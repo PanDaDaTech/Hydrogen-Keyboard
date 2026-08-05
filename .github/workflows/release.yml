@@ -1,0 +1,248 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example v1.0.0)
+        required: true
+        type: string
+      title:
+        description: Release title (leave empty to use the tag)
+        required: false
+        type: string
+      draft:
+        description: Create as a draft release
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: Mark as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+env:
+  YY_THUNKS_VER: 1.2.2
+  VC_LTL_VER: 5.3.1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate release tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Tag must use a version format such as v1.0.0 or v1.0.0-rc.1."
+          }
+
+      - name: Locate Visual Studio
+        id: vs
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do (
+              echo VS_PATH=%%i>> "%GITHUB_OUTPUT%"
+              echo [Info] Found VS at: %%i
+          )
+
+
+      - name: Download YY-Thunks & VC-LTL (NuGet)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path deps | Out-Null
+
+          # YY-Thunks: 提供 WinXP 兼容 thunk 桩对象
+          $yyUrl = "https://api.nuget.org/v3-flatcontainer/yy-thunks/${{ env.YY_THUNKS_VER }}/yy-thunks.${{ env.YY_THUNKS_VER }}.nupkg"
+          Write-Host "Downloading YY-Thunks ${{ env.YY_THUNKS_VER }} ..."
+          Invoke-WebRequest -Uri $yyUrl -OutFile deps/yy-thunks.zip
+          Expand-Archive -Path deps/yy-thunks.zip -DestinationPath deps/YY-Thunks -Force
+          Remove-Item deps/yy-thunks.zip
+
+          # VC-LTL: 静态链接 CRT，减小体积并支持 XP 子系统
+          $ltlUrl = "https://api.nuget.org/v3-flatcontainer/vc-ltl/${{ env.VC_LTL_VER }}/vc-ltl.${{ env.VC_LTL_VER }}.nupkg"
+          Write-Host "Downloading VC-LTL ${{ env.VC_LTL_VER }} ..."
+          Invoke-WebRequest -Uri $ltlUrl -OutFile deps/vc-ltl.zip
+          Expand-Archive -Path deps/vc-ltl.zip -DestinationPath deps/VC-LTL -Force
+          Remove-Item deps/vc-ltl.zip
+
+          Write-Host "`nDependencies ready."
+
+
+      - name: Build x86
+        shell: cmd
+        run: |
+          call "${{ steps.vs.outputs.VS_PATH }}\Common7\Tools\VsDevCmd.bat" -arch=x86
+          if %errorlevel% neq 0 (
+              echo [Error] Failed to init MSVC x86 environment.
+              exit /b 1
+          )
+          if not exist "build\x86" mkdir "build\x86"
+          if not exist "dist\x86" mkdir "dist\x86"
+
+          rem Locate YY-Thunks obj
+          set "YY_OBJ="
+          for /f "delims=" %%f in ('dir /s /b "deps\YY-Thunks\YY_Thunks_for_WinXP.obj" 2^>nul') do (
+              echo %%f | findstr /i "x86" >nul && set "YY_OBJ=%%f"
+          )
+          if defined YY_OBJ (echo [x86] YY-Thunks: %YY_OBJ%) else (echo [x86] YY-Thunks obj not found!)
+
+          rem Locate VC-LTL paths
+          set "LTL_INC="
+          set "LTL_LIB="
+          set "LTL_INC2="
+          for /f "delims=" %%d in ('dir /s /b /ad "deps\VC-LTL\header" 2^>nul') do (
+              if not defined LTL_INC set "LTL_INC=%%d"
+          )
+          for /f "delims=" %%d in ('dir /s /b /ad "deps\VC-LTL\5.1.2600.0" 2^>nul') do (
+              if not defined LTL_LIB (
+                  if exist "%%d\lib\Win32" set "LTL_LIB=%%d\lib\Win32"
+                  if exist "%%d\lib\x86" set "LTL_LIB=%%d\lib\x86"
+                  if exist "%%d\header" set "LTL_INC2=%%d\header"
+              )
+          )
+
+          if defined LTL_INC set "INCLUDE=%LTL_INC%;%INCLUDE%"
+          if defined LTL_INC2 set "INCLUDE=%LTL_INC2%;%INCLUDE%"
+          if defined LTL_LIB set "LIB=%LTL_LIB%;%LIB%"
+          if defined LTL_LIB (echo [x86] VC-LTL lib: %LTL_LIB%) else (echo [x86] VC-LTL not found, using default CRT)
+
+          rem Compile resources
+          rc /nologo /c65001 /fo "build\x86\touch_keyboard.res" "touch_keyboard.rc"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Compile source
+          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "touch_keyboard.cpp" /Fo"build\x86\touch_keyboard.obj"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Link (with YY-Thunks if available)
+          if defined YY_OBJ (
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x86\touch_keyboard.obj" "build\x86\touch_keyboard.res" "%YY_OBJ%" /link /OUT:"dist\x86\UI_TouchKeyboard_x86.exe" /SUBSYSTEM:WINDOWS,5.01 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+          ) else (
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x86\touch_keyboard.obj" "build\x86\touch_keyboard.res" /link /OUT:"dist\x86\UI_TouchKeyboard_x86.exe" /SUBSYSTEM:WINDOWS,5.01 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+          )
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          echo [x86] Build succeeded.
+
+
+      - name: Build x64
+        shell: cmd
+        run: |
+          call "${{ steps.vs.outputs.VS_PATH }}\Common7\Tools\VsDevCmd.bat" -arch=x64
+          if %errorlevel% neq 0 (
+              echo [Error] Failed to init MSVC x64 environment.
+              exit /b 1
+          )
+          if not exist "build\x64" mkdir "build\x64"
+          if not exist "dist\x64" mkdir "dist\x64"
+
+          rem Locate YY-Thunks obj
+          set "YY_OBJ="
+          for /f "delims=" %%f in ('dir /s /b "deps\YY-Thunks\YY_Thunks_for_WinXP.obj" 2^>nul') do (
+              echo %%f | findstr /i "x64" >nul && set "YY_OBJ=%%f"
+          )
+          if defined YY_OBJ (echo [x64] YY-Thunks: %YY_OBJ%) else (echo [x64] YY-Thunks obj not found!)
+
+          rem Locate VC-LTL paths
+          set "LTL_INC="
+          set "LTL_LIB="
+          set "LTL_INC2="
+          for /f "delims=" %%d in ('dir /s /b /ad "deps\VC-LTL\header" 2^>nul') do (
+              if not defined LTL_INC set "LTL_INC=%%d"
+          )
+          for /f "delims=" %%d in ('dir /s /b /ad "deps\VC-LTL\5.2.3790.0" 2^>nul') do (
+              if not defined LTL_LIB (
+                  if exist "%%d\lib\x64" set "LTL_LIB=%%d\lib\x64"
+                  if exist "%%d\header" set "LTL_INC2=%%d\header"
+              )
+          )
+
+          if defined LTL_INC set "INCLUDE=%LTL_INC%;%INCLUDE%"
+          if defined LTL_INC2 set "INCLUDE=%LTL_INC2%;%INCLUDE%"
+          if defined LTL_LIB set "LIB=%LTL_LIB%;%LIB%"
+          if defined LTL_LIB (echo [x64] VC-LTL lib: %LTL_LIB%) else (echo [x64] VC-LTL not found, using default CRT)
+
+          rem Compile resources
+          rc /nologo /c65001 /fo "build\x64\touch_keyboard.res" "touch_keyboard.rc"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Compile source
+          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "touch_keyboard.cpp" /Fo"build\x64\touch_keyboard.obj"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Link (with YY-Thunks if available)
+          if defined YY_OBJ (
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x64\touch_keyboard.obj" "build\x64\touch_keyboard.res" "%YY_OBJ%" /link /OUT:"dist\x64\UI_TouchKeyboard_x64.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+          ) else (
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x64\touch_keyboard.obj" "build\x64\touch_keyboard.res" /link /OUT:"dist\x64\UI_TouchKeyboard_x64.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+          )
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          echo [x64] Build succeeded.
+
+
+      - name: Package release archive (7z)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) {
+            throw "7-Zip not found at $sevenZip; cannot create the release archive."
+          }
+          & $sevenZip a -t7z -mx=9 'dist/release/UI_TouchKeyboard_X86_X64.7z' 'dist/x86/UI_TouchKeyboard_x86.exe' 'dist/x64/UI_TouchKeyboard_x64.exe'
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip packaging failed with exit code $LASTEXITCODE"
+          }
+          Get-Item -LiteralPath 'dist/release/UI_TouchKeyboard_X86_X64.7z' | Select-Object Name, Length
+
+      - name: Verify release files
+        shell: pwsh
+        run: |
+          $required = @(
+            'dist/x86/UI_TouchKeyboard_x86.exe',
+            'dist/x64/UI_TouchKeyboard_x64.exe',
+            'dist/release/UI_TouchKeyboard_X86_X64.7z'
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Missing release file: $file"
+            }
+          }
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: UI_TouchKeyboard_${{ inputs.tag }}
+          if-no-files-found: error
+          path: |
+            dist/x86/UI_TouchKeyboard_x86.exe
+            dist/x64/UI_TouchKeyboard_x64.exe
+            dist/release/UI_TouchKeyboard_X86_X64.7z
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.title || inputs.tag }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/x86/UI_TouchKeyboard_x86.exe
+            dist/x64/UI_TouchKeyboard_x64.exe
+            dist/release/UI_TouchKeyboard_X86_X64.7z

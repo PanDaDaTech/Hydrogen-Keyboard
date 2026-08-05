@@ -1,0 +1,34 @@
+// touch_keyboard.rc
+#include "resource.h"
+#include <winres.h>
+
+IDI_MAIN_ICON ICON "winres/main.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION VER_FILEVERSION
+ PRODUCTVERSION VER_PRODUCTVERSION
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "TouchKeyboard"
+            VALUE "FileDescription", "Screen Keyboard"
+            VALUE "FileVersion", VER_FILEVERSION_STR
+            VALUE "InternalName", "UI_TouchKeyboard"
+            VALUE "LegalCopyright", "Copyright (C) 2024-2026"
+            VALUE "OriginalFilename", "UI_TouchKeyboard.exe"
+            VALUE "ProductName", "ScreenKeyboard"
+            VALUE "ProductVersion", VER_PRODUCTVERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

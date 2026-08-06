@@ -187,7 +187,7 @@ BOOL        g_manualShow = FALSE;
 BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
 int         g_winCount = 0;           // Win 键点击状态：0=空闲 1=锁定(Win+快捷键) 2=开始菜单已打开（0→1→2→0）
-DWORD       g_winLockTick = 0;        // Win 键锁定时刻（超时自动解锁，防止一直高亮）
+DWORD       g_lastWinTick = 0;        // 最近一次 Win 键点击时刻（状态超时复位用）
 int         g_shiftCount = 0;         // 左右 Shift 共享点击计数：1=特殊符号 2=切换中/英
 HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/Shift/Caps 状态同步显示）
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
@@ -725,15 +725,17 @@ static void DoKeyAction(const KeyDef* k) {
             if (g_winCount == 0) {
                 g_winCount = 1;
                 g_winKey = TRUE;
-                g_winLockTick = GetTickCount();
+                g_lastWinTick = GetTickCount();
                 g_fnLayer = FALSE;
             } else if (g_winCount == 1) {
                 g_winCount = 2;
                 g_winKey = FALSE;
+                g_lastWinTick = GetTickCount();
                 SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 打开开始菜单
             } else {
                 g_winCount = 0;
                 g_winKey = FALSE;                       // 关闭开始菜单，回到空闲
+                g_lastWinTick = GetTickCount();
                 SendKey(VK_LWIN, FALSE, FALSE, FALSE);
             }
             break;
@@ -1283,7 +1285,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return HTCLIENT;
     }
-    case WM_LBUTTONDOWN: OnLDown(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: OnLDown(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_LBUTTONUP: OnLUp(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
@@ -1341,8 +1344,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 InvalidateRect(hWnd, 0, TRUE);
             }
 
-            // Win 锁定超时自动解锁：防止锁定后一直高亮、下次点击误弹开始菜单
-            if (g_winKey && (GetTickCount() - g_winLockTick) > 8000) {
+            // Win 状态超时自动复位：锁定(1) 5 秒、开始菜单(2) 8 秒未操作即回到空闲，
+            // 防止一直高亮，以及残留状态导致“第一次点击就弹开始菜单”。
+            if (g_winCount != 0 && (GetTickCount() - g_lastWinTick) > (g_winCount == 1 ? 5000 : 8000)) {
                 ClearWinLock();
                 InvalidateRect(hWnd, 0, TRUE);
             }

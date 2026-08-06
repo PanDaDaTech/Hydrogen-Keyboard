@@ -186,7 +186,8 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
-int         g_winCount = 0;           // Win 键点击状态：0=空闲 1=锁定 2=开始菜单已打开 3=关闭后锁定（0→1→2→1→0）
+int         g_winCount = 0;           // Win 键点击状态：0=空闲 1=锁定(Win+快捷键) 2=开始菜单已打开（0→1→2→0）
+DWORD       g_winLockTick = 0;        // Win 键锁定时刻（超时自动解锁，防止一直高亮）
 int         g_shiftCount = 0;         // 左右 Shift 共享点击计数：1=特殊符号 2=切换中/英
 HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/Shift/Caps 状态同步显示）
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
@@ -418,6 +419,35 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     RECT rb = {x, y + h / 2, x + w, y + h};
     SelectObject(dc, fBase);
     SetTextColor(dc, baseC);
+    DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+// Fn 层双符号键绘制：上=副符号（随 Shift 灰/白），中=F 键标签，下=主字符
+static void DrawKeyFnDual(HDC dc, int x, int y, int w, int h,
+                          wchar_t baseCh, wchar_t shiftCh, const wchar_t* fnText,
+                          DWORD textC, DWORD shiftC) {
+    wchar_t buf[2] = {0, 0};
+    int h3 = h / 3;
+
+    // 副符号（上）
+    buf[0] = shiftCh;
+    RECT rt = {x, y, x + w, y + h3};
+    SelectObject(dc, g_f12);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, shiftC);
+    DrawTextW(dc, buf, -1, &rt, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    // F 键标签（中）
+    RECT rm = {x, y + h3, x + w, y + h3 * 2};
+    SelectObject(dc, g_f13b);
+    SetTextColor(dc, textC);
+    DrawTextW(dc, fnText, -1, &rm, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    // 主字符（下）
+    buf[0] = baseCh;
+    RECT rb = {x, y + h3 * 2, x + w, y + h};
+    SelectObject(dc, g_f12);
+    SetTextColor(dc, textC);
     DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -716,27 +746,24 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         if (k->vk == VK_LWIN) {
-            // Win 键点击状态循环 0→1→2→1→0（同步原生 OSK 逻辑），不依赖开始菜单检测：
+            // Win 键点击状态循环 0→1→2→0，不依赖开始菜单检测：
             //  第 1 次：0→1 锁定并高亮，下一个键组成 Win+快捷键；
             //  第 2 次：1→2 发送 Win 键打开开始菜单；
-            //  第 3 次：2→1 再发送 Win 键关闭开始菜单并回到锁定态；
-            //  第 4 次：1→0 解除锁定。
-            // 内部以 0/1/2/3 表示，其中 1 和 3 都显示为“锁定(1)”高亮状态。
+            //  第 3 次：2→0 再发送 Win 键关闭开始菜单，
+            //          回到空闲（不再重新锁定，避免关闭后 Win 键一直高亮）。
             if (g_winCount == 0) {
                 g_winCount = 1;
                 g_winKey = TRUE;
+                g_winLockTick = GetTickCount();
                 g_fnLayer = FALSE;
             } else if (g_winCount == 1) {
                 g_winCount = 2;
                 g_winKey = FALSE;
                 SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 打开开始菜单
-            } else if (g_winCount == 2) {
-                g_winCount = 3;
-                g_winKey = TRUE;                        // 关闭开始菜单后回到锁定态
-                SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 关闭开始菜单
             } else {
                 g_winCount = 0;
-                g_winKey = FALSE;                       // 解除锁定
+                g_winKey = FALSE;                       // 关闭开始菜单，回到空闲
+                SendKey(VK_LWIN, FALSE, FALSE, FALSE);
             }
             break;
         }
@@ -903,14 +930,23 @@ static void DrawKeys(HDC dc) {
         DWORD textC = (active || pressed) && IsLightColor(bg) ? 0x1A1A1A : C_WHITE;
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，
-        // 副符号在 Shift 未触发时灰色、触发后白色；Fn 层时仍显示 F1~F12。
+        // 副符号在 Shift 未触发时灰色、触发后白色；
+        // Fn 层时数字行/-/= 键在双符号基础上叠加 F1~F12 标签。
         wchar_t baseCh = 0, shiftCh = 0;
-        if (k->type == K_NORMAL && !g_fnLayer) {
+        const wchar_t* fnTxt = NULL;
+        wchar_t fnBuf[8] = {0};
+        if (k->type == K_NORMAL) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
+            if (g_fnLayer) {
+                int fn = FnMap(k->vk);
+                if (fn) { swprintf(fnBuf, 8, L"F%d", fn); fnTxt = fnBuf; }
+            }
         }
-        if (baseCh && shiftCh && shiftCh != baseCh) {
-            DWORD shiftC = (g_sh || g_physShift) ? textC : C_DIM;
+        DWORD shiftC = (g_sh || g_physShift) ? textC : C_DIM;
+        if (fnTxt) {
+            DrawKeyFnDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, fnTxt, textC, shiftC);
+        } else if (baseCh && shiftCh && shiftCh != baseCh) {
             DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, shiftC);
         } else {
             DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
@@ -1132,6 +1168,10 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
                     break;
                 case VK_LWIN: case VK_RWIN:
                     if (g_physWin != down) { g_physWin = down; changed = TRUE; }
+                    if (down) {
+                        // 实体 Win 键已由系统弹出/关闭开始菜单，重置虚拟计数避免失步
+                        if (g_winCount != 0 || g_winKey) { g_winCount = 0; g_winKey = FALSE; changed = TRUE; }
+                    }
                     break;
                 case VK_CAPITAL:
                     if (down) { g_cp = !g_cp; changed = TRUE; }
@@ -1337,6 +1377,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             if (g_winKey && IsStartMenuOpen()) {
                 ClearWinLock();
                 InvalidateRect(hWnd, 0, TRUE);
+            }
+
+            // Win 锁定超时自动解锁：防止锁定后一直高亮、下次点击误弹开始菜单
+            if (g_winKey && (GetTickCount() - g_winLockTick) > 8000) {
+                ClearWinLock();
+                InvalidateRect(hWnd, 0, TRUE);
+            }
+
+            // 实体键状态自校正：钩子偶尔漏掉 keyup/keydown 时，按物理键实际状态修正显示，避免高亮残留
+            {
+                BOOL pShift = ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0) ||
+                              ((GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0);
+                BOOL pWin   = ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
+                              ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
+                if (g_physShift != pShift || g_physWin != pWin) {
+                    g_physShift = pShift;
+                    g_physWin = pWin;
+                    InvalidateRect(hWnd, 0, TRUE);
+                }
             }
 
             if (!g_af || GetTickCount() - g_lht < 1000) return 0;

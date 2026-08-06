@@ -1169,6 +1169,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
     int ki = HitKey(x, y);
     if (ki < 0) return;
     g_pk = ki;
+    SetCapture(hWnd);   // 捕获鼠标，防止开始菜单等出现时抢走鼠标抬起消息导致键一直高亮
     const KeyDef* k = &g_keys[ki];
     DoKeyAction(k);
 
@@ -1184,6 +1185,7 @@ static void OnLUp(HWND hWnd, int x, int y) {
     (void)y;
     KillTimer(hWnd, TIMER_REPEAT);
     g_repeatKeyIdx = -1;
+    if (GetCapture() == hWnd) ReleaseCapture();
 
     if (g_pk >= 0) {
         g_pk = -1;
@@ -1289,6 +1291,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: OnLDown(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_LBUTTONUP: OnLUp(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
+    case WM_CAPTURECHANGED:
+        // 鼠标捕获被夺走（如开始菜单弹出）时清除按下状态，避免键一直高亮
+        g_pk = -1;
+        KillTimer(hWnd, TIMER_REPEAT);
+        g_repeatKeyIdx = -1;
+        InvalidateRect(hWnd, 0, TRUE);
+        return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
         if (g_af && !g_vis && (GetTickCount() - g_lht >= 1000)) {

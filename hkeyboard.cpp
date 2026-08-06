@@ -504,7 +504,7 @@ static BOOL IsActive(const KeyDef* k) {
     if (k->vk == 0x14 && g_cp) return TRUE;
     if ((k->vk == VK_SHIFT || k->vk == VK_LSHIFT || k->vk == VK_RSHIFT) && (g_sh || g_physShift)) return TRUE;
     if (k->vk == 0x11 && g_ct) return TRUE;
-    if (k->vk == VK_LWIN && g_physWin) return TRUE;   // 仅实体 Win 按下时高亮，虚拟锁定不持久高亮
+    if (k->vk == VK_LWIN && (g_winKey || g_physWin)) return TRUE;   // 锁定(等 Win+快捷键)或实体 Win 按下时高亮
     if (k->vk == 0x12 && g_al) return TRUE;
     if (k->type == K_SPECIAL && k->vk == 0 && g_fnLayer) return TRUE;
     return FALSE;
@@ -719,10 +719,10 @@ static void DoKeyAction(const KeyDef* k) {
         }
         if (k->vk == VK_LWIN) {
             // Win 键点击状态 0→1→2→0，不依赖开始菜单检测：
-            //  0=空闲：第 1 次点击 → 1 静默锁定（不持久高亮），下一个键组成 Win+快捷键；
+            //  0=空闲：第 1 次点击 → 1 锁定并高亮，下一个键组成 Win+快捷键；
             //  1=锁定：第 2 次点击 → 2 发送 Win 键打开开始菜单；
             //  2=已开：第 3 次点击 → 0 发送 Win 键关闭开始菜单，回到空闲。
-            // 普通键或超时都会回到 0；Win 键高亮仅在点击瞬间/实体按住时显示。
+            // 普通键或超时都会回到 0；锁定期间保持高亮，关闭开始菜单后高亮自动消失。
             if (g_winCount == 0) {
                 g_winCount = 1;
                 g_winKey = TRUE;
@@ -1354,9 +1354,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 InvalidateRect(hWnd, 0, TRUE);
             }
 
-            // Win 状态超时自动复位：锁定(1) 4 秒、开始菜单已开(2) 8 秒未操作即回到空闲，
+            // Win 状态超时自动复位：锁定/开始菜单已开未操作 8 秒即回到空闲，
             // 防止一直高亮，以及残留状态导致“第一次点击就弹开始菜单”。
-            if (g_winCount != 0 && (GetTickCount() - g_lastWinTick) > (g_winCount == 1 ? 4000 : 8000)) {
+            if (g_winCount != 0 && (GetTickCount() - g_lastWinTick) > 8000) {
                 ClearWinLock();
                 InvalidateRect(hWnd, 0, TRUE);
             }

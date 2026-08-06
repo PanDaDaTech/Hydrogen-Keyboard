@@ -900,11 +900,10 @@ static void DrawKeys(HDC dc) {
         if (k->vk == 0x20 || k->type == K_SPACE) f = g_f14b;
         DWORD textC = (active || pressed) && IsLightColor(bg) ? 0x1A1A1A : C_WHITE;
 
-        // 双符号键（数字行/标点）：同时显示主字符与副符号，
-        // 副符号在 Shift 未触发时灰色、触发后白色；
-        // Fn 层时数字行/-/= 键仅显示 F1~F12（不显示副符号）。
+        // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
+        // Fn 层时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
         wchar_t baseCh = 0, shiftCh = 0;
-        if (k->type == K_NORMAL && !g_fnLayer) {
+        if (k->type == K_NORMAL && !(g_fnLayer && FnMap(k->vk) != 0)) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }

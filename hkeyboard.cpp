@@ -186,7 +186,7 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
-int         g_winCount = 0;           // Win 键点击状态：0=空闲 1=锁定(Win+快捷键) 2=开始菜单已打开（0→1→2→0）
+int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定 2=切换开始菜单（0→1→2，2 态稳定）
 DWORD       g_lastWinTick = 0;        // 最近一次 Win 键点击时刻（状态超时复位用）
 int         g_shiftCount = 0;         // 左右 Shift 共享点击计数：1=特殊符号 2=切换中/英
 HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/Shift/Caps 状态同步显示）
@@ -693,6 +693,7 @@ static void DoKeyAction(const KeyDef* k) {
             BOOL us = g_sh ? !(GetKeyState(VK_CAPITAL) & 1) : FALSE;
             SendKey(k->vk, us, FALSE, FALSE);
             if (g_sh) g_sh = FALSE;
+            ClearWinLock();   // 普通键也退出 Win 锁定/切换状态
         }
         break;
     case K_NORMAL:
@@ -717,26 +718,22 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         if (k->vk == VK_LWIN) {
-            // Win 键点击状态循环 0→1→2→0，不依赖开始菜单检测：
-            //  第 1 次：0→1 锁定并高亮，下一个键组成 Win+快捷键；
-            //  第 2 次：1→2 发送 Win 键打开开始菜单；
-            //  第 3 次：2→0 再发送 Win 键关闭开始菜单，
-            //          回到空闲（不再重新锁定，避免关闭后 Win 键一直高亮）。
+            // Win 键状态机（0→1→2，2 态稳定），不依赖开始菜单检测：
+            //  0=空闲：第 1 次点击 → 1 锁定并高亮，下一个键组成 Win+快捷键；
+            //  1=锁定：第 2 次点击 → 2 发送 Win 键（打开开始菜单），不再高亮；
+            //  2=切换：之后每次点击都直接发送 Win 键，由系统决定开/关开始菜单，
+            //         状态保持在 2，不再靠计数猜测开始菜单状态（避免失步）。
+            // 按任意普通键或超时都会回到 0（空闲）。
             if (g_winCount == 0) {
                 g_winCount = 1;
                 g_winKey = TRUE;
                 g_lastWinTick = GetTickCount();
                 g_fnLayer = FALSE;
-            } else if (g_winCount == 1) {
-                g_winCount = 2;
+            } else {
+                if (g_winCount == 1) g_winCount = 2;   // 锁定 → 进入切换模式
                 g_winKey = FALSE;
                 g_lastWinTick = GetTickCount();
-                SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 打开开始菜单
-            } else {
-                g_winCount = 0;
-                g_winKey = FALSE;                       // 关闭开始菜单，回到空闲
-                g_lastWinTick = GetTickCount();
-                SendKey(VK_LWIN, FALSE, FALSE, FALSE);
+                SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 直接发送 Win 键，系统切换开始菜单
             }
             break;
         }
@@ -1344,9 +1341,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 InvalidateRect(hWnd, 0, TRUE);
             }
 
-            // Win 状态超时自动复位：锁定(1) 5 秒、开始菜单(2) 8 秒未操作即回到空闲，
+            // Win 状态超时自动复位：锁定(1) 4 秒、切换(2) 8 秒未操作即回到空闲，
             // 防止一直高亮，以及残留状态导致“第一次点击就弹开始菜单”。
-            if (g_winCount != 0 && (GetTickCount() - g_lastWinTick) > (g_winCount == 1 ? 5000 : 8000)) {
+            if (g_winCount != 0 && (GetTickCount() - g_lastWinTick) > (g_winCount == 1 ? 4000 : 8000)) {
                 ClearWinLock();
                 InvalidateRect(hWnd, 0, TRUE);
             }

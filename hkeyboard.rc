@@ -21,7 +21,7 @@ BEGIN
             VALUE "FileDescription", "HKeyboard - Screen Keyboard"
             VALUE "FileVersion", VER_FILEVERSION_STR
             VALUE "InternalName", "HKeyboard"
-            VALUE "LegalCopyright", "Copyright (C) 2024-2026"
+            VALUE "LegalCopyright", "Copyright (C) 2024-2026 PanDaTech"
             VALUE "OriginalFilename", "HKeyboard.exe"
             VALUE "ProductName", "HKeyboard"
             VALUE "ProductVersion", VER_PRODUCTVERSION_STR

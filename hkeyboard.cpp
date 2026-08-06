@@ -1,5 +1,5 @@
 // hkeyboard.cpp - HKeyboard 轻键 (Pure Win32 C++)
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0501
 #include <windows.h>

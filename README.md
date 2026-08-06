@@ -1,6 +1,7 @@
 # 轻键 (HKeyboard)
 
-> 作者：江南一根葱 & PanDaTech
+> 作者：PanDaTech
+> 原项目作者：江南一根葱（原项目地址：待补充）
 
 > 专为 Windows 11 / 10 及 WinPE 离线环境打造的**极轻量级、原生 Win32 C++ 触控键盘**。
 > 无任何重型 UI 框架依赖，内存占用仅 **~3MB**，二进制文件仅 **~30KB**，支持 4K 高分屏自适应与完整 QWERTY 键盘布局。
@@ -82,4 +83,4 @@ HKeyboard_x64.exe -noauto -show
 
 ## 开源协议 (License)
 
-本项目基于 [GPL-3.0-or-later](LICENSE) 开源。
+本项目基于 [MIT](LICENSE) 许可证开源。

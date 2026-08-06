@@ -1,4 +1,4 @@
-# 屏幕键盘 (Screen Keyboard)
+# 轻键 (HKeyboard)
 
 > 作者：江南一根葱 & PanDaTech
 
@@ -41,13 +41,13 @@
 
 ```bat
 :: 1. 触摸屏设备静默自启（驻留托盘，点击输入框自动弹显）
-UI_TouchKeyboard_x64.exe -hide -touchonly
+HKeyboard_x64.exe -hide -touchonly
 
 :: 2. 强制浅色主题并直接显示
-UI_TouchKeyboard_x64.exe -light -show
+HKeyboard_x64.exe -light -show
 
 :: 3. 关闭自动呼出并直接显示
-UI_TouchKeyboard_x64.exe -noauto -show
+HKeyboard_x64.exe -noauto -show
 ```
 
 ---

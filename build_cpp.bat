@@ -84,10 +84,10 @@ if not defined Z7_EXE (
 )
 
 if defined Z7_EXE (
-    if exist "%SRC%\dist\release\UI_TouchKeyboard_X86_X64.7z" del /f /q "%SRC%\dist\release\UI_TouchKeyboard_X86_X64.7z"
-    "!Z7_EXE!" a -t7z -mx=9 "%SRC%\dist\release\UI_TouchKeyboard_X86_X64.7z" "%SRC%\dist\x86\UI_TouchKeyboard_x86.exe" "%SRC%\dist\x64\UI_TouchKeyboard_x64.exe"
-    if exist "%SRC%\dist\release\UI_TouchKeyboard_X86_X64.7z" (
-        echo [Info] Successfully created release package: dist\release\UI_TouchKeyboard_X86_X64.7z
+    if exist "%SRC%\dist\release\HKeyboard_X86_X64.7z" del /f /q "%SRC%\dist\release\HKeyboard_X86_X64.7z"
+    "!Z7_EXE!" a -t7z -mx=9 "%SRC%\dist\release\HKeyboard_X86_X64.7z" "%SRC%\dist\x86\HKeyboard_x86.exe" "%SRC%\dist\x64\HKeyboard_x64.exe"
+    if exist "%SRC%\dist\release\HKeyboard_X86_X64.7z" (
+        echo [Info] Successfully created release package: dist\release\HKeyboard_X86_X64.7z
     ) else (
         echo [Warn] Failed to create release package.
     )
@@ -240,15 +240,15 @@ if defined VCLTL_FOUND (
 
 rem Compile resource file
 echo [%ARCH%] Compiling resources...
-rc /nologo /c65001 /fo "%SRC%\build\%ARCH%\touch_keyboard.res" "%SRC%\touch_keyboard.rc"
+rc /nologo /c65001 /fo "%SRC%\build\%ARCH%\hkeyboard.res" "%SRC%\hkeyboard.rc"
 if !errorlevel! neq 0 (
     echo [Error] Resource compilation failed.
     exit /b 1
 )
 
-rem Compile touch_keyboard.cpp
-echo [%ARCH%] Compiling touch_keyboard.cpp ...
-cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "%SRC%\touch_keyboard.cpp" /Fo"%SRC%\build\%ARCH%\touch_keyboard.obj"
+rem Compile hkeyboard.cpp
+echo [%ARCH%] Compiling hkeyboard.cpp ...
+cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "%SRC%\hkeyboard.cpp" /Fo"%SRC%\build\%ARCH%\hkeyboard.obj"
 if !errorlevel! neq 0 (
     echo [Error] Compilation failed.
     exit /b 1
@@ -257,9 +257,9 @@ if !errorlevel! neq 0 (
 rem Link
 echo [%ARCH%] Linking...
 if defined YY_THUNK_OBJ (
-    cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\touch_keyboard.obj" "%SRC%\build\%ARCH%\touch_keyboard.res" "!YY_THUNK_OBJ!" /link /OUT:"%SRC%\dist\%ARCH%\UI_TouchKeyboard_%ARCH%.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+    cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\hkeyboard.obj" "%SRC%\build\%ARCH%\hkeyboard.res" "!YY_THUNK_OBJ!" /link /OUT:"%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
 ) else (
-    cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\touch_keyboard.obj" "%SRC%\build\%ARCH%\touch_keyboard.res" /link /OUT:"%SRC%\dist\%ARCH%\UI_TouchKeyboard_%ARCH%.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+    cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\hkeyboard.obj" "%SRC%\build\%ARCH%\hkeyboard.res" /link /OUT:"%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
 )
 if !errorlevel! neq 0 (
     echo [Error] Linking failed.
@@ -267,13 +267,13 @@ if !errorlevel! neq 0 (
 )
 
 rem Compress with UPX (optional)
-if exist "%SRC%\dist\%ARCH%\UI_TouchKeyboard_%ARCH%.exe" (
+if exist "%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" (
     if exist "%SRC%\bin\upx.exe" (
         echo [%ARCH%] Compressing final executable with UPX...
-        "%SRC%\bin\upx.exe" --best --force "%SRC%\dist\%ARCH%\UI_TouchKeyboard_%ARCH%.exe"
+        "%SRC%\bin\upx.exe" --best --force "%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe"
     )
 )
 
-echo [%ARCH%] Build succeeded: dist\%ARCH%\UI_TouchKeyboard_%ARCH%.exe
+echo [%ARCH%] Build succeeded: dist\%ARCH%\HKeyboard_%ARCH%.exe
 endlocal
 exit /b 0

@@ -1,4 +1,4 @@
-// touch_keyboard.cpp - Touch Keyboard (Pure Win32 C++)
+// hkeyboard.cpp - HKeyboard 轻键 (Pure Win32 C++)
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0501
@@ -962,10 +962,10 @@ static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
 static void PromptCloseAction(HWND hWnd) {
     int ret = MessageBoxW(hWnd,
-        L"\x8BF7\x9009\x62E9\x5C4F\x5E55\x952E\x76D8\x9000\x51FA\x65B9\x5F0F\xFF1A\n\n"
+        L"\x8BF7\x9009\x62E9\x8F7B\x952E\x9000\x51FA\x65B9\x5F0F\xFF1A\n\n"
         L"\x3010\x662F(Y)\x3011\x5B8C\x5168\x9000\x51FA\x7A0B\x5E8F\n"
         L"\x3010\x5426(N)\x3011\x9690\x85CF\x5230\x7CFB\x7EDF\x6258\x76D8",
-        L"\x5C4F\x5E55\x952E\x76D8",
+        L"\x8F7B\x952E",
         MB_YESNOCANCEL | MB_ICONQUESTION);
     if (ret == IDYES) {
         DestroyWindow(hWnd);
@@ -998,14 +998,14 @@ static void AddTray() {
     g_nid.uCallbackMessage = WM_TRAY;
     if (!g_hTrayIcon) g_hTrayIcon = LoadMainIcon(16);
     g_nid.hIcon = g_hTrayIcon;
-    strcpy(g_nid.szTip, "\xE5\xB1\x8F\xE5\xB9\x95\xE9\x94\xAE\xE7\x9B\x98");
+    strcpy(g_nid.szTip, "\xE8\xBD\xBB\xE9\x94\xAE");
     Shell_NotifyIconA(NIM_ADD, &g_nid);
     g_tray = TRUE;
 }
 
 static void ShowAboutDialog(HWND hWnd) {
     MessageBoxW(hWnd,
-        L"Screen Keyboard \x5C4F\x5E55\x952E\x76D8\n"
+        L"HKeyboard \x8F7B\x952E\n"
         L"Powered By \x6C5F\x5357\x4E00\x6839\x8471 & PanDaTech\n\n"
         L"\x89E6\x63A7\x4E0E\x9AD8\x6E05\x5C4F\x663E\x8F93\x5165\x5DE5\x5177",
         L"\x5173\x4E8E",
@@ -1033,7 +1033,7 @@ static void ShowHelpDialog(HWND hWnd) {
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, g_vis ? L"\x9690\x85CF\x5C4F\x5E55\x952E\x76D8" : L"\x663E\x793A\x5C4F\x5E55\x952E\x76D8");
+    AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, g_vis ? L"\x9690\x85CF\x8F7B\x952E" : L"\x663E\x793A\x8F7B\x952E");
 
     AppendMenuW(m, MF_STRING, ID_MENU_AUTO, g_af ? L"\x7981\x7528\x81EA\x52A8\x547C\x51FA" : L"\x542F\x7528\x81EA\x52A8\x547C\x51FA");
 
@@ -1456,10 +1456,10 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     if (fNoAuto) g_af = FALSE;
     else if (fAuto) g_af = TRUE;
 
-    g_mutex = CreateMutexW(0, FALSE, L"UI_TouchKeyboard_Mutex");
+    g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(g_mutex);
-        HWND ew = FindWindowW(L"UI_TouchKeyboard", 0);
+        HWND ew = FindWindowW(L"HKeyboard", 0);
         if (ew) {
             if (!fHide) ShowWindow(ew, SW_SHOW);
             SetForegroundWindow(ew);
@@ -1469,7 +1469,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     HICON hAppIcon = LoadMainIcon(32);
     WNDCLASSEXW wc = {sizeof(wc), CS_DBLCLKS, WndProc, 0, 0, hI,
-        hAppIcon, LoadCursor(0, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), 0, L"UI_TouchKeyboard", hAppIcon};
+        hAppIcon, LoadCursor(0, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), 0, L"HKeyboard", hAppIcon};
     RegisterClassExW(&wc);
 
     InitWindowSizeForDpi();
@@ -1477,7 +1477,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     HWND hWnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,
-        L"UI_TouchKeyboard", L"\x5C4F\x5E55\x952E\x76D8", WS_POPUP,
+        L"HKeyboard", L"\x8F7B\x952E", WS_POPUP,
         work.left + ((work.right - work.left) - g_ww) / 2,
         work.bottom - g_wh - 6,
         g_ww, g_wh, 0, 0, hI, 0);

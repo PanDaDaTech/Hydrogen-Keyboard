@@ -122,18 +122,18 @@ jobs:
           if defined LTL_LIB (echo [x86] VC-LTL lib: %LTL_LIB%) else (echo [x86] VC-LTL not found, using default CRT)
 
           rem Compile resources
-          rc /nologo /c65001 /fo "build\x86\touch_keyboard.res" "touch_keyboard.rc"
+          rc /nologo /c65001 /fo "build\x86\hkeyboard.res" "hkeyboard.rc"
           if %errorlevel% neq 0 exit /b %errorlevel%
 
           rem Compile source
-          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "touch_keyboard.cpp" /Fo"build\x86\touch_keyboard.obj"
+          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "hkeyboard.cpp" /Fo"build\x86\hkeyboard.obj"
           if %errorlevel% neq 0 exit /b %errorlevel%
 
           rem Link (with YY-Thunks if available)
           if defined YY_OBJ (
-              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x86\touch_keyboard.obj" "build\x86\touch_keyboard.res" "%YY_OBJ%" /link /OUT:"dist\x86\UI_TouchKeyboard_x86.exe" /SUBSYSTEM:WINDOWS,5.01 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x86\hkeyboard.obj" "build\x86\hkeyboard.res" "%YY_OBJ%" /link /OUT:"dist\x86\HKeyboard_x86.exe" /SUBSYSTEM:WINDOWS,5.01 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
           ) else (
-              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x86\touch_keyboard.obj" "build\x86\touch_keyboard.res" /link /OUT:"dist\x86\UI_TouchKeyboard_x86.exe" /SUBSYSTEM:WINDOWS,5.01 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x86\hkeyboard.obj" "build\x86\hkeyboard.res" /link /OUT:"dist\x86\HKeyboard_x86.exe" /SUBSYSTEM:WINDOWS,5.01 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
           )
           if %errorlevel% neq 0 exit /b %errorlevel%
           echo [x86] Build succeeded.
@@ -177,18 +177,18 @@ jobs:
           if defined LTL_LIB (echo [x64] VC-LTL lib: %LTL_LIB%) else (echo [x64] VC-LTL not found, using default CRT)
 
           rem Compile resources
-          rc /nologo /c65001 /fo "build\x64\touch_keyboard.res" "touch_keyboard.rc"
+          rc /nologo /c65001 /fo "build\x64\hkeyboard.res" "hkeyboard.rc"
           if %errorlevel% neq 0 exit /b %errorlevel%
 
           rem Compile source
-          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "touch_keyboard.cpp" /Fo"build\x64\touch_keyboard.obj"
+          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "hkeyboard.cpp" /Fo"build\x64\hkeyboard.obj"
           if %errorlevel% neq 0 exit /b %errorlevel%
 
           rem Link (with YY-Thunks if available)
           if defined YY_OBJ (
-              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x64\touch_keyboard.obj" "build\x64\touch_keyboard.res" "%YY_OBJ%" /link /OUT:"dist\x64\UI_TouchKeyboard_x64.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x64\hkeyboard.obj" "build\x64\hkeyboard.res" "%YY_OBJ%" /link /OUT:"dist\x64\HKeyboard_x64.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
           ) else (
-              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x64\touch_keyboard.obj" "build\x64\touch_keyboard.res" /link /OUT:"dist\x64\UI_TouchKeyboard_x64.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\x64\hkeyboard.obj" "build\x64\hkeyboard.res" /link /OUT:"dist\x64\HKeyboard_x64.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
           )
           if %errorlevel% neq 0 exit /b %errorlevel%
           echo [x64] Build succeeded.
@@ -202,19 +202,19 @@ jobs:
           if (-not (Test-Path -LiteralPath $sevenZip)) {
             throw "7-Zip not found at $sevenZip; cannot create the release archive."
           }
-          & $sevenZip a -t7z -mx=9 'dist/release/UI_TouchKeyboard_X86_X64.7z' 'dist/x86/UI_TouchKeyboard_x86.exe' 'dist/x64/UI_TouchKeyboard_x64.exe'
+          & $sevenZip a -t7z -mx=9 'dist/release/HKeyboard_X86_X64.7z' 'dist/x86/HKeyboard_x86.exe' 'dist/x64/HKeyboard_x64.exe'
           if ($LASTEXITCODE -ne 0) {
             throw "7-Zip packaging failed with exit code $LASTEXITCODE"
           }
-          Get-Item -LiteralPath 'dist/release/UI_TouchKeyboard_X86_X64.7z' | Select-Object Name, Length
+          Get-Item -LiteralPath 'dist/release/HKeyboard_X86_X64.7z' | Select-Object Name, Length
 
       - name: Verify release files
         shell: pwsh
         run: |
           $required = @(
-            'dist/x86/UI_TouchKeyboard_x86.exe',
-            'dist/x64/UI_TouchKeyboard_x64.exe',
-            'dist/release/UI_TouchKeyboard_X86_X64.7z'
+            'dist/x86/HKeyboard_x86.exe',
+            'dist/x64/HKeyboard_x64.exe',
+            'dist/release/HKeyboard_X86_X64.7z'
           )
           foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath $file)) {
@@ -225,12 +225,12 @@ jobs:
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: UI_TouchKeyboard_${{ inputs.tag }}
+          name: HKeyboard_${{ inputs.tag }}
           if-no-files-found: error
           path: |
-            dist/x86/UI_TouchKeyboard_x86.exe
-            dist/x64/UI_TouchKeyboard_x64.exe
-            dist/release/UI_TouchKeyboard_X86_X64.7z
+            dist/x86/HKeyboard_x86.exe
+            dist/x64/HKeyboard_x64.exe
+            dist/release/HKeyboard_X86_X64.7z
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -243,6 +243,6 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/x86/UI_TouchKeyboard_x86.exe
-            dist/x64/UI_TouchKeyboard_x64.exe
-            dist/release/UI_TouchKeyboard_X86_X64.7z
+            dist/x86/HKeyboard_x86.exe
+            dist/x64/HKeyboard_x64.exe
+            dist/release/HKeyboard_X86_X64.7z

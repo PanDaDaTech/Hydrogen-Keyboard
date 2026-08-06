@@ -1,4 +1,4 @@
-// touch_keyboard.rc
+// hkeyboard.rc
 #include "resource.h"
 #include <winres.h>
 
@@ -17,13 +17,13 @@ BEGIN
     BEGIN
         BLOCK "080404b0"
         BEGIN
-            VALUE "CompanyName", "TouchKeyboard"
-            VALUE "FileDescription", "Screen Keyboard"
+            VALUE "CompanyName", "HKeyboard"
+            VALUE "FileDescription", "HKeyboard - Screen Keyboard"
             VALUE "FileVersion", VER_FILEVERSION_STR
-            VALUE "InternalName", "UI_TouchKeyboard"
+            VALUE "InternalName", "HKeyboard"
             VALUE "LegalCopyright", "Copyright (C) 2024-2026"
-            VALUE "OriginalFilename", "UI_TouchKeyboard.exe"
-            VALUE "ProductName", "ScreenKeyboard"
+            VALUE "OriginalFilename", "HKeyboard.exe"
+            VALUE "ProductName", "HKeyboard"
             VALUE "ProductVersion", VER_PRODUCTVERSION_STR
         END
     END

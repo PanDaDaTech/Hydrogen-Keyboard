@@ -422,27 +422,6 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
-// Fn 层键绘制：上=副符号（特殊符号，随 Shift 灰/白同步），下=F1~F12 标签（主显示）
-static void DrawKeyFnDual(HDC dc, int x, int y, int w, int h,
-                          wchar_t shiftCh, const wchar_t* fnText,
-                          DWORD textC, DWORD shiftC) {
-    wchar_t buf[2] = {0, 0};
-
-    // 副符号（键上半部，随 Shift 灰/白同步）
-    buf[0] = shiftCh;
-    RECT rt = {x, y, x + w, y + h / 2};
-    SelectObject(dc, g_f12);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, shiftC);
-    DrawTextW(dc, buf, -1, &rt, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-    // F1~F12 标签（键下半部，主显示）
-    RECT rb = {x, y + h / 2, x + w, y + h};
-    SelectObject(dc, g_f13b);
-    SetTextColor(dc, textC);
-    DrawTextW(dc, fnText, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-}
-
 // 判断 BGR 颜色是否为浅色，用于在高亮按钮上自动选择深/浅色文字以保证可读性
 static BOOL IsLightColor(DWORD bgr) {
     int r = bgr & 0xFF;
@@ -923,22 +902,14 @@ static void DrawKeys(HDC dc) {
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，
         // 副符号在 Shift 未触发时灰色、触发后白色；
-        // Fn 层时数字行/-/= 键主显示 F1~F12，副符号仍随 Shift 灰/白同步。
+        // Fn 层时数字行/-/= 键仅显示 F1~F12（不显示副符号）。
         wchar_t baseCh = 0, shiftCh = 0;
-        const wchar_t* fnTxt = NULL;
-        wchar_t fnBuf[8] = {0};
-        if (k->type == K_NORMAL) {
+        if (k->type == K_NORMAL && !g_fnLayer) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
-            if (g_fnLayer) {
-                int fn = FnMap(k->vk);
-                if (fn) { swprintf(fnBuf, 8, L"F%d", fn); fnTxt = fnBuf; }
-            }
         }
         DWORD shiftC = (g_sh || g_physShift) ? textC : C_DIM;
-        if (fnTxt) {
-            DrawKeyFnDual(dc, k->x, k->y, k->w, k->h, shiftCh, fnTxt, textC, shiftC);
-        } else if (baseCh && shiftCh && shiftCh != baseCh) {
+        if (baseCh && shiftCh && shiftCh != baseCh) {
             DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, shiftC);
         } else {
             DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);

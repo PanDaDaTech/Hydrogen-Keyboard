@@ -304,6 +304,7 @@ static void BuildKeys() {
     }
     y += g_keyHeight + g_keyGap;
 
+    int xUp = 0;   // ↑ 键起始 x（函数作用域，供第 4 行对齐方向键）
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
@@ -318,9 +319,8 @@ static void BuildKeys() {
         short v[13] = {0xA0,0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF,0x26,0xA1};
         KeyType t[13] = {K_MOD,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_ARROW,K_MOD};
         int x = KEY_AREA_X;
-        int xUp = 0;   // ↑ 键起始 x，供第 4 行对齐方向键
         for (int i = 0; i < 13; i++) {
-            if (i == 11) xUp = x;
+            if (i == 11) xUp = x;   // 记录 ↑ 起始 x，供第 4 行对齐
             AddKey(x, y, w[i], g_keyHeight, v[i], t[i]);
             x += w[i] + g_keyGap;
         }

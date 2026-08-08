@@ -309,7 +309,7 @@ static void BuildKeys() {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = (int)(96 * dpiScale * scaleX);
+        int wRSh = wUp;
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
@@ -333,7 +333,7 @@ static void BuildKeys() {
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
-        int wArw = (int)(74 * dpiScale * scaleX);
+        int wArw = (int)(52 * dpiScale * scaleX);
         int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
         int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
         if (spaceW < 60) spaceW = 60;

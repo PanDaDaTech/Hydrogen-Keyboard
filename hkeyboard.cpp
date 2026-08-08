@@ -308,7 +308,7 @@ static void BuildKeys() {
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wRSh = (int)(70 * dpiScale * scaleX);
+        int wRSh = (int)(60 * dpiScale * scaleX);   // 微调缩小，把宽度让给空格键（方向键仍由 xUp 公式对齐）
         int wUp = (int)(52 * dpiScale * scaleX);
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;

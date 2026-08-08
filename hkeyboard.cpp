@@ -304,11 +304,11 @@ static void BuildKeys() {
     }
     y += g_keyHeight + g_keyGap;
 
-    int xUp = 0;   // ↑ 键起始 x（函数作用域，供第 4 行对齐方向键）
+    int xUp = 0;   // ↑ 键左边界，第 5 行的 ↓ 键与其对齐
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wRSh = (int)(66 * dpiScale * scaleX);   // 加长右 Shift（方向键仍由 xUp 公式对齐）
+        int wRSh = (int)(66 * dpiScale * scaleX);   // 右 Shift 保持比左 Shift 窄
         int wUp = (int)(52 * dpiScale * scaleX);
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
@@ -334,9 +334,9 @@ static void BuildKeys() {
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
-        int fixed = wFn + wCtl + wWin + wAlt + wAlt + wCtl + wArw * 3;
-        // Fn/Win/Ctrl 略缩窄让位，加长空格键，并使 ↓ 与上行 ↑ 对齐
-        int spaceW = xUp - KEY_AREA_X - (wFn + wCtl + wWin + wAlt + wAlt + wCtl + wArw) - 8 * g_keyGap;
+        // 底部方向键组与第 4 行的 ↑ 共用同一网格位置：← 在左侧，↓ 直接在 ↑ 下方，→ 在右侧。
+        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
+        int spaceW = xUp - KEY_AREA_X - leftOfArrows - wArw - 8 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
         int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
         short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};

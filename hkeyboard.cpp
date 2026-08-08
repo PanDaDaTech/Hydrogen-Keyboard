@@ -721,7 +721,9 @@ static void DoKeyAction(const KeyDef* k) {
             // Win 键点击状态 0→1→2→0，不依赖开始菜单检测：
             //  0=空闲：第 1 次点击 → 1 锁定并高亮，下一个键组成 Win+快捷键；
             //  1=锁定：第 2 次点击 → 2 发送 Win 键打开开始菜单；
-            //  2=已开：第 3 次点击 → 0 发送 Win 键关闭开始菜单，回到空闲。
+            //  2=已开：第 3 次点击 → 0 关闭开始菜单。
+            //         注意：点击虚拟键盘本身就会收起已打开的开始菜单，
+            //         因此关闭时不再发送 Win 键（否则会把刚收起的菜单重新弹出）。
             // 普通键或超时都会回到 0；锁定期间保持高亮，关闭开始菜单后高亮自动消失。
             if (g_winCount == 0) {
                 g_winCount = 1;
@@ -737,7 +739,7 @@ static void DoKeyAction(const KeyDef* k) {
                 g_winCount = 0;
                 g_winKey = FALSE;
                 g_lastWinTick = GetTickCount();
-                SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 关闭开始菜单，回到空闲
+                // 不再发送 Win 键：点击本身已收起开始菜单
             }
             break;
         }

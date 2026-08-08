@@ -333,13 +333,11 @@ static void BuildKeys() {
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);
-        int wRight = (int)(96 * dpiScale * scaleX);
-        int beforeSpace = wFn + wCtl + wWin + wAlt;
-        int afterSpace = wAlt + wCtl + wArw;
-        int spaceW = xUp - KEY_AREA_X - beforeSpace - afterSpace - 8 * g_keyGap;
+        int wArw = (int)(74 * dpiScale * scaleX);
+        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
+        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
-        int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wRight};
+        int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
         short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
         KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
         int x = KEY_AREA_X;

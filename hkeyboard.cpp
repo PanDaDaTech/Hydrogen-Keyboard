@@ -1114,7 +1114,7 @@ static void ShowMenu(HWND hWnd) {
     } else if (id == ID_MENU_ABOUT) {
         ShowAboutDialog(hWnd);
     } else if (id == ID_MENU_EXIT) {
-        PromptCloseAction(hWnd);
+        DestroyWindow(hWnd);
     }
 }
 
@@ -1454,7 +1454,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_ABOUT: ShowAboutDialog(hWnd); break;
-        case ID_MENU_EXIT: PromptCloseAction(hWnd); break;
+        case ID_MENU_EXIT: DestroyWindow(hWnd); break;
         }
         return 0;
     case WM_TRAY:

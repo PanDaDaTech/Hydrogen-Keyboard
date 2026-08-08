@@ -626,6 +626,29 @@ static void ToggleImeLang() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
+// 发送一次 Win 键（开/关开始菜单）：按下与抬起分两次注入并留出间隔，
+// 确保系统可靠识别切换，避免快速连点时注入被合并/吞掉导致“关闭又弹开”。
+static void SendWinToggle() {
+    UINT sc = MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
+    if (sc == 0) sc = 0x5B;  // 左 Win 标准扫描码
+
+    INPUT in = {};
+    in.type = INPUT_KEYBOARD;
+
+    // 按下 Win
+    in.ki.wVk = VK_LWIN;
+    in.ki.wScan = (WORD)sc;
+    in.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+    SendInput(1, &in, sizeof(INPUT));
+
+    // 给开始菜单足够时间处理切换
+    Sleep(50);
+
+    // 抬起 Win
+    in.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+    SendInput(1, &in, sizeof(INPUT));
+}
+
 // 清除 Win 锁定：解锁并重置点击计数（使用 Win+快捷键或检测到开始菜单时调用）
 static void ClearWinLock() {
     g_winKey = FALSE;
@@ -721,10 +744,10 @@ static void DoKeyAction(const KeyDef* k) {
             // Win 键点击状态 0→1→2→0，不依赖开始菜单检测：
             //  0=空闲：第 1 次点击 → 1 锁定并高亮，下一个键组成 Win+快捷键；
             //  1=锁定：第 2 次点击 → 2 发送 Win 键打开开始菜单；
-            //  2=已开：第 3 次点击 → 0 关闭开始菜单。
-            //         注意：点击虚拟键盘本身就会收起已打开的开始菜单，
-            //         因此关闭时不再发送 Win 键（否则会把刚收起的菜单重新弹出）。
+            //  2=已开：第 3 次点击 → 0 发送 Win 键关闭开始菜单，回到空闲。
             // 普通键或超时都会回到 0；锁定期间保持高亮，关闭开始菜单后高亮自动消失。
+            // 开/关开始菜单统一用 SendWinToggle()，按下/抬起分开注入并留间隔，
+            // 避免快速连点时 Win 注入被系统合并/吞掉导致“关闭又弹开”。
             if (g_winCount == 0) {
                 g_winCount = 1;
                 g_winKey = TRUE;
@@ -734,12 +757,12 @@ static void DoKeyAction(const KeyDef* k) {
                 g_winCount = 2;
                 g_winKey = FALSE;
                 g_lastWinTick = GetTickCount();
-                SendKey(VK_LWIN, FALSE, FALSE, FALSE);  // 打开开始菜单
+                SendWinToggle();  // 打开开始菜单
             } else {
                 g_winCount = 0;
                 g_winKey = FALSE;
                 g_lastWinTick = GetTickCount();
-                // 不再发送 Win 键：点击本身已收起开始菜单
+                SendWinToggle();  // 关闭开始菜单，回到空闲
             }
             break;
         }

@@ -308,7 +308,7 @@ static void BuildKeys() {
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wRSh = (int)(60 * dpiScale * scaleX);   // 微调缩小，把宽度让给空格键（方向键仍由 xUp 公式对齐）
+        int wRSh = (int)(66 * dpiScale * scaleX);   // 加长右 Shift（方向键仍由 xUp 公式对齐）
         int wUp = (int)(52 * dpiScale * scaleX);
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
@@ -329,13 +329,13 @@ static void BuildKeys() {
 
     // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, →  (10 keys)
     {
-        int wFn  = (int)(50 * dpiScale * scaleX);
-        int wCtl = (int)(58 * dpiScale * scaleX);
-        int wWin = (int)(50 * dpiScale * scaleX);
+        int wFn  = (int)(46 * dpiScale * scaleX);
+        int wCtl = (int)(56 * dpiScale * scaleX);
+        int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
         int fixed = wFn + wCtl + wWin + wAlt + wAlt + wCtl + wArw * 3;
-        // 缩短空格键，使 ↓ 与上行 ↑ 对齐（上下左右方向键一体对齐）
+        // Fn/Win/Ctrl 略缩窄让位，加长空格键，并使 ↓ 与上行 ↑ 对齐
         int spaceW = xUp - KEY_AREA_X - (wFn + wCtl + wWin + wAlt + wAlt + wCtl + wArw) - 8 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
         int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};

@@ -318,7 +318,12 @@ static void BuildKeys() {
         short v[13] = {0xA0,0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF,0x26,0xA1};
         KeyType t[13] = {K_MOD,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_ARROW,K_MOD};
         int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        int xUp = 0;   // ↑ 键起始 x，供第 4 行对齐方向键
+        for (int i = 0; i < 13; i++) {
+            if (i == 11) xUp = x;
+            AddKey(x, y, w[i], g_keyHeight, v[i], t[i]);
+            x += w[i] + g_keyGap;
+        }
     }
     y += g_keyHeight + g_keyGap;
 
@@ -330,7 +335,8 @@ static void BuildKeys() {
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
         int fixed = wFn + wCtl + wWin + wAlt + wAlt + wCtl + wArw * 3;
-        int spaceW = KEY_AREA_W - fixed - 9 * g_keyGap;
+        // 缩短空格键，使 ↓ 与上行 ↑ 对齐（上下左右方向键一体对齐）
+        int spaceW = xUp - KEY_AREA_X - (wFn + wCtl + wWin + wAlt + wAlt + wCtl + wArw) - 8 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
         int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
         short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
@@ -753,13 +759,13 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         if (k->vk == VK_LWIN) {
-            // Win 键点击状态 0→1→2→0，不依赖开始菜单检测：
+            // Win 键点击状态 0→1→2→1→0（内部用 0/1/2/3），不依赖开始菜单检测：
             //  0=空闲：第 1 次点击 → 1 锁定并高亮，下一个键组成 Win+快捷键；
             //  1=锁定：第 2 次点击 → 2 发送 Win 键打开开始菜单；
-            //  2=已开：第 3 次点击 → 0 发送 Esc 关闭开始菜单，回到空闲。
-            // 普通键或超时都会回到 0；锁定期间保持高亮，关闭开始菜单后高亮自动消失。
-            // 打开用 SendWinToggle()（按下/抬起分开注入），
-            // 关闭用 Esc 可靠关闭开始菜单。
+            //  2=已开：第 3 次点击 → 3 发送 Esc 关闭开始菜单，并回到锁定态（高亮）；
+            //  3=锁定(关闭后)：第 4 次点击 → 0 解除锁定。
+            // 普通键或超时都会回到 0；锁定期间保持高亮。
+            // 打开用 SendWinToggle()（按下/抬起分开注入），关闭用 Esc 可靠关闭开始菜单。
             if (g_winCount == 0) {
                 g_winCount = 1;
                 g_winKey = TRUE;
@@ -770,11 +776,15 @@ static void DoKeyAction(const KeyDef* k) {
                 g_winKey = FALSE;
                 g_lastWinTick = GetTickCount();
                 SendWinToggle();  // 打开开始菜单
+            } else if (g_winCount == 2) {
+                g_winCount = 3;
+                g_winKey = TRUE;                 // 关闭后回到锁定态（高亮）
+                g_lastWinTick = GetTickCount();
+                CloseStartMenu();                // 关闭开始菜单
             } else {
                 g_winCount = 0;
-                g_winKey = FALSE;
+                g_winKey = FALSE;                // 解除锁定
                 g_lastWinTick = GetTickCount();
-                CloseStartMenu();  // 关闭开始菜单，回到空闲
             }
             break;
         }
@@ -1555,9 +1565,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         g_ww, g_wh, 0, 0, hI, 0);
     if (!hWnd) return 1;
 
-    if (isTouch || fHide) {
-        AddTray();
-    }
+    AddTray();   // 无论是否触屏/隐藏模式，始终创建托盘图标，以便从托盘恢复
 
     if (!fHide) {
         ShowKB(TRUE, TRUE);

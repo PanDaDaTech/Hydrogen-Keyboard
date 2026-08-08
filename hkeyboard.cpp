@@ -309,7 +309,7 @@ static void BuildKeys() {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = (int)(66 * dpiScale * scaleX);
+        int wRSh = (int)(78 * dpiScale * scaleX);
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;

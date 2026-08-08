@@ -308,8 +308,8 @@ static void BuildKeys() {
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wRSh = (int)(66 * dpiScale * scaleX);   // 右 Shift 保持比左 Shift 窄
         int wUp = (int)(52 * dpiScale * scaleX);
+        int wRSh = wUp;
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
@@ -336,7 +336,7 @@ static void BuildKeys() {
         int wArw = (int)(52 * dpiScale * scaleX);
         // 底部方向键组与第 4 行的 ↑ 共用同一网格位置：← 在左侧，↓ 直接在 ↑ 下方，→ 在右侧。
         int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-        int spaceW = xUp - KEY_AREA_X - leftOfArrows - wArw - 8 * g_keyGap;
+        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
         int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
         short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};

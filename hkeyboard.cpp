@@ -333,10 +333,14 @@ static void BuildKeys() {
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);
-        // 底部方向键组与第 4 行的 ↑ 共用同一网格位置：← 在左侧，↓ 直接在 ↑ 下方，→ 在右侧。
+        int wUp = (int)(52 * dpiScale * scaleX);
+        int upCenter = xUp + wUp / 2;
+        int rightEdge = KEY_AREA_X + KEY_AREA_W;
+        // 三个底部方向键等宽、贴齐右边界，并让 ↓ 的中心线与 ↑ 对齐。
+        int wArw = 2 * (rightEdge - g_keyGap - upCenter) / 3;
+        if (wArw < 36) wArw = 36;
         int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-        int spaceW = xUp - KEY_AREA_X - leftOfArrows - wArw - 8 * g_keyGap;
+        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
         int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
         short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};

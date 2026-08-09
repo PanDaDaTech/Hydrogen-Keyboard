@@ -29,6 +29,7 @@ int g_keyHeight = 46;
 #define TIMER_EXIT      8822
 #define TIMER_SLIDE     8823
 #define TIMER_REPEAT    8826
+#define TIMER_EDGE      8831
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 
@@ -186,7 +187,7 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
-int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定 2=切换开始菜单（0→1→2，2 态稳定）
+int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定（已打开菜单，支持 Win+组合键）
 DWORD       g_lastWinTick = 0;        // 最近一次 Win 键点击时刻（状态超时复位用）
 int         g_shiftCount = 0;         // 左右 Shift 共享点击计数：1=特殊符号 2=切换中/英
 HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/Shift/Caps 状态同步显示）
@@ -200,10 +201,27 @@ int         g_repeatKeyIdx = -1;
 BOOL        g_tracking = FALSE;
 BOOL        g_tray = FALSE;
 int         g_slideFrom = 0, g_slideTo = 0, g_slideStep = -1;
+int         g_slideXFrom = 0, g_slideXTo = 0;      // 水平滑动目标（边缘隐藏用）
 HWINEVENTHOOK g_winHook = 0;
 HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
 #define SLIDE_MS 12
+
+// ========== 桌面边缘隐藏（QQ 风格） ==========
+#define EDGE_NONE    0
+#define EDGE_LEFT    1
+#define EDGE_RIGHT   2
+#define EDGE_TOP     3
+#define EDGE_BOTTOM  4
+#define EDGE_THRESH  28      // 判定“靠近屏幕边缘”的距离（px）
+#define EDGE_STRIP   8       // 收起后露出的条宽（px）
+#define EDGE_HOT     48      // 露出条的热区扩展（px）
+#define EDGE_DELAY   900     // 鼠标离开多久后自动收起（ms）
+static int  g_edge = EDGE_NONE;      // 当前停靠边缘（NONE=未贴边）
+static BOOL g_edgeHidden = FALSE;    // 是否处于“只露一条”的收起态
+static BOOL g_edgeArmed = FALSE;     // 鼠标离开计时是否已启动
+static DWORD g_lastMouseOut = 0;     // 鼠标离开时刻
+static int  g_homeX = 0, g_homeY = 0; // 完全展开时的窗口位置（贴边停靠用）
 HFONT       g_f12 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
 NOTIFYICONDATAA g_nid;
 
@@ -758,33 +776,26 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         if (k->vk == VK_LWIN) {
-            // Win 键点击状态 0→1→2→1→0（内部用 0/1/2/3），不依赖开始菜单检测：
-            //  0=空闲：第 1 次点击 → 1 锁定并高亮，下一个键组成 Win+快捷键；
-            //  1=锁定：第 2 次点击 → 2 发送 Win 键打开开始菜单；
-            //  2=已开：第 3 次点击 → 3 发送 Esc 关闭开始菜单，并回到锁定态（高亮）；
-            //  3=锁定(关闭后)：第 4 次点击 → 0 解除锁定。
-            // 普通键或超时都会回到 0；锁定期间保持高亮。
-            // 打开用 SendWinToggle()（按下/抬起分开注入），关闭用 Esc 可靠关闭开始菜单。
-            if (g_winCount == 0) {
-                g_winCount = 1;
-                g_winKey = TRUE;
-                g_lastWinTick = GetTickCount();
-                g_fnLayer = FALSE;
-            } else if (g_winCount == 1) {
-                g_winCount = 2;
+            // Win 键：每次点击稳定切换开始菜单（不再用点击计数猜测状态，避免连续点击失步）。
+            //  - 空闲且菜单未开：发送 Win 键打开菜单，并进入锁定态（高亮），
+            //    此时点击其它键可发送 Win+组合键（如 Win+E）；
+            //  - 空闲且菜单已开（由外部打开）：发送 Esc 关闭，不锁定；
+            //  - 锁定态：发送 Esc 关闭菜单并解除锁定。
+            // 连续点击时“开→关→开→关”交替，第 3、4 次及之后每次都能稳定切换。
+            if (g_winKey) {
                 g_winKey = FALSE;
-                g_lastWinTick = GetTickCount();
-                SendWinToggle();  // 打开开始菜单
-            } else if (g_winCount == 2) {
-                g_winCount = 3;
-                g_winKey = TRUE;                 // 关闭后回到锁定态（高亮）
-                g_lastWinTick = GetTickCount();
-                CloseStartMenu();                // 关闭开始菜单
-            } else {
                 g_winCount = 0;
-                g_winKey = FALSE;                // 解除锁定
-                g_lastWinTick = GetTickCount();
+                CloseStartMenu();                // 关闭开始菜单并解除锁定
+            } else if (IsStartMenuOpen()) {
+                CloseStartMenu();                // 菜单已开（外部打开）→ 关闭
+            } else {
+                SendWinToggle();                 // 打开开始菜单
+                g_winKey = TRUE;                 // 锁定，支持 Win+组合键
+                g_winCount = 1;
             }
+            g_lastWinTick = GetTickCount();
+            g_fnLayer = FALSE;
+            InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
@@ -830,7 +841,6 @@ static void DoKeyAction(const KeyDef* k) {
 }
 // ========== Header Layout & Dynamic DPI Positioning ==========
 #define HDR_DOCK  1000
-#define HDR_AUTO  1002
 #define HDR_MIN   1003
 #define HDR_CLOSE 1004
 
@@ -844,17 +854,14 @@ static int HitHeader(int x, int y) {
     int gap     = (int)(6 * dpiScale * scaleX);
     int wClose = (int)(36 * dpiScale * scaleX);
     int wMin   = (int)(36 * dpiScale * scaleX);
-    int wAuto  = (int)(96 * dpiScale * scaleX);
     int wMenu  = (int)(48 * dpiScale * scaleX);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
-    int xAuto  = xMin - gap - wAuto;
     int xMenu  = (int)(6 * dpiScale * scaleX);
 
     if (x >= xClose && x < g_ww) return HDR_CLOSE;
     if (x >= xMin && x < xClose) return HDR_MIN;
-    if (x >= xAuto && x < xMin) return HDR_AUTO;
     if (x >= xMenu && x < xMenu + wMenu + gap) return HDR_DOCK;
     return -1;
 }
@@ -874,27 +881,20 @@ static void DrawHeader(HDC dc) {
 
     int wClose = (int)(36 * dpiScale * scaleX);
     int wMin   = (int)(36 * dpiScale * scaleX);
-    int wAuto  = (int)(96 * dpiScale * scaleX);
     int wMenu  = (int)(48 * dpiScale * scaleX);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
-    int xAuto  = xMin - gap - wAuto;
     int xMenu  = (int)(6 * dpiScale * scaleX);
 
     DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
     DrawTextC(dc, xMenu, btnY, wMenu, btnH, L"\x83DC\x5355", g_f12, C_WHITE);
 
     int xTitle = xMenu + wMenu + gap;
-    int wTitle = xAuto - xTitle - gap;
+    int wTitle = xMin - xTitle - gap;
     if (wTitle > 40) {
         DrawTextC(dc, xTitle, 0, wTitle, g_headerH, L"", g_f12, C_DIM);
     }
-
-    DWORD autoBg = g_af ? C_HOT : C_KEY;
-    DWORD autoText = IsLightColor(autoBg) ? 0x1A1A1A : C_WHITE;
-    DrawRoundRect(dc, xAuto, btnY, wAuto, btnH, autoBg, C_KEY_BORDER, 12);
-    DrawTextC(dc, xAuto, btnY, wAuto, btnH, g_af ? L"\x81EA\x52A8\x547C\x51FA:\x5F00" : L"\x81EA\x52A8\x547C\x51FA:\x5173", g_f12, autoText);
 
     // 最小化图标：直接绘制居中小横条（避免字体缺少 U+229F 字形时显示为 "-"）
     {
@@ -973,6 +973,61 @@ static int HitKey(int x, int y) {
     return -1;
 }
 
+static void SlideWindowTo(int tx, int ty) {
+    if (!g_hWnd) return;
+    RECT rc; GetWindowRect(g_hWnd, &rc);
+    g_slideXFrom = rc.left;  g_slideXTo = tx;
+    g_slideFrom  = rc.top;   g_slideTo  = ty;
+    g_slideStep = 0;
+    SetTimer(g_hWnd, TIMER_SLIDE, SLIDE_MS, 0);
+}
+
+// 是否处于可边缘收起的停靠边（左/右/上；底边为键盘常规位置，不自动收起）
+static BOOL IsDockEdge() {
+    return (g_edge == EDGE_LEFT || g_edge == EDGE_RIGHT || g_edge == EDGE_TOP);
+}
+
+// 根据窗口当前位置判定停靠边缘，并记录完全展开时的位置
+static void UpdateDockEdge() {
+    if (g_edgeHidden || !g_hWnd) return;
+    RECT rc; GetWindowRect(g_hWnd, &rc);
+    RECT work; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int e = EDGE_NONE;
+    if (rc.left - work.left <= EDGE_THRESH) e = EDGE_LEFT;
+    else if (work.right - rc.right <= EDGE_THRESH) e = EDGE_RIGHT;
+    else if (rc.top - work.top <= EDGE_THRESH) e = EDGE_TOP;
+    else if (work.bottom - rc.bottom <= EDGE_THRESH) e = EDGE_BOTTOM;
+    g_edge = e;
+    if (e != EDGE_NONE) {
+        g_homeX = rc.left;
+        g_homeY = rc.top;
+    }
+}
+
+// 从边缘收起态滑出到完全展开位置
+static void RevealFromEdge() {
+    if (!g_edgeHidden) return;
+    g_edgeHidden = FALSE;
+    g_edgeArmed = FALSE;
+    SlideWindowTo(g_homeX, g_homeY);
+}
+
+// 滑向边缘，只露出 EDGE_STRIP 宽的条（QQ 风格）
+static void TuckToEdge() {
+    if (g_edgeHidden || !IsDockEdge()) return;
+    RECT work; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int tx = g_homeX, ty = g_homeY;
+    switch (g_edge) {
+    case EDGE_LEFT:  tx = work.left - g_ww + EDGE_STRIP; break;
+    case EDGE_RIGHT: tx = work.right - EDGE_STRIP;       break;
+    case EDGE_TOP:   ty = work.top - g_wh + EDGE_STRIP;  break;
+    default: return;
+    }
+    g_edgeHidden = TRUE;
+    g_edgeArmed = FALSE;
+    SlideWindowTo(tx, ty);
+}
+
 static void ShowKB(BOOL show, BOOL isManual) {
     if (!g_hWnd) return;
     KillTimer(g_hWnd, TIMER_SLIDE);
@@ -983,15 +1038,22 @@ static void ShowKB(BOOL show, BOOL isManual) {
 
     if (show) {
         if (isManual) g_manualShow = TRUE;
+        // 停靠在左/右/上边缘时，回到停靠位置；否则回到底部居中
+        int tx = sx, ty = targetY;
+        if (IsDockEdge()) { tx = g_homeX; ty = g_homeY; }
+        g_edgeHidden = FALSE;
+        g_edgeArmed = FALSE;
         if (g_vis) {
-            SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            SlideWindowTo(tx, ty);
             return;
         }
         g_vis = TRUE;
         g_slideFrom = work.bottom;
-        g_slideTo = targetY;
+        g_slideTo = ty;
+        g_slideXFrom = tx;
+        g_slideXTo = tx;
         g_slideStep = 0;
-        SetWindowPos(g_hWnd, HWND_TOPMOST, sx, g_slideFrom, g_ww, g_wh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(g_hWnd, HWND_TOPMOST, tx, g_slideFrom, g_ww, g_wh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
         SetTimer(g_hWnd, TIMER_SLIDE, SLIDE_MS, 0);
     } else {
         if (!g_vis) return;
@@ -1000,6 +1062,8 @@ static void ShowKB(BOOL show, BOOL isManual) {
         RECT rc; GetWindowRect(g_hWnd, &rc);
         g_slideFrom = rc.top;
         g_slideTo = work.bottom;
+        g_slideXFrom = rc.left;
+        g_slideXTo = sx;
         g_slideStep = 0;
         SetTimer(g_hWnd, TIMER_SLIDE, SLIDE_MS, 0);
     }
@@ -1082,7 +1146,8 @@ static void ShowMenu(HWND hWnd) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, g_vis ? L"\x9690\x85CF\x8F7B\x952E" : L"\x663E\x793A\x8F7B\x952E");
 
-    AppendMenuW(m, MF_STRING, ID_MENU_AUTO, g_af ? L"\x7981\x7528\x81EA\x52A8\x547C\x51FA" : L"\x542F\x7528\x81EA\x52A8\x547C\x51FA");
+    // 自动呼出：菜单勾选项（主界面不再显示开关按钮）
+    AppendMenuW(m, MF_STRING | (g_af ? MF_CHECKED : 0), ID_MENU_AUTO, L"\x81EA\x52A8\x547C\x51FA");
 
     // 主题切换子菜单
     HMENU themeMenu = CreatePopupMenu();
@@ -1201,11 +1266,16 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
 }
 
 static void OnLDown(HWND hWnd, int x, int y) {
+    // 边缘收起态：点一下露出条先滑出，不触发按键
+    if (g_edgeHidden) {
+        RevealFromEdge();
+        return;
+    }
+
     int hh = HitHeader(x, y);
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: ShowMenu(hWnd); break;
-        case HDR_AUTO: g_af = !g_af; InvalidateRect(hWnd, 0, TRUE); break;
         case HDR_MIN: ShowKB(FALSE, FALSE); break;
         case HDR_CLOSE: PromptCloseAction(hWnd); break;
         }
@@ -1268,6 +1338,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, PhysKeyHookProc, g_hInst, 0);
         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;  // 启动时同步 CapsLock 状态
         SetTimer(hWnd, TIMER_FOCUS, 200, 0);
+        SetTimer(hWnd, TIMER_EDGE, 50, 0);   // 桌面边缘隐藏轮询
         return 0;
     }
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
@@ -1299,6 +1370,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_EXITSIZEMOVE:
+        UpdateDockEdge();   // 拖拽/缩放结束后重新判定停靠边缘
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
@@ -1346,8 +1420,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
-        if (g_af && !g_vis && (GetTickCount() - g_lht >= 1000)) {
-            ShowKB(TRUE, FALSE);
+        if (g_af && (GetTickCount() - g_lht >= 1000)) {
+            if (!g_vis) {
+                ShowKB(TRUE, FALSE);
+            } else if (g_edgeHidden) {
+                RevealFromEdge();
+            }
         }
         return 0;
     case WM_SETTINGCHANGE: {
@@ -1378,27 +1456,63 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             }
         } else if (w == TIMER_SLIDE) {
             g_slideStep++;
+            int nx = g_slideXFrom + (g_slideXTo - g_slideXFrom) * g_slideStep / SLIDE_STEPS;
             int ny = g_slideFrom + (g_slideTo - g_slideFrom) * g_slideStep / SLIDE_STEPS;
             RECT work = {0};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-            int sx = work.left + ((work.right - work.left) - g_ww) / 2;
-            SetWindowPos(hWnd, HWND_TOPMOST, sx, ny, g_ww, g_wh, SWP_NOACTIVATE);
+            SetWindowPos(hWnd, HWND_TOPMOST, nx, ny, g_ww, g_wh, SWP_NOACTIVATE);
             if (g_slideStep >= SLIDE_STEPS) {
                 KillTimer(hWnd, TIMER_SLIDE);
                 g_slideStep = -1;
-                SetWindowPos(hWnd, HWND_TOPMOST, sx, g_slideTo, g_ww, g_wh, SWP_NOACTIVATE);
+                SetWindowPos(hWnd, HWND_TOPMOST, g_slideXTo, g_slideTo, g_ww, g_wh, SWP_NOACTIVATE);
                 if (g_slideTo >= work.bottom) {
                     g_vis = FALSE;
                     ShowWindow(hWnd, SW_HIDE);
                 }
             }
-        } else if (w == TIMER_FOCUS) {
-            // Win 锁定/高亮状态与开始菜单状态同步：
-            // 开始菜单（无论由本键盘还是任务栏打开）一旦显示，即清除 Win 锁定，避免高亮残留。
-            if (g_winKey && IsStartMenuOpen()) {
-                ClearWinLock();
-                InvalidateRect(hWnd, 0, TRUE);
+        } else if (w == TIMER_EDGE) {
+            // ===== 桌面边缘隐藏（QQ 风格） =====
+            if (!g_vis || !IsWindowVisible(hWnd)) return 0;
+
+            RECT rc; GetWindowRect(hWnd, &rc);
+            RECT work; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+            POINT pt; GetCursorPos(&pt);
+
+            if (g_edgeHidden) {
+                // 收起态：鼠标进入露出条热区即滑出
+                RECT hot = rc;
+                InflateRect(&hot, EDGE_HOT, EDGE_HOT);
+                if (hot.left < work.left) hot.left = work.left;
+                if (hot.right > work.right) hot.right = work.right;
+                if (hot.top < work.top) hot.top = work.top;
+                if (hot.bottom > work.bottom) hot.bottom = work.bottom;
+                if (PtInRect(&hot, pt)) RevealFromEdge();
+            } else {
+                // 展开态：更新停靠边缘；鼠标离开一段时间后自动收起
+                UpdateDockEdge();
+                if (IsDockEdge()) {
+                    BOOL inside = PtInRect(&rc, pt);
+                    // 贴边热区也视为“在键盘附近”，避免滑出后鼠标仍在边缘附近时又立刻收起
+                    if (!inside) {
+                        if (g_edge == EDGE_LEFT  && pt.x <= work.left  + EDGE_STRIP + EDGE_HOT) inside = TRUE;
+                        if (g_edge == EDGE_RIGHT && pt.x >= work.right - EDGE_STRIP - EDGE_HOT) inside = TRUE;
+                        if (g_edge == EDGE_TOP   && pt.y <= work.top   + EDGE_STRIP + EDGE_HOT) inside = TRUE;
+                    }
+                    if (!inside) {
+                        if (!g_edgeArmed) {
+                            g_edgeArmed = TRUE;
+                            g_lastMouseOut = GetTickCount();
+                        } else if (GetTickCount() - g_lastMouseOut >= EDGE_DELAY) {
+                            TuckToEdge();
+                        }
+                    } else {
+                        g_edgeArmed = FALSE;
+                    }
+                } else {
+                    g_edgeArmed = FALSE;
+                }
             }
+        } else if (w == TIMER_FOCUS) {
 
             // Win 状态超时自动复位：锁定/开始菜单已开未操作 8 秒即回到空闲，
             // 防止一直高亮，以及残留状态导致“第一次点击就弹开始菜单”。
@@ -1436,9 +1550,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 }
             }
 
-            if (hasFocusInput && !g_vis) {
-                ShowKB(TRUE, FALSE);
-            } else if (!hasFocusInput && g_vis && !g_manualShow) {
+            if (hasFocusInput) {
+                if (!g_vis) {
+                    ShowKB(TRUE, FALSE);
+                } else if (g_edgeHidden) {
+                    RevealFromEdge();   // 有输入焦点时把边缘收起态滑出
+                }
+            } else if (!hasFocusInput && g_vis && !g_manualShow && !IsDockEdge()) {
                 POINT pt; GetCursorPos(&pt);
                 if (WindowFromPoint(pt) != g_hWnd) {
                     ShowKB(FALSE, FALSE);
@@ -1469,6 +1587,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         KillTimer(hWnd, TIMER_FOCUS);
         KillTimer(hWnd, TIMER_SLIDE);
         KillTimer(hWnd, TIMER_REPEAT);
+        KillTimer(hWnd, TIMER_EDGE);
         if (g_winHook) { UnhookWinEvent(g_winHook); g_winHook = 0; }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = 0; }
         DeleteObject(g_f12); DeleteObject(g_f13b); DeleteObject(g_f14);

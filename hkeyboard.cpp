@@ -1063,7 +1063,10 @@ static void ShowHelpDialog(HWND hWnd) {
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, g_vis ? L"\x9690\x85CF\x8F7B\x952E" : L"\x663E\x793A\x8F7B\x952E");
+    // 隐藏/收起交给标题栏“最小化”按钮，菜单只保留隐藏状态下的“显示轻键”
+    if (!g_vis) {
+        AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, L"\x663E\x793A\x8F7B\x952E");
+    }
 
     // 自动呼出：菜单勾选项（主界面不再显示开关按钮）
     AppendMenuW(m, MF_STRING | (g_af ? MF_CHECKED : 0), ID_MENU_AUTO, L"\x81EA\x52A8\x547C\x51FA");
@@ -1454,6 +1457,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         KillTimer(hWnd, TIMER_REPEAT);
         if (g_winHook) { UnhookWinEvent(g_winHook); g_winHook = 0; }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = 0; }
+        if (g_tray) {   // 显式删除托盘图标，避免程序退出后图标残留到鼠标悬停才消失
+            Shell_NotifyIconA(NIM_DELETE, &g_nid);
+            g_tray = FALSE;
+        }
         DeleteObject(g_f12); DeleteObject(g_f13b); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
         PostQuitMessage(0);

@@ -208,7 +208,7 @@ HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
 #define SLIDE_MS 12
 HFONT       g_f12 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
-NOTIFYICONDATAA g_nid;
+NOTIFYICONDATAW g_nid;
 
 // Fn 功能键层：TRUE 时数字行显示为 F1~F12
 BOOL        g_fnLayer = FALSE;
@@ -1026,8 +1026,8 @@ static void AddTray() {
     g_nid.uCallbackMessage = WM_TRAY;
     if (!g_hTrayIcon) g_hTrayIcon = LoadMainIcon(16);
     g_nid.hIcon = g_hTrayIcon;
-    strcpy(g_nid.szTip, "\xE8\xBD\xBB\xE9\x94\xAE");
-    Shell_NotifyIconA(NIM_ADD, &g_nid);
+    wcscpy(g_nid.szTip, L"轻键");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_tray = TRUE;
 }
 
@@ -1456,7 +1456,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (g_winHook) { UnhookWinEvent(g_winHook); g_winHook = 0; }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = 0; }
         if (g_tray) {   // 显式删除托盘图标，避免程序退出后图标残留到鼠标悬停才消失
-            Shell_NotifyIconA(NIM_DELETE, &g_nid);
+            Shell_NotifyIconW(NIM_DELETE, &g_nid);
             g_tray = FALSE;
         }
         DeleteObject(g_f12); DeleteObject(g_f13b); DeleteObject(g_f14);

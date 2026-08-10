@@ -29,6 +29,9 @@ int g_keyHeight = 46;
 #define TIMER_EXIT      8822
 #define TIMER_SLIDE     8823
 #define TIMER_REPEAT    8826
+// 自动呼出参数
+#define AUTO_POP_COOLDOWN_MS 400    // 隐藏后再次自动弹出冷却（毫秒）
+#define MANUAL_HIDE_GRACE_MS 3000   // 手动显示后自动隐藏宽限期（毫秒）
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 
@@ -184,6 +187,7 @@ HWND        g_hWnd = 0;
 HICON       g_hTrayIcon = 0;
 BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
+DWORD       g_manualShowTick = 0;        // 手动显示时刻（自动隐藏宽限期用）
 BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
 int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定（等待 Win+组合键）
@@ -961,7 +965,7 @@ static void ShowKB(BOOL show, BOOL isManual) {
     int targetY = work.bottom - g_wh - 6;
 
     if (show) {
-        if (isManual) g_manualShow = TRUE;
+        if (isManual) { g_manualShow = TRUE; g_manualShowTick = GetTickCount(); }
         if (g_vis) {
             SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
             return;
@@ -1135,7 +1139,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
             }
         }
 
-        if (isText && !g_vis && (GetTickCount() - g_lht >= 1000)) {
+        if (isText && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
             PostMessage(g_hWnd, WM_FOCUS_EVENT, TRUE, 0);
         }
     }
@@ -1325,7 +1329,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
-        if (g_af && !g_vis && (GetTickCount() - g_lht >= 1000)) {
+        if (g_af && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
             ShowKB(TRUE, FALSE);
         }
         return 0;
@@ -1399,7 +1403,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 }
             }
 
-            if (!g_af || GetTickCount() - g_lht < 1000) return 0;
+            if (!g_af || GetTickCount() - g_lht < AUTO_POP_COOLDOWN_MS) return 0;
 
             HWND fg = GetForegroundWindow();
             if (!fg || fg == g_hWnd) return 0;
@@ -1417,7 +1421,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
             if (hasFocusInput && !g_vis) {
                 ShowKB(TRUE, FALSE);
-            } else if (!hasFocusInput && g_vis && !g_manualShow) {
+            } else if (!hasFocusInput && g_vis && (!g_manualShow || GetTickCount() - g_manualShowTick > MANUAL_HIDE_GRACE_MS)) {
                 POINT pt; GetCursorPos(&pt);
                 if (WindowFromPoint(pt) != g_hWnd) {
                     ShowKB(FALSE, FALSE);

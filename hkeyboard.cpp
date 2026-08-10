@@ -760,14 +760,16 @@ static void DoKeyAction(const KeyDef* k) {
         if (k->vk == VK_LWIN) {
             // Win 键参考大写键（Caps）的开关逻辑：
             //  第 1 次点击：锁定并高亮（等待 Win+组合键，再点其它键发送 Win+按键）；
-            //  第 2 次点击：轻按一次 Win 键（打开/关闭开始菜单），并解除锁定、取消高亮。
-            // 连续点击按“锁定→轻按→锁定→轻按”交替，不会计数失步。
+            //  第 2 次点击：轻按一次 Win 键（打开开始菜单），解除锁定、取消高亮；
+            //  第 3 次起：每次点击都轻按 Win 键（开始菜单随点击开/关交替），不再失步。
             if (g_winKey) {
                 g_winKey = FALSE;
                 g_winCount = 0;
-                SendWinToggle();   // 轻按 Win 键
+                SendWinToggle();                 // 轻按 Win 键
+            } else if (IsStartMenuOpen()) {
+                SendWinToggle();                 // 菜单开着 → 轻按关闭
             } else {
-                g_winKey = TRUE;
+                g_winKey = TRUE;                 // 锁定，等待 Win+组合键
                 g_winCount = 1;
             }
             g_lastWinTick = GetTickCount();

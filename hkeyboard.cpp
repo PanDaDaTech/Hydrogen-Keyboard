@@ -192,7 +192,6 @@ BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
 int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定（等待 Win+组合键）
 DWORD       g_lastWinTick = 0;        // 最近一次 Win 键点击时刻（状态超时复位用）
-int         g_shiftCount = 0;         // 左右 Shift 共享点击计数：1=特殊符号 2=切换中/英
 HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/Shift/Caps 状态同步显示）
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
@@ -786,12 +785,11 @@ static void DoKeyAction(const KeyDef* k) {
         break;
     case K_MOD:
         if (k->vk == VK_RSHIFT || k->vk == VK_SHIFT || k->vk == VK_LSHIFT) {
-            // 左右 Shift 共享点击计数，行为同步：
-            //  第 1 次：与左 Shift 原行为一致，锁定特殊符号；
-            //  第 2 次：切换中/英输入法，并退出特殊符号锁定，计数清零。
-            g_shiftCount++;
-            if (g_shiftCount >= 2) {
-                g_shiftCount = 0;
+            // 左右 Shift 状态机（状态以 g_sh 为准）：
+            //  - 未处于 Shift 状态：点击进入 Shift 锁定（后续按键为 Shift+组合键）；
+            //  - 已处于 Shift 状态：再次点击切换中/英输入法，并退出 Shift 锁定。
+            // 任意 Shift+组合键使用后会退出 Shift 状态，因此下次点击 Shift 可再次正常进入，不会失步。
+            if (g_sh) {
                 g_sh = FALSE;
                 g_fnLayer = FALSE;
                 ToggleImeLang();

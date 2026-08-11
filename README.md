@@ -1,15 +1,21 @@
-# 轻键 (HKeyboard)
+<div align="center">
 
-> 作者：PanDaTech
-> 原项目作者：江南一根葱
+<img src="./winres/main.ico" alt="HKeyboard" width="20%" />
 
-> 专为 Windows 11 / 10 及 WinPE 离线环境打造的**极轻量级、原生 Win32 C++ 屏幕键盘**。
-> 无任何重型 UI 框架依赖，内存占用仅 **~3MB**，二进制文件仅 **~30KB**，支持 4K 高分屏自适应与完整 QWERTY 键盘布局。
+# 轻键 Hydrogen Keyboard
 
----
+[![GitHub Release](https://img.shields.io/github/v/release/PanDaDaTech/Hydrogen-Keyboard?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/PanDaDaTech/Hydrogen-Keyboard/releases)
+[![GitHub last commit](https://img.shields.io/github/last-commit/PanDaDaTech/Hydrogen-Keyboard?label=%E4%B8%8A%E6%AC%A1%E6%8F%90%E4%BA%A4)](https://github.com/PanDaDaTech/Hydrogen-Keyboard/commits)
+[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/PanDaDaTech/Hydrogen-Keyboard/build.yml?label=CI%E6%9E%84%E5%BB%BA)](https://github.com/PanDaDaTech/Hydrogen-Keyboard/actions)
+[![License](https://img.shields.io/github/license/PanDaDaTech/Hydrogen-Keyboard?label=%E5%BC%80%E6%BA%90%E8%AE%B8%E5%8F%AF)](https://github.com/PanDaDaTech/Hydrogen-Keyboard/blob/main/LICENSE)
+</div>
 
-## 核心亮点 (Key Features)
+## 致谢
+- [NB_TouchKeyboard](https://github.com/zwj4031/NB_TouchKeyboard)：提供项目源代码参考
 
+## 核心亮点
+
+- **基于 NB_TouchKeyboard 项目增强修改开发，并运用 Github Actions 实现在线构建**
 - **零延迟响应**：原生 Win32 GDI 双缓冲绘制，按压 0ms 瞬间直出上屏；退格、删除、空格与方向键支持高频连发 (Auto-Repeat)。
 - **4K 高分屏 & 矢量自适应**：原生适配 1080P / 2K / 4K（125%~250% DPI 缩放），支持 8 方向边框自由拖拽拉大拉小，按键与字号全矢量等比放缩。
 - **完整 QWERTY 与 Fn 功能层**：提供标准 QWERTY 全键盘布局，点击 `Fn` 后数字行 `1`~`0`、`-`、`=` 可快速切换为 `F1`~`F12`。
@@ -19,43 +25,7 @@
 - **兼容微软拼音 / 五笔输入法**：按键通过 `SendInput` 虚拟键码 (VK) + 正确扫描码发送，完整经过 TSF 组合管线，拼音 / 五笔组字无障碍。
 - **极致轻量与兼容**：兼容 Windows XP ~ Windows 11，适配 WinPE 维护环境，支持系统托盘常驻与后台静默运行。
 
----
-
-## 界面与操作 (UI & Operations)
-
-### 标题栏
-
-| 按钮 | 说明 |
-| :--- | :--- |
-| **菜单** | 打开右键菜单（自动呼出、主题、显示轻键、关于、退出键盘等） |
-| **—（最小化）** | 收起键盘（滑出屏幕，驻留系统托盘） |
-| **×（关闭）** | 弹窗询问：完全退出程序，或隐藏到系统托盘 |
-
-### 右键菜单
-
-- **自动呼出**：勾选项，开启后点击输入框自动弹出、离焦自动收回（默认开启）。
-- **显示轻键**：仅在键盘隐藏时出现，点击重新显示键盘（隐藏时也可直接左键单击托盘图标）。
-- **主题**：跟随系统 / 深色主题 / 浅色主题。
-- **关于**、**退出键盘**。
-
-### 系统托盘
-
-- **左键单击 / 双击**：显示 / 隐藏键盘切换。
-- **右键**：打开上述右键菜单。
-- 程序退出（× → 选择“是”）时托盘图标会立即移除，不会残留。
-
-
-## 键盘快捷技巧
-
-- **Shift（左右共用）**：第 1 次点击锁定并高亮，再点其它键发送 `Shift+按键`（如 `Shift+A`）；连续第 2 次点击切换当前输入法的中英文状态。使用 `Shift+组合键` 后状态自动复位，可反复正常使用。
-- **Ctrl / Alt**：点击锁定（高亮），再点其它键发送 `Ctrl+按键` / `Alt+按键`；组合使用后自动解除锁定，再次点击可重新锁定。
-- **Win 键（参考大写键）**：第 1 次点击锁定并高亮，再点其它键发送 `Win+按键`（如 `Win+E`）；第 2 次及之后的每次点击轻按一次 `Win` 键，开始菜单随点击开 / 关，不会失步。
-- **F1~F12 功能层**：点击 `Fn` 后，数字行 `1`~`0`、`-`、`=` 显示并发送 `F1`~`F12`；选择功能键后自动退出 Fn 层。
-- **自由放缩**：鼠标或手指按住键盘四周任意边框或角落拖动，即可自由调整键盘大小。
-
----
-
-## 命令行参数说明 (CLI Parameters)
+## 命令行参数说明
 
 支持以下启动参数，方便集成到 WinPE 启动脚本、第三方 Shell 或快捷方式中：
 
@@ -87,7 +57,7 @@ HKeyboard_x64.exe -noauto -show
 
 ---
 
-## 编译指南 (Build Instructions)
+## 编译指南
 
 本项目采用纯 Win32 API 编写，无第三方运行时依赖。
 
@@ -96,16 +66,17 @@ HKeyboard_x64.exe -noauto -show
 - **常规 CI 构建**：`.github/workflows/build.yml` 保持原有推送、拉取请求、标签及手动构建流程。
 - **按需发布**：`.github/workflows/release.yml` 仅支持手动触发；填写版本标签后才会构建并创建 GitHub Release，默认创建为草稿，不会替代或自动触发现有 Build 工作流。
 
-### XP 兼容依赖（自动下载）
+### XP 兼容依赖
 
 构建脚本依赖 [YY-Thunks](https://github.com/Chuyu-Team/YY-Thunks)（WinXP API 桩）和 [VC-LTL](https://github.com/Chuyu-Team/VC-LTL)（静态 CRT 链接）以实现 Windows XP 兼容。
 
 - 若本地未找到这两个依赖，`build_cpp.bat` 会**自动从 NuGet 下载**到 `deps/` 目录（YY-Thunks 1.2.2 + VC-LTL 5.3.1）。
 - 也可通过环境变量 `TOOLCHAIN_ROOT` 指定自定义路径（如 `set TOOLCHAIN_ROOT=D:\MyTools`），脚本会在 `%TOOLCHAIN_ROOT%\YY-Thunks\` 和 `%TOOLCHAIN_ROOT%\VC-LTL\` 下查找。
-- GitHub Actions 中由 workflow 自动下载，无需手动配置。
+- 在 GitHub Actions 构建时会自动从 NuGet 中自动下载依赖，无需手动配置。
 
 ---
 
-## 开源协议 (License)
-
-本项目基于 [MIT](LICENSE) 许可证开源。
+### 使用到的项目：
+- [NB_TouchKeyboard](https://github.com/zwj4031/NB_TouchKeyboard)
+- [YY-Thunks](https://github.com/Chuyu-Team/YY-Thunks)
+- [VC-LTL](https://github.com/Chuyu-Team/VC-LTL)

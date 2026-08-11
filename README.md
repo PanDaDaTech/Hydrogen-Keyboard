@@ -55,8 +55,6 @@ HKeyboard_x64.exe -light -show
 HKeyboard_x64.exe -noauto -show
 ```
 
----
-
 ## 编译指南
 
 本项目采用纯 Win32 API 编写，无第三方运行时依赖。
@@ -74,9 +72,7 @@ HKeyboard_x64.exe -noauto -show
 - 也可通过环境变量 `TOOLCHAIN_ROOT` 指定自定义路径（如 `set TOOLCHAIN_ROOT=D:\MyTools`），脚本会在 `%TOOLCHAIN_ROOT%\YY-Thunks\` 和 `%TOOLCHAIN_ROOT%\VC-LTL\` 下查找。
 - 在 GitHub Actions 构建时会自动从 NuGet 中自动下载依赖，无需手动配置。
 
----
-
-### 使用到的项目：
+## 使用到的项目：
 - [NB_TouchKeyboard](https://github.com/zwj4031/NB_TouchKeyboard)
 - [YY-Thunks](https://github.com/Chuyu-Team/YY-Thunks)
 - [VC-LTL](https://github.com/Chuyu-Team/VC-LTL)

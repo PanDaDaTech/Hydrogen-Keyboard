@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include "resource.h"
 
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
@@ -362,7 +363,7 @@ static void LoadEmbeddedFonts() {
         { IDR_FONT_BOLD,    &g_fontRegBold },
     };
     for (int i = 0; i < 2; i++) {
-        HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), RT_RCDATA);
+        HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), MAKEINTRESOURCEW(10));  // RT_RCDATA
         if (!hr) continue;
         HGLOBAL hg = LoadResource(g_hInst, hr);
         if (!hg) continue;

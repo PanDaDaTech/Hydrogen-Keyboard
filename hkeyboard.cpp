@@ -212,6 +212,9 @@ HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
 #define SLIDE_MS 12
 HFONT       g_f12 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
+static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
+static HANDLE g_fontRegBold = 0;
+static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
 
 // Fn 功能键层：TRUE 时数字行显示为 F1~F12
@@ -352,6 +355,29 @@ static void BuildKeys() {
     }
 }
 
+// 注册内嵌字体（阿里巴巴普惠体精简版）到当前进程；失败则回退系统字体
+static void LoadEmbeddedFonts() {
+    struct { int id; HANDLE* slot; } fonts[2] = {
+        { IDR_FONT_REGULAR, &g_fontRegRegular },
+        { IDR_FONT_BOLD,    &g_fontRegBold },
+    };
+    for (int i = 0; i < 2; i++) {
+        HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), RT_RCDATA);
+        if (!hr) continue;
+        HGLOBAL hg = LoadResource(g_hInst, hr);
+        if (!hg) continue;
+        void* data = LockResource(hg);
+        DWORD sz = SizeofResource(g_hInst, hr);
+        if (!data || sz == 0) continue;
+        DWORD n = 0;
+        HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
+        if (h && n > 0) {
+            *fonts[i].slot = h;
+            g_fontReady = TRUE;
+        }
+    }
+}
+
 static HFONT MakeFont(int size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv(size, 96, 72);
@@ -359,7 +385,7 @@ static HFONT MakeFont(int size, BOOL bold) {
     return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+        DEFAULT_PITCH | FF_DONTCARE, g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei");
 }
 
 static void RecreateFontsAndLayout() {
@@ -1772,6 +1798,8 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         if (pSetDPIAware) pSetDPIAware();
     }
 
+    LoadEmbeddedFonts();   // 注册内嵌字体（阿里巴巴普惠体精简版），失败自动回退系统字体
+
     BOOL fShow   = (strstr(cmd, "-show") != NULL);
     BOOL fHide   = (strstr(cmd, "-hide") != NULL || strstr(cmd, "-min") != NULL || strstr(cmd, "-tray") != NULL);
     BOOL tOnly   = (strstr(cmd, "-touchonly") != NULL);
@@ -1863,5 +1891,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
+    if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
     return (int)msg.wParam;
 }

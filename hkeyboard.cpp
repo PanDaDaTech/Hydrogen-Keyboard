@@ -178,6 +178,7 @@ struct KeyDef { int x, y, w, h; short vk; KeyType type; };
 static void ShowKB(BOOL show, BOOL isManual = FALSE);
 static void ToggleKB();
 static void HandleCloseAction(HWND hWnd);
+static void OpenClosePrompt();
 static void RecreateFontsAndLayout();
 static double GetSystemDpiScale();
 static void InitWindowSizeForDpi();
@@ -1019,14 +1020,10 @@ static void ShowKB(BOOL show, BOOL isManual) {
 
 static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
-// × 关闭行为：根据设置决定直接退出还是隐藏到托盘
+// × 关闭：弹出关闭方式提示窗口（含“记住我的选择”）
 static void HandleCloseAction(HWND hWnd) {
-    if (g_closeToTray) {
-        g_manualHide = TRUE;      // 显式隐藏到托盘后不再自动弹出，需手动（托盘/菜单）重新显示
-        ShowKB(FALSE, FALSE);
-    } else {
-        DestroyWindow(hWnd);
-    }
+    (void)hWnd;
+    OpenClosePrompt();
 }
 
 static HICON LoadMainIcon(int size) {
@@ -1151,7 +1148,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right, H = rc.bottom;
     double dpi = GetSystemDpiScale();
-    int hdr = (int)(40 * dpi), tabH = (int)(44 * dpi);
+    int hdr = (int)(40 * dpi);
 
     Fill(dc, 0, 0, W, hdr, C_HDR);
     DrawTextL(dc, 14, 0, W - 90, hdr, L"设置", g_f14b, C_WHITE);
@@ -1164,12 +1161,15 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     MoveToEx(dc, mx + r, my - r, NULL); LineTo(dc, mx - r, my + r);
     SelectObject(dc, op); DeleteObject(pen);
 
-    int tx = 12, ty = hdr + 6, tw = (int)(110 * dpi), th = tabH - 12;
-    SettingsTab(dc, tx, ty, tw, th, L"常规", g_sTab == 0, g_sHov == S_HIT_TAB0); tx += tw + 8;
-    SettingsTab(dc, tx, ty, tw, th, L"主题", g_sTab == 1, g_sHov == S_HIT_TAB1); tx += tw + 8;
-    SettingsTab(dc, tx, ty, tw, th, L"关于", g_sTab == 2, g_sHov == S_HIT_TAB2);
+    // 左侧 Tab（纵向），关于在最底
+    int tabX = 12, tabY = hdr + 12;
+    int tabW = (int)(110 * dpi), tabH = (int)(38 * dpi), tabGap = (int)(8 * dpi);
+    SettingsTab(dc, tabX, tabY, tabW, tabH, L"常规", g_sTab == 0, g_sHov == S_HIT_TAB0); tabY += tabH + tabGap;
+    SettingsTab(dc, tabX, tabY, tabW, tabH, L"主题", g_sTab == 1, g_sHov == S_HIT_TAB1); tabY += tabH + tabGap;
+    SettingsTab(dc, tabX, tabY, tabW, tabH, L"关于", g_sTab == 2, g_sHov == S_HIT_TAB2);
 
-    int x0 = 20, y = hdr + tabH + 10, cw = W - 40;
+    // 右侧内容
+    int x0 = tabX + tabW + 16, y = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
     if (g_sTab == 0) {
         DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"自动呼出", g_f14b, C_DIM); y += (int)(24 * dpi);
@@ -1215,16 +1215,17 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right;
     double dpi = GetSystemDpiScale();
-    int hdr = (int)(40 * dpi), tabH = (int)(44 * dpi);
+    int hdr = (int)(40 * dpi);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     if (x >= bx && x < bx + bw && y >= by && y < by + bh) return S_HIT_CLOSE;
-    int tx = 12, ty = hdr + 6, tw = (int)(110 * dpi), th = tabH - 12;
+    // 左侧 Tab（纵向），关于在最底
+    int tabX = 12, tabY = hdr + 12, tabW = (int)(110 * dpi), tabH = (int)(38 * dpi), tabGap = (int)(8 * dpi);
     for (int i = 0; i < 3; i++) {
-        if (x >= tx && x < tx + tw && y >= ty && y < ty + th) return S_HIT_TAB0 + i;
-        tx += tw + 8;
+        if (x >= tabX && x < tabX + tabW && y >= tabY && y < tabY + tabH) return S_HIT_TAB0 + i;
+        tabY += tabH + tabGap;
     }
-    int x0 = 20, yy = hdr + tabH + 10, cw = W - 40;
+    int x0 = tabX + tabW + 16, yy = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
     if (g_sTab == 0) {
         yy += (int)(24 * dpi);
@@ -1346,7 +1347,7 @@ static void OpenSettings() {
         return;
     }
     double dpi = GetSystemDpiScale();
-    int w = (int)(480 * dpi), h = (int)(390 * dpi);
+    int w = (int)(520 * dpi), h = (int)(400 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;
@@ -1356,6 +1357,183 @@ static void OpenSettings() {
     if (g_settingsHwnd) {
         ShowWindow(g_settingsHwnd, SW_SHOW);
         SetForegroundWindow(g_settingsHwnd);
+    }
+}
+
+// ========== 关闭方式提示窗口 ==========
+#define P_HIT_NONE      0
+#define P_HIT_CLOSE     1
+#define P_HIT_DIRECT    2
+#define P_HIT_TRAY      3
+#define P_HIT_REMEMBER  4
+#define P_HIT_OK        5
+#define P_HIT_CANCEL    6
+
+static HWND g_closePromptHwnd = 0;
+static int  g_pChoice = 0;       // 0=直接退出 1=隐藏到托盘
+static BOOL g_pRemember = FALSE;
+static int  g_pHov = -1;
+static BOOL g_pTracking = FALSE;
+
+static void PromptDraw(HDC dc, HWND hWnd) {
+    RECT rc; GetClientRect(hWnd, &rc);
+    int W = rc.right, H = rc.bottom;
+    double dpi = GetSystemDpiScale();
+    int hdr = (int)(40 * dpi);
+    Fill(dc, 0, 0, W, hdr, C_HDR);
+    DrawTextL(dc, 14, 0, W - 90, hdr, L"关闭轻键", g_f14b, C_WHITE);
+    int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
+    int bx = W - bw - 8, by = (hdr - bh) / 2;
+    DrawRoundRect(dc, bx, by, bw, bh, (g_pHov == P_HIT_CLOSE) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
+    int mx = bx + bw / 2, my = by + bh / 2, r = (int)(5 * dpi);
+    HPEN pen = CreatePen(PS_SOLID, 2, C_DIM); HPEN op = (HPEN)SelectObject(dc, pen);
+    MoveToEx(dc, mx - r, my - r, NULL); LineTo(dc, mx + r, my + r);
+    MoveToEx(dc, mx + r, my - r, NULL); LineTo(dc, mx - r, my + r);
+    SelectObject(dc, op); DeleteObject(pen);
+
+    int x0 = 20, y = hdr + 18, cw = W - 40;
+    int rowH = (int)(26 * dpi);
+    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"请选择关闭方式：", g_f14b, C_DIM); y += (int)(26 * dpi);
+    DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_f14, C_WHITE);
+    y += rowH;
+    DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_f14, C_WHITE);
+    y += rowH + (int)(6 * dpi);
+    DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_pRemember);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_f14, C_WHITE);
+    y += rowH + (int)(12 * dpi);
+    int bw2 = (int)(84 * dpi), bh2 = (int)(30 * dpi);
+    DrawRoundRect(dc, x0, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 8);
+    DrawTextC(dc, x0, y, bw2, bh2, L"确定", g_f14b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
+    DrawRoundRect(dc, x0 + bw2 + (int)(12 * dpi), y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 8);
+    DrawTextC(dc, x0 + bw2 + (int)(12 * dpi), y, bw2, bh2, L"取消", g_f14b, C_WHITE);
+    y += bh2 + (int)(10 * dpi);
+    DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"勾选后可记住本次选择", g_f12, C_DIM);
+}
+
+static int PromptHitTest(HWND hWnd, int x, int y) {
+    RECT rc; GetClientRect(hWnd, &rc);
+    int W = rc.right;
+    double dpi = GetSystemDpiScale();
+    int hdr = (int)(40 * dpi);
+    int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
+    int bx = W - bw - 8, by = (hdr - bh) / 2;
+    if (x >= bx && x < bx + bw && y >= by && y < by + bh) return P_HIT_CLOSE;
+    int x0 = 20, yy = hdr + 18, cw = W - 40;
+    int rowH = (int)(26 * dpi);
+    yy += (int)(26 * dpi);
+    if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_DIRECT;
+    yy += rowH;
+    if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_TRAY;
+    yy += rowH + (int)(6 * dpi);
+    if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_REMEMBER;
+    yy += rowH + (int)(12 * dpi);
+    int bw2 = (int)(84 * dpi), bh2 = (int)(30 * dpi);
+    if (x >= x0 && x < x0 + bw2 && y >= yy && y < yy + bh2) return P_HIT_OK;
+    if (x >= x0 + bw2 + (int)(12 * dpi) && x < x0 + bw2 + (int)(12 * dpi) + bw2 && y >= yy && y < yy + bh2) return P_HIT_CANCEL;
+    return P_HIT_NONE;
+}
+
+static void PromptOnClick(HWND hWnd, int x, int y) {
+    int hit = PromptHitTest(hWnd, x, y);
+    switch (hit) {
+    case P_HIT_CLOSE:
+    case P_HIT_CANCEL:
+        DestroyWindow(hWnd);
+        return;
+    case P_HIT_DIRECT:   g_pChoice = 0; break;
+    case P_HIT_TRAY:     g_pChoice = 1; break;
+    case P_HIT_REMEMBER: g_pRemember = !g_pRemember; break;
+    case P_HIT_OK: {
+        g_closeToTray = (g_pChoice == 1);
+        g_rememberClose = g_pRemember;
+        SaveCloseSettings();          // 持久化选择与“记住我的选择”标志
+        DestroyWindow(hWnd);
+        if (g_closeToTray) {
+            g_manualHide = TRUE;      // 显式隐藏到托盘后不再自动弹出
+            ShowKB(FALSE, FALSE);
+        } else if (g_hWnd && IsWindow(g_hWnd)) {
+            DestroyWindow(g_hWnd);
+        }
+        return;
+    }
+    default: return;
+    }
+    InvalidateRect(hWnd, NULL, TRUE);
+}
+
+static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hWnd, &ps);
+        RECT rc; GetClientRect(hWnd, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
+        Fill(mem, 0, 0, rc.right, rc.bottom, C_BG);
+        PromptDraw(mem, hWnd);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        PromptOnClick(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        return 0;
+    case WM_MOUSEMOVE: {
+        if (!g_pTracking) { TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hWnd, 0}; TrackMouseEvent(&tme); g_pTracking = TRUE; }
+        int hov = PromptHitTest(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        if (hov != g_pHov) { g_pHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_pTracking = FALSE;
+        if (g_pHov != -1) { g_pHov = -1; InvalidateRect(hWnd, NULL, TRUE); }
+        return 0;
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) { DestroyWindow(hWnd); return 0; }
+        break;
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        ScreenToClient(hWnd, &pt);
+        int hdr = (int)(40 * GetSystemDpiScale());
+        if (pt.y >= 0 && pt.y < hdr) {
+            if (PromptHitTest(hWnd, pt.x, pt.y) != P_HIT_CLOSE) return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+    case WM_CLOSE: DestroyWindow(hWnd); return 0;
+    case WM_DESTROY:
+        g_closePromptHwnd = NULL;
+        g_pHov = -1;
+        g_pTracking = FALSE;
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, w, l);
+}
+
+static void OpenClosePrompt() {
+    if (g_closePromptHwnd && IsWindow(g_closePromptHwnd)) {
+        SetForegroundWindow(g_closePromptHwnd);
+        return;
+    }
+    g_pChoice = g_closeToTray ? 1 : 0;
+    g_pRemember = g_rememberClose;
+    double dpi = GetSystemDpiScale();
+    int w = (int)(420 * dpi), h = (int)(280 * dpi);
+    RECT work = {0};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int x = work.left + ((work.right - work.left) - w) / 2;
+    int y = work.top + ((work.bottom - work.top) - h) / 2;
+    g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", L"关闭轻键", WS_POPUP,
+        x, y, w, h, NULL, NULL, g_hInst, NULL);
+    if (g_closePromptHwnd) {
+        ShowWindow(g_closePromptHwnd, SW_SHOW);
+        SetForegroundWindow(g_closePromptHwnd);
     }
 }
 
@@ -1712,7 +1890,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
             HWND fg = GetForegroundWindow();
             if (!fg || fg == g_hWnd) return 0;
-            if (g_settingsHwnd && fg == g_settingsHwnd) return 0;   // 设置页在前台时不自动收起键盘
+            if ((g_settingsHwnd && fg == g_settingsHwnd) || (g_closePromptHwnd && fg == g_closePromptHwnd)) return 0;   // 设置页/关闭提示在前台时不自动收起键盘
 
             DWORD tid = GetWindowThreadProcessId(fg, NULL);
             GUITHREADINFO gi = {sizeof(gi)};
@@ -1866,6 +2044,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     WNDCLASSEXW wcs = {sizeof(wcs), CS_DBLCLKS, SettingsWndProc, 0, 0, hI,
         hAppIcon, LoadCursor(0, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), 0, L"HKeyboardSettings", hAppIcon};
     RegisterClassExW(&wcs);
+    WNDCLASSEXW wcp = {sizeof(wcp), CS_DBLCLKS, PromptWndProc, 0, 0, hI,
+        hAppIcon, LoadCursor(0, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), 0, L"HKeyboardClosePrompt", hAppIcon};
+    RegisterClassExW(&wcp);
 
     InitWindowSizeForDpi();
 

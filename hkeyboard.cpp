@@ -189,6 +189,7 @@ HICON       g_hTrayIcon = 0;
 BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 DWORD       g_manualShowTick = 0;        // 手动显示时刻（自动隐藏宽限期用）
+BOOL        g_manualHide = FALSE;      // 用户显式收起（×/最小化）后不自动弹出，直到手动重新显示
 BOOL        g_sh = FALSE, g_ct = FALSE, g_al = FALSE, g_cp = FALSE;
 BOOL        g_winKey = FALSE;
 int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定（等待 Win+组合键）
@@ -198,7 +199,8 @@ BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示�
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
-BOOL        g_closeToTray = TRUE;      // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出
+BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
+BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
 int         g_repeatKeyIdx = -1;
@@ -965,7 +967,7 @@ static void ShowKB(BOOL show, BOOL isManual) {
     int targetY = work.bottom - g_wh - 6;
 
     if (show) {
-        if (isManual) { g_manualShow = TRUE; g_manualShowTick = GetTickCount(); }
+        if (isManual) { g_manualShow = TRUE; g_manualShowTick = GetTickCount(); g_manualHide = FALSE; }
         if (g_vis) {
             SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
             return;
@@ -993,6 +995,7 @@ static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 // × 关闭行为：根据设置决定直接退出还是隐藏到托盘
 static void HandleCloseAction(HWND hWnd) {
     if (g_closeToTray) {
+        g_manualHide = TRUE;      // 显式隐藏到托盘后不再自动弹出，需手动（托盘/菜单）重新显示
         ShowKB(FALSE, FALSE);
     } else {
         DestroyWindow(hWnd);
@@ -1068,6 +1071,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_THEME_DARK     14
 #define S_HIT_THEME_LIGHT    15
 #define S_HIT_WALLPAPER      16
+#define S_HIT_REMEMBER       17
 
 static HWND g_settingsHwnd = 0;
 static int  g_sTab = 0;        // 0=常规 1=主题 2=关于
@@ -1151,6 +1155,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         y += rowH;
         DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_closeToTray);
         DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_f14, C_WHITE);
+        y += rowH + (int)(4 * dpi);
+        DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_rememberClose);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_f14, C_WHITE);
         y += rowH + (int)(8 * dpi);
         DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：托盘右键菜单可随时显示 / 退出程序", g_f12, C_DIM);
     } else if (g_sTab == 1) {
@@ -1199,6 +1206,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_CLOSE_DIRECT;
         yy += rowH;
         if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_CLOSE_TRAY;
+        yy += rowH + (int)(4 * dpi);
+        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_REMEMBER;
     } else if (g_sTab == 1) {
         yy += (int)(24 * dpi);
         if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_THEME_SYSTEM;
@@ -1212,12 +1221,24 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     return S_HIT_NONE;
 }
 
+// 持久化“× 关闭行为”选择（HKCU\Software\HKeyboard）
+static void SaveCloseSettings() {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\HKeyboard", 0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) != ERROR_SUCCESS) return;
+    DWORD remember = g_rememberClose ? 1 : 0;
+    DWORD tray = g_closeToTray ? 1 : 0;
+    RegSetValueExW(hk, L"RememberClose", 0, REG_DWORD, (const BYTE*)&remember, sizeof(remember));
+    RegSetValueExW(hk, L"CloseToTray", 0, REG_DWORD, (const BYTE*)&tray, sizeof(tray));
+    RegCloseKey(hk);
+}
+
 static void SettingsApplyHit(HWND hWnd, int hit) {
     BOOL themeChanged = FALSE;
     switch (hit) {
     case S_HIT_AUTO: g_af = !g_af; break;
-    case S_HIT_CLOSE_DIRECT: g_closeToTray = FALSE; break;
-    case S_HIT_CLOSE_TRAY:   g_closeToTray = TRUE;  break;
+    case S_HIT_CLOSE_DIRECT: g_closeToTray = FALSE; if (g_rememberClose) SaveCloseSettings(); break;
+    case S_HIT_CLOSE_TRAY:   g_closeToTray = TRUE;  if (g_rememberClose) SaveCloseSettings(); break;
+    case S_HIT_REMEMBER:     g_rememberClose = !g_rememberClose; SaveCloseSettings(); break;
     case S_HIT_THEME_SYSTEM: if (g_themeMode != 0) { g_themeMode = 0; themeChanged = TRUE; } break;
     case S_HIT_THEME_DARK:   if (g_themeMode != 1) { g_themeMode = 1; themeChanged = TRUE; } break;
     case S_HIT_THEME_LIGHT:  if (g_themeMode != 2) { g_themeMode = 2; themeChanged = TRUE; } break;
@@ -1446,7 +1467,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
-        case HDR_MIN: ShowKB(FALSE, FALSE); break;
+        case HDR_MIN: g_manualHide = TRUE; ShowKB(FALSE, FALSE); break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         }
         return;
@@ -1586,7 +1607,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
-        if (g_af && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
+        if (g_af && !g_manualHide && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
             ShowKB(TRUE, FALSE);
         }
         return 0;
@@ -1677,7 +1698,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 }
             }
 
-            if (hasFocusInput && !g_vis) {
+            if (hasFocusInput && !g_vis && !g_manualHide) {
                 ShowKB(TRUE, FALSE);
             } else if (!hasFocusInput && g_vis && (!g_manualShow || GetTickCount() - g_manualShowTick > MANUAL_HIDE_GRACE_MS)) {
                 POINT pt; GetCursorPos(&pt);
@@ -1782,6 +1803,21 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     if (fNoAuto) g_af = FALSE;
     else if (fAuto) g_af = TRUE;
+
+    // 读取“× 关闭行为”记忆（若之前勾选了“记住我的选择”）
+    {
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\HKeyboard", 0, KEY_READ, &hk) == ERROR_SUCCESS) {
+            DWORD v = 0, sz = sizeof(v);
+            if (RegQueryValueExW(hk, L"RememberClose", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS && v) {
+                g_rememberClose = TRUE;
+                sz = sizeof(v);
+                if (RegQueryValueExW(hk, L"CloseToTray", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS)
+                    g_closeToTray = (v != 0);
+            }
+            RegCloseKey(hk);
+        }
+    }
 
     g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {

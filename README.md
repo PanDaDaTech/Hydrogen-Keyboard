@@ -60,7 +60,8 @@ HKeyboard_x64.exe -noauto -show
 本项目采用纯 Win32 API 编写，无第三方运行时依赖。
 
 - **编译器**：MSVC (Visual Studio 2019 / 2022)
-- **本地编译**：直接运行根目录下的 `build_cpp.bat`，生成 x86 / x64 双架构二进制程序及 7z 发布包。
+- **本地编译**：直接运行根目录下的 `build_cpp.bat`，生成 x86 / x64 / arm64 三架构二进制程序及 7z 发布包。
+- **ARM64（Windows on ARM）**：`build_cpp.bat` 同时产出 `HKeyboard_arm64.exe`（ARM64 原生版）；CI 在 x64 宿主上交叉编译，真机功能验证需 ARM64 Windows 设备。
 - **常规 CI 构建**：`.github/workflows/build.yml` 保持原有推送、拉取请求、标签及手动构建流程。
 - **按需发布**：`.github/workflows/release.yml` 仅支持手动触发；填写版本标签后才会构建并创建 GitHub Release，默认创建为草稿，不会替代或自动触发现有 Build 工作流。
 

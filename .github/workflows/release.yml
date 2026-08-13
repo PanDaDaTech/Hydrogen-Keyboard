@@ -194,6 +194,61 @@ jobs:
           echo [x64] Build succeeded.
 
 
+      - name: Build arm64
+        shell: cmd
+        run: |
+          call "${{ steps.vs.outputs.VS_PATH }}\Common7\Tools\VsDevCmd.bat" -arch=arm64
+          if %errorlevel% neq 0 (
+              echo [Error] Failed to init MSVC arm64 environment.
+              exit /b 1
+          )
+          if not exist "build\arm64" mkdir "build\arm64"
+          if not exist "dist\arm64" mkdir "dist\arm64"
+
+          rem Locate YY-Thunks obj (ARM64 Windows 为 Win10+，无 XP 需求；找不到则跳过)
+          set "YY_OBJ="
+          for /f "delims=" %%f in ('dir /s /b "deps\YY-Thunks\YY_Thunks_for_WinXP.obj" 2^>nul') do (
+              echo %%f | findstr /i "arm64" >nul && set "YY_OBJ=%%f"
+          )
+          if defined YY_OBJ (echo [arm64] YY-Thunks: %YY_OBJ%) else (echo [arm64] YY-Thunks obj not found, skip XP thunk)
+
+          rem Locate VC-LTL paths
+          set "LTL_INC="
+          set "LTL_LIB="
+          set "LTL_INC2="
+          for /f "delims=" %%d in ('dir /s /b /ad "deps\VC-LTL\header" 2^>nul') do (
+              if not defined LTL_INC set "LTL_INC=%%d"
+          )
+          for /f "delims=" %%d in ('dir /s /b /ad "deps\VC-LTL\5.2.3790.0" 2^>nul') do (
+              if not defined LTL_LIB (
+                  if exist "%%d\lib\arm64" set "LTL_LIB=%%d\lib\arm64"
+                  if exist "%%d\header" set "LTL_INC2=%%d\header"
+              )
+          )
+
+          if defined LTL_INC set "INCLUDE=%LTL_INC%;%INCLUDE%"
+          if defined LTL_INC2 set "INCLUDE=%LTL_INC2%;%INCLUDE%"
+          if defined LTL_LIB set "LIB=%LTL_LIB%;%LIB%"
+          if defined LTL_LIB (echo [arm64] VC-LTL lib: %LTL_LIB%) else (echo [arm64] VC-LTL not found, using default CRT)
+
+          rem Compile resources
+          rc /nologo /c65001 /fo "build\arm64\hkeyboard.res" "hkeyboard.rc"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Compile source
+          cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "hkeyboard.cpp" /Fo"build\arm64\hkeyboard.obj"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Link (with YY-Thunks if available)
+          if defined YY_OBJ (
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\arm64\hkeyboard.obj" "build\arm64\hkeyboard.res" "%YY_OBJ%" /link /OUT:"dist\arm64\HKeyboard_arm64.exe" /SUBSYSTEM:WINDOWS,6.02 /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+          ) else (
+              cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "build\arm64\hkeyboard.obj" "build\arm64\hkeyboard.res" /link /OUT:"dist\arm64\HKeyboard_arm64.exe" /SUBSYSTEM:WINDOWS,6.02 /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+          )
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          echo [arm64] Build succeeded.
+
+
       - name: Package release archive (7z)
         shell: pwsh
         run: |
@@ -202,11 +257,11 @@ jobs:
           if (-not (Test-Path -LiteralPath $sevenZip)) {
             throw "7-Zip not found at $sevenZip; cannot create the release archive."
           }
-          & $sevenZip a -t7z -mx=9 'dist/release/HKeyboard_X86_X64.7z' 'dist/x86/HKeyboard_x86.exe' 'dist/x64/HKeyboard_x64.exe'
+          & $sevenZip a -t7z -mx=9 'dist/release/HKeyboard_X86_X64_Arm64.7z' 'dist/x86/HKeyboard_x86.exe' 'dist/x64/HKeyboard_x64.exe' 'dist/arm64/HKeyboard_arm64.exe'
           if ($LASTEXITCODE -ne 0) {
             throw "7-Zip packaging failed with exit code $LASTEXITCODE"
           }
-          Get-Item -LiteralPath 'dist/release/HKeyboard_X86_X64.7z' | Select-Object Name, Length
+          Get-Item -LiteralPath 'dist/release/HKeyboard_X86_X64_Arm64.7z' | Select-Object Name, Length
 
       - name: Verify release files
         shell: pwsh
@@ -214,7 +269,8 @@ jobs:
           $required = @(
             'dist/x86/HKeyboard_x86.exe',
             'dist/x64/HKeyboard_x64.exe',
-            'dist/release/HKeyboard_X86_X64.7z'
+            'dist/arm64/HKeyboard_arm64.exe',
+            'dist/release/HKeyboard_X86_X64_Arm64.7z'
           )
           foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath $file)) {
@@ -230,7 +286,8 @@ jobs:
           path: |
             dist/x86/HKeyboard_x86.exe
             dist/x64/HKeyboard_x64.exe
-            dist/release/HKeyboard_X86_X64.7z
+            dist/arm64/HKeyboard_arm64.exe
+            dist/release/HKeyboard_X86_X64_Arm64.7z
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -245,4 +302,5 @@ jobs:
           files: |
             dist/x86/HKeyboard_x86.exe
             dist/x64/HKeyboard_x64.exe
-            dist/release/HKeyboard_X86_X64.7z
+            dist/arm64/HKeyboard_arm64.exe
+            dist/release/HKeyboard_X86_X64_Arm64.7z

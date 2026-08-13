@@ -69,6 +69,14 @@ if !errorlevel! neq 0 (
     exit /b 1
 )
 
+rem 3. Build ARM64 Version (ARM64 Windows 为 Win10+，无 XP 兼容需求)
+call :BUILD_ARCH arm64 6.02
+if !errorlevel! neq 0 (
+    echo [Error] arm64 build failed.
+    if not defined IS_CI pause
+    exit /b 1
+)
+
 rem 4. Package Release with 7-Zip
 echo.
 echo ========================================
@@ -84,10 +92,10 @@ if not defined Z7_EXE (
 )
 
 if defined Z7_EXE (
-    if exist "%SRC%\dist\release\HKeyboard_X86_X64.7z" del /f /q "%SRC%\dist\release\HKeyboard_X86_X64.7z"
-    "!Z7_EXE!" a -t7z -mx=9 "%SRC%\dist\release\HKeyboard_X86_X64.7z" "%SRC%\dist\x86\HKeyboard_x86.exe" "%SRC%\dist\x64\HKeyboard_x64.exe"
-    if exist "%SRC%\dist\release\HKeyboard_X86_X64.7z" (
-        echo [Info] Successfully created release package: dist\release\HKeyboard_X86_X64.7z
+    if exist "%SRC%\dist\release\HKeyboard_X86_X64_Arm64.7z" del /f /q "%SRC%\dist\release\HKeyboard_X86_X64_Arm64.7z"
+    "!Z7_EXE!" a -t7z -mx=9 "%SRC%\dist\release\HKeyboard_X86_X64_Arm64.7z" "%SRC%\dist\x86\HKeyboard_x86.exe" "%SRC%\dist\x64\HKeyboard_x64.exe" "%SRC%\dist\arm64\HKeyboard_arm64.exe"
+    if exist "%SRC%\dist\release\HKeyboard_X86_X64_Arm64.7z" (
+        echo [Info] Successfully created release package: dist\release\HKeyboard_X86_X64_Arm64.7z
     ) else (
         echo [Warn] Failed to create release package.
     )
@@ -97,7 +105,7 @@ if defined Z7_EXE (
 
 echo.
 echo ========================================
-echo All Done! Outputs are in dist\x86, dist\x64 and dist\release
+echo All Done! Outputs are in dist\x86, dist\x64, dist\arm64 and dist\release
 echo ========================================
 if not defined IS_CI pause
 exit /b 0

@@ -1258,22 +1258,66 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     return S_HIT_NONE;
 }
 
-// 配置文件路径：exe 同目录 HKeyboard.ini（便携式）
+// ========== 配置文件（exe 同目录 HKeyboard.ini，便携式） ==========
 static void GetConfigPath(wchar_t* buf, int cch) {
     GetModuleFileNameW(NULL, buf, cch);
     wchar_t* slash = wcsrchr(buf, L'\\');
     if (slash) wcscpy(slash + 1, L"HKeyboard.ini");
 }
 
-// 持久化“× 关闭行为”选择（HKeyboard.ini）
-static void SaveCloseSettings() {
+static void IniSetInt(const wchar_t* section, const wchar_t* key, int val) {
     wchar_t path[MAX_PATH];
     GetConfigPath(path, MAX_PATH);
-    wchar_t val[16];
-    swprintf(val, 16, L"%d", g_rememberClose ? 1 : 0);
-    WritePrivateProfileStringW(L"General", L"RememberClose", val, path);
-    swprintf(val, 16, L"%d", g_closeToTray ? 1 : 0);
-    WritePrivateProfileStringW(L"General", L"CloseToTray", val, path);
+    wchar_t buf[16];
+    swprintf(buf, 16, L"%d", val);
+    WritePrivateProfileStringW(section, key, buf, path);
+}
+
+static int IniGetInt(const wchar_t* section, const wchar_t* key, int def) {
+    wchar_t path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    wchar_t buf[16];
+    swprintf(buf, 16, L"%d", def);
+    GetPrivateProfileStringW(section, key, buf, buf, 16, path);
+    return _wtoi(buf);
+}
+
+// 首次启动自动生成 HKeyboard.ini（含默认值），之后按需写入
+static void EnsureConfigFile() {
+    wchar_t path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;   // 已存在
+    IniSetInt(L"General", L"RememberClose", 0);
+    IniSetInt(L"General", L"CloseToTray", 0);
+    IniSetInt(L"Window", L"Width", g_ww);
+    IniSetInt(L"Window", L"Height", g_wh);
+    IniSetInt(L"Theme", L"Mode", 0);
+    IniSetInt(L"Theme", L"Wallpaper", 0);
+}
+
+// 读取上次的窗口大小 / 主题 / 关闭行为
+static void LoadConfig() {
+    g_rememberClose = (IniGetInt(L"General", L"RememberClose", 0) != 0);
+    if (g_rememberClose)
+        g_closeToTray = (IniGetInt(L"General", L"CloseToTray", 0) != 0);
+    int w = IniGetInt(L"Window", L"Width", 0);
+    int h = IniGetInt(L"Window", L"Height", 0);
+    if (w >= 300 && h >= 150) { g_ww = w; g_wh = h; }   // 上次调整过的窗口大小
+    int tm = IniGetInt(L"Theme", L"Mode", -1);
+    if (tm >= 0 && tm <= 2) g_themeMode = tm;
+    g_wallpaperAccent = (IniGetInt(L"Theme", L"Wallpaper", 0) != 0);
+}
+
+// 持久化“× 关闭行为”选择
+static void SaveCloseSettings() {
+    IniSetInt(L"General", L"RememberClose", g_rememberClose ? 1 : 0);
+    IniSetInt(L"General", L"CloseToTray", g_closeToTray ? 1 : 0);
+}
+
+// 持久化主题选择（设置页 / 菜单修改时调用）
+static void SaveThemeConfig() {
+    IniSetInt(L"Theme", L"Mode", g_themeMode);
+    IniSetInt(L"Theme", L"Wallpaper", g_wallpaperAccent ? 1 : 0);
 }
 
 static void SettingsApplyHit(HWND hWnd, int hit) {
@@ -1291,6 +1335,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     }
     if (themeChanged) {
         ApplyTheme();                                   // 立即换肤
+        SaveThemeConfig();                              // 持久化主题选择
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     }
     InvalidateRect(hWnd, NULL, TRUE);                   // 设置页立即刷新
@@ -1585,11 +1630,11 @@ static void ShowMenu(HWND hWnd) {
         g_af = !g_af;
         InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_THEME + 1) {
-        g_themeMode = 0; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE);
+        g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_THEME + 2) {
-        g_themeMode = 1; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE);
+        g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_THEME + 3) {
-        g_themeMode = 2; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE);
+        g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_SETTINGS) {
         OpenSettings();
     } else if (id == ID_MENU_ABOUT) {
@@ -1779,6 +1824,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_EXITSIZEMOVE:
+        // 记录上次调整过的窗口大小
+        IniSetInt(L"Window", L"Width", g_ww);
+        IniSetInt(L"Window", L"Height", g_wh);
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
@@ -1931,9 +1981,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         switch (LOWORD(w)) {
         case ID_MENU_TOGGLE: ToggleKB(); break;
         case ID_MENU_AUTO: g_af = !g_af; InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 1: g_themeMode = 0; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); InvalidateRect(hWnd, 0, TRUE); break;
+        case ID_MENU_THEME + 1: g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
+        case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
+        case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_SETTINGS: OpenSettings(); break;
         case ID_MENU_ABOUT: ShowAboutDialog(hWnd); break;
         case ID_MENU_EXIT: DestroyWindow(hWnd); break;
@@ -2010,7 +2060,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     else if (fLight) g_themeMode = 2;
     else g_themeMode = 0;  // 默认跟随系统
     g_wallpaperAccent = fWall;  // 壁纸强调色默认关闭，仅 -wallpaper 开启
-    ApplyTheme();
+    BOOL fThemeCli = (fDark || fLight || HasArg(cmd, "-theme:system"));   // 命令行是否显式指定主题
 
     // -h / -help / -?：仅显示命令行参数帮助，不打开主界面
     if (fHelp) {
@@ -2024,18 +2074,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     if (fNoAuto) g_af = FALSE;
     else if (fAuto) g_af = TRUE;
-
-    // 读取“× 关闭行为”记忆（HKeyboard.ini，若之前勾选了“记住我的选择”）
-    {
-        wchar_t path[MAX_PATH], val[16];
-        GetConfigPath(path, MAX_PATH);
-        GetPrivateProfileStringW(L"General", L"RememberClose", L"0", val, 16, path);
-        if (val[0] == L'1') {
-            g_rememberClose = TRUE;
-            GetPrivateProfileStringW(L"General", L"CloseToTray", L"0", val, 16, path);
-            g_closeToTray = (val[0] == L'1');
-        }
-    }
 
     g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2060,6 +2098,13 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     RegisterClassExW(&wcp);
 
     InitWindowSizeForDpi();
+
+    // 配置：首次启动自动生成 HKeyboard.ini；恢复上次的窗口大小 / 主题 / 关闭行为
+    EnsureConfigFile();
+    LoadConfig();
+    if (fThemeCli) g_themeMode = fDark ? 1 : (fLight ? 2 : 0);   // 命令行主题优先
+    if (fWall) g_wallpaperAccent = TRUE;
+    ApplyTheme();
 
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);

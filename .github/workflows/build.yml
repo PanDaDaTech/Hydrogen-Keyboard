@@ -163,7 +163,7 @@ jobs:
     - name: Build arm64
       shell: cmd
       run: |
-        call "${{ steps.vs.outputs.VS_PATH }}\Common7\Tools\VsDevCmd.bat" -arch=arm64
+        call "${{ steps.vs.outputs.VS_PATH }}\Common7\Tools\VsDevCmd.bat" -arch=arm64 -host_arch=x64
         if %errorlevel% neq 0 (
             echo [Error] Failed to init MSVC arm64 environment.
             exit /b 1

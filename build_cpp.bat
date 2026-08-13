@@ -151,7 +151,12 @@ echo Building %ARCH% Version... [Subsystem: %SUBSYS_VER%]
 echo ========================================
 
 rem Init MSVC Env
-call "%VSDEVCMD%" -arch=%ARCH% >nul 2>&1
+rem arm64 交叉编译：工具用 x64 宿主版（-host_arch=x64），避免 arm64 的 rc.exe/link.exe 在 x64 上无法运行
+if /i "%ARCH%"=="arm64" (
+    call "%VSDEVCMD%" -arch=arm64 -host_arch=x64 >nul 2>&1
+) else (
+    call "%VSDEVCMD%" -arch=%ARCH% >nul 2>&1
+)
 
 rem Init directories
 if not exist "%SRC%\build\%ARCH%" mkdir "%SRC%\build\%ARCH%"

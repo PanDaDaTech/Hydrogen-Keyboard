@@ -1020,9 +1020,18 @@ static void ShowKB(BOOL show, BOOL isManual) {
 
 static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
-// × 关闭：弹出关闭方式提示窗口（含“记住我的选择”）
+// × 关闭：已记住选择则直接按所记方式执行，否则弹出关闭方式提示窗口
 static void HandleCloseAction(HWND hWnd) {
     (void)hWnd;
+    if (g_rememberClose) {
+        if (g_closeToTray) {
+            g_manualHide = TRUE;      // 显式隐藏到托盘后不再自动弹出
+            ShowKB(FALSE, FALSE);
+        } else if (g_hWnd && IsWindow(g_hWnd)) {
+            DestroyWindow(g_hWnd);
+        }
+        return;
+    }
     OpenClosePrompt();
 }
 
@@ -1249,15 +1258,22 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     return S_HIT_NONE;
 }
 
-// 持久化“× 关闭行为”选择（HKCU\Software\HKeyboard）
+// 配置文件路径：exe 同目录 HKeyboard.ini（便携式）
+static void GetConfigPath(wchar_t* buf, int cch) {
+    GetModuleFileNameW(NULL, buf, cch);
+    wchar_t* slash = wcsrchr(buf, L'\\');
+    if (slash) wcscpy(slash + 1, L"HKeyboard.ini");
+}
+
+// 持久化“× 关闭行为”选择（HKeyboard.ini）
 static void SaveCloseSettings() {
-    HKEY hk;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\HKeyboard", 0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) != ERROR_SUCCESS) return;
-    DWORD remember = g_rememberClose ? 1 : 0;
-    DWORD tray = g_closeToTray ? 1 : 0;
-    RegSetValueExW(hk, L"RememberClose", 0, REG_DWORD, (const BYTE*)&remember, sizeof(remember));
-    RegSetValueExW(hk, L"CloseToTray", 0, REG_DWORD, (const BYTE*)&tray, sizeof(tray));
-    RegCloseKey(hk);
+    wchar_t path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    wchar_t val[16];
+    swprintf(val, 16, L"%d", g_rememberClose ? 1 : 0);
+    WritePrivateProfileStringW(L"General", L"RememberClose", val, path);
+    swprintf(val, 16, L"%d", g_closeToTray ? 1 : 0);
+    WritePrivateProfileStringW(L"General", L"CloseToTray", val, path);
 }
 
 static void SettingsApplyHit(HWND hWnd, int hit) {
@@ -1408,8 +1424,6 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     DrawTextC(dc, x0, y, bw2, bh2, L"确定", g_f14b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
     DrawRoundRect(dc, x0 + bw2 + (int)(12 * dpi), y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 8);
     DrawTextC(dc, x0 + bw2 + (int)(12 * dpi), y, bw2, bh2, L"取消", g_f14b, C_WHITE);
-    y += bh2 + (int)(10 * dpi);
-    DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"勾选后可记住本次选择", g_f12, C_DIM);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {
@@ -2011,18 +2025,15 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     if (fNoAuto) g_af = FALSE;
     else if (fAuto) g_af = TRUE;
 
-    // 读取“× 关闭行为”记忆（若之前勾选了“记住我的选择”）
+    // 读取“× 关闭行为”记忆（HKeyboard.ini，若之前勾选了“记住我的选择”）
     {
-        HKEY hk;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\HKeyboard", 0, KEY_READ, &hk) == ERROR_SUCCESS) {
-            DWORD v = 0, sz = sizeof(v);
-            if (RegQueryValueExW(hk, L"RememberClose", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS && v) {
-                g_rememberClose = TRUE;
-                sz = sizeof(v);
-                if (RegQueryValueExW(hk, L"CloseToTray", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS)
-                    g_closeToTray = (v != 0);
-            }
-            RegCloseKey(hk);
+        wchar_t path[MAX_PATH], val[16];
+        GetConfigPath(path, MAX_PATH);
+        GetPrivateProfileStringW(L"General", L"RememberClose", L"0", val, 16, path);
+        if (val[0] == L'1') {
+            g_rememberClose = TRUE;
+            GetPrivateProfileStringW(L"General", L"CloseToTray", L"0", val, 16, path);
+            g_closeToTray = (val[0] == L'1');
         }
     }
 

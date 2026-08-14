@@ -384,20 +384,32 @@ static void BuildKeys() {
     }
     y += g_keyHeight + g_keyGap;
 
-    // Row 1: Tab, q-p, [, ], \, Del  (15 keys)
+    // Row 1: Tab, q-p, [, ], \, Del  (15 keys)；F 行开启时隐藏原 Del
     {
         int wTab = (int)(68 * dpiScale * scaleX);
         int wDel = (int)(68 * dpiScale * scaleX);
-        int fixed = wTab + wDel;
-        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-        int w[15]; w[0] = wTab;
-        for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[14] = wDel;
-        short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
-        KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        if (g_showFKeys) {
+            // 无 Del：Tab, q-p, [, ], \ (14 keys)
+            int aw = (KEY_AREA_W - wTab - 13 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - wTab - 13 * g_keyGap - aw * 13;
+            int w[14]; w[0] = wTab;
+            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+            short v[14] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC};
+            KeyType t[14] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 14; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            int fixed = wTab + wDel;
+            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
+            int w[15]; w[0] = wTab;
+            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+            w[14] = wDel;
+            short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
+            KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        }
     }
     y += g_keyHeight + g_keyGap;
 

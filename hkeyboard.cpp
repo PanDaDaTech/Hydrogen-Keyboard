@@ -1076,14 +1076,6 @@ static void AddTray() {
     g_tray = TRUE;
 }
 
-static void ShowAboutDialog(HWND hWnd) {
-    MessageBoxW(hWnd,
-        L"HKeyboard \x8F7B\x952E\n"
-        L"Powered By \x6C5F\x5357\x4E00\x6839\x8471 & PanDaTech\n\n"
-        L"\x89E6\x63A7\x4E0E\x9AD8\x6E05\x5C4F\x663E\x8F93\x5165\x5DE5\x5177",
-        L"\x5173\x4E8E",
-        MB_OK | MB_ICONINFORMATION);
-}
 
 static void ShowHelpDialog(HWND hWnd) {
     MessageBoxW(hWnd,
@@ -1413,10 +1405,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     return DefWindowProcW(hWnd, msg, w, l);
 }
 
-static void OpenSettings() {
+static void OpenSettingsTab(int tab) {
+    g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
         ShowWindow(g_settingsHwnd, SW_SHOW);
         SetForegroundWindow(g_settingsHwnd);
+        InvalidateRect(g_settingsHwnd, NULL, TRUE);   // 切到指定 Tab 后刷新
         return;
     }
     double dpi = GetSystemDpiScale();
@@ -1432,6 +1426,8 @@ static void OpenSettings() {
         SetForegroundWindow(g_settingsHwnd);
     }
 }
+
+static void OpenSettings() { OpenSettingsTab(0); }   // 默认打开“常规”Tab
 
 // ========== 关闭方式提示窗口 ==========
 #define P_HIT_NONE      0
@@ -1634,7 +1630,7 @@ static void ShowMenu(HWND hWnd) {
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_MENU_ABOUT, L"\x5173\x4E8E");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_MENU_EXIT, L"\x9000\x51FA\x952E\x76D8");
+    AppendMenuW(m, MF_STRING, ID_MENU_EXIT, L"\x5173\x95ED\x8F7B\x952E");   // 关闭轻键
 
     SetForegroundWindow(hWnd);
     int id = TrackPopupMenu(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, NULL);
@@ -1654,7 +1650,7 @@ static void ShowMenu(HWND hWnd) {
     } else if (id == ID_MENU_SETTINGS) {
         OpenSettings();
     } else if (id == ID_MENU_ABOUT) {
-        ShowAboutDialog(hWnd);
+        OpenSettingsTab(2);   // 跳转到设置“关于”Tab
     } else if (id == ID_MENU_EXIT) {
         DestroyWindow(hWnd);
     }
@@ -2001,7 +1997,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_SETTINGS: OpenSettings(); break;
-        case ID_MENU_ABOUT: ShowAboutDialog(hWnd); break;
+        case ID_MENU_ABOUT: OpenSettingsTab(2); break;
         case ID_MENU_EXIT: DestroyWindow(hWnd); break;
         }
         return 0;

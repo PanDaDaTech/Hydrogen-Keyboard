@@ -2067,8 +2067,11 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
             }
         }
 
-        if (isText && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
-            PostMessage(g_hWnd, WM_FOCUS_EVENT, TRUE, 0);
+        if (isText && !g_vis) {
+            if (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS) {
+                g_manualHide = FALSE;   // 点击输入框后恢复自动呼出（最小化后可再次弹出）
+                PostMessage(g_hWnd, WM_FOCUS_EVENT, TRUE, 0);
+            }
         } else if (!isText && g_vis && !g_manualShow) {
             PostMessage(g_hWnd, WM_FOCUS_EVENT, FALSE, 0);   // 离焦立即隐藏（加速）
         }
@@ -2119,7 +2122,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
-        case HDR_MIN: ShowKB(FALSE, FALSE); break;
+        case HDR_MIN: g_manualHide = TRUE; ShowKB(FALSE, FALSE); break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         }
         return;

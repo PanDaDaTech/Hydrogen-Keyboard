@@ -214,6 +214,7 @@ HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
 #define SLIDE_MS 12
 HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
+static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -388,6 +389,15 @@ static HFONT MakeFont(int size, BOOL bold) {
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei");
+}
+
+// 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
+static void InitFixedFonts() {
+    double dpi = GetSystemDpiScale();
+    g_sf12  = MakeFont((int)(12 * dpi), 0);
+    g_sf13  = MakeFont((int)(13 * dpi), 0);
+    g_sf13b = MakeFont((int)(13 * dpi), 1);
+    g_sf14b = MakeFont((int)(14 * dpi), 1);
 }
 
 static void RecreateFontsAndLayout() {
@@ -1152,7 +1162,7 @@ static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
 static void SettingsTab(HDC dc, int x, int y, int w, int h, const wchar_t* label, BOOL active, BOOL hover) {
     DWORD bg = active ? C_HOT : (hover ? C_HOVER : C_KEY);
     DrawRoundRect(dc, x, y, w, h, bg, C_KEY_BORDER, 6);
-    DrawTextC(dc, x, y, w, h, label, g_f13b, IsLightColor(bg) ? 0x1A1A1A : C_WHITE);
+    DrawTextC(dc, x, y, w, h, label, g_sf13b, IsLightColor(bg) ? 0x1A1A1A : C_WHITE);
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
@@ -1162,7 +1172,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     int hdr = (int)(40 * dpi);
 
     Fill(dc, 0, 0, W, hdr, C_HDR);
-    DrawTextL(dc, 14, 0, W - 90, hdr, L"设置", g_f13, C_WHITE);
+    DrawTextL(dc, 14, 0, W - 90, hdr, L"设置", g_sf13, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     DrawRoundRect(dc, bx, by, bw, bh, (g_sHov == S_HIT_CLOSE) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
@@ -1183,42 +1193,42 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     int x0 = tabX + tabW + 16, y = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
     if (g_sTab == 0) {
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"自动呼出", g_f13b, C_DIM); y += (int)(24 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"自动呼出", g_sf13b, C_DIM); y += (int)(24 * dpi);
         DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_af);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"点击输入框时自动弹出键盘", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"点击输入框时自动弹出键盘", g_sf13, C_WHITE);
         y += rowH + (int)(16 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"关闭按钮 (×)", g_f13b, C_DIM); y += (int)(24 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"关闭按钮 (×)", g_sf13b, C_DIM); y += (int)(24 * dpi);
         DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), !g_closeToTray);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_sf13, C_WHITE);
         y += rowH;
         DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_closeToTray);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_sf13, C_WHITE);
         y += rowH + (int)(4 * dpi);
         DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_rememberClose);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_sf13, C_WHITE);
         y += rowH + (int)(8 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：托盘右键菜单可随时显示 / 退出程序", g_f12, C_DIM);
+        DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：托盘右键菜单可随时显示 / 退出程序", g_sf12, C_DIM);
     } else if (g_sTab == 1) {
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"主题模式", g_f13b, C_DIM); y += (int)(24 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"主题模式", g_sf13b, C_DIM); y += (int)(24 * dpi);
         DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_themeMode == 0);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"跟随系统", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"跟随系统", g_sf13, C_WHITE);
         y += rowH;
         DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_themeMode == 1);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"深色主题", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"深色主题", g_sf13, C_WHITE);
         y += rowH;
         DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_themeMode == 2);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"浅色主题", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"浅色主题", g_sf13, C_WHITE);
         y += rowH + (int)(16 * dpi);
         DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_wallpaperAccent);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"高亮按钮跟随壁纸强调色", g_f13, C_WHITE);
+        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"高亮按钮跟随壁纸强调色", g_sf13, C_WHITE);
         y += rowH + (int)(8 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：修改即时生效", g_f12, C_DIM);
+        DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：修改即时生效", g_sf12, C_DIM);
     } else {
-        DrawTextL(dc, x0, y, cw, (int)(26 * dpi), L"HKeyboard 轻键", g_f14b, C_WHITE); y += (int)(34 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"轻量屏幕键盘 · 纯 Win32 C++", g_f13, C_WHITE); y += (int)(26 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"作者：PanDaTech / 江南一根葱", g_f13, C_WHITE); y += (int)(26 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"版本：v1.1.0.0", g_f13, C_WHITE); y += (int)(26 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"开源协议：MIT", g_f13, C_WHITE);
+        DrawTextL(dc, x0, y, cw, (int)(26 * dpi), L"HKeyboard 轻键", g_sf14b, C_WHITE); y += (int)(34 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"轻量屏幕键盘 · 纯 Win32 C++", g_sf13, C_WHITE); y += (int)(26 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"作者：PanDaTech / 江南一根葱", g_sf13, C_WHITE); y += (int)(26 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"版本：v1.1.0.0", g_sf13, C_WHITE); y += (int)(26 * dpi);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"开源协议：MIT", g_sf13, C_WHITE);
     }
 }
 
@@ -1444,7 +1454,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     double dpi = GetSystemDpiScale();
     int hdr = (int)(36 * dpi);
     Fill(dc, 0, 0, W, hdr, C_HDR);
-    DrawTextL(dc, 14, 0, W - 90, hdr, L"关闭轻键", g_f13, C_WHITE);
+    DrawTextL(dc, 14, 0, W - 90, hdr, L"关闭轻键", g_sf13, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     DrawRoundRect(dc, bx, by, bw, bh, (g_pHov == P_HIT_CLOSE) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
@@ -1456,23 +1466,23 @@ static void PromptDraw(HDC dc, HWND hWnd) {
 
     int x0 = 20, y = hdr + 12, cw = W - 40;
     int rowH = (int)(24 * dpi);
-    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"请选择关闭方式：", g_f13b, C_DIM); y += (int)(22 * dpi);
+    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"请选择关闭方式：", g_sf13b, C_DIM); y += (int)(22 * dpi);
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_f13, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_sf13, C_WHITE);
     y += rowH;
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_f13, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_sf13, C_WHITE);
     y += rowH + (int)(4 * dpi);
     DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_pRemember);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_f13, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_sf13, C_WHITE);
     y += rowH + (int)(8 * dpi);
     int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 8);
-    DrawTextC(dc, bxOk, y, bw2, bh2, L"确定", g_f13b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
+    DrawTextC(dc, bxOk, y, bw2, bh2, L"确定", g_sf13b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
     DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 8);
-    DrawTextC(dc, bxCancel, y, bw2, bh2, L"取消", g_f13b, C_WHITE);
+    DrawTextC(dc, bxCancel, y, bw2, bh2, L"取消", g_sf13b, C_WHITE);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {
@@ -1589,7 +1599,7 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    int w = (int)(300 * dpi), h = (int)(220 * dpi);
+    int w = (int)(300 * dpi), h = (int)(190 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;
@@ -2015,6 +2025,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f13b); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
+        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b);
         PostQuitMessage(0);
         return 0;
     }
@@ -2048,6 +2059,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
 
     LoadEmbeddedFonts();   // 注册内嵌字体（阿里巴巴普惠体精简版），失败自动回退系统字体
+    InitFixedFonts();      // 设置/关闭窗口固定字号字体
 
     BOOL fShow   = (strstr(cmd, "-show") != NULL);
     BOOL fHide   = (strstr(cmd, "-hide") != NULL || strstr(cmd, "-min") != NULL || strstr(cmd, "-tray") != NULL);

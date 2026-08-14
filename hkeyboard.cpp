@@ -1467,10 +1467,12 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_f13, C_WHITE);
     y += rowH + (int)(12 * dpi);
     int bw2 = (int)(84 * dpi), bh2 = (int)(30 * dpi);
-    DrawRoundRect(dc, x0, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 8);
-    DrawTextC(dc, x0, y, bw2, bh2, L"确定", g_f13b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
-    DrawRoundRect(dc, x0 + bw2 + (int)(12 * dpi), y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 8);
-    DrawTextC(dc, x0 + bw2 + (int)(12 * dpi), y, bw2, bh2, L"取消", g_f13b, C_WHITE);
+    int bxCancel = W - 20 - bw2;                    // 按钮右对齐
+    int bxOk = bxCancel - (int)(12 * dpi) - bw2;
+    DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 8);
+    DrawTextC(dc, bxOk, y, bw2, bh2, L"确定", g_f13b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
+    DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 8);
+    DrawTextC(dc, bxCancel, y, bw2, bh2, L"取消", g_f13b, C_WHITE);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {
@@ -1491,8 +1493,10 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
     if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_REMEMBER;
     yy += rowH + (int)(12 * dpi);
     int bw2 = (int)(84 * dpi), bh2 = (int)(30 * dpi);
-    if (x >= x0 && x < x0 + bw2 && y >= yy && y < yy + bh2) return P_HIT_OK;
-    if (x >= x0 + bw2 + (int)(12 * dpi) && x < x0 + bw2 + (int)(12 * dpi) + bw2 && y >= yy && y < yy + bh2) return P_HIT_CANCEL;
+    int bxCancel = W - 20 - bw2;                    // 与绘制一致（右对齐）
+    int bxOk = bxCancel - (int)(12 * dpi) - bw2;
+    if (x >= bxOk && x < bxOk + bw2 && y >= yy && y < yy + bh2) return P_HIT_OK;
+    if (x >= bxCancel && x < bxCancel + bw2 && y >= yy && y < yy + bh2) return P_HIT_CANCEL;
     return P_HIT_NONE;
 }
 
@@ -1585,7 +1589,7 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    int w = (int)(420 * dpi), h = (int)(280 * dpi);
+    int w = (int)(380 * dpi), h = (int)(260 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;

@@ -21,6 +21,11 @@
 #define HK_ARCH L"32位"
 #endif
 
+// 界面语言与高亮颜色（需在 ArchName / ApplyTheme 之前声明，供其读取）
+int         g_lang = 0;                // 语言：0=中文 1=English
+int         g_hlMode = 0;              // 高亮颜色：0=默认 1=自定义
+int         g_hlColor = 0xD47800;      // 自定义高亮颜色（BGR）
+
 // 关于页架构显示（随语言切换 64/32位或 64/32-bit）
 static const wchar_t* ArchName() {
 #ifdef _M_ARM64
@@ -234,9 +239,6 @@ BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘
 DWORD       g_hideUntil = 0;           // 最小化后禁止自动呼出的截止时刻（3 秒抑制）
 int         g_hideDelayMs = 500;       // 自动隐藏延迟（毫秒）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
-int         g_lang = 0;                // 语言：0=中文 1=English
-int         g_hlMode = 0;              // 高亮颜色：0=默认 1=自定义
-int         g_hlColor = 0xD47800;      // 自定义高亮颜色（BGR）
 
 // 语言切换：g_lang=0 简体中文，1 English；返回当前语言对应的文案
 static const wchar_t* T(const wchar_t* zh, const wchar_t* en) { return g_lang ? en : zh; }
@@ -1421,8 +1423,10 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_HIDEDELAY_OPT0  41
 #define S_HIT_LANG_DROP       50
 #define S_HIT_LANG_OPT0       51
+#define S_HIT_LANG_OPT1       52
 #define S_HIT_HL_DROP         60
 #define S_HIT_HL_OPT0         61
+#define S_HIT_HL_OPT1         62
 #define S_HIT_HL_BOX          63
 
 static HWND g_settingsHwnd = 0;

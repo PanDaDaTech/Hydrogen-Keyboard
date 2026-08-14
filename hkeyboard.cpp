@@ -1429,7 +1429,6 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             if (g_dropLayout) DrawComboList(dc, ix, comboY + comboH + 2, comboW, comboH, g_layoutNames, 2, g_layoutMode, g_dropLayoutHov);
         }
         py += p3h;
-        DrawTextL(dc, x0, py + 8, cw, (int)(18 * dpi), L"提示：托盘右键菜单可随时显示 / 退出程序", g_sf12, C_DIM);
     } else if (g_sTab == 1) {
         // ===== 主题：圆角面板 ======
         int py = y;
@@ -1446,7 +1445,6 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"高亮按钮跟随壁纸强调色", g_sf13, C_WHITE);
             if (g_dropTheme) DrawComboList(dc, ix, comboY + comboH + 2, comboW, comboH, g_themeNames, 3, g_themeMode, g_dropThemeHov);
         }
-        DrawTextL(dc, x0, py + ph + 8, cw, (int)(18 * dpi), L"提示：修改即时生效", g_sf12, C_DIM);
     } else {
         // ===== 关于：Logo + 名称 + 版本(架构) + 底部项目地址 ======
         int logo = (int)(72 * dpi);

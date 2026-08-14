@@ -1426,7 +1426,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             HPEN pen2 = CreatePen(PS_SOLID, 1, C_HOT);
             HPEN op2 = (HPEN)SelectObject(dc, pen2);
             MoveToEx(dc, x0, uy + (int)(15 * dpi), NULL);
-            LineTo(dc, x0 + sz.cx, uy + (int)(15 * dpi), NULL);
+            LineTo(dc, x0 + sz.cx, uy + (int)(15 * dpi));
             SelectObject(dc, op2); DeleteObject(pen2);
         }
     }

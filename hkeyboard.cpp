@@ -482,10 +482,10 @@ static HFONT MakeFont(int size, BOOL bold) {
 // 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
-    g_sf12  = MakeFont((int)(12 * dpi), 0);
-    g_sf13  = MakeFont((int)(13 * dpi), 0);
-    g_sf13b = MakeFont((int)(13 * dpi), 1);
-    g_sf14b = MakeFont((int)(14 * dpi), 1);
+    g_sf12  = MakeFont((int)(11 * dpi), 0);   // 提示小字
+    g_sf13  = MakeFont((int)(12 * dpi), 0);   // 行文本
+    g_sf13b = MakeFont((int)(12 * dpi), 1);   // Tab / 小节标题 / 按钮
+    g_sf14b = MakeFont((int)(13 * dpi), 1);   // 关于大标题
 }
 
 static void RecreateFontsAndLayout() {

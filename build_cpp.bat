@@ -9,6 +9,15 @@ set "SRC=%CD%"
 rem Detect CI environment (GitHub Actions sets CI=true)
 set "IS_CI=%CI%"
 
+rem Debug build mode: build_cpp.bat debug  ->  /Od /Zi + .pdb (for breakpoint debugging)
+set "DEBUG_BUILD="
+if /i "%~1"=="debug" set "DEBUG_BUILD=1"
+if defined DEBUG_BUILD (
+    echo [Info] DEBUG build: /Od /Zi + PDB, output *_debug.exe
+) else (
+    echo [Info] Release build
+)
+
 rem 1. Locate VsDevCmd.bat
 
 set "VSDEVCMD="
@@ -145,6 +154,15 @@ setlocal EnableDelayedExpansion
 set "ARCH=%1"
 set "SUBSYS_VER=%2"
 
+set "OPT=/O2"
+set "OUT_SUFFIX="
+set "LINK_DBG="
+if defined DEBUG_BUILD (
+    set "OPT=/Od /Zi"
+    set "OUT_SUFFIX=_debug"
+    set "LINK_DBG=/DEBUG"
+)
+
 echo.
 echo ========================================
 echo Building %ARCH% Version... [Subsystem: %SUBSYS_VER%]
@@ -261,7 +279,7 @@ if !errorlevel! neq 0 (
 
 rem Compile hkeyboard.cpp
 echo [%ARCH%] Compiling hkeyboard.cpp ...
-cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "%SRC%\hkeyboard.cpp" /Fo"%SRC%\build\%ARCH%\hkeyboard.obj"
+cl /nologo /utf-8 !OPT! /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- /D_WIN32_WINNT=0x0501 /c "%SRC%\hkeyboard.cpp" /Fo"%SRC%\build\%ARCH%\hkeyboard.obj"
 if !errorlevel! neq 0 (
     echo [Error] Compilation failed.
     exit /b 1
@@ -270,23 +288,25 @@ if !errorlevel! neq 0 (
 rem Link
 echo [%ARCH%] Linking...
 if defined YY_THUNK_OBJ (
-    cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\hkeyboard.obj" "%SRC%\build\%ARCH%\hkeyboard.res" "!YY_THUNK_OBJ!" /link /OUT:"%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO /CETCOMPAT:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+    cl /nologo /utf-8 !OPT! /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\hkeyboard.obj" "%SRC%\build\%ARCH%\hkeyboard.res" "!YY_THUNK_OBJ!" /link /OUT:"%SRC%\dist\%ARCH%\HKeyboard_%ARCH%!OUT_SUFFIX!.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO /CETCOMPAT:NO !LINK_DBG! Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
 ) else (
-    cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\hkeyboard.obj" "%SRC%\build\%ARCH%\hkeyboard.res" /link /OUT:"%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+    cl /nologo /utf-8 !OPT! /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- "%SRC%\build\%ARCH%\hkeyboard.obj" "%SRC%\build\%ARCH%\hkeyboard.res" /link /OUT:"%SRC%\dist\%ARCH%\HKeyboard_%ARCH%!OUT_SUFFIX!.exe" /SUBSYSTEM:WINDOWS,%SUBSYS_VER% /MANIFEST:NO /CETCOMPAT:NO !LINK_DBG! Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
 )
 if !errorlevel! neq 0 (
     echo [Error] Linking failed.
     exit /b 1
 )
 
-rem Compress with UPX (optional)
-if exist "%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" (
-    if exist "%SRC%\bin\upx.exe" (
-        echo [%ARCH%] Compressing final executable with UPX...
-        "%SRC%\bin\upx.exe" --best --force "%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe"
+rem Compress with UPX (optional; skipped for debug builds to keep symbols/PDB usable)
+if not defined DEBUG_BUILD (
+    if exist "%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe" (
+        if exist "%SRC%\bin\upx.exe" (
+            echo [%ARCH%] Compressing final executable with UPX...
+            "%SRC%\bin\upx.exe" --best --force "%SRC%\dist\%ARCH%\HKeyboard_%ARCH%.exe"
+        )
     )
 )
 
-echo [%ARCH%] Build succeeded: dist\%ARCH%\HKeyboard_%ARCH%.exe
+echo [%ARCH%] Build succeeded: dist\%ARCH%\HKeyboard_%ARCH%!OUT_SUFFIX!.exe
 endlocal
 exit /b 0

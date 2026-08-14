@@ -224,7 +224,7 @@ int         g_slideFrom = 0, g_slideTo = 0, g_slideStep = -1;
 HWINEVENTHOOK g_winHook = 0;
 HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
-#define SLIDE_MS 12
+#define SLIDE_MS 8
 HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
@@ -1116,9 +1116,11 @@ static void DrawKeys(HDC dc) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }
-        DWORD shiftC = ((g_sh || g_physShift) && g_shiftSymbols) ? textC : C_DIM;
+        // 按 Shift（且开启“仅显示特殊符号”）时只显示特殊符号，否则只显示原字符（不再双符号）
+        BOOL shiftOn = ((g_sh || g_physShift) && g_shiftSymbols);
         if (baseCh && shiftCh && shiftCh != baseCh) {
-            DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, shiftC);
+            wchar_t single[2] = { shiftOn ? shiftCh : baseCh, 0 };
+            DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);
         } else {
             DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
         }
@@ -1312,7 +1314,7 @@ static void DrawPanel(HDC dc, int x, int y, int w, int h) {
 
 // 下拉框
 static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, BOOL open, BOOL hover) {
-    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_BG, C_KEY_BORDER, 6);
+    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_DARK, C_DIM, 6);
     DrawTextL(dc, x + 10, y, w - 30, h, text, g_sf13, C_WHITE);
     int ax = x + w - 14, ay = y + h / 2;
     HPEN pen = CreatePen(PS_SOLID, 1, C_DIM);
@@ -1327,7 +1329,7 @@ static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, B
 
 // 下拉列表（选中项带勾，浅/深色模式一致）
 static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
-    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_BG, C_KEY_BORDER, 8);
+    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_DARK, C_DIM, 8);
     for (int i = 0; i < count; i++) {
         int iy = y + 2 + i * itemH;
         if (i == hov) Fill(dc, x + 2, iy, w - 4, itemH, C_HOVER);
@@ -2067,6 +2069,8 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
 
         if (isText && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
             PostMessage(g_hWnd, WM_FOCUS_EVENT, TRUE, 0);
+        } else if (!isText && g_vis && !g_manualShow) {
+            PostMessage(g_hWnd, WM_FOCUS_EVENT, FALSE, 0);   // 离焦立即隐藏（加速）
         }
     }
 }
@@ -2115,7 +2119,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
-        case HDR_MIN: g_manualHide = TRUE; ShowKB(FALSE, FALSE); break;
+        case HDR_MIN: ShowKB(FALSE, FALSE); break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         }
         return;
@@ -2260,8 +2264,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
-        if (g_af && !g_manualHide && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
-            ShowKB(TRUE, FALSE);
+        if (w) {
+            if (g_af && !g_manualHide && !g_vis && (GetTickCount() - g_lht >= AUTO_POP_COOLDOWN_MS)) {
+                ShowKB(TRUE, FALSE);
+            }
+        } else {
+            HWND fg = GetForegroundWindow();
+            if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return 0;   // 设置/提示窗口在前台不收起
+            if (g_vis && !g_manualShow && !g_manualHide) {
+                POINT pt; GetCursorPos(&pt);
+                if (WindowFromPoint(pt) != g_hWnd) ShowKB(FALSE, FALSE);
+            }
         }
         return 0;
     case WM_SETTINGCHANGE: {

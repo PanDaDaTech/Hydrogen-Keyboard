@@ -14,11 +14,11 @@
 
 // 当前编译架构（关于页显示用）
 #ifdef _M_ARM64
-#define HK_ARCH "arm64"
+#define HK_ARCH L"arm64"
 #elif defined(_M_X64)
-#define HK_ARCH "64位"
+#define HK_ARCH L"64位"
 #else
-#define HK_ARCH "32位"
+#define HK_ARCH L"32位"
 #endif
 
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
@@ -337,12 +337,13 @@ static void BuildKeys() {
         return;
     }
 
-    // F1~F12 顶行（可选）
+    // F1~F12 顶行（可选）：Esc, F1~F12, Del（F12 后面为 Del）
     if (g_showFKeys) {
-        // Row F: Esc, F1~F12  (13 keys)
-        int wEsc = (int)(64 * dpiScale * scaleX);
-        int aw = (KEY_AREA_W - wEsc - 12 * g_keyGap) / 12;
-        int rem = KEY_AREA_W - wEsc - 12 * g_keyGap - aw * 12;
+        int wEsc = (int)(56 * dpiScale * scaleX);
+        int wDel = (int)(56 * dpiScale * scaleX);
+        int fixed = wEsc + wDel;
+        int aw = (KEY_AREA_W - fixed - 13 * g_keyGap) / 12;
+        int rem = KEY_AREA_W - fixed - 13 * g_keyGap - aw * 12;
         int x = KEY_AREA_X;
         AddKey(x, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); x += wEsc + g_keyGap;
         for (int i = 0; i < 12; i++) {
@@ -350,24 +351,36 @@ static void BuildKeys() {
             AddKey(x, y, w, g_keyHeight, (short)(0x70 + i), K_NORMAL);
             x += w + g_keyGap;
         }
+        AddKey(x, y, wDel, g_keyHeight, 0x2E, K_SPECIAL);   // Del
         y += g_keyHeight + g_keyGap;
     }
 
     // ===== Win10 屏幕键盘风格布局 =====
-    // Row 0: Esc, `, 1-0, -, =, Backspace  (15 keys)
+    // Row 0: Esc, `, 1-0, -, =, Backspace  (15 keys)；F 行开启时隐藏原 Esc
     {
         int wEsc = (int)(50 * dpiScale * scaleX);
         int wBksp = (int)(68 * dpiScale * scaleX);
-        int fixed = wEsc + wBksp;
-        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-        int w[15]; w[0] = wEsc;
-        for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[14] = wBksp;
-        short v[15] = {0x1B,0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
-        KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        if (g_showFKeys) {
+            // 无 Esc：`, 1-0, -, =, Backspace (14 keys)
+            int aw = (KEY_AREA_W - wBksp - 13 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - wBksp - 13 * g_keyGap - aw * 13;
+            short v[14] = {0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
+            KeyType t[14] = {K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 13; i++) { AddKey(x, y, aw + (i < rem ? 1 : 0), g_keyHeight, v[i], t[i]); x += aw + (i < rem ? 1 : 0) + g_keyGap; }
+            AddKey(x, y, wBksp, g_keyHeight, 0x08, K_SPECIAL);
+        } else {
+            int fixed = wEsc + wBksp;
+            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
+            int w[15]; w[0] = wEsc;
+            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+            w[14] = wBksp;
+            short v[15] = {0x1B,0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
+            KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        }
     }
     y += g_keyHeight + g_keyGap;
 
@@ -428,21 +441,33 @@ static void BuildKeys() {
     }
     y += g_keyHeight + g_keyGap;
 
-    // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, →  (10 keys)
+    // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, →  (10 keys)；F 行开启时隐藏 Fn
     {
         int wFn  = (int)(46 * dpiScale * scaleX);
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
-        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
-        if (spaceW < 60) spaceW = 60;
-        int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
-        short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
-        KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        if (g_showFKeys) {
+            // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, → (9 keys)
+            int leftOfArrows = wCtl + wWin + wAlt + wAlt + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 8 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[9] = {wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+            short v[9] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[9] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 9; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+            short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        }
     }
 }
 
@@ -1412,7 +1437,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         y += (int)(34 * dpi);
         // 版本号（架构，居中，小一号）
         wchar_t ver[64];
-        swprintf(ver, 64, L"版本：v%hs (%hs)", VER_FILEVERSION_STR, HK_ARCH);
+        swprintf(ver, 64, L"版本：v%hs (%ls)", VER_FILEVERSION_STR, HK_ARCH);
         DrawTextC(dc, x0, y, cw, (int)(18 * dpi), ver, g_sf12, C_WHITE);
         // 底部项目地址（超链接）
         const wchar_t* urlText = L"项目地址：https://github.com/PanDaDaTech/Hydrogen-Keyboard";

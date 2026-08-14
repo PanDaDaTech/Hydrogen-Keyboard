@@ -1442,7 +1442,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right, H = rc.bottom;
     double dpi = GetSystemDpiScale();
-    int hdr = (int)(40 * dpi);
+    int hdr = (int)(36 * dpi);
     Fill(dc, 0, 0, W, hdr, C_HDR);
     DrawTextL(dc, 14, 0, W - 90, hdr, L"关闭轻键", g_f13, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
@@ -1454,19 +1454,19 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     MoveToEx(dc, mx + r, my - r, NULL); LineTo(dc, mx - r, my + r);
     SelectObject(dc, op); DeleteObject(pen);
 
-    int x0 = 20, y = hdr + 18, cw = W - 40;
-    int rowH = (int)(26 * dpi);
-    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"请选择关闭方式：", g_f13b, C_DIM); y += (int)(26 * dpi);
+    int x0 = 20, y = hdr + 12, cw = W - 40;
+    int rowH = (int)(24 * dpi);
+    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"请选择关闭方式：", g_f13b, C_DIM); y += (int)(22 * dpi);
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0);
     DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_f13, C_WHITE);
     y += rowH;
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1);
     DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_f13, C_WHITE);
-    y += rowH + (int)(6 * dpi);
+    y += rowH + (int)(4 * dpi);
     DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_pRemember);
     DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_f13, C_WHITE);
-    y += rowH + (int)(12 * dpi);
-    int bw2 = (int)(84 * dpi), bh2 = (int)(30 * dpi);
+    y += rowH + (int)(8 * dpi);
+    int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 8);
@@ -1479,20 +1479,20 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right;
     double dpi = GetSystemDpiScale();
-    int hdr = (int)(40 * dpi);
+    int hdr = (int)(36 * dpi);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     if (x >= bx && x < bx + bw && y >= by && y < by + bh) return P_HIT_CLOSE;
-    int x0 = 20, yy = hdr + 18, cw = W - 40;
-    int rowH = (int)(26 * dpi);
-    yy += (int)(26 * dpi);
+    int x0 = 20, yy = hdr + 12, cw = W - 40;
+    int rowH = (int)(24 * dpi);
+    yy += (int)(22 * dpi);
     if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_DIRECT;
     yy += rowH;
     if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_TRAY;
-    yy += rowH + (int)(6 * dpi);
+    yy += rowH + (int)(4 * dpi);
     if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_REMEMBER;
-    yy += rowH + (int)(12 * dpi);
-    int bw2 = (int)(84 * dpi), bh2 = (int)(30 * dpi);
+    yy += rowH + (int)(8 * dpi);
+    int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
     int bxCancel = W - 20 - bw2;                    // 与绘制一致（右对齐）
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     if (x >= bxOk && x < bxOk + bw2 && y >= yy && y < yy + bh2) return P_HIT_OK;
@@ -1565,7 +1565,7 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ScreenToClient(hWnd, &pt);
-        int hdr = (int)(40 * GetSystemDpiScale());
+        int hdr = (int)(36 * GetSystemDpiScale());
         if (pt.y >= 0 && pt.y < hdr) {
             if (PromptHitTest(hWnd, pt.x, pt.y) != P_HIT_CLOSE) return HTCAPTION;
         }
@@ -1589,7 +1589,7 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    int w = (int)(380 * dpi), h = (int)(260 * dpi);
+    int w = (int)(300 * dpi), h = (int)(220 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;

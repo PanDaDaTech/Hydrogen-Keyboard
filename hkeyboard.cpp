@@ -12,6 +12,15 @@
 #include <string.h>
 #include "resource.h"
 
+// 当前编译架构（关于页显示用）
+#ifdef _M_ARM64
+#define HK_ARCH "arm64"
+#elif defined(_M_X64)
+#define HK_ARCH "x64"
+#else
+#define HK_ARCH "x86"
+#endif
+
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -1216,11 +1225,23 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         y += rowH + (int)(8 * dpi);
         DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：修改即时生效", g_sf12, C_DIM);
     } else {
-        DrawTextL(dc, x0, y, cw, (int)(26 * dpi), L"HKeyboard 轻键", g_sf14b, C_WHITE); y += (int)(34 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"轻量屏幕键盘 · 纯 Win32 C++", g_sf13, C_WHITE); y += (int)(26 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"作者：PanDaTech / 江南一根葱", g_sf13, C_WHITE); y += (int)(26 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"版本：v1.1.0.0", g_sf13, C_WHITE); y += (int)(26 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"开源协议：MIT", g_sf13, C_WHITE);
+        // Logo（应用图标）
+        int logo = (int)(72 * dpi);
+        HICON hIcon = LoadMainIcon(logo);
+        if (hIcon) {
+            DrawIconEx(dc, x0 + (cw - logo) / 2, y, hIcon, logo, logo, 0, NULL, DI_NORMAL);
+            DestroyIcon(hIcon);
+        }
+        y += logo + (int)(22 * dpi);
+        // 项目名称
+        DrawTextL(dc, x0, y, cw, (int)(26 * dpi), L"HKeyboard 轻键", g_sf14b, C_WHITE);
+        y += (int)(34 * dpi);
+        // 版本号（架构）
+        wchar_t ver[64];
+        swprintf(ver, 64, L"版本：v%hs (%hs)", VER_FILEVERSION_STR, HK_ARCH);
+        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), ver, g_sf13, C_WHITE);
+        // 底部项目地址
+        DrawTextL(dc, x0, H - (int)(34 * dpi), cw, (int)(18 * dpi), L"项目地址：https://github.com/PanDaDaTech/Hydrogen-Keyboard", g_sf12, C_DIM);
     }
 }
 

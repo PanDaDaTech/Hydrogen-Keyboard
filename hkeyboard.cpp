@@ -1116,11 +1116,16 @@ static void DrawKeys(HDC dc) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }
-        // 按 Shift（且开启“仅显示特殊符号”）时只显示特殊符号，否则只显示原字符（不再双符号）
-        BOOL shiftOn = ((g_sh || g_physShift) && g_shiftSymbols);
+        // 未按 Shift：双符号显示（数字 + 顶部特殊符号，副符号置灰）；
+        // 按 Shift：开启“仅显示特殊符号”时只显示顶部符号（不显示数字），关闭时仍显示数字。
+        BOOL shiftOn = (g_sh || g_physShift);
         if (baseCh && shiftCh && shiftCh != baseCh) {
-            wchar_t single[2] = { shiftOn ? shiftCh : baseCh, 0 };
-            DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);
+            if (shiftOn) {
+                wchar_t single[2] = { g_shiftSymbols ? shiftCh : baseCh, 0 };
+                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);
+            } else {
+                DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
+            }
         } else {
             DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
         }

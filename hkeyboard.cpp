@@ -16,9 +16,9 @@
 #ifdef _M_ARM64
 #define HK_ARCH "arm64"
 #elif defined(_M_X64)
-#define HK_ARCH "x64"
+#define HK_ARCH "64位"
 #else
-#define HK_ARCH "x86"
+#define HK_ARCH "32位"
 #endif
 
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
@@ -212,6 +212,8 @@ BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多
 BOOL        g_af = TRUE;
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
+int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘
+BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
 int         g_repeatKeyIdx = -1;
@@ -246,8 +248,13 @@ static double GetSystemDpiScale() {
 
 static void InitWindowSizeForDpi() {
     double dpiScale = GetSystemDpiScale();
-    g_ww = (int)(980.0 * dpiScale);
-    g_wh = (int)(320.0 * dpiScale);
+    if (g_layoutMode == 1) {        // 小键盘默认更窄
+        g_ww = (int)(430 * dpiScale);
+        g_wh = (int)(320 * dpiScale);
+    } else {                        // 全尺寸
+        g_ww = (int)(980 * dpiScale);
+        g_wh = (int)(320 * dpiScale);
+    }
 }
 
 static int AddKey(int x, int y, int w, int h, short vk, KeyType type) {
@@ -255,6 +262,54 @@ static int AddKey(int x, int y, int w, int h, short vk, KeyType type) {
     KeyDef* k = &g_keys[g_nk++];
     k->x = x; k->y = y; k->w = w; k->h = h; k->vk = vk; k->type = type;
     return g_nk;
+}
+
+// 小键盘布局（4 列 × 5 行，支持跨行/跨列）
+static void BuildNumpad(int y) {
+    int colW = (KEY_AREA_W - 3 * g_keyGap) / 4;
+    int x = KEY_AREA_X;
+
+    // Row 0: NumLock, /, *, -
+    {
+        short v[4] = {0x90, 0x6F, 0x6A, 0x6D};
+        KeyType t[4] = {K_SPECIAL, K_NORMAL, K_NORMAL, K_NORMAL};
+        int cx = x;
+        for (int i = 0; i < 4; i++) { AddKey(cx, y, colW, g_keyHeight, v[i], t[i]); cx += colW + g_keyGap; }
+    }
+    y += g_keyHeight + g_keyGap;
+
+    // Row 1: 7, 8, 9, +（+ 跨 2 行）
+    {
+        int h2 = g_keyHeight * 2 + g_keyGap;
+        int cx = x;
+        for (int i = 0; i < 3; i++) { AddKey(cx, y, colW, g_keyHeight, (short)(0x67 + i), K_NORMAL); cx += colW + g_keyGap; }
+        AddKey(cx, y, colW, h2, 0x6B, K_NORMAL);
+    }
+    y += g_keyHeight + g_keyGap;
+
+    // Row 2: 4, 5, 6
+    {
+        int cx = x;
+        for (int i = 0; i < 3; i++) { AddKey(cx, y, colW, g_keyHeight, (short)(0x64 + i), K_NORMAL); cx += colW + g_keyGap; }
+    }
+    y += g_keyHeight + g_keyGap;
+
+    // Row 3: 1, 2, 3, Enter（Enter 跨 2 行）
+    {
+        int h2 = g_keyHeight * 2 + g_keyGap;
+        int cx = x;
+        for (int i = 0; i < 3; i++) { AddKey(cx, y, colW, g_keyHeight, (short)(0x61 + i), K_NORMAL); cx += colW + g_keyGap; }
+        AddKey(cx, y, colW, h2, 0x0D, K_SPECIAL);
+    }
+    y += g_keyHeight + g_keyGap;
+
+    // Row 4: 0（跨 2 列）, .
+    {
+        int cx = x;
+        AddKey(cx, y, colW * 2 + g_keyGap, g_keyHeight, 0x60, K_NORMAL);
+        cx += colW * 2 + g_keyGap + g_keyGap;
+        AddKey(cx, y, colW, g_keyHeight, 0x6E, K_NORMAL);
+    }
 }
 
 static void BuildKeys() {
@@ -269,10 +324,34 @@ static void BuildKeys() {
 
     g_headerH = (int)(36.0 * dpiScale * scaleY); if (g_headerH < 28) g_headerH = 28;
     g_keyGap = (int)(4.0 * dpiScale * scaleX); if (g_keyGap < 2) g_keyGap = 2;
-    g_keyHeight = (g_wh - g_headerH - 8 - 5 * g_keyGap) / 5;
+
+    // 行数：全尺寸 5 行 + 可选 F1~F12 顶行；小键盘 5 行
+    int rows = 5 + (g_layoutMode == 0 && g_showFKeys ? 1 : 0);
+    g_keyHeight = (g_wh - g_headerH - 8 - (rows - 1) * g_keyGap) / rows;
     if (g_keyHeight < 20) g_keyHeight = 20;
 
     int y = g_headerH + g_keyGap + 2;
+
+    if (g_layoutMode == 1) {   // 小键盘
+        BuildNumpad(y);
+        return;
+    }
+
+    // F1~F12 顶行（可选）
+    if (g_showFKeys) {
+        // Row F: Esc, F1~F12  (13 keys)
+        int wEsc = (int)(64 * dpiScale * scaleX);
+        int aw = (KEY_AREA_W - wEsc - 12 * g_keyGap) / 12;
+        int rem = KEY_AREA_W - wEsc - 12 * g_keyGap - aw * 12;
+        int x = KEY_AREA_X;
+        AddKey(x, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); x += wEsc + g_keyGap;
+        for (int i = 0; i < 12; i++) {
+            int w = aw + (i < rem ? 1 : 0);
+            AddKey(x, y, w, g_keyHeight, (short)(0x70 + i), K_NORMAL);
+            x += w + g_keyGap;
+        }
+        y += g_keyHeight + g_keyGap;
+    }
 
     // ===== Win10 屏幕键盘风格布局 =====
     // Row 0: Esc, `, 1-0, -, =, Backspace  (15 keys)
@@ -536,7 +615,16 @@ static const wchar_t* KeyText(const KeyDef* k) {
         wchar_t ch = GetSymForKey(k->vk, g_sh);
         if (ch) { buf[0] = ch; buf[1] = 0; return buf; }
     }
+    // F1~F12 顶行 / 小键盘数字
+    if (k->vk >= 0x70 && k->vk <= 0x7B) { swprintf(buf, 16, L"F%d", k->vk - 0x6F); return buf; }
+    if (k->vk >= 0x60 && k->vk <= 0x69) { buf[0] = (wchar_t)(L'0' + (k->vk - 0x60)); buf[1] = 0; return buf; }
     switch (k->vk) {
+        case 0x6A: return L"*";
+        case 0x6B: return L"+";
+        case 0x6D: return L"-";
+        case 0x6E: return L".";
+        case 0x6F: return L"/";
+        case 0x90: return L"Num";
         case 0x1B: return L"Esc";
         case 0x2E: return L"Del";
         case 0x08: return L"\x2190";
@@ -1113,16 +1201,28 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_AUTO           10
 #define S_HIT_CLOSE_DIRECT   11
 #define S_HIT_CLOSE_TRAY     12
-#define S_HIT_THEME_SYSTEM   13
-#define S_HIT_THEME_DARK     14
-#define S_HIT_THEME_LIGHT    15
-#define S_HIT_WALLPAPER      16
-#define S_HIT_REMEMBER       17
+#define S_HIT_REMEMBER       13
+#define S_HIT_LAYOUT_DROP    14
+#define S_HIT_LAYOUT_OPT0    15
+#define S_HIT_LAYOUT_OPT1    16
+#define S_HIT_FKEYS          17
+#define S_HIT_THEME_DROP     20
+#define S_HIT_THEME_OPT0     21
+#define S_HIT_THEME_OPT1     22
+#define S_HIT_THEME_OPT2     23
+#define S_HIT_WALLPAPER      24
+#define S_HIT_URL            30
 
 static HWND g_settingsHwnd = 0;
 static int  g_sTab = 0;        // 0=常规 1=主题 2=关于
 static int  g_sHov = -1;       // 悬停元素，-1=无
 static BOOL g_sTracking = FALSE;
+static BOOL g_dropTheme = FALSE;    // 主题下拉是否展开
+static BOOL g_dropLayout = FALSE;   // 布局下拉是否展开
+static int  g_dropThemeHov = -1;
+static int  g_dropLayoutHov = -1;
+static const wchar_t* g_themeNames[3] = { L"跟随系统", L"深色主题", L"浅色主题" };
+static const wchar_t* g_layoutNames[2] = { L"全尺寸", L"小键盘" };
 
 static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
     RECT r = {x, y, x + w, y + h};
@@ -1166,6 +1266,46 @@ static void SettingsTab(HDC dc, int x, int y, int w, int h, const wchar_t* label
     DrawTextC(dc, x, y, w, h, label, g_sf13b, IsLightColor(bg) ? 0x1A1A1A : C_WHITE);
 }
 
+// 圆角方框面板（设置项容器）
+static void DrawPanel(HDC dc, int x, int y, int w, int h) {
+    DrawRoundRect(dc, x, y, w, h, C_KEY, C_KEY_BORDER, 8);
+}
+
+// 下拉框
+static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, BOOL open, BOOL hover) {
+    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
+    DrawTextL(dc, x + 10, y, w - 30, h, text, g_sf13, C_WHITE);
+    int ax = x + w - 14, ay = y + h / 2;
+    HPEN pen = CreatePen(PS_SOLID, 1, C_DIM);
+    HPEN op = (HPEN)SelectObject(dc, pen);
+    HBRUSH br = CreateSolidBrush(C_DIM);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    POINT tri[3] = { {ax - 5, ay - 3}, {ax + 5, ay - 3}, {ax, ay + 3} };
+    Polygon(dc, tri, 3);
+    SelectObject(dc, ob); DeleteObject(br);
+    SelectObject(dc, op); DeleteObject(pen);
+}
+
+// 下拉列表（选中项带勾，浅/深色模式一致）
+static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
+    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_KEY, C_KEY_BORDER, 8);
+    for (int i = 0; i < count; i++) {
+        int iy = y + 2 + i * itemH;
+        if (i == hov) Fill(dc, x + 2, iy, w - 4, itemH, C_HOVER);
+        if (i == sel) {
+            HPEN pen = CreatePen(PS_SOLID, 2, C_HOT);
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            MoveToEx(dc, x + 10, iy + itemH / 2, NULL);
+            LineTo(dc, x + 15, iy + itemH / 2 + 4);
+            LineTo(dc, x + 22, iy + itemH / 2 - 4);
+            SelectObject(dc, op); DeleteObject(pen);
+            DrawTextL(dc, x + 28, iy, w - 34, itemH, items[i], g_sf13, C_HOT);
+        } else {
+            DrawTextL(dc, x + 28, iy, w - 34, itemH, items[i], g_sf13, C_WHITE);
+        }
+    }
+}
+
 static void SettingsDraw(HDC dc, HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right, H = rc.bottom;
@@ -1193,39 +1333,73 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     // 右侧内容
     int x0 = tabX + tabW + 16, y = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
+    int panelPad = 12, comboW = (int)(150 * dpi), comboH = (int)(24 * dpi);
     if (g_sTab == 0) {
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"自动呼出", g_sf13b, C_DIM); y += (int)(24 * dpi);
-        DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_af);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"点击输入框时自动弹出键盘", g_sf13, C_WHITE);
-        y += rowH + (int)(16 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"关闭按钮 (×)", g_sf13b, C_DIM); y += (int)(24 * dpi);
-        DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), !g_closeToTray);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"直接退出程序", g_sf13, C_WHITE);
-        y += rowH;
-        DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_closeToTray);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_sf13, C_WHITE);
-        y += rowH + (int)(4 * dpi);
-        DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_rememberClose);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"记住我的选择", g_sf13, C_WHITE);
-        y += rowH + (int)(8 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：托盘右键菜单可随时显示 / 退出程序", g_sf12, C_DIM);
+        // ===== 常规：三个圆角面板 ======
+        int py = y;
+        // 面板 1：自动呼出
+        int p1h = 8 + 20 + 4 + rowH + 8;
+        DrawPanel(dc, x0, py, cw, p1h);
+        {
+            int ix = x0 + panelPad, iy = py + 8;
+            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), L"自动呼出", g_sf13b, C_DIM);
+            iy += (int)(20 * dpi) + 4;
+            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_af);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"点击输入框时自动弹出键盘", g_sf13, C_WHITE);
+        }
+        py += p1h + 10;
+        // 面板 2：关闭按钮
+        int p2h = 8 + 20 + 4 + rowH * 3 + 8;
+        DrawPanel(dc, x0, py, cw, p2h);
+        {
+            int ix = x0 + panelPad, iy = py + 8;
+            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), L"关闭按钮 (×)", g_sf13b, C_DIM);
+            iy += (int)(20 * dpi) + 4;
+            DrawRadio(dc, ix + (int)(8 * dpi), iy + rowH / 2, (int)(7 * dpi), !g_closeToTray);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"直接退出程序", g_sf13, C_WHITE);
+            iy += rowH;
+            DrawRadio(dc, ix + (int)(8 * dpi), iy + rowH / 2, (int)(7 * dpi), g_closeToTray);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"隐藏到系统托盘", g_sf13, C_WHITE);
+            iy += rowH;
+            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_rememberClose);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"记住我的选择", g_sf13, C_WHITE);
+        }
+        py += p2h + 10;
+        // 面板 3：键盘布局
+        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        DrawPanel(dc, x0, py, cw, p3h);
+        {
+            int ix = x0 + panelPad, iy = py + 8;
+            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), L"键盘布局", g_sf13b, C_DIM);
+            iy += (int)(20 * dpi) + 4;
+            int comboY = iy;
+            DrawCombo(dc, ix, comboY, comboW, comboH, g_layoutNames[g_layoutMode], g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
+            iy += comboH + 6;
+            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_showFKeys);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"顶部显示 F1~F12 键", g_sf13, C_WHITE);
+            if (g_dropLayout) DrawComboList(dc, ix, comboY + comboH + 2, comboW, comboH, g_layoutNames, 2, g_layoutMode, g_dropLayoutHov);
+        }
+        py += p3h;
+        DrawTextL(dc, x0, py + 8, cw, (int)(18 * dpi), L"提示：托盘右键菜单可随时显示 / 退出程序", g_sf12, C_DIM);
     } else if (g_sTab == 1) {
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), L"主题模式", g_sf13b, C_DIM); y += (int)(24 * dpi);
-        DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_themeMode == 0);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"跟随系统", g_sf13, C_WHITE);
-        y += rowH;
-        DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_themeMode == 1);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"深色主题", g_sf13, C_WHITE);
-        y += rowH;
-        DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_themeMode == 2);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"浅色主题", g_sf13, C_WHITE);
-        y += rowH + (int)(16 * dpi);
-        DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_wallpaperAccent);
-        DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, L"高亮按钮跟随壁纸强调色", g_sf13, C_WHITE);
-        y += rowH + (int)(8 * dpi);
-        DrawTextL(dc, x0, y, cw, (int)(18 * dpi), L"提示：修改即时生效", g_sf12, C_DIM);
+        // ===== 主题：圆角面板 ======
+        int py = y;
+        int ph = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        DrawPanel(dc, x0, py, cw, ph);
+        {
+            int ix = x0 + panelPad, iy = py + 8;
+            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), L"主题模式", g_sf13b, C_DIM);
+            iy += (int)(20 * dpi) + 4;
+            int comboY = iy;
+            DrawCombo(dc, ix, comboY, comboW, comboH, g_themeNames[g_themeMode], g_dropTheme, g_sHov == S_HIT_THEME_DROP);
+            iy += comboH + 6;
+            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_wallpaperAccent);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"高亮按钮跟随壁纸强调色", g_sf13, C_WHITE);
+            if (g_dropTheme) DrawComboList(dc, ix, comboY + comboH + 2, comboW, comboH, g_themeNames, 3, g_themeMode, g_dropThemeHov);
+        }
+        DrawTextL(dc, x0, py + ph + 8, cw, (int)(18 * dpi), L"提示：修改即时生效", g_sf12, C_DIM);
     } else {
-        // Logo（应用图标）
+        // ===== 关于：Logo + 名称 + 版本(架构) + 底部项目地址 ======
         int logo = (int)(72 * dpi);
         HICON hIcon = LoadMainIcon(logo);
         if (hIcon) {
@@ -1233,21 +1407,34 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DestroyIcon(hIcon);
         }
         y += logo + (int)(22 * dpi);
-        // 项目名称
-        DrawTextL(dc, x0, y, cw, (int)(26 * dpi), L"HKeyboard 轻键", g_sf14b, C_WHITE);
+        // 项目名称（居中）
+        DrawTextC(dc, x0, y, cw, (int)(26 * dpi), L"HKeyboard 轻键", g_sf14b, C_WHITE);
         y += (int)(34 * dpi);
-        // 版本号（架构）
+        // 版本号（架构，居中，小一号）
         wchar_t ver[64];
         swprintf(ver, 64, L"版本：v%hs (%hs)", VER_FILEVERSION_STR, HK_ARCH);
-        DrawTextL(dc, x0, y, cw, (int)(20 * dpi), ver, g_sf13, C_WHITE);
-        // 底部项目地址
-        DrawTextL(dc, x0, H - (int)(34 * dpi), cw, (int)(18 * dpi), L"项目地址：https://github.com/PanDaDaTech/Hydrogen-Keyboard", g_sf12, C_DIM);
+        DrawTextC(dc, x0, y, cw, (int)(18 * dpi), ver, g_sf12, C_WHITE);
+        // 底部项目地址（超链接）
+        const wchar_t* urlText = L"项目地址：https://github.com/PanDaDaTech/Hydrogen-Keyboard";
+        int uy = H - (int)(34 * dpi);
+        DrawTextL(dc, x0, uy, cw, (int)(18 * dpi), urlText, g_sf12, C_HOT);
+        if (g_sHov == S_HIT_URL) {
+            SIZE sz;
+            HFONT of = (HFONT)SelectObject(dc, g_sf12);
+            GetTextExtentPoint32W(dc, urlText, (int)wcslen(urlText), &sz);
+            SelectObject(dc, of);
+            HPEN pen2 = CreatePen(PS_SOLID, 1, C_HOT);
+            HPEN op2 = (HPEN)SelectObject(dc, pen2);
+            MoveToEx(dc, x0, uy + (int)(15 * dpi), NULL);
+            LineTo(dc, x0 + sz.cx, uy + (int)(15 * dpi), NULL);
+            SelectObject(dc, op2); DeleteObject(pen2);
+        }
     }
 }
 
 static int SettingsHitTest(HWND hWnd, int x, int y) {
     RECT rc; GetClientRect(hWnd, &rc);
-    int W = rc.right;
+    int W = rc.right, H = rc.bottom;
     double dpi = GetSystemDpiScale();
     int hdr = (int)(40 * dpi);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
@@ -1261,24 +1448,60 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     }
     int x0 = tabX + tabW + 16, yy = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
+    int panelPad = 12, comboW = (int)(150 * dpi), comboH = (int)(24 * dpi);
     if (g_sTab == 0) {
-        yy += (int)(24 * dpi);
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_AUTO;
-        yy += rowH + (int)(16 * dpi) + (int)(24 * dpi);
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_CLOSE_DIRECT;
-        yy += rowH;
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_CLOSE_TRAY;
-        yy += rowH + (int)(4 * dpi);
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_REMEMBER;
+        int py = yy;
+        int p1h = 8 + 20 + 4 + rowH + 8;
+        {
+            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_AUTO;
+        }
+        py += p1h + 10;
+        int p2h = 8 + 20 + 4 + rowH * 3 + 8;
+        {
+            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_CLOSE_DIRECT;
+            iy += rowH;
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_CLOSE_TRAY;
+            iy += rowH;
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_REMEMBER;
+        }
+        py += p2h + 10;
+        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        {
+            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
+            int comboY = iy;
+            if (g_dropLayout) {
+                int ly = comboY + comboH + 2;
+                for (int i = 0; i < 2; i++) {
+                    if (x >= ix && x < ix + comboW && y >= ly && y < ly + comboH) return S_HIT_LAYOUT_OPT0 + i;
+                    ly += comboH;
+                }
+            }
+            if (x >= ix && x < ix + comboW && y >= comboY && y < comboY + comboH) return S_HIT_LAYOUT_DROP;
+            iy += comboH + 6;
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_FKEYS;
+        }
     } else if (g_sTab == 1) {
-        yy += (int)(24 * dpi);
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_THEME_SYSTEM;
-        yy += rowH;
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_THEME_DARK;
-        yy += rowH;
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_THEME_LIGHT;
-        yy += rowH + (int)(16 * dpi);
-        if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return S_HIT_WALLPAPER;
+        int py = yy;
+        int ph = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        {
+            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
+            int comboY = iy;
+            if (g_dropTheme) {
+                int ly = comboY + comboH + 2;
+                for (int i = 0; i < 3; i++) {
+                    if (x >= ix && x < ix + comboW && y >= ly && y < ly + comboH) return S_HIT_THEME_OPT0 + i;
+                    ly += comboH;
+                }
+            }
+            if (x >= ix && x < ix + comboW && y >= comboY && y < comboY + comboH) return S_HIT_THEME_DROP;
+            iy += comboH + 6;
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_WALLPAPER;
+        }
+    } else if (g_sTab == 2) {
+        int uy = H - (int)(34 * dpi);
+        if (x >= x0 && x < x0 + cw && y >= uy && y < uy + (int)(18 * dpi)) return S_HIT_URL;
     }
     return S_HIT_NONE;
 }
@@ -1318,6 +1541,8 @@ static void EnsureConfigFile() {
     IniSetInt(L"Window", L"Height", g_wh);
     IniSetInt(L"Theme", L"Mode", 0);
     IniSetInt(L"Theme", L"Wallpaper", 0);
+    IniSetInt(L"Keyboard", L"Layout", 0);
+    IniSetInt(L"Keyboard", L"FKeys", 0);
 }
 
 // 读取上次的窗口大小 / 主题 / 关闭行为
@@ -1331,6 +1556,9 @@ static void LoadConfig() {
     int tm = IniGetInt(L"Theme", L"Mode", -1);
     if (tm >= 0 && tm <= 2) g_themeMode = tm;
     g_wallpaperAccent = (IniGetInt(L"Theme", L"Wallpaper", 0) != 0);
+    g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
+    if (g_layoutMode < 0 || g_layoutMode > 1) g_layoutMode = 0;
+    g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
 }
 
 // 持久化“× 关闭行为”选择
@@ -1345,17 +1573,56 @@ static void SaveThemeConfig() {
     IniSetInt(L"Theme", L"Wallpaper", g_wallpaperAccent ? 1 : 0);
 }
 
+// 持久化键盘布局设置
+static void SaveLayoutConfig() {
+    IniSetInt(L"Keyboard", L"Layout", g_layoutMode);
+    IniSetInt(L"Keyboard", L"FKeys", g_showFKeys ? 1 : 0);
+}
+
+// 应用键盘布局：保存设置、重建按键并调整窗口默认大小
+static void ApplyKeyboardLayout() {
+    SaveLayoutConfig();
+    InitWindowSizeForDpi();
+    if (g_hWnd && IsWindow(g_hWnd)) {
+        RecreateFontsAndLayout();
+        SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, g_ww, g_wh, SWP_NOMOVE | SWP_NOACTIVATE);
+        InvalidateRect(g_hWnd, NULL, TRUE);
+    }
+}
+
 static void SettingsApplyHit(HWND hWnd, int hit) {
     BOOL themeChanged = FALSE;
+    BOOL layoutChanged = FALSE;
     switch (hit) {
     case S_HIT_AUTO: g_af = !g_af; break;
     case S_HIT_CLOSE_DIRECT: g_closeToTray = FALSE; if (g_rememberClose) SaveCloseSettings(); break;
     case S_HIT_CLOSE_TRAY:   g_closeToTray = TRUE;  if (g_rememberClose) SaveCloseSettings(); break;
     case S_HIT_REMEMBER:     g_rememberClose = !g_rememberClose; SaveCloseSettings(); break;
-    case S_HIT_THEME_SYSTEM: if (g_themeMode != 0) { g_themeMode = 0; themeChanged = TRUE; } break;
-    case S_HIT_THEME_DARK:   if (g_themeMode != 1) { g_themeMode = 1; themeChanged = TRUE; } break;
-    case S_HIT_THEME_LIGHT:  if (g_themeMode != 2) { g_themeMode = 2; themeChanged = TRUE; } break;
-    case S_HIT_WALLPAPER:    g_wallpaperAccent = !g_wallpaperAccent; themeChanged = TRUE; break;
+    case S_HIT_LAYOUT_DROP:
+        g_dropLayout = !g_dropLayout;
+        if (g_dropLayout) { g_dropTheme = FALSE; g_dropLayoutHov = -1; }
+        break;
+    case S_HIT_LAYOUT_OPT0:
+    case S_HIT_LAYOUT_OPT1:
+        g_layoutMode = hit - S_HIT_LAYOUT_OPT0;
+        g_dropLayout = FALSE;
+        layoutChanged = TRUE;
+        break;
+    case S_HIT_FKEYS: g_showFKeys = !g_showFKeys; layoutChanged = TRUE; break;
+    case S_HIT_THEME_DROP:
+        g_dropTheme = !g_dropTheme;
+        if (g_dropTheme) { g_dropLayout = FALSE; g_dropThemeHov = -1; }
+        break;
+    case S_HIT_THEME_OPT0:
+    case S_HIT_THEME_OPT1:
+    case S_HIT_THEME_OPT2:
+        if (g_themeMode != hit - S_HIT_THEME_OPT0) { g_themeMode = hit - S_HIT_THEME_OPT0; themeChanged = TRUE; }
+        g_dropTheme = FALSE;
+        break;
+    case S_HIT_WALLPAPER: g_wallpaperAccent = !g_wallpaperAccent; themeChanged = TRUE; break;
+    case S_HIT_URL:
+        ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard", NULL, NULL, SW_SHOWNORMAL);
+        break;
     default: return;
     }
     if (themeChanged) {
@@ -1363,14 +1630,28 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         SaveThemeConfig();                              // 持久化主题选择
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     }
+    if (layoutChanged) ApplyKeyboardLayout();           // 应用并保存布局
     InvalidateRect(hWnd, NULL, TRUE);                   // 设置页立即刷新
 }
 
 static void SettingsOnClick(HWND hWnd, int x, int y) {
     int hit = SettingsHitTest(hWnd, x, y);
     if (hit == S_HIT_CLOSE) { DestroyWindow(hWnd); return; }
-    if (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2) { g_sTab = hit - S_HIT_TAB0; InvalidateRect(hWnd, NULL, TRUE); return; }
-    if (hit != S_HIT_NONE) SettingsApplyHit(hWnd, hit);
+    if (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2) {
+        g_sTab = hit - S_HIT_TAB0;
+        g_dropTheme = FALSE;
+        g_dropLayout = FALSE;
+        InvalidateRect(hWnd, NULL, TRUE);
+        return;
+    }
+    if (hit != S_HIT_NONE) {
+        SettingsApplyHit(hWnd, hit);
+    } else if (g_dropTheme || g_dropLayout) {
+        // 点击空白处关闭下拉
+        g_dropTheme = FALSE;
+        g_dropLayout = FALSE;
+        InvalidateRect(hWnd, NULL, TRUE);
+    }
 }
 
 static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
@@ -1398,7 +1679,24 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         if (!g_sTracking) { TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hWnd, 0}; TrackMouseEvent(&tme); g_sTracking = TRUE; }
         int hov = SettingsHitTest(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (hov != g_sHov) { g_sHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
+        int thov = (hov >= S_HIT_THEME_OPT0 && hov <= S_HIT_THEME_OPT2) ? hov - S_HIT_THEME_OPT0 : -1;
+        int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT1) ? hov - S_HIT_LAYOUT_OPT0 : -1;
+        if (thov != g_dropThemeHov || lhov != g_dropLayoutHov) {
+            g_dropThemeHov = thov;
+            g_dropLayoutHov = lhov;
+            InvalidateRect(hWnd, NULL, TRUE);
+        }
         return 0;
+    }
+    case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hWnd, &pt);
+        if (g_sTab == 2 && SettingsHitTest(hWnd, pt.x, pt.y) == S_HIT_URL) {
+            SetCursor(LoadCursor(NULL, IDC_HAND));
+            return TRUE;
+        }
+        break;
     }
     case WM_MOUSELEAVE:
         g_sTracking = FALSE;
@@ -1421,6 +1719,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_settingsHwnd = NULL;
         g_sHov = -1;
         g_sTracking = FALSE;
+        g_dropTheme = FALSE;
+        g_dropLayout = FALSE;
         return 0;
     }
     return DefWindowProcW(hWnd, msg, w, l);
@@ -2132,13 +2432,12 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         hAppIcon, LoadCursor(0, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), 0, L"HKeyboardClosePrompt", hAppIcon};
     RegisterClassExW(&wcp);
 
-    InitWindowSizeForDpi();
-
-    // 配置：首次启动自动生成 HKeyboard.ini；恢复上次的窗口大小 / 主题 / 关闭行为
+    // 配置：首次启动自动生成 HKeyboard.ini；恢复上次的布局 / 窗口大小 / 主题 / 关闭行为
     EnsureConfigFile();
     LoadConfig();
     if (fThemeCli) g_themeMode = fDark ? 1 : (fLight ? 2 : 0);   // 命令行主题优先
     if (fWall) g_wallpaperAccent = TRUE;
+    InitWindowSizeForDpi();   // 布局决定默认窗口大小（在 LoadConfig 之后）
     ApplyTheme();
 
     RECT work = {0};

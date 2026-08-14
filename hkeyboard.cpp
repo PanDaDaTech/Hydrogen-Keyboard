@@ -214,6 +214,7 @@ BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
+BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
 int         g_repeatKeyIdx = -1;
@@ -649,7 +650,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
             int fn = FnMap(k->vk);
             if (fn) { swprintf(buf, 16, L"F%d", fn); return buf; }
         }
-        wchar_t ch = GetSymForKey(k->vk, g_sh);
+        wchar_t ch = GetSymForKey(k->vk, g_sh && g_shiftSymbols);
         if (ch) { buf[0] = ch; buf[1] = 0; return buf; }
     }
     // F1~F12 顶行 / 小键盘数字
@@ -1115,7 +1116,7 @@ static void DrawKeys(HDC dc) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }
-        DWORD shiftC = (g_sh || g_physShift) ? textC : C_DIM;
+        DWORD shiftC = ((g_sh || g_physShift) && g_shiftSymbols) ? textC : C_DIM;
         if (baseCh && shiftCh && shiftCh != baseCh) {
             DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, shiftC);
         } else {
@@ -1243,6 +1244,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_LAYOUT_OPT0    15
 #define S_HIT_LAYOUT_OPT1    16
 #define S_HIT_FKEYS          17
+#define S_HIT_SHIFTSYM       18
 #define S_HIT_THEME_DROP     20
 #define S_HIT_THEME_OPT0     21
 #define S_HIT_THEME_OPT1     22
@@ -1288,7 +1290,7 @@ static void DrawRadio(HDC dc, int x, int cy, int r, BOOL on) {
 static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
     DrawRoundRect(dc, x, y, s, s, on ? C_HOT : C_KEY, C_KEY_BORDER, s / 3);
     if (on) {
-        HPEN p = CreatePen(PS_SOLID, 2, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
+        HPEN p = CreatePen(PS_SOLID, 2, 0xFFFFFF);   // 勾固定白色，深浅色一致
         HPEN op = (HPEN)SelectObject(dc, p);
         MoveToEx(dc, x + 3, y + s / 2, NULL);
         LineTo(dc, x + s / 2, y + s - 3);
@@ -1310,7 +1312,7 @@ static void DrawPanel(HDC dc, int x, int y, int w, int h) {
 
 // 下拉框
 static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, BOOL open, BOOL hover) {
-    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
+    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_BG, C_KEY_BORDER, 6);
     DrawTextL(dc, x + 10, y, w - 30, h, text, g_sf13, C_WHITE);
     int ax = x + w - 14, ay = y + h / 2;
     HPEN pen = CreatePen(PS_SOLID, 1, C_DIM);
@@ -1325,7 +1327,7 @@ static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, B
 
 // 下拉列表（选中项带勾，浅/深色模式一致）
 static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
-    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_KEY, C_KEY_BORDER, 8);
+    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_BG, C_KEY_BORDER, 8);
     for (int i = 0; i < count; i++) {
         int iy = y + 2 + i * itemH;
         if (i == hov) Fill(dc, x + 2, iy, w - 4, itemH, C_HOVER);
@@ -1403,7 +1405,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         }
         py += p2h + 10;
         // 面板 3：键盘布局
-        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 4 + rowH + 8;
         DrawPanel(dc, x0, py, cw, p3h);
         {
             int ix = x0 + panelPad, iy = py + 8;
@@ -1414,6 +1416,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             iy += comboH + 6;
             DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_showFKeys);
             DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"顶部显示 F1~F12 键", g_sf13, C_WHITE);
+            iy += rowH + (int)(4 * dpi);
+            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_shiftSymbols);
+            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, L"按 Shift 时显示特殊符号（否则显示数字）", g_sf13, C_WHITE);
             if (g_dropLayout) DrawComboList(dc, ix, comboY + comboH + 2, comboW, comboH, g_layoutNames, 2, g_layoutMode, g_dropLayoutHov);
         }
         py += p3h;
@@ -1504,7 +1509,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_REMEMBER;
         }
         py += p2h + 10;
-        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 4 + rowH + 8;
         {
             int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
             int comboY = iy;
@@ -1518,6 +1523,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= ix && x < ix + comboW && y >= comboY && y < comboY + comboH) return S_HIT_LAYOUT_DROP;
             iy += comboH + 6;
             if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_FKEYS;
+            iy += rowH + (int)(4 * dpi);
+            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_SHIFTSYM;
         }
     } else if (g_sTab == 1) {
         int py = yy;
@@ -1580,6 +1587,7 @@ static void EnsureConfigFile() {
     IniSetInt(L"Theme", L"Wallpaper", 0);
     IniSetInt(L"Keyboard", L"Layout", 0);
     IniSetInt(L"Keyboard", L"FKeys", 0);
+    IniSetInt(L"General", L"ShiftSymbols", 1);
 }
 
 // 读取上次的窗口大小 / 主题 / 关闭行为
@@ -1596,6 +1604,7 @@ static void LoadConfig() {
     g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
     if (g_layoutMode < 0 || g_layoutMode > 1) g_layoutMode = 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
+    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
 }
 
 // 持久化“× 关闭行为”选择
@@ -1646,6 +1655,11 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         layoutChanged = TRUE;
         break;
     case S_HIT_FKEYS: g_showFKeys = !g_showFKeys; layoutChanged = TRUE; break;
+    case S_HIT_SHIFTSYM:
+        g_shiftSymbols = !g_shiftSymbols;
+        IniSetInt(L"General", L"ShiftSymbols", g_shiftSymbols ? 1 : 0);
+        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
+        break;
     case S_HIT_THEME_DROP:
         g_dropTheme = !g_dropTheme;
         if (g_dropTheme) { g_dropLayout = FALSE; g_dropThemeHov = -1; }
@@ -1772,7 +1786,7 @@ static void OpenSettingsTab(int tab) {
         return;
     }
     double dpi = GetSystemDpiScale();
-    int w = (int)(520 * dpi), h = (int)(400 * dpi);
+    int w = (int)(520 * dpi), h = (int)(440 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;

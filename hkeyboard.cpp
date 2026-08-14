@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "resource.h"
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 
 // 当前编译架构（关于页显示用）
 #ifdef _M_ARM64
@@ -272,6 +274,23 @@ static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌�
 static HANDLE g_fontRegBold = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
+
+// ===== GDI+ 平滑绘图（抗锯齿圆形，避免 GDI Ellipse 锯齿） =====
+static ULONG_PTR g_gdiplusToken = 0;
+static void InitGdiPlus() {
+    Gdiplus::GdiplusStartupInput in;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &in, NULL);
+}
+static void ShutdownGdiPlus() {
+    if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
+}
+static void DrawCircleAA(HDC dc, int x, int y, int r, DWORD fill) {
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
+    g.FillEllipse(&br, (Gdiplus::REAL)(x - r), (Gdiplus::REAL)(y - r),
+                  (Gdiplus::REAL)(r * 2), (Gdiplus::REAL)(r * 2));
+}
 
 // Fn 功能键层：TRUE 时数字行显示为 F1~F12
 BOOL        g_fnLayer = FALSE;
@@ -1404,8 +1423,6 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_TAB1           3
 #define S_HIT_TAB2           4
 #define S_HIT_AUTO           10
-#define S_HIT_CLOSE_DIRECT   11
-#define S_HIT_CLOSE_TRAY     12
 #define S_HIT_REMEMBER       13
 #define S_HIT_LAYOUT_DROP    14
 #define S_HIT_LAYOUT_OPT0    15
@@ -1418,6 +1435,10 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_THEME_OPT1     22
 #define S_HIT_THEME_OPT2     23
 #define S_HIT_URL            30
+#define S_HIT_FEEDBACK       31
+#define S_HIT_CLOSE_DROP     70
+#define S_HIT_CLOSE_OPT0     71
+#define S_HIT_CLOSE_OPT1     72
 #define S_HIT_HIDEDELAY_DROP  40
 #define S_HIT_HIDEDELAY_OPT0  41
 #define S_HIT_LANG_DROP       50
@@ -1443,6 +1464,8 @@ static BOOL g_dropLang = FALSE;        // 语言下拉
 static int  g_dropLangHov = -1;
 static BOOL g_dropHl = FALSE;          // 高亮颜色下拉
 static int  g_dropHlHov = -1;
+static BOOL g_dropClose = FALSE;        // 关闭按钮操作下拉
+static int  g_dropCloseHov = -1;
 static BOOL g_hlEditFocus = FALSE;     // HEX 输入框是否处于编辑态
 static wchar_t g_hlEditBuf[8] = {0};   // 编辑中的 HEX 文本（#RRGGBB）
 static const int g_hideDelayValues[6] = {0, 300, 500, 1000, 2000, 5000};
@@ -1466,21 +1489,18 @@ static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
 }
 
 static void DrawRadio(HDC dc, int x, int cy, int r, BOOL on, DWORD bg) {
-    // 用填充圆环替代 1px 描边，避免细线锯齿
-    HBRUSH ring = CreateSolidBrush(C_DIM);
-    HBRUSH oring = (HBRUSH)SelectObject(dc, ring);
-    Ellipse(dc, x - r, cy - r, x + r, cy + r);
-    SelectObject(dc, oring); DeleteObject(ring);
-    HBRUSH hole = CreateSolidBrush(bg);
-    HBRUSH ohole = (HBRUSH)SelectObject(dc, hole);
-    Ellipse(dc, x - r + 2, cy - r + 2, x + r - 2, cy + r - 2);
-    SelectObject(dc, ohole); DeleteObject(hole);
-    if (on) {
-        HBRUSH dot = CreateSolidBrush(C_HOT);
-        HBRUSH odot = (HBRUSH)SelectObject(dc, dot);
-        Ellipse(dc, x - r + 3, cy - r + 3, x + r - 3, cy + r - 3);
-        SelectObject(dc, odot); DeleteObject(dot);
-    }
+    // GDI+ 抗锯齿圆环：外圈 + 内圈挖空 + 选中实心点
+    DrawCircleAA(dc, x, cy, r, C_DIM);
+    DrawCircleAA(dc, x, cy, r - 2, bg);
+    if (on) DrawCircleAA(dc, x, cy, r - 4, C_HOT);
+}
+
+// 开关按钮（on=开启；通常右侧对齐显示）
+static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
+    DrawRoundRect(dc, x, y, w, h, on ? C_HOT : C_DARK, C_KEY_BORDER, h / 2);
+    int knob = h - 6;
+    int kx = on ? x + w - knob - 3 : x + 3;
+    DrawRoundRect(dc, kx, y + 3, knob, knob, on ? 0xFFFFFF : C_DIM, on ? 0xFFFFFF : C_DIM, knob / 2);
 }
 
 static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
@@ -1580,6 +1600,11 @@ static int HlSel() {
     if (g_wallpaperAccent) return 1;
     return g_hlMode == 1 ? 2 : 0;
 }
+// 关闭按钮操作下拉当前文案
+static const wchar_t* CloseActionName() {
+    return T(g_closeToTray ? L"隐藏到系统托盘" : L"直接退出程序",
+             g_closeToTray ? L"Hide to tray" : L"Exit program");
+}
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
@@ -1618,6 +1643,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     int x0 = tabX + tabW + 16, y = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
     int panelPad = 12, comboW = (int)(150 * dpi), comboH = (int)(24 * dpi);
+    int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
+    int swX = x0 + cw - panelPad - swW;
     if (g_sTab == 0) {
         // ===== 常规：三个圆角面板 ======
         int py = y;
@@ -1628,25 +1655,23 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             int ix = x0 + panelPad, iy = py + 8;
             DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"自动呼出", L"Auto Pop-up"), g_sf13b, C_DIM);
             iy += (int)(20 * dpi) + 4;
-            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_af);
-            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, T(L"点击输入框时自动弹出键盘", L"Auto show when clicking an input"), g_sf13, C_WHITE);
+            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_af);
+            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"点击输入框时自动弹出键盘", L"Auto show when clicking an input"), g_sf13, C_WHITE);
         }
         py += p1h + 10;
-        // 面板 2：关闭按钮
-        int p2h = 8 + 20 + 4 + rowH * 3 + 8;
+        // 面板 2：关闭按钮（下拉选择操作 + 记住选择开关）
+        int p2h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
         DrawPanel(dc, x0, py, cw, p2h);
         {
             int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"关闭按钮 (×)", L"Close Button (×)"), g_sf13b, C_DIM);
+            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"关闭按钮", L"Close Button"), g_sf13b, C_DIM);
             iy += (int)(20 * dpi) + 4;
-            DrawRadio(dc, ix + (int)(8 * dpi), iy + rowH / 2, (int)(7 * dpi), !g_closeToTray, C_KEY);
-            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sf13, C_WHITE);
-            iy += rowH;
-            DrawRadio(dc, ix + (int)(8 * dpi), iy + rowH / 2, (int)(7 * dpi), g_closeToTray, C_KEY);
-            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sf13, C_WHITE);
-            iy += rowH;
-            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_rememberClose);
-            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, T(L"记住我的选择", L"Remember my choice"), g_sf13, C_WHITE);
+            int comboY = iy;
+            int comboX = swX - comboW;   // 操作选择框右对齐
+            DrawCombo(dc, comboX, comboY, comboW, comboH, CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
+            iy += comboH + 6;
+            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_rememberClose);
+            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"记住我的选择", L"Remember my choice"), g_sf13, C_WHITE);
         }
         py += p2h + 10;
         // 面板 3：键盘布局
@@ -1659,11 +1684,11 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             int comboY = iy;
             DrawCombo(dc, ix, comboY, comboW, comboH, g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode], g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
             iy += comboH + 6;
-            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_showFKeys);
-            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, T(L"顶部显示 F1~F12 键", L"Show F1~F12 row"), g_sf13, C_WHITE);
+            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_showFKeys);
+            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"顶部显示 F1~F12 键", L"Show F1~F12 row"), g_sf13, C_WHITE);
             iy += rowH + (int)(4 * dpi);
-            DrawCheck(dc, ix, iy + (int)(2 * dpi), (int)(16 * dpi), g_shiftSymbols);
-            DrawTextL(dc, ix + (int)(26 * dpi), iy, cw - 24 - (int)(26 * dpi), rowH, T(L"按 Shift 时显示特殊符号（否则显示数字）", L"Show symbols on Shift (else numbers)"), g_sf13, C_WHITE);
+            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_shiftSymbols);
+            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"按 Shift 时显示特殊符号（否则显示数字）", L"Show symbols on Shift (else numbers)"), g_sf13, C_WHITE);
         }
         py += p3h + 10;
         // 面板 4：自动隐藏延迟
@@ -1737,11 +1762,10 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         wchar_t ver[64];
         swprintf(ver, 64, T(L"版本：v%hs (%ls)", L"Version: v%hs (%ls)"), VER_FILEVERSION_STR, ArchName());
         DrawTextC(dc, x0, y, cw, (int)(18 * dpi), ver, g_sf12, C_WHITE);
-        // 底部项目地址（超链接，单独一行避免超宽裁剪）
-        const wchar_t* urlText = L"https://github.com/PanDaDaTech/Hydrogen-Keyboard";
-        int uy = H - (int)(56 * dpi);
-        DrawTextL(dc, x0, uy, cw, (int)(18 * dpi), T(L"项目地址", L"Project URL"), g_sf12, C_DIM);
-        DrawTextL(dc, x0, uy + (int)(20 * dpi), cw, (int)(18 * dpi), urlText, g_sf12, C_HOT);
+        // 底部项目地址 / 问题反馈：可点击超链接（不显示完整 URL）
+        int uy = H - (int)(64 * dpi);
+        const wchar_t* urlText = T(L"项目地址", L"Project URL");
+        DrawTextL(dc, x0, uy, cw, (int)(18 * dpi), urlText, g_sf12, C_HOT);
         if (g_sHov == S_HIT_URL) {
             SIZE sz;
             HFONT of = (HFONT)SelectObject(dc, g_sf12);
@@ -1749,8 +1773,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             SelectObject(dc, of);
             HPEN pen2 = CreatePen(PS_SOLID, 1, C_HOT);
             HPEN op2 = (HPEN)SelectObject(dc, pen2);
-            MoveToEx(dc, x0, uy + (int)(34 * dpi), NULL);
-            LineTo(dc, x0 + sz.cx, uy + (int)(34 * dpi));
+            MoveToEx(dc, x0, uy + (int)(16 * dpi), NULL);
+            LineTo(dc, x0 + sz.cx, uy + (int)(16 * dpi));
+            SelectObject(dc, op2); DeleteObject(pen2);
+        }
+        int fby = uy + (int)(22 * dpi);
+        const wchar_t* fbText = T(L"问题反馈", L"Feedback");
+        DrawTextL(dc, x0, fby, cw, (int)(18 * dpi), fbText, g_sf12, C_HOT);
+        if (g_sHov == S_HIT_FEEDBACK) {
+            SIZE sz;
+            HFONT of = (HFONT)SelectObject(dc, g_sf12);
+            GetTextExtentPoint32W(dc, fbText, (int)wcslen(fbText), &sz);
+            SelectObject(dc, of);
+            HPEN pen2 = CreatePen(PS_SOLID, 1, C_HOT);
+            HPEN op2 = (HPEN)SelectObject(dc, pen2);
+            MoveToEx(dc, x0, fby + (int)(16 * dpi), NULL);
+            LineTo(dc, x0 + sz.cx, fby + (int)(16 * dpi));
             SelectObject(dc, op2); DeleteObject(pen2);
         }
     }
@@ -1760,7 +1798,17 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         int py = y;
         int p1h = 8 + 20 + 4 + rowH + 8;
         py += p1h + 10;
-        int p2h = 8 + 20 + 4 + rowH * 3 + 8;
+        int p2h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
+        {
+            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
+            int comboX = swX - comboW;
+            if (g_dropClose) {
+                const wchar_t* names[2];
+                names[0] = T(L"直接退出程序", L"Exit program");
+                names[1] = T(L"隐藏到系统托盘", L"Hide to tray");
+                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 2, g_closeToTray ? 1 : 0, g_dropCloseHov);
+            }
+        }
         py += p2h + 10;
         int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 4 + rowH + 8;
         {
@@ -1830,6 +1878,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     int x0 = tabX + tabW + 16, yy = hdr + 16, cw = W - x0 - 16;
     int rowH = (int)(26 * dpi);
     int panelPad = 12, comboW = (int)(150 * dpi), comboH = (int)(24 * dpi);
+    int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
+    int swX = x0 + cw - panelPad - swW;
     if (g_sTab == 0) {
         int py = yy;
         int p1h = 8 + 20 + 4 + rowH + 8;
@@ -1838,13 +1888,20 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_AUTO;
         }
         py += p1h + 10;
-        int p2h = 8 + 20 + 4 + rowH * 3 + 8;
+        int p2h = 8 + 20 + 4 + comboH + 6 + rowH + 8;
         {
             int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_CLOSE_DIRECT;
-            iy += rowH;
-            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_CLOSE_TRAY;
-            iy += rowH;
+            int comboY = iy;
+            int comboX = swX - comboW;
+            if (g_dropClose) {
+                int ly = comboY + comboH + 2;
+                for (int i = 0; i < 2; i++) {
+                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_CLOSE_OPT0 + i;
+                    ly += comboH;
+                }
+            }
+            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_CLOSE_DROP;
+            iy += comboH + 6;
             if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_REMEMBER;
         }
         py += p2h + 10;
@@ -1928,8 +1985,9 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             }
         }
     } else if (g_sTab == 2) {
-        int uy = H - (int)(56 * dpi);
-        if (x >= x0 && x < x0 + cw && y >= uy + (int)(20 * dpi) && y < uy + (int)(38 * dpi)) return S_HIT_URL;
+        int uy = H - (int)(64 * dpi);
+        if (x >= x0 && x < x0 + cw && y >= uy && y < uy + (int)(18 * dpi)) return S_HIT_URL;
+        if (x >= x0 && x < x0 + cw && y >= uy + (int)(22 * dpi) && y < uy + (int)(40 * dpi)) return S_HIT_FEEDBACK;
     }
     return S_HIT_NONE;
 }
@@ -2054,12 +2112,20 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     BOOL layoutChanged = FALSE;
     switch (hit) {
     case S_HIT_AUTO: g_af = !g_af; break;
-    case S_HIT_CLOSE_DIRECT: g_closeToTray = FALSE; if (g_rememberClose) SaveCloseSettings(); break;
-    case S_HIT_CLOSE_TRAY:   g_closeToTray = TRUE;  if (g_rememberClose) SaveCloseSettings(); break;
+    case S_HIT_CLOSE_DROP:
+        g_dropClose = !g_dropClose;
+        if (g_dropClose) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropCloseHov = -1; }
+        break;
+    case S_HIT_CLOSE_OPT0:
+    case S_HIT_CLOSE_OPT1:
+        g_closeToTray = (hit == S_HIT_CLOSE_OPT1);
+        g_dropClose = FALSE;
+        if (g_rememberClose) SaveCloseSettings();
+        break;
     case S_HIT_REMEMBER:     g_rememberClose = !g_rememberClose; SaveCloseSettings(); break;
     case S_HIT_LAYOUT_DROP:
         g_dropLayout = !g_dropLayout;
-        if (g_dropLayout) { g_dropTheme = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropLayoutHov = -1; }
+        if (g_dropLayout) { g_dropTheme = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLayoutHov = -1; }
         break;
     case S_HIT_LAYOUT_OPT0:
     case S_HIT_LAYOUT_OPT1:
@@ -2076,7 +2142,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_THEME_DROP:
         g_dropTheme = !g_dropTheme;
-        if (g_dropTheme) { g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropThemeHov = -1; }
+        if (g_dropTheme) { g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropThemeHov = -1; }
         break;
     case S_HIT_THEME_OPT0:
     case S_HIT_THEME_OPT1:
@@ -2086,7 +2152,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_HIDEDELAY_DROP:
         g_dropHideDelay = !g_dropHideDelay;
-        if (g_dropHideDelay) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropHideDelayHov = -1; }
+        if (g_dropHideDelay) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropHideDelayHov = -1; }
         break;
     case S_HIT_HIDEDELAY_OPT0:
     case S_HIT_HIDEDELAY_OPT0 + 1:
@@ -2100,7 +2166,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_LANG_DROP:
         g_dropLang = !g_dropLang;
-        if (g_dropLang) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropHl = FALSE; g_dropLangHov = -1; }
+        if (g_dropLang) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLangHov = -1; }
         break;
     case S_HIT_LANG_OPT0:
     case S_HIT_LANG_OPT1:
@@ -2111,7 +2177,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_HL_DROP:
         g_dropHl = !g_dropHl;
-        if (g_dropHl) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHlHov = -1; }
+        if (g_dropHl) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropClose = FALSE; g_dropHlHov = -1; }
         break;
     case S_HIT_HL_OPT0:
     case S_HIT_HL_OPT1:
@@ -2143,6 +2209,9 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     case S_HIT_URL:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard", NULL, NULL, SW_SHOWNORMAL);
         break;
+    case S_HIT_FEEDBACK:
+        ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/issues", NULL, NULL, SW_SHOWNORMAL);
+        break;
     default: return;
     }
     if (themeChanged) {
@@ -2165,18 +2234,20 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropHideDelay = FALSE;
         g_dropLang = FALSE;
         g_dropHl = FALSE;
+        g_dropClose = FALSE;
         InvalidateRect(hWnd, NULL, TRUE);
         return;
     }
     if (hit != S_HIT_NONE) {
         SettingsApplyHit(hWnd, hit);
-    } else if (g_dropTheme || g_dropLayout || g_dropHideDelay || g_dropLang || g_dropHl) {
+    } else if (g_dropTheme || g_dropLayout || g_dropHideDelay || g_dropLang || g_dropHl || g_dropClose) {
         // 点击空白处关闭下拉
         g_dropTheme = FALSE;
         g_dropLayout = FALSE;
         g_dropHideDelay = FALSE;
         g_dropLang = FALSE;
         g_dropHl = FALSE;
+        g_dropClose = FALSE;
         InvalidateRect(hWnd, NULL, TRUE);
     }
 }
@@ -2211,13 +2282,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         int hhov = (hov >= S_HIT_HIDEDELAY_OPT0 && hov <= S_HIT_HIDEDELAY_OPT0 + 5) ? hov - S_HIT_HIDEDELAY_OPT0 : -1;
         int langov = (hov >= S_HIT_LANG_OPT0 && hov <= S_HIT_LANG_OPT1) ? hov - S_HIT_LANG_OPT0 : -1;
         int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT0 + 2) ? hov - S_HIT_HL_OPT0 : -1;
+        int clov = (hov >= S_HIT_CLOSE_OPT0 && hov <= S_HIT_CLOSE_OPT1) ? hov - S_HIT_CLOSE_OPT0 : -1;
         if (thov != g_dropThemeHov || lhov != g_dropLayoutHov || hhov != g_dropHideDelayHov ||
-            langov != g_dropLangHov || hlov != g_dropHlHov) {
+            langov != g_dropLangHov || hlov != g_dropHlHov || clov != g_dropCloseHov) {
             g_dropThemeHov = thov;
             g_dropLayoutHov = lhov;
             g_dropHideDelayHov = hhov;
             g_dropLangHov = langov;
             g_dropHlHov = hlov;
+            g_dropCloseHov = clov;
             InvalidateRect(hWnd, NULL, TRUE);
         }
         return 0;
@@ -2226,9 +2299,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hWnd, &pt);
-        if (g_sTab == 2 && SettingsHitTest(hWnd, pt.x, pt.y) == S_HIT_URL) {
-            SetCursor(LoadCursor(NULL, IDC_HAND));
-            return TRUE;
+        if (g_sTab == 2) {
+            int hv = SettingsHitTest(hWnd, pt.x, pt.y);
+            if (hv == S_HIT_URL || hv == S_HIT_FEEDBACK) {
+                SetCursor(LoadCursor(NULL, IDC_HAND));
+                return TRUE;
+            }
         }
         break;
     }
@@ -2285,6 +2361,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_dropHideDelay = FALSE;
         g_dropLang = FALSE;
         g_dropHl = FALSE;
+        g_dropClose = FALSE;
         g_hlEditFocus = FALSE;
         return 0;
     }
@@ -2355,8 +2432,10 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1, C_BG);
     DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sf13, C_WHITE);
     y += rowH + (int)(4 * dpi);
-    DrawCheck(dc, x0, y + (int)(2 * dpi), (int)(16 * dpi), g_pRemember);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"记住我的选择", L"Remember my choice"), g_sf13, C_WHITE);
+    int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
+    int swX = x0 + cw - swW;
+    DrawSwitch(dc, swX, y + (rowH - swH) / 2, swW, swH, g_pRemember);
+    DrawTextL(dc, x0, y, (swX - 12) - x0, rowH, T(L"记住我的选择", L"Remember my choice"), g_sf13, C_WHITE);
     y += rowH + (int)(8 * dpi);
     int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
@@ -2969,6 +3048,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         if (pSetDPIAware) pSetDPIAware();
     }
 
+    InitGdiPlus();       // 初始化 GDI+ （抗锯齿圆形绘图）
     LoadEmbeddedFonts();   // 注册内嵌字体（阿里巴巴普惠体精简版），失败自动回退系统字体
     InitFixedFonts();      // 设置/关闭窗口固定字号字体
 
@@ -3059,5 +3139,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
     if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
     if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
+    ShutdownGdiPlus();
     return (int)msg.wParam;
 }

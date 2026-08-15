@@ -221,6 +221,17 @@ static void RefreshThemeAndRepaint(HWND hWnd) {
 #define C_WHITE        (g_theme->text)
 #define C_DIM          (g_theme->dim)
 
+// DWM backdrop can resolve to a light surface independently of the Windows
+// theme query. Use the palette actually being rendered and force normal text
+// to pure black on light Mica/Acrylic surfaces.
+static DWORD ResolveFontColor(DWORD color) {
+    if (g_materialMode != 0 && g_theme->bg == g_lightTheme.bg &&
+        (color == g_theme->text || color == g_theme->dim)) {
+        return RGB(0, 0, 0);
+    }
+    return color;
+}
+
 enum KeyType {
     K_NORMAL, K_LETTER, K_MOD, K_CAPS,
     K_SPECIAL, K_ARROW, K_SPACE, K_HIDE, K_DOCK, K_MIN, K_CLOSE
@@ -1004,7 +1015,7 @@ static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, c);
+    SetTextColor(dc, ResolveFontColor(c));
     DrawTextW(dc, s, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -1019,14 +1030,14 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     RECT rt = {x, y, x + w, y + h / 2};
     SelectObject(dc, fShift);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, shiftC);
+    SetTextColor(dc, ResolveFontColor(shiftC));
     DrawTextW(dc, buf, -1, &rt, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     // 主字符（键下半部）
     buf[0] = baseCh;
     RECT rb = {x, y + h / 2, x + w, y + h};
     SelectObject(dc, fBase);
-    SetTextColor(dc, baseC);
+    SetTextColor(dc, ResolveFontColor(baseC));
     DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -1768,7 +1779,7 @@ static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, c);
+    SetTextColor(dc, ResolveFontColor(c));
     DrawTextW(dc, s, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -1942,7 +1953,7 @@ static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
     RECT r = {x, y, x + size, y + size};
     SelectObject(dc, g_sfIcon);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, C_WHITE);
+    SetTextColor(dc, ResolveFontColor(C_WHITE));
     DrawTextW(dc, glyphs[kind], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 

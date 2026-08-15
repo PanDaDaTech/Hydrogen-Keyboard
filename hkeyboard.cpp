@@ -139,22 +139,8 @@ static BOOL IsSystemDarkMode() {
     return (val == 0);
 }
 
-static BOOL IsSystemBackdropDarkMode() {
-    HKEY hKey;
-    DWORD val = 1, sz = sizeof(val);
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegQueryValueExW(hKey, L"SystemUsesLightTheme", NULL, NULL, (LPBYTE)&val, &sz);
-        RegCloseKey(hKey);
-    }
-    return val == 0;
-}
-
 static BOOL IsDarkThemeActive() {
-    if (g_themeMode == 1) return TRUE;
-    if (g_themeMode == 2) return FALSE;
-    return g_materialMode != 0 ? IsSystemBackdropDarkMode() : IsSystemDarkMode();
+    return g_themeMode == 1 || (g_themeMode == 0 && IsSystemDarkMode());
 }
 
 // 读取系统壁纸自动派生的强调色并转为 GDI COLORREF (BGR)。
@@ -937,7 +923,6 @@ static void ApplyWindowMaterial(HWND hWnd) {
     SetWindowCompositionAttributeProc setComposition = GetSetWindowCompositionAttribute();
     BOOL applied = FALSE;
     BOOL extendBackdrop = FALSE;
-    BOOL acrylicApplied = FALSE;
 
     // Fully reset the previous material first. Mica and Acrylic use different
     // composition paths and otherwise leak state into each other when switched.
@@ -960,7 +945,7 @@ static void ApplyWindowMaterial(HWND hWnd) {
 
     if (setAttr) {
         const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE = 20;
-        BOOL dark = IsDarkThemeActive();
+        BOOL dark = g_theme->bg == g_darkTheme.bg;
         if (FAILED(setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE, &dark, sizeof(dark)))) {
             const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE = 19;
             setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE, &dark, sizeof(dark));
@@ -972,40 +957,32 @@ static void ApplyWindowMaterial(HWND hWnd) {
         return;
     }
 
-    if (setAttr) {
-        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int backdrop = 2;
-        if (g_materialMode == 1 && SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
-                                                     &backdrop, sizeof(backdrop)))) {
+    // Use one composition path for both materials. The tint comes from the
+    // application's active palette, so backdrop and text can never disagree.
+    if (setComposition) {
+        AccentPolicyLocal policy = {0, 0, 0, 0};
+        BOOL dark = g_theme->bg == g_darkTheme.bg;
+        policy.state = g_materialMode == 1 ? 5 : 4; // HOSTBACKDROP / ACRYLICBLURBEHIND
+        policy.flags = 2;
+        DWORD tintAlpha;
+        if (g_materialMode == 1) tintAlpha = dark ? 0xE0 : 0xE4;
+        else tintAlpha = dark ? 0xC0 : 0xC8;
+        policy.gradientColor = (tintAlpha << 24) | (C_BG & 0x00FFFFFF);
+        WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
+        if (setComposition(hWnd, &data)) {
             applied = TRUE;
-            extendBackdrop = TRUE;
-        }
-
-        // Windows 11 Acrylic-style transient backdrop. Prefer this path so
-        // Mica/Acrylic transitions remain within the same DWM state machine.
-        int acrylicBackdrop = 3;
-        if (g_materialMode == 2 && SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
-                                                     &acrylicBackdrop, sizeof(acrylicBackdrop)))) {
-            applied = TRUE;
-            acrylicApplied = TRUE;
             extendBackdrop = TRUE;
         }
     }
 
-    // Windows 10 fallback: use AccentPolicy with a theme-colored tint.
-    if (!acrylicApplied && setComposition) {
-        AccentPolicyLocal policy = {0, 0, 0, 0};
-        if (g_materialMode == 2) {
-            policy.state = 4; // ACCENT_ENABLE_ACRYLICBLURBEHIND
-            policy.flags = 2;
-            DWORD tintAlpha = IsDarkThemeActive() ? 0xD8 : 0xCC;
-            policy.gradientColor = (tintAlpha << 24) | (C_BG & 0x00FFFFFF);
-            WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
-            if (setComposition(hWnd, &data)) {
-                applied = TRUE;
-                acrylicApplied = TRUE;
-                extendBackdrop = TRUE;
-            }
+    // Compatibility fallback for systems that reject AccentPolicy.
+    if (!applied && setAttr) {
+        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
+        int backdrop = g_materialMode == 1 ? 2 : 3;
+        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
+                              &backdrop, sizeof(backdrop)))) {
+            applied = TRUE;
+            extendBackdrop = TRUE;
         }
     }
 
@@ -1026,7 +1003,34 @@ static void ApplyAllWindowMaterials() {
     ApplyWindowMaterial(g_closePromptHwnd);
 }
 
+static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
+                             const wchar_t* text, HFONT font, DWORD color,
+                             Gdiplus::StringAlignment alignment) {
+    if (g_materialMode == 0 || !text || !font || w <= 0 || h <= 0) return FALSE;
+
+    LOGFONTW lf = {};
+    if (GetObjectW(font, sizeof(lf), &lf) == 0) return FALSE;
+
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    Gdiplus::Font gpFont(dc, &lf);
+    if (gpFont.GetLastStatus() != Gdiplus::Ok) return FALSE;
+
+    DWORD resolved = ResolveFontColor(color);
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(resolved),
+                                             GetGValue(resolved), GetBValue(resolved)));
+    Gdiplus::StringFormat format(*Gdiplus::StringFormat::GenericTypographic());
+    format.SetAlignment(alignment);
+    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    format.SetFormatFlags(format.GetFormatFlags() | Gdiplus::StringFormatFlagsNoWrap);
+    Gdiplus::RectF bounds((Gdiplus::REAL)x, (Gdiplus::REAL)y,
+                          (Gdiplus::REAL)w, (Gdiplus::REAL)h);
+    graphics.DrawString(text, -1, &gpFont, bounds, &format, &brush);
+    return TRUE;
+}
+
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
+    if (DrawMaterialText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentCenter)) return;
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
@@ -1043,17 +1047,23 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     // 副符号（键上半部）
     buf[0] = shiftCh;
     RECT rt = {x, y, x + w, y + h / 2};
-    SelectObject(dc, fShift);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, ResolveFontColor(shiftC));
-    DrawTextW(dc, buf, -1, &rt, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (!DrawMaterialText(dc, rt.left, rt.top, rt.right - rt.left, rt.bottom - rt.top,
+                          buf, fShift, shiftC, Gdiplus::StringAlignmentCenter)) {
+        SelectObject(dc, fShift);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, ResolveFontColor(shiftC));
+        DrawTextW(dc, buf, -1, &rt, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
 
     // 主字符（键下半部）
     buf[0] = baseCh;
     RECT rb = {x, y + h / 2, x + w, y + h};
-    SelectObject(dc, fBase);
-    SetTextColor(dc, ResolveFontColor(baseC));
-    DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (!DrawMaterialText(dc, rb.left, rb.top, rb.right - rb.left, rb.bottom - rb.top,
+                          buf, fBase, baseC, Gdiplus::StringAlignmentCenter)) {
+        SelectObject(dc, fBase);
+        SetTextColor(dc, ResolveFontColor(baseC));
+        DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
 }
 
 // 判断 BGR 颜色是否为浅色，用于在高亮按钮上自动选择深/浅色文字以保证可读性
@@ -1791,6 +1801,7 @@ static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
 static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
+    if (DrawMaterialText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear)) return;
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
@@ -1966,6 +1977,8 @@ static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
         L"\xE790"  // Color
     };
     RECT r = {x, y, x + size, y + size};
+    if (DrawMaterialText(dc, x, y, size, size, glyphs[kind], g_sfIcon,
+                         C_WHITE, Gdiplus::StringAlignmentCenter)) return;
     SelectObject(dc, g_sfIcon);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, ResolveFontColor(C_WHITE));

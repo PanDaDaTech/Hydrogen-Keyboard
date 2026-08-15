@@ -139,8 +139,22 @@ static BOOL IsSystemDarkMode() {
     return (val == 0);
 }
 
+static BOOL IsSystemBackdropDarkMode() {
+    HKEY hKey;
+    DWORD val = 1, sz = sizeof(val);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"SystemUsesLightTheme", NULL, NULL, (LPBYTE)&val, &sz);
+        RegCloseKey(hKey);
+    }
+    return val == 0;
+}
+
 static BOOL IsDarkThemeActive() {
-    return g_themeMode == 1 || (g_themeMode == 0 && IsSystemDarkMode());
+    if (g_themeMode == 1) return TRUE;
+    if (g_themeMode == 2) return FALSE;
+    return g_materialMode != 0 ? IsSystemBackdropDarkMode() : IsSystemDarkMode();
 }
 
 // 读取系统壁纸自动派生的强调色并转为 GDI COLORREF (BGR)。
@@ -772,10 +786,17 @@ static void RecreateFontsAndLayout() {
 }
 
 static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
-    RECT r = {x, y, x + w, y + h};
-    HBRUSH br = CreateSolidBrush(c);
-    FillRect(dc, &r, br);
-    DeleteObject(br);
+    if (w <= 0 || h <= 0) return;
+    Gdiplus::Graphics graphics(dc);
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)));
+    graphics.FillRectangle(&brush, x, y, w, h);
+}
+
+static void DrawLineAA(HDC dc, int x1, int y1, int x2, int y2, DWORD color, float width) {
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)), width);
+    graphics.DrawLine(&pen, x1, y1, x2, y2);
 }
 
 static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD borderC, int radius) {
@@ -810,6 +831,11 @@ typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND, DWORD, LPCVOID, DWORD)
 struct DwmMarginsLocal { int left, right, top, bottom; };
 typedef HRESULT (WINAPI *DwmExtendFrameIntoClientAreaProc)(HWND, const DwmMarginsLocal*);
 typedef HRESULT (WINAPI *DwmFlushProc)();
+typedef HANDLE PaintBufferHandleLocal;
+typedef HRESULT (WINAPI *BufferedPaintInitProc)();
+typedef PaintBufferHandleLocal (WINAPI *BeginBufferedPaintProc)(HDC, const RECT*, int, const void*, HDC*);
+typedef HRESULT (WINAPI *EndBufferedPaintProc)(PaintBufferHandleLocal, BOOL);
+typedef HRESULT (WINAPI *BufferedPaintClearProc)(PaintBufferHandleLocal, const RECT*);
 
 struct AccentPolicyLocal {
     int state;
@@ -860,6 +886,33 @@ static DwmFlushProc GetDwmFlush() {
     return proc;
 }
 
+struct BufferedPaintApiLocal {
+    BufferedPaintInitProc init;
+    BeginBufferedPaintProc begin;
+    EndBufferedPaintProc end;
+    BufferedPaintClearProc clear;
+};
+
+static const BufferedPaintApiLocal* GetBufferedPaintApi() {
+    static HMODULE module = NULL;
+    static BufferedPaintApiLocal api = {};
+    static BOOL initialized = FALSE;
+    if (!initialized) {
+        initialized = TRUE;
+        module = LoadLibraryW(L"uxtheme.dll");
+        if (module) {
+            api.init = (BufferedPaintInitProc)GetProcAddress(module, "BufferedPaintInit");
+            api.begin = (BeginBufferedPaintProc)GetProcAddress(module, "BeginBufferedPaint");
+            api.end = (EndBufferedPaintProc)GetProcAddress(module, "EndBufferedPaint");
+            api.clear = (BufferedPaintClearProc)GetProcAddress(module, "BufferedPaintClear");
+            if (!api.init || !api.begin || !api.end || FAILED(api.init())) {
+                ZeroMemory(&api, sizeof(api));
+            }
+        }
+    }
+    return api.begin ? &api : NULL;
+}
+
 static SetWindowCompositionAttributeProc GetSetWindowCompositionAttribute() {
     static SetWindowCompositionAttributeProc proc = NULL;
     static BOOL initialized = FALSE;
@@ -900,9 +953,65 @@ static BOOL IsMaterialApplied(HWND hWnd) {
     return hWnd && GetPropW(hWnd, L"HKeyboardMaterial") != NULL;
 }
 
+static BOOL g_alphaPaintActive = FALSE;
+
+struct WindowPaintSurfaceLocal {
+    HDC dc;
+    PaintBufferHandleLocal buffered;
+    HDC memory;
+    HBITMAP bitmap;
+    HBITMAP oldBitmap;
+    BOOL alpha;
+    BOOL previousAlpha;
+};
+
+static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, const RECT& rc) {
+    WindowPaintSurfaceLocal surface = {};
+    surface.previousAlpha = g_alphaPaintActive;
+
+    if (IsMaterialApplied(hWnd)) {
+        const BufferedPaintApiLocal* api = GetBufferedPaintApi();
+        if (api) {
+            HDC bufferedDc = NULL;
+            surface.buffered = api->begin(target, &rc, 2, NULL, &bufferedDc); // BPBF_TOPDOWNDIB
+            if (surface.buffered && bufferedDc) {
+                surface.dc = bufferedDc;
+                surface.alpha = TRUE;
+                g_alphaPaintActive = TRUE;
+                api->clear(surface.buffered, NULL);
+                return surface;
+            }
+        }
+    }
+
+    surface.memory = CreateCompatibleDC(target);
+    surface.bitmap = CreateCompatibleBitmap(target, rc.right - rc.left, rc.bottom - rc.top);
+    surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
+    surface.dc = surface.memory;
+    surface.alpha = FALSE;
+    return surface;
+}
+
+static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit) {
+    if (!surface) return;
+    if (surface->buffered) {
+        const BufferedPaintApiLocal* api = GetBufferedPaintApi();
+        if (api) api->end(surface->buffered, commit);
+        g_alphaPaintActive = surface->previousAlpha;
+        return;
+    }
+    if (surface->memory) {
+        SelectObject(surface->memory, surface->oldBitmap);
+        if (surface->bitmap) DeleteObject(surface->bitmap);
+        DeleteDC(surface->memory);
+    }
+    g_alphaPaintActive = surface->previousAlpha;
+}
+
 static void ClearWindowBackBuffer(HDC dc, HWND hWnd, int w, int h) {
     // DWM backdrop requires a clean glass surface. Copying the previous window DC
     // reintroduces stale pixels and causes Tab/page ghosting after every repaint.
+    if (IsMaterialApplied(hWnd) && g_alphaPaintActive) return;
     Fill(dc, 0, 0, w, h, IsMaterialApplied(hWnd) ? 0x000000 : C_BG);
 }
 
@@ -957,30 +1066,28 @@ static void ApplyWindowMaterial(HWND hWnd) {
         return;
     }
 
-    // Use one composition path for both materials. The tint comes from the
-    // application's active palette, so backdrop and text can never disagree.
-    if (setComposition) {
-        AccentPolicyLocal policy = {0, 0, 0, 0};
-        BOOL dark = g_theme->bg == g_darkTheme.bg;
-        policy.state = g_materialMode == 1 ? 5 : 4; // HOSTBACKDROP / ACRYLICBLURBEHIND
-        policy.flags = 2;
-        DWORD tintAlpha;
-        if (g_materialMode == 1) tintAlpha = dark ? 0xE0 : 0xE4;
-        else tintAlpha = dark ? 0xC0 : 0xC8;
-        policy.gradientColor = (tintAlpha << 24) | (C_BG & 0x00FFFFFF);
-        WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
-        if (setComposition(hWnd, &data)) {
+    // Windows 11 native backdrops. Mica and Acrylic stay on the same DWM path.
+    if (setAttr) {
+        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
+        int backdrop = g_materialMode == 1 ? 2 : 3;
+        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
+                              &backdrop, sizeof(backdrop)))) {
             applied = TRUE;
             extendBackdrop = TRUE;
         }
     }
 
-    // Compatibility fallback for systems that reject AccentPolicy.
-    if (!applied && setAttr) {
-        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int backdrop = g_materialMode == 1 ? 2 : 3;
-        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
-                              &backdrop, sizeof(backdrop)))) {
+    // Compatibility fallback for Windows 10 or older Win11 builds.
+    if (!applied && setComposition) {
+        AccentPolicyLocal policy = {0, 0, 0, 0};
+        BOOL dark = g_theme->bg == g_darkTheme.bg;
+        policy.state = g_materialMode == 1 ? 5 : 4;
+        policy.flags = 2;
+        DWORD tintAlpha = g_materialMode == 1 ? (dark ? 0xE0 : 0xE4)
+                                               : (dark ? 0xC0 : 0xC8);
+        policy.gradientColor = (tintAlpha << 24) | (C_BG & 0x00FFFFFF);
+        WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
+        if (setComposition(hWnd, &data)) {
             applied = TRUE;
             extendBackdrop = TRUE;
         }
@@ -2257,11 +2364,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     {
         int cx = m.closeX + m.closeW / 2, cy = m.closeY + m.closeH / 2;
         int r = (int)(5 * m.dpi);
-        HPEN pen = CreatePen(PS_SOLID, 2, C_DIM);
-        HPEN old = (HPEN)SelectObject(dc, pen);
-        MoveToEx(dc, cx - r, cy - r, NULL); LineTo(dc, cx + r, cy + r);
-        MoveToEx(dc, cx + r, cy - r, NULL); LineTo(dc, cx - r, cy + r);
-        SelectObject(dc, old); DeleteObject(pen);
+        DrawLineAA(dc, cx - r, cy - r, cx + r, cy + r, C_DIM, 2.0f);
+        DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
     }
 
     int tabX = m.margin;
@@ -3013,13 +3117,12 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-        ClearWindowBackBuffer(mem, hWnd, rc.right, rc.bottom);
-        SettingsDraw(mem, hWnd);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+        WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+        ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        SettingsDraw(surface.dc, hWnd);
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface, TRUE);
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -3201,10 +3304,8 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     DrawRoundRect(dc, bx, by, bw, bh, (g_pHov == P_HIT_CLOSE) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
     int mx = bx + bw / 2, my = by + bh / 2, r = (int)(5 * dpi);
-    HPEN pen = CreatePen(PS_SOLID, 2, C_DIM); HPEN op = (HPEN)SelectObject(dc, pen);
-    MoveToEx(dc, mx - r, my - r, NULL); LineTo(dc, mx + r, my + r);
-    MoveToEx(dc, mx + r, my - r, NULL); LineTo(dc, mx - r, my + r);
-    SelectObject(dc, op); DeleteObject(pen);
+    DrawLineAA(dc, mx - r, my - r, mx + r, my + r, C_DIM, 2.0f);
+    DrawLineAA(dc, mx + r, my - r, mx - r, my + r, C_DIM, 2.0f);
 
     int x0 = 20, y = hdr + 12, cw = W - 40;
     int rowH = (int)(24 * dpi);
@@ -3296,13 +3397,12 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-        ClearWindowBackBuffer(mem, hWnd, rc.right, rc.bottom);
-        PromptDraw(mem, hWnd);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+        WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+        ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        PromptDraw(surface.dc, hWnd);
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface, TRUE);
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -3788,16 +3888,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, g_ww, g_wh);
-        HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-
-        ClearWindowBackBuffer(mem, hWnd, g_ww, g_wh);
-        DrawHeader(mem);
-        DrawKeys(mem);
-
-        BitBlt(dc, 0, 0, g_ww, g_wh, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+        RECT rc = {0, 0, g_ww, g_wh};
+        WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+        ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
+        DrawHeader(surface.dc);
+        DrawKeys(surface.dc);
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, g_ww, g_wh, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface, TRUE);
         EndPaint(hWnd, &ps);
         return 0;
     }

@@ -1019,10 +1019,10 @@ static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
     DWORD resolved = ResolveFontColor(color);
     Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(resolved),
                                              GetGValue(resolved), GetBValue(resolved)));
-    Gdiplus::StringFormat format(*Gdiplus::StringFormat::GenericTypographic());
+    Gdiplus::StringFormat format;
     format.SetAlignment(alignment);
     format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    format.SetFormatFlags(format.GetFormatFlags() | Gdiplus::StringFormatFlagsNoWrap);
+    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
     Gdiplus::RectF bounds((Gdiplus::REAL)x, (Gdiplus::REAL)y,
                           (Gdiplus::REAL)w, (Gdiplus::REAL)h);
     graphics.DrawString(text, -1, &gpFont, bounds, &format, &brush);

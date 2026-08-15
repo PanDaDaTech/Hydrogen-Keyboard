@@ -911,7 +911,7 @@ static void ApplyWindowMaterial(HWND hWnd) {
     SetWindowCompositionAttributeProc setComposition = GetSetWindowCompositionAttribute();
     BOOL applied = FALSE;
     BOOL extendBackdrop = FALSE;
-    BOOL acrylicAccent = FALSE;
+    BOOL acrylicApplied = FALSE;
 
     // Fully reset the previous material first. Mica and Acrylic use different
     // composition paths and otherwise leak state into each other when switched.
@@ -941,9 +941,7 @@ static void ApplyWindowMaterial(HWND hWnd) {
         }
     }
 
-    // GDI does not preserve the alpha channel required for a readable light
-    // backdrop. Keep the selected mode, but use the stable opaque light surface.
-    if (g_materialMode == 0 || !IsDarkThemeActive()) {
+    if (g_materialMode == 0) {
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
         return;
     }
@@ -956,31 +954,32 @@ static void ApplyWindowMaterial(HWND hWnd) {
             applied = TRUE;
             extendBackdrop = TRUE;
         }
+
+        // Windows 11 Acrylic-style transient backdrop. Prefer this path so
+        // Mica/Acrylic transitions remain within the same DWM state machine.
+        int acrylicBackdrop = 3;
+        if (g_materialMode == 2 && SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
+                                                     &acrylicBackdrop, sizeof(acrylicBackdrop)))) {
+            applied = TRUE;
+            acrylicApplied = TRUE;
+            extendBackdrop = TRUE;
+        }
     }
 
-    // Acrylic uses an explicit theme-colored tint to preserve contrast.
-    if (setComposition) {
+    // Windows 10 fallback: use AccentPolicy with a theme-colored tint.
+    if (!acrylicApplied && setComposition) {
         AccentPolicyLocal policy = {0, 0, 0, 0};
         if (g_materialMode == 2) {
             policy.state = 4; // ACCENT_ENABLE_ACRYLICBLURBEHIND
             policy.flags = 2;
-            policy.gradientColor = 0xE8000000 | (C_BG & 0x00FFFFFF);
+            DWORD tintAlpha = IsDarkThemeActive() ? 0xD8 : 0xCC;
+            policy.gradientColor = (tintAlpha << 24) | (C_BG & 0x00FFFFFF);
             WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
             if (setComposition(hWnd, &data)) {
                 applied = TRUE;
-                acrylicAccent = TRUE;
+                acrylicApplied = TRUE;
                 extendBackdrop = TRUE;
             }
-        }
-    }
-
-    // If Acrylic accent is unavailable, use the Win11 transient backdrop.
-    if (g_materialMode == 2 && !acrylicAccent && setAttr) {
-        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int backdrop = 3;
-        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop)))) {
-            applied = TRUE;
-            extendBackdrop = TRUE;
         }
     }
 

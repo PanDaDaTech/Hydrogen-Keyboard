@@ -7,6 +7,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <objbase.h>
+#include <oleacc.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -58,7 +59,6 @@ int g_keyHeight = 46;
 #define TIMER_SLIDE     8823
 #define TIMER_REPEAT    8826
 #define TIMER_SETTINGS_ANIM 8827
-#define MANUAL_HIDE_GRACE_MS 3000   // 手动显示后自动隐藏宽限期（毫秒）
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 
@@ -137,6 +137,10 @@ static BOOL IsSystemDarkMode() {
         RegCloseKey(hKey);
     }
     return (val == 0);
+}
+
+static BOOL IsDarkThemeActive() {
+    return g_themeMode == 1 || (g_themeMode == 0 && IsSystemDarkMode());
 }
 
 // 读取系统壁纸自动派生的强调色并转为 GDI COLORREF (BGR)。
@@ -244,12 +248,13 @@ static HWND g_closePromptHwnd = 0;
 HICON       g_hTrayIcon = 0;
 BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
-DWORD       g_manualShowTick = 0;        // 手动显示时刻（自动隐藏宽限期用）
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
 BOOL        g_autoMinimized = FALSE;   // 标题栏最小化后抑制当前输入框再次自动呼出
-HWND        g_suppressedInput = NULL;  // 最小化时仍保持焦点的输入控件
+ULONG_PTR   g_suppressedInputToken = 0; // 最小化时仍保持焦点的输入控件标识
+ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
 int         g_hideDelayMs = 500;       // 自动隐藏延迟（毫秒）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
+DWORD       g_inputLostTick = 0;       // 最小化抑制仅在稳定离开输入框后解除
 
 // 语言切换：g_lang=0 简体中文，1 English；返回当前语言对应的文案
 static const wchar_t* T(const wchar_t* zh, const wchar_t* en) { return g_lang ? en : zh; }
@@ -792,6 +797,7 @@ static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD
 typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND, DWORD, LPCVOID, DWORD);
 struct DwmMarginsLocal { int left, right, top, bottom; };
 typedef HRESULT (WINAPI *DwmExtendFrameIntoClientAreaProc)(HWND, const DwmMarginsLocal*);
+typedef HRESULT (WINAPI *DwmFlushProc)();
 
 struct AccentPolicyLocal {
     int state;
@@ -826,6 +832,18 @@ static DwmExtendFrameIntoClientAreaProc GetDwmExtendFrameIntoClientArea() {
         initialized = TRUE;
         dwm = LoadLibraryW(L"dwmapi.dll");
         if (dwm) proc = (DwmExtendFrameIntoClientAreaProc)GetProcAddress(dwm, "DwmExtendFrameIntoClientArea");
+    }
+    return proc;
+}
+
+static DwmFlushProc GetDwmFlush() {
+    static HMODULE dwm = NULL;
+    static DwmFlushProc proc = NULL;
+    static BOOL initialized = FALSE;
+    if (!initialized) {
+        initialized = TRUE;
+        dwm = LoadLibraryW(L"dwmapi.dll");
+        if (dwm) proc = (DwmFlushProc)GetProcAddress(dwm, "DwmFlush");
     }
     return proc;
 }
@@ -889,32 +907,58 @@ static void ApplyWindowMaterial(HWND hWnd) {
 
     DwmSetWindowAttributeProc setAttr = GetDwmSetWindowAttribute();
     DwmExtendFrameIntoClientAreaProc extendFrame = GetDwmExtendFrameIntoClientArea();
+    DwmFlushProc flush = GetDwmFlush();
     SetWindowCompositionAttributeProc setComposition = GetSetWindowCompositionAttribute();
     BOOL applied = FALSE;
     BOOL extendBackdrop = FALSE;
     BOOL acrylicAccent = FALSE;
 
+    // Fully reset the previous material first. Mica and Acrylic use different
+    // composition paths and otherwise leak state into each other when switched.
+    if (setComposition) {
+        AccentPolicyLocal disabled = {0, 0, 0, 0};
+        WindowCompositionAttribDataLocal data = {19, &disabled, sizeof(disabled)};
+        setComposition(hWnd, &data);
+    }
+    if (setAttr) {
+        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
+        int none = 1;
+        setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &none, sizeof(none));
+    }
+    if (extendFrame) {
+        DwmMarginsLocal margins = {0, 0, 0, 0};
+        extendFrame(hWnd, &margins);
+    }
+    RemovePropW(hWnd, L"HKeyboardMaterial");
+    if (flush) flush();
+
     if (setAttr) {
         const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE = 20;
-        BOOL dark = g_themeMode == 1 || (g_themeMode == 0 && IsSystemDarkMode());
+        BOOL dark = IsDarkThemeActive();
         if (FAILED(setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE, &dark, sizeof(dark)))) {
             const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE = 19;
             setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE, &dark, sizeof(dark));
         }
+    }
 
+    // GDI does not preserve the alpha channel required for a readable light
+    // backdrop. Keep the selected mode, but use the stable opaque light surface.
+    if (g_materialMode == 0 || !IsDarkThemeActive()) {
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+        return;
+    }
+
+    if (setAttr) {
         const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int backdrop = g_materialMode == 1 ? 2 : 1;
-        if (g_materialMode == 1 &&
-            SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop)))) {
+        int backdrop = 2;
+        if (g_materialMode == 1 && SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
+                                                     &backdrop, sizeof(backdrop)))) {
             applied = TRUE;
             extendBackdrop = TRUE;
-        } else {
-            backdrop = 1;
-            setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop));
         }
     }
 
-    // Acrylic uses an explicit theme-colored tint to preserve contrast in light mode.
+    // Acrylic uses an explicit theme-colored tint to preserve contrast.
     if (setComposition) {
         AccentPolicyLocal policy = {0, 0, 0, 0};
         if (g_materialMode == 2) {
@@ -927,10 +971,6 @@ static void ApplyWindowMaterial(HWND hWnd) {
                 acrylicAccent = TRUE;
                 extendBackdrop = TRUE;
             }
-        } else {
-            policy.state = 0; // ACCENT_DISABLED
-            WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
-            setComposition(hWnd, &data);
         }
     }
 
@@ -1540,10 +1580,10 @@ static void ShowKB(BOOL show, BOOL isManual) {
     if (show) {
         if (isManual) {
             g_manualShow = TRUE;
-            g_manualShowTick = GetTickCount();
             g_manualHide = FALSE;
             g_autoMinimized = FALSE;
-            g_suppressedInput = NULL;
+            g_suppressedInputToken = 0;
+            g_inputLostTick = 0;
         }
         if (g_vis) {
             SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -1677,6 +1717,9 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_HL_OPT1         62
 #define S_HIT_HL_OPT2         63
 #define S_HIT_HL_BOX          64
+#define S_HIT_HL_HUE          65
+#define S_HIT_HL_SAT          66
+#define S_HIT_HL_VAL          67
 #define S_HIT_HL_PAL0         80
 #define S_HIT_MATERIAL_DROP   90
 #define S_HIT_MATERIAL_OPT0   91
@@ -1702,6 +1745,7 @@ static BOOL g_dropMaterial = FALSE;     // 背景材质下拉
 static int  g_dropMaterialHov = -1;
 static BOOL g_hlEditFocus = FALSE;     // HEX 输入框是否处于编辑态
 static wchar_t g_hlEditBuf[8] = {0};   // 编辑中的 HEX 文本（#RRGGBB）
+static int g_hlSliderDrag = S_HIT_NONE;
 static const int g_hideDelayValues[6] = {0, 300, 500, 1000, 2000, 5000};
 static const wchar_t* g_hideDelayNames[6] = { L"立即隐藏", L"0.3 秒", L"0.5 秒", L"1 秒", L"2 秒", L"5 秒" };
 static const wchar_t* g_hideDelayNamesEn[6] = { L"Immediately", L"0.3 s", L"0.5 s", L"1 s", L"2 s", L"5 s" };
@@ -1837,25 +1881,32 @@ static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, i
     return above >= minY ? above : minY;
 }
 
-static RECT SettingsCustomColorRect(const SettingsMetrics& m) {
-    RECT r = SettingsRowRect(m, 3);
-    r.bottom = r.top + (int)(104 * m.dpi);
+static RECT SettingsHighlightRect(const SettingsMetrics& m, BOOL expanded) {
+    RECT r = SettingsRowRect(m, 2);
+    if (expanded) r.bottom = r.top + (int)(260 * m.dpi);
     return r;
 }
 
 static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
-    int w = (int)(144 * m.dpi), h = (int)(30 * m.dpi);
-    RECT r = {row.right - (int)(16 * m.dpi) - w, row.top + (int)(12 * m.dpi),
-              row.right - (int)(16 * m.dpi), row.top + (int)(12 * m.dpi) + h};
+    int w = (int)(150 * m.dpi), h = (int)(32 * m.dpi);
+    RECT r = {row.left + (int)(74 * m.dpi), row.top + (int)(216 * m.dpi),
+              row.left + (int)(74 * m.dpi) + w, row.top + (int)(216 * m.dpi) + h};
     return r;
 }
 
 static void SettingsPaletteMetrics(const SettingsMetrics& m, const RECT& row,
                                    int* x, int* y, int* size, int* gap) {
-    *x = row.left + (int)(52 * m.dpi);
-    *y = row.top + (int)(66 * m.dpi);
-    *size = (int)(20 * m.dpi);
-    *gap = (int)(7 * m.dpi);
+    *x = row.left + (int)(30 * m.dpi);
+    *y = row.top + (int)(70 * m.dpi);
+    *size = (int)(26 * m.dpi);
+    *gap = (int)(14 * m.dpi);
+}
+
+static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row, int index) {
+    int x = row.left + (int)(30 * m.dpi);
+    int y = row.top + (int)((112 + index * 36) * m.dpi);
+    RECT r = {x, y, row.right - (int)(30 * m.dpi), y + (int)(14 * m.dpi)};
+    return r;
 }
 
 static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
@@ -1947,13 +1998,114 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
     DrawRoundRect(dc, kx, y + 3, knob, knob, knobColor, knobColor, knob / 2);
 }
 
-// 高亮色板（RGB）：常用颜色供自定义时点选
-static const int g_paletteRgb[10] = {
-    0x0078D4, 0x107C10, 0xD13438, 0xCA5010, 0x8764B8,
-    0xE3008C, 0x00B7C3, 0xFCE100, 0x6A6A6A, 0x000000
+// 高亮色板（RGB）：与自定义编辑器顶部的常用主题色对应
+static const int g_paletteRgb[5] = {
+    0x3B82F6, 0x22C55E, 0x8B5CF6, 0xF43F5E, 0xB4A5F4
 };
 static DWORD RgbToBgr(int rgb) {
     return (DWORD)(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF));
+}
+
+static DWORD HsvToBgr(double hue, double sat, double val) {
+    while (hue < 0.0) hue += 360.0;
+    while (hue >= 360.0) hue -= 360.0;
+    if (sat < 0.0) sat = 0.0; if (sat > 1.0) sat = 1.0;
+    if (val < 0.0) val = 0.0; if (val > 1.0) val = 1.0;
+
+    double hh = hue / 60.0;
+    int sector = (int)hh;
+    double f = hh - sector;
+    double p = val * (1.0 - sat);
+    double q = val * (1.0 - sat * f);
+    double t = val * (1.0 - sat * (1.0 - f));
+    double r = val, g = t, b = p;
+    switch (sector % 6) {
+    case 0: r = val; g = t; b = p; break;
+    case 1: r = q; g = val; b = p; break;
+    case 2: r = p; g = val; b = t; break;
+    case 3: r = p; g = q; b = val; break;
+    case 4: r = t; g = p; b = val; break;
+    case 5: r = val; g = p; b = q; break;
+    }
+    return RGB((int)(r * 255.0 + 0.5), (int)(g * 255.0 + 0.5), (int)(b * 255.0 + 0.5));
+}
+
+static void BgrToHsv(DWORD bgr, double* hue, double* sat, double* val) {
+    double r = GetRValue(bgr) / 255.0;
+    double g = GetGValue(bgr) / 255.0;
+    double b = GetBValue(bgr) / 255.0;
+    double maxv = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    double minv = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    double delta = maxv - minv;
+    double h = 0.0;
+    if (delta > 0.0001) {
+        if (maxv == r) h = 60.0 * ((g - b) / delta);
+        else if (maxv == g) h = 60.0 * (2.0 + (b - r) / delta);
+        else h = 60.0 * (4.0 + (r - g) / delta);
+        if (h < 0.0) h += 360.0;
+    }
+    *hue = h;
+    *sat = maxv <= 0.0001 ? 0.0 : delta / maxv;
+    *val = maxv;
+}
+
+static Gdiplus::Color GpColorFromBgr(DWORD color) {
+    return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+static void DrawColorSlider(HDC dc, const RECT& r, int kind, double hue, double sat, double val) {
+    int w = r.right - r.left;
+    int h = r.bottom - r.top;
+    if (w <= 1 || h <= 1) return;
+
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+        Gdiplus::GraphicsPath path;
+        Gdiplus::REAL radius = (Gdiplus::REAL)h / 2.0f;
+        Gdiplus::REAL diameter = radius * 2.0f;
+        Gdiplus::REAL x = (Gdiplus::REAL)r.left + 0.5f;
+        Gdiplus::REAL y = (Gdiplus::REAL)r.top + 0.5f;
+        Gdiplus::REAL width = (Gdiplus::REAL)w - 1.0f;
+        Gdiplus::REAL height = (Gdiplus::REAL)h - 1.0f;
+        path.AddArc(x, y, diameter, diameter, 90.0f, 180.0f);
+        path.AddArc(x + width - diameter, y, diameter, diameter, 270.0f, 180.0f);
+        path.CloseFigure();
+        g.SetClip(&path);
+
+        if (kind == 0) {
+            for (int i = 0; i < 6; i++) {
+                Gdiplus::REAL left = x + width * (Gdiplus::REAL)i / 6.0f;
+                Gdiplus::REAL right = x + width * (Gdiplus::REAL)(i + 1) / 6.0f + 1.0f;
+                Gdiplus::LinearGradientBrush brush(
+                    Gdiplus::PointF(left, y), Gdiplus::PointF(right, y),
+                    GpColorFromBgr(HsvToBgr(i * 60.0, 1.0, 1.0)),
+                    GpColorFromBgr(HsvToBgr((i + 1) * 60.0, 1.0, 1.0)));
+                g.FillRectangle(&brush, left, y, right - left, height);
+            }
+        } else {
+            DWORD from = kind == 1 ? HsvToBgr(hue, 0.0, val) : HsvToBgr(hue, sat, 0.0);
+            DWORD to = kind == 1 ? HsvToBgr(hue, 1.0, val) : HsvToBgr(hue, sat, 1.0);
+            Gdiplus::LinearGradientBrush brush(
+                Gdiplus::PointF(x, y), Gdiplus::PointF(x + width, y),
+                GpColorFromBgr(from), GpColorFromBgr(to));
+            g.FillRectangle(&brush, x, y, width, height);
+        }
+        g.ResetClip();
+        Gdiplus::Pen border(GpColorFromBgr(C_KEY_BORDER), 1.0f);
+        g.DrawPath(&border, &path);
+    }
+
+    double selected = kind == 0 ? hue / 359.0 : (kind == 1 ? sat : val);
+    if (selected < 0.0) selected = 0.0; if (selected > 1.0) selected = 1.0;
+    int cx = r.left + (int)((w - 1) * selected + 0.5);
+    int cy = (r.top + r.bottom) / 2;
+    int radius = h / 2 + 3;
+    DrawCircleAA(dc, cx, cy, radius, C_WHITE);
+    DrawCircleAA(dc, cx, cy, radius - 2, kind == 0 ? HsvToBgr(hue, 1.0, 1.0) :
+                 (kind == 1 ? HsvToBgr(hue, sat, 1.0) : HsvToBgr(hue, sat, val)));
 }
 
 // 下拉框
@@ -2138,45 +2290,68 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   g_lang ? g_materialNamesEn[g_materialMode] : g_materialNames[g_materialMode],
                   g_dropMaterial, g_sHov == S_HIT_MATERIAL_DROP);
 
-        r = SettingsRowRect(m, 2);
-        DrawSettingRow(dc, r, 8, T(L"高亮颜色", L"Highlight Color"),
-                       T(L"使用默认颜色、壁纸强调色或自定义颜色", L"Use the default, wallpaper accent, or a custom color"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
+        BOOL customColor = HlSel() == 2;
+        r = SettingsHighlightRect(m, customColor);
+        DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, C_KEY, C_KEY_BORDER, 8);
+        DrawSettingsIcon(dc, r.left + (int)(14 * m.dpi), r.top + (int)(14 * m.dpi), 8);
+        int tx = r.left + (int)(52 * m.dpi);
+        int tw = r.right - tx - (int)(220 * m.dpi);
+        DrawTextL(dc, tx, r.top + (int)(5 * m.dpi), tw, (int)(20 * m.dpi),
+                  T(L"高亮颜色", L"Highlight Color"), g_sf14b, C_WHITE);
+        DrawTextL(dc, tx, r.top + (int)(27 * m.dpi), tw, (int)(18 * m.dpi),
+                  T(L"使用默认颜色、壁纸强调色或自定义颜色", L"Use the default, wallpaper accent, or a custom color"), g_sf12, C_DIM);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, SettingsRowRect(m, 2)),
+                  m.comboW, m.comboH, g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
                   g_dropHl, g_sHov == S_HIT_HL_DROP);
 
-        if (HlSel() == 2) {
-            r = SettingsCustomColorRect(m);
-            DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, C_KEY, C_KEY_BORDER, 8);
-            DrawSettingsIcon(dc, r.left + (int)(14 * m.dpi), r.top + (int)(12 * m.dpi), 8);
-            int tx = r.left + (int)(52 * m.dpi);
-            RECT input = SettingsHexRect(m, r);
-            int textW = input.left - tx - (int)(16 * m.dpi);
-            DrawTextL(dc, tx, r.top + (int)(10 * m.dpi), textW, (int)(20 * m.dpi),
-                      T(L"自定义颜色", L"Custom Color"), g_sf14b, C_WHITE);
-            DrawTextL(dc, tx, r.top + (int)(32 * m.dpi), textW, (int)(20 * m.dpi),
-                      T(L"输入 #RRGGBB 或选择下方色板", L"Enter #RRGGBB or choose a swatch below"), g_sf12, C_DIM);
-
-            int inputW = input.right - input.left, inputH = input.bottom - input.top;
-            DrawRoundRect(dc, input.left, input.top, inputW, inputH,
-                          g_hlEditFocus ? C_HOVER : C_DARK, g_hlEditFocus ? C_HOT : C_DIM, 6);
-            int sw = inputH - (int)(10 * m.dpi);
-            DrawRoundRect(dc, input.left + (int)(6 * m.dpi), input.top + (inputH - sw) / 2,
-                          sw, sw, (DWORD)g_hlColor, C_KEY_BORDER, 4);
-            wchar_t hexbuf[8];
-            if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(g_hlColor, hexbuf);
-            BOOL showHint = g_hlEditFocus && hexbuf[0] == 0;
-            DrawTextL(dc, input.left + sw + (int)(14 * m.dpi), input.top,
-                      inputW - sw - (int)(20 * m.dpi), inputH,
-                      showHint ? L"#RRGGBB" : hexbuf, g_sf13, showHint ? C_DIM : C_WHITE);
+        if (customColor) {
+            Fill(dc, r.left + (int)(18 * m.dpi), r.top + (int)(56 * m.dpi),
+                 r.right - r.left - (int)(36 * m.dpi), 1, C_KEY_BORDER);
 
             int palX, palY, palS, palGap;
             SettingsPaletteMetrics(m, r, &palX, &palY, &palS, &palGap);
-            for (int i = 0; i < 10; i++) {
-                int px = palX + i * (palS + palGap);
-                DrawRoundRect(dc, px, palY, palS, palS, RgbToBgr(g_paletteRgb[i]),
-                              (g_sHov == S_HIT_HL_PAL0 + i) ? C_HOT : C_KEY_BORDER, 5);
+            for (int i = 0; i < 5; i++) {
+                DWORD color = RgbToBgr(g_paletteRgb[i]);
+                int cx = palX + i * (palS + palGap) + palS / 2;
+                int cy = palY + palS / 2;
+                BOOL selected = color == (DWORD)g_hlColor;
+                if (selected || g_sHov == S_HIT_HL_PAL0 + i)
+                    DrawCircleAA(dc, cx, cy, palS / 2 + (int)(3 * m.dpi), selected ? C_WHITE : C_HOT);
+                DrawCircleAA(dc, cx, cy, palS / 2, color);
+                if (selected) {
+                    DWORD check = IsLightColor(color) ? 0x202020 : 0xFFFFFF;
+                    HPEN pen = CreatePen(PS_SOLID, 2, check);
+                    HPEN old = (HPEN)SelectObject(dc, pen);
+                    MoveToEx(dc, cx - (int)(5 * m.dpi), cy, NULL);
+                    LineTo(dc, cx - (int)(1 * m.dpi), cy + (int)(4 * m.dpi));
+                    LineTo(dc, cx + (int)(6 * m.dpi), cy - (int)(5 * m.dpi));
+                    SelectObject(dc, old); DeleteObject(pen);
+                }
             }
+
+            double hue, sat, val;
+            BgrToHsv((DWORD)g_hlColor, &hue, &sat, &val);
+            for (int i = 0; i < 3; i++) {
+                RECT slider = SettingsColorSliderRect(m, r, i);
+                DrawColorSlider(dc, slider, i, hue, sat, val);
+            }
+
+            RECT input = SettingsHexRect(m, r);
+            int inputW = input.right - input.left, inputH = input.bottom - input.top;
+            int colorCx = r.left + (int)(42 * m.dpi);
+            int colorCy = input.top + inputH / 2;
+            DrawCircleAA(dc, colorCx, colorCy, (int)(11 * m.dpi), C_KEY_BORDER);
+            DrawCircleAA(dc, colorCx, colorCy, (int)(9 * m.dpi), (DWORD)g_hlColor);
+            DrawTextC(dc, r.left + (int)(55 * m.dpi), input.top, (int)(18 * m.dpi), inputH,
+                      L"#", g_sf13b, C_DIM);
+            DrawRoundRect(dc, input.left, input.top, inputW, inputH,
+                          g_hlEditFocus ? C_HOVER : C_DARK, g_hlEditFocus ? C_HOT : C_KEY_BORDER, 6);
+            wchar_t hexbuf[8];
+            if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(g_hlColor, hexbuf);
+            const wchar_t* shown = hexbuf[0] == L'#' ? hexbuf + 1 : hexbuf;
+            BOOL showHint = g_hlEditFocus && shown[0] == 0;
+            DrawTextL(dc, input.left + (int)(12 * m.dpi), input.top, inputW - (int)(20 * m.dpi), inputH,
+                      showHint ? L"RRGGBB" : shown, g_sf13, showHint ? C_DIM : C_WHITE);
         }
     } else {
         int x0 = m.contentX, y = m.contentY + (int)(26 * m.dpi), cw = m.contentW;
@@ -2407,14 +2582,20 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HL_DROP;
 
         if (HlSel() == 2) {
-            r = SettingsCustomColorRect(m);
+            r = SettingsHighlightRect(m, TRUE);
             RECT input = SettingsHexRect(m, r);
             if (x >= input.left && x < input.right && y >= input.top && y < input.bottom) return S_HIT_HL_BOX;
             int palX, palY, palS, palGap;
             SettingsPaletteMetrics(m, r, &palX, &palY, &palS, &palGap);
-            for (int i = 0; i < 10; i++) {
+            for (int i = 0; i < 5; i++) {
                 int px = palX + i * (palS + palGap);
                 if (x >= px && x < px + palS && y >= palY && y < palY + palS) return S_HIT_HL_PAL0 + i;
+            }
+            for (int i = 0; i < 3; i++) {
+                RECT slider = SettingsColorSliderRect(m, r, i);
+                int pad = (int)(8 * m.dpi);
+                if (x >= slider.left && x < slider.right && y >= slider.top - pad && y < slider.bottom + pad)
+                    return S_HIT_HL_HUE + i;
             }
         }
     } else {
@@ -2538,7 +2719,6 @@ static void TryApplyHexEdit(HWND hWnd) {
     g_hlColor = (int)bgr;
     g_hlMode = 1;
     ApplyTheme();
-    ApplyAllWindowMaterials();
     IniSetInt(L"General", L"HighlightMode", 1);
     IniSetInt(L"General", L"HighlightColor", (int)bgr);
     if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
@@ -2548,6 +2728,39 @@ static void CommitHexEdit(HWND hWnd) {
     TryApplyHexEdit(hWnd);   // 合法则应用，非法则保留原色
     g_hlEditFocus = FALSE;
     InvalidateRect(hWnd, NULL, TRUE);
+}
+
+static void UpdateHighlightSlider(HWND hWnd, int hit, int mouseX) {
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    RECT row = SettingsHighlightRect(m, TRUE);
+    int index = hit - S_HIT_HL_HUE;
+    if (index < 0 || index > 2) return;
+    RECT slider = SettingsColorSliderRect(m, row, index);
+    double p = (double)(mouseX - slider.left) / (double)(slider.right - slider.left - 1);
+    if (p < 0.0) p = 0.0; if (p > 1.0) p = 1.0;
+
+    double hue, sat, val;
+    BgrToHsv((DWORD)g_hlColor, &hue, &sat, &val);
+    if (index == 0) {
+        hue = p * 359.0;
+        if (sat < 0.05) sat = 0.70;
+        if (val < 0.20) val = 1.0;
+    } else if (index == 1) {
+        sat = p;
+    } else {
+        val = p;
+    }
+
+    g_hlColor = (int)HsvToBgr(hue, sat, val);
+    g_hlMode = 1;
+    g_wallpaperAccent = FALSE;
+    g_hlEditFocus = FALSE;
+    ApplyTheme();
+    IniSetInt(L"General", L"HighlightMode", 1);
+    IniSetInt(L"General", L"HighlightColor", g_hlColor);
+    IniSetInt(L"Theme", L"Wallpaper", 0);
+    if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
 }
 
 static void SettingsApplyHit(HWND hWnd, int hit) {
@@ -2656,7 +2869,6 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         g_dropHl = FALSE;
         if (g_hlMode == 0) g_hlEditFocus = FALSE;
         ApplyTheme();
-        ApplyAllWindowMaterials();
         IniSetInt(L"General", L"HighlightMode", g_hlMode);
         IniSetInt(L"Theme", L"Wallpaper", g_wallpaperAccent ? 1 : 0);
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
@@ -2678,17 +2890,11 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     case S_HIT_HL_PAL0 + 2:
     case S_HIT_HL_PAL0 + 3:
     case S_HIT_HL_PAL0 + 4:
-    case S_HIT_HL_PAL0 + 5:
-    case S_HIT_HL_PAL0 + 6:
-    case S_HIT_HL_PAL0 + 7:
-    case S_HIT_HL_PAL0 + 8:
-    case S_HIT_HL_PAL0 + 9:
         g_hlColor = (int)RgbToBgr(g_paletteRgb[hit - S_HIT_HL_PAL0]);
         g_hlMode = 1;
         g_wallpaperAccent = FALSE;
         g_hlEditFocus = FALSE;
         ApplyTheme();
-        ApplyAllWindowMaterials();
         IniSetInt(L"General", L"HighlightMode", 1);
         IniSetInt(L"General", L"HighlightColor", g_hlColor);
         IniSetInt(L"Theme", L"Wallpaper", 0);
@@ -2719,6 +2925,12 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 static void SettingsOnClick(HWND hWnd, int x, int y) {
     int hit = SettingsHitTest(hWnd, x, y);
     if (g_hlEditFocus && hit != S_HIT_HL_BOX) CommitHexEdit(hWnd);   // 点击其它位置时提交 HEX 编辑
+    if (hit >= S_HIT_HL_HUE && hit <= S_HIT_HL_VAL) {
+        g_hlSliderDrag = hit;
+        SetCapture(hWnd);
+        UpdateHighlightSlider(hWnd, hit, x);
+        return;
+    }
     if (hit == S_HIT_CLOSE) { DestroyWindow(hWnd); return; }
     if (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2) {
         g_sTab = hit - S_HIT_TAB0;
@@ -2755,7 +2967,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
-        ApplyWindowMaterial(hWnd);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -2776,7 +2987,19 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_LBUTTONDBLCLK:
         SettingsOnClick(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         return 0;
+    case WM_LBUTTONUP:
+        if (g_hlSliderDrag != S_HIT_NONE) {
+            UpdateHighlightSlider(hWnd, g_hlSliderDrag, GET_X_LPARAM(l));
+            g_hlSliderDrag = S_HIT_NONE;
+            if (GetCapture() == hWnd) ReleaseCapture();
+            return 0;
+        }
+        break;
     case WM_MOUSEMOVE: {
+        if (g_hlSliderDrag != S_HIT_NONE) {
+            UpdateHighlightSlider(hWnd, g_hlSliderDrag, GET_X_LPARAM(l));
+            return 0;
+        }
         if (!g_sTracking) { TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hWnd, 0}; TrackMouseEvent(&tme); g_sTracking = TRUE; }
         int hov = SettingsHitTest(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (hov != g_sHov) { g_sHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
@@ -2816,6 +3039,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_MOUSELEAVE:
         g_sTracking = FALSE;
         if (g_sHov != -1) { g_sHov = -1; InvalidateRect(hWnd, NULL, TRUE); }
+        return 0;
+    case WM_CAPTURECHANGED:
+        g_hlSliderDrag = S_HIT_NONE;
         return 0;
     case WM_TIMER:
         if (w == TIMER_SETTINGS_ANIM) {
@@ -2880,6 +3106,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_dropHl = FALSE;
         g_dropClose = FALSE;
         g_hlEditFocus = FALSE;
+        g_hlSliderDrag = S_HIT_NONE;
         return 0;
     }
     return DefWindowProcW(hWnd, msg, w, l);
@@ -3023,7 +3250,6 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
-        ApplyWindowMaterial(hWnd);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -3147,6 +3373,124 @@ static void ShowMenu(HWND hWnd) {
     }
 }
 
+typedef HRESULT (WINAPI *AccessibleObjectFromWindowProc)(HWND, DWORD, REFIID, void**);
+
+static const IID IID_IUnknownLocal =
+    {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const IID IID_IAccessibleLocal =
+    {0x618736e0, 0x3c3d, 0x11cf, {0x81, 0x0c, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
+static AccessibleObjectFromWindowProc GetAccessibleObjectFromWindow() {
+    static HMODULE module = NULL;
+    static AccessibleObjectFromWindowProc proc = NULL;
+    static BOOL initialized = FALSE;
+    if (!initialized) {
+        initialized = TRUE;
+        module = LoadLibraryW(L"oleacc.dll");
+        if (module) proc = (AccessibleObjectFromWindowProc)GetProcAddress(module, "AccessibleObjectFromWindow");
+    }
+    return proc;
+}
+
+static BOOL EnsureAccessibilityCom() {
+    static BOOL initialized = FALSE;
+    static BOOL ready = FALSE;
+    if (!initialized) {
+        initialized = TRUE;
+        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        ready = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    }
+    return ready;
+}
+
+static ULONG_PTR AccessibleIdentityToken(IAccessible* acc, VARIANT child) {
+    if (!acc) return 0;
+    LONG left = 0, top = 0, width = 0, height = 0;
+    if (SUCCEEDED(acc->accLocation(&left, &top, &width, &height, child)) && (width > 0 || height > 0)) {
+        ULONG_PTR token = (ULONG_PTR)(DWORD)left;
+        token = token * 16777619u ^ (ULONG_PTR)(DWORD)top;
+        token = token * 16777619u ^ (ULONG_PTR)(DWORD)width;
+        token = token * 16777619u ^ (ULONG_PTR)(DWORD)height;
+        return token ? token : 1;
+    }
+
+    IUnknown* identity = NULL;
+    ULONG_PTR token = 0;
+    if (SUCCEEDED(acc->QueryInterface(IID_IUnknownLocal, (void**)&identity)) && identity) {
+        token = (ULONG_PTR)identity;
+        identity->Release();
+    }
+    return token;
+}
+
+static BOOL AccessibleRoleIsEditable(IAccessible* acc, VARIANT child) {
+    if (!acc) return FALSE;
+    VARIANT role, state;
+    ZeroMemory(&role, sizeof(role));
+    ZeroMemory(&state, sizeof(state));
+    if (FAILED(acc->get_accRole(child, &role)) || role.vt != VT_I4) return FALSE;
+
+    const LONG ROLE_SYSTEM_TEXT_LOCAL = 0x2A;
+    const LONG ROLE_SYSTEM_SPINBUTTON_LOCAL = 0x34;
+    if (role.lVal != ROLE_SYSTEM_TEXT_LOCAL && role.lVal != ROLE_SYSTEM_SPINBUTTON_LOCAL) return FALSE;
+
+    if (SUCCEEDED(acc->get_accState(child, &state)) && state.vt == VT_I4) {
+        const LONG STATE_SYSTEM_READONLY_LOCAL = 0x40;
+        if ((state.lVal & STATE_SYSTEM_READONLY_LOCAL) != 0) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* token) {
+    if (!acc || depth > 3) return FALSE;
+    VARIANT focus;
+    ZeroMemory(&focus, sizeof(focus));
+    if (FAILED(acc->get_accFocus(&focus))) return FALSE;
+
+    VARIANT self;
+    ZeroMemory(&self, sizeof(self));
+    self.vt = VT_I4;
+    self.lVal = 0; // CHILDID_SELF
+
+    if (focus.vt == VT_I4) {
+        if (AccessibleRoleIsEditable(acc, focus)) {
+            if (token) *token = AccessibleIdentityToken(acc, focus) ^ ((ULONG_PTR)(DWORD)focus.lVal << 4);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    if (focus.vt == VT_DISPATCH && focus.pdispVal) {
+        IAccessible* focused = NULL;
+        HRESULT hr = focus.pdispVal->QueryInterface(IID_IAccessibleLocal, (void**)&focused);
+        focus.pdispVal->Release();
+        if (FAILED(hr) || !focused) return FALSE;
+
+        ULONG_PTR identity = AccessibleIdentityToken(focused, self);
+        BOOL editable = AccessibleRoleIsEditable(focused, self);
+        if (!editable) editable = AccessibleHasEditableFocus(focused, depth + 1, token);
+        if (editable && token && *token == 0) *token = identity;
+        focused->Release();
+        return editable;
+    }
+    return FALSE;
+}
+
+static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
+    AccessibleObjectFromWindowProc proc = GetAccessibleObjectFromWindow();
+    if (!proc || !EnsureAccessibilityCom() || !hWnd) return FALSE;
+
+    IAccessible* root = NULL;
+    HRESULT hr = proc(hWnd, OBJID_CLIENT, IID_IAccessibleLocal, (void**)&root);
+    if (FAILED(hr) || !root) return FALSE;
+
+    ULONG_PTR detected = 0;
+    BOOL result = AccessibleHasEditableFocus(root, 0, &detected);
+    root->Release();
+    if (result && token) *token = detected ? detected : (ULONG_PTR)hWnd;
+    return result;
+}
+
 static BOOL IsInputControl(HWND hw) {
     if (!hw || !IsWindow(hw)) return FALSE;
     char buf[128] = {0};
@@ -3174,18 +3518,33 @@ static BOOL IsOwnForegroundWindow(HWND fg) {
 // 只返回当前前台线程中真实获得输入焦点的控件。浏览器/Qt/Afx 顶层窗口不再
 // 一概视为输入框，避免焦点离开文本区域后键盘仍持续显示。
 static HWND GetFocusedInputControl() {
+    g_detectedInputToken = 0;
     HWND fg = GetForegroundWindow();
     if (!fg || IsOwnForegroundWindow(fg)) return NULL;
 
     DWORD tid = GetWindowThreadProcessId(fg, NULL);
     GUITHREADINFO gi = {sizeof(gi)};
-    if (!GetGUIThreadInfo(tid, &gi)) return NULL;
+    BOOL haveGuiInfo = GetGUIThreadInfo(tid, &gi);
+    HWND focus = haveGuiInfo && gi.hwndFocus ? gi.hwndFocus : fg;
+    if (haveGuiInfo) {
+        if (IsInputControl(focus)) {
+            g_detectedInputToken = (ULONG_PTR)focus;
+            return focus;
+        }
 
-    HWND focus = gi.hwndFocus ? gi.hwndFocus : fg;
-    if (IsInputControl(focus)) return focus;
+        if (gi.hwndCaret || (gi.flags & GUI_CARETBLINKING) != 0) {
+            if (gi.hwndCaret && IsWindow(gi.hwndCaret)) {
+                g_detectedInputToken = (ULONG_PTR)gi.hwndCaret;
+                return gi.hwndCaret;
+            }
+            g_detectedInputToken = (ULONG_PTR)focus;
+            return focus;
+        }
+    }
 
-    if (gi.hwndCaret || (gi.flags & GUI_CARETBLINKING) != 0) {
-        if (gi.hwndCaret && IsWindow(gi.hwndCaret)) return gi.hwndCaret;
+    ULONG_PTR token = 0;
+    if (IsAccessibleInputWindow(focus, &token) || (focus != fg && IsAccessibleInputWindow(fg, &token))) {
+        g_detectedInputToken = token ? token : (ULONG_PTR)focus;
         return focus;
     }
     return NULL;
@@ -3197,10 +3556,12 @@ static void UpdateAutoVisibility() {
     HWND input = GetFocusedInputControl();
     if (input) {
         g_lastNonInput = 0;
+        g_inputLostTick = 0;
+        g_manualShow = FALSE;
         if (g_autoMinimized) {
-            if (input == g_suppressedInput) return;
+            if (g_detectedInputToken == g_suppressedInputToken) return;
             g_autoMinimized = FALSE;
-            g_suppressedInput = NULL;
+            g_suppressedInputToken = 0;
         }
         if (!g_manualHide && !g_vis) ShowKB(TRUE, FALSE);
         return;
@@ -3209,12 +3570,17 @@ static void UpdateAutoVisibility() {
     HWND fg = GetForegroundWindow();
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return;
 
-    g_autoMinimized = FALSE;
-    g_suppressedInput = NULL;
+    DWORD now = GetTickCount();
+    if (g_autoMinimized) {
+        if (g_inputLostTick == 0) g_inputLostTick = now;
+        if (now - g_inputLostTick < 350) return;
+        g_autoMinimized = FALSE;
+        g_suppressedInputToken = 0;
+    }
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
     if (!g_vis || g_manualHide) return;
     if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) return;
-    if (g_manualShow && GetTickCount() - g_manualShowTick <= MANUAL_HIDE_GRACE_MS) return;
+    if (g_manualShow) return;
 
     ShowKB(FALSE, FALSE);
 }
@@ -3273,8 +3639,10 @@ static void OnLDown(HWND hWnd, int x, int y) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
         case HDR_MIN:
-            g_suppressedInput = GetFocusedInputControl();
+            GetFocusedInputControl();
+            g_suppressedInputToken = g_detectedInputToken;
             g_autoMinimized = TRUE;
+            g_inputLostTick = 0;
             ShowKB(FALSE, FALSE);
             break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
@@ -3339,7 +3707,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // 实体键盘状态监控：安装低级键盘钩子（只监控 Win/Shift/Caps，Fn 预留接口）
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, PhysKeyHookProc, g_hInst, 0);
         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;  // 启动时同步 CapsLock 状态
-        SetTimer(hWnd, TIMER_FOCUS, 200, 0);
+        SetTimer(hWnd, TIMER_FOCUS, 100, 0);
         return 0;
     }
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
@@ -3368,7 +3736,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (g_ww > 0 && g_wh > 0) {
             RecreateFontsAndLayout();
             ApplyRoundedWindow(hWnd, 10);
-            ApplyWindowMaterial(hWnd);
             InvalidateRect(hWnd, NULL, TRUE);
         }
         return 0;

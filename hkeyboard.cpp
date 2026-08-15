@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 #include "resource.h"
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
@@ -737,6 +736,18 @@ static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD
     SelectObject(dc, op); DeleteObject(p);
 }
 
+static void ApplyRoundedWindow(HWND hWnd, int logicalRadius) {
+    RECT rc;
+    if (!GetWindowRect(hWnd, &rc)) return;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    int radius = (int)(logicalRadius * GetSystemDpiScale());
+    if (radius < 6) radius = 6;
+    HRGN region = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
+    if (!region) return;
+    if (!SetWindowRgn(hWnd, region, TRUE)) DeleteObject(region);
+}
+
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
@@ -1176,17 +1187,15 @@ static int HitHeader(int x, int y) {
     if (y < 0 || y >= g_headerH) return -1;
 
     double dpiScale = GetSystemDpiScale();
-    double scaleX = (double)g_ww / (980.0 * dpiScale);
-
-    int rMargin = (int)(6 * dpiScale * scaleX);
-    int gap     = (int)(6 * dpiScale * scaleX);
-    int wClose = (int)(36 * dpiScale * scaleX);
-    int wMin   = (int)(36 * dpiScale * scaleX);
-    int wMenu  = (int)(48 * dpiScale * scaleX);
+    int rMargin = (int)(6 * dpiScale);
+    int gap     = (int)(6 * dpiScale);
+    int wClose = (int)(36 * dpiScale);
+    int wMin   = (int)(36 * dpiScale);
+    int wMenu  = (int)(48 * dpiScale);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
-    int xMenu  = (int)(6 * dpiScale * scaleX);
+    int xMenu  = (int)(6 * dpiScale);
 
     if (x >= xClose && x < g_ww) return HDR_CLOSE;
     if (x >= xMin && x < xClose) return HDR_MIN;
@@ -1198,22 +1207,21 @@ static void DrawHeader(HDC dc) {
     Fill(dc, 0, 0, g_ww, g_headerH, C_HDR);
 
     double dpiScale = GetSystemDpiScale();
-    double scaleX = (double)g_ww / (980.0 * dpiScale);
     double scaleY = (double)g_wh / (320.0 * dpiScale);
 
-    int rMargin = (int)(6 * dpiScale * scaleX);
-    int gap     = (int)(6 * dpiScale * scaleX);
+    int rMargin = (int)(6 * dpiScale);
+    int gap     = (int)(6 * dpiScale);
     int btnH    = g_headerH - (int)(12 * dpiScale * scaleY);
     if (btnH < 22) btnH = 22;
     int btnY = (g_headerH - btnH) / 2;
 
-    int wClose = (int)(36 * dpiScale * scaleX);
-    int wMin   = (int)(36 * dpiScale * scaleX);
-    int wMenu  = (int)(48 * dpiScale * scaleX);
+    int wClose = (int)(36 * dpiScale);
+    int wMin   = (int)(36 * dpiScale);
+    int wMenu  = (int)(48 * dpiScale);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
-    int xMenu  = (int)(6 * dpiScale * scaleX);
+    int xMenu  = (int)(6 * dpiScale);
 
     DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
     DrawTextC(dc, xMenu, btnY, wMenu, btnH, T(L"\x8BBE\x7F6E", L"Settings"), g_f12, C_WHITE);   // 菜单按钮 → 打开设置页
@@ -1226,7 +1234,7 @@ static void DrawHeader(HDC dc) {
 
     // 最小化图标：直接绘制居中小横条（避免字体缺少 U+229F 字形时显示为 "-"）
     {
-        int barW = (int)(14 * dpiScale * scaleX);
+        int barW = (int)(14 * dpiScale);
         int barH = (int)(2 * dpiScale * scaleY); if (barH < 2) barH = 2;
         int barX = xMin + (wMin - barW) / 2;
         int barY = btnY + btnH / 2 - barH / 2;
@@ -1236,7 +1244,7 @@ static void DrawHeader(HDC dc) {
     {
         int cx = xClose + wClose / 2;
         int cy = g_headerH / 2;
-        int r  = (int)(7 * dpiScale * scaleX); if (r < 5) r = 5;
+        int r  = (int)(7 * dpiScale); if (r < 5) r = 5;
         HPEN pen = CreatePen(PS_SOLID, 2, C_DIM);
         HPEN op = (HPEN)SelectObject(dc, pen);
         HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -1428,9 +1436,9 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_LAYOUT_DROP    14
 #define S_HIT_LAYOUT_OPT0    15
 #define S_HIT_LAYOUT_OPT1    16
-#define S_HIT_LAYOUT_OPT2    19
-#define S_HIT_FKEYS          17
-#define S_HIT_SHIFTSYM       18
+#define S_HIT_LAYOUT_OPT2    17
+#define S_HIT_FKEYS          18
+#define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
 #define S_HIT_THEME_OPT0     21
 #define S_HIT_THEME_OPT1     22
@@ -1598,69 +1606,104 @@ static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, i
     return above >= minY ? above : minY;
 }
 
+static RECT SettingsCustomColorRect(const SettingsMetrics& m) {
+    RECT r = SettingsRowRect(m, 2);
+    r.bottom = r.top + (int)(110 * m.dpi);
+    return r;
+}
+
+static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
+    int w = (int)(150 * m.dpi), h = (int)(34 * m.dpi);
+    RECT r = {row.right - (int)(20 * m.dpi) - w, row.top + (int)(14 * m.dpi),
+              row.right - (int)(20 * m.dpi), row.top + (int)(14 * m.dpi) + h};
+    return r;
+}
+
+static void SettingsPaletteMetrics(const SettingsMetrics& m, const RECT& row,
+                                   int* x, int* y, int* size, int* gap) {
+    *x = row.left + (int)(66 * m.dpi);
+    *y = row.top + (int)(70 * m.dpi);
+    *size = (int)(22 * m.dpi);
+    *gap = (int)(9 * m.dpi);
+}
+
 static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
-    HPEN pen = CreatePen(PS_SOLID, 2, C_WHITE);
-    HPEN oldPen = (HPEN)SelectObject(dc, pen);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    int cx = x + 16, cy = y + 16;
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    float s = (float)GetSystemDpiScale();
+    Gdiplus::Color color(255, GetRValue(C_WHITE), GetGValue(C_WHITE), GetBValue(C_WHITE));
+    Gdiplus::Pen pen(color, 1.7f * s);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    float X = (float)x, Y = (float)y;
+    float cx = X + 16.0f * s, cy = Y + 16.0f * s;
     switch (kind) {
     case 0: // 自动呼出 / 输入框
-        RoundRect(dc, x + 2, y + 5, x + 25, y + 22, 4, 4);
-        MoveToEx(dc, x + 6, y + 26, NULL); LineTo(dc, x + 21, y + 26);
-        Ellipse(dc, x + 20, y + 14, x + 28, y + 22);
-        MoveToEx(dc, x + 30, y + 16, NULL); LineTo(dc, x + 34, y + 16);
-        MoveToEx(dc, x + 24, y + 10, NULL); LineTo(dc, x + 24, y + 6);
+        g.DrawRectangle(&pen, X + 2*s, Y + 5*s, 23*s, 16*s);
+        g.DrawLine(&pen, X + 7*s, Y + 25*s, X + 20*s, Y + 25*s);
+        g.DrawLine(&pen, X + 12*s, Y + 21*s, X + 12*s, Y + 25*s);
+        g.DrawEllipse(&pen, X + 22*s, Y + 14*s, 8*s, 8*s);
+        g.DrawLine(&pen, X + 26*s, Y + 10*s, X + 26*s, Y + 7*s);
+        g.DrawLine(&pen, X + 30*s, Y + 12*s, X + 32*s, Y + 10*s);
         break;
     case 1: // 关闭按钮
-        RoundRect(dc, x + 3, y + 4, x + 29, y + 26, 4, 4);
-        MoveToEx(dc, x + 18, y + 12, NULL); LineTo(dc, x + 25, y + 19);
-        MoveToEx(dc, x + 25, y + 12, NULL); LineTo(dc, x + 18, y + 19);
+        g.DrawRectangle(&pen, X + 3*s, Y + 5*s, 27*s, 22*s);
+        g.DrawLine(&pen, X + 3*s, Y + 11*s, X + 30*s, Y + 11*s);
+        g.DrawLine(&pen, X + 20*s, Y + 15*s, X + 26*s, Y + 21*s);
+        g.DrawLine(&pen, X + 26*s, Y + 15*s, X + 20*s, Y + 21*s);
         break;
     case 2: // 键盘布局
-        RoundRect(dc, x + 1, y + 7, x + 31, y + 24, 4, 4);
+        g.DrawRectangle(&pen, X + 1*s, Y + 7*s, 31*s, 19*s);
         for (int i = 0; i < 4; i++) {
-            MoveToEx(dc, x + 6 + i * 6, y + 12, NULL); LineTo(dc, x + 9 + i * 6, y + 12);
-            MoveToEx(dc, x + 6 + i * 6, y + 18, NULL); LineTo(dc, x + 9 + i * 6, y + 18);
+            g.DrawLine(&pen, X + (5 + i*7)*s, Y + 12*s, X + (8 + i*7)*s, Y + 12*s);
+            g.DrawLine(&pen, X + (5 + i*7)*s, Y + 18*s, X + (8 + i*7)*s, Y + 18*s);
         }
+        g.DrawLine(&pen, X + 9*s, Y + 23*s, X + 24*s, Y + 23*s);
         break;
     case 3: // 功能键
-        RoundRect(dc, x + 3, y + 5, x + 29, y + 26, 4, 4);
-        DrawTextC(dc, x + 3, y + 5, 26, 21, L"F", g_sf13b, C_WHITE);
+        g.DrawRectangle(&pen, X + 4*s, Y + 4*s, 25*s, 25*s);
+        g.DrawLine(&pen, X + 12*s, Y + 11*s, X + 12*s, Y + 23*s);
+        g.DrawLine(&pen, X + 12*s, Y + 11*s, X + 21*s, Y + 11*s);
+        g.DrawLine(&pen, X + 12*s, Y + 16*s, X + 19*s, Y + 16*s);
         break;
     case 4: // Shift 符号
-        RoundRect(dc, x + 3, y + 5, x + 29, y + 26, 4, 4);
-        MoveToEx(dc, cx, y + 10, NULL); LineTo(dc, cx - 6, y + 16);
-        MoveToEx(dc, cx, y + 10, NULL); LineTo(dc, cx + 6, y + 16);
-        MoveToEx(dc, cx, y + 10, NULL); LineTo(dc, cx, y + 22);
+        g.DrawRectangle(&pen, X + 3*s, Y + 5*s, 27*s, 23*s);
+        g.DrawLine(&pen, cx, Y + 10*s, X + 10*s, Y + 16*s);
+        g.DrawLine(&pen, cx, Y + 10*s, X + 22*s, Y + 16*s);
+        g.DrawLine(&pen, cx, Y + 10*s, cx, Y + 23*s);
+        g.DrawLine(&pen, X + 12*s, Y + 23*s, X + 20*s, Y + 23*s);
         break;
     case 5: // 自动隐藏 / 时钟
-        Ellipse(dc, x + 3, y + 3, x + 29, y + 29);
-        MoveToEx(dc, cx, cy, NULL); LineTo(dc, cx, y + 9);
-        MoveToEx(dc, cx, cy, NULL); LineTo(dc, x + 23, y + 20);
+        g.DrawEllipse(&pen, X + 3*s, Y + 3*s, 27*s, 27*s);
+        g.DrawLine(&pen, cx, cy, cx, Y + 9*s);
+        g.DrawLine(&pen, cx, cy, X + 23*s, Y + 20*s);
         break;
     case 6: // 语言
-        Ellipse(dc, x + 3, y + 3, x + 29, y + 29);
-        MoveToEx(dc, x + 4, cy, NULL); LineTo(dc, x + 28, cy);
-        MoveToEx(dc, cx, y + 4, NULL); LineTo(dc, cx, y + 28);
-        Arc(dc, x + 8, y + 3, x + 24, y + 29, x + 16, y + 3, x + 16, y + 29);
+        g.DrawEllipse(&pen, X + 3*s, Y + 3*s, 27*s, 27*s);
+        g.DrawLine(&pen, X + 4*s, cy, X + 29*s, cy);
+        g.DrawArc(&pen, X + 9*s, Y + 3*s, 14*s, 27*s, 90.0f, 180.0f);
+        g.DrawArc(&pen, X + 9*s, Y + 3*s, 14*s, 27*s, 270.0f, 180.0f);
         break;
     case 7: // 主题
-        Ellipse(dc, x + 5, y + 5, x + 27, y + 27);
-        for (int i = 0; i < 8; i++) {
-            double a = i * 3.1415926535 / 4.0;
-            int x1 = cx + (int)(14 * cos(a)), y1 = cy + (int)(14 * sin(a));
-            int x2 = cx + (int)(17 * cos(a)), y2 = cy + (int)(17 * sin(a));
-            MoveToEx(dc, x1, y1, NULL); LineTo(dc, x2, y2);
-        }
+        g.DrawEllipse(&pen, X + 8*s, Y + 8*s, 16*s, 16*s);
+        g.DrawLine(&pen, cx, Y + 2*s, cx, Y + 6*s);
+        g.DrawLine(&pen, cx, Y + 26*s, cx, Y + 30*s);
+        g.DrawLine(&pen, X + 2*s, cy, X + 6*s, cy);
+        g.DrawLine(&pen, X + 26*s, cy, X + 30*s, cy);
+        g.DrawLine(&pen, X + 6*s, Y + 6*s, X + 9*s, Y + 9*s);
+        g.DrawLine(&pen, X + 23*s, Y + 23*s, X + 26*s, Y + 26*s);
+        g.DrawLine(&pen, X + 23*s, Y + 9*s, X + 26*s, Y + 6*s);
+        g.DrawLine(&pen, X + 6*s, Y + 26*s, X + 9*s, Y + 23*s);
         break;
     case 8: // 高亮颜色
-        MoveToEx(dc, cx, y + 3, NULL); LineTo(dc, x + 28, y + 15);
-        Arc(dc, x + 8, y + 8, x + 24, y + 28, x + 8, y + 16, x + 16, y + 8);
-        LineTo(dc, x + 12, y + 27);
+        g.DrawLine(&pen, X + 8*s, Y + 24*s, X + 24*s, Y + 8*s);
+        g.DrawLine(&pen, X + 20*s, Y + 6*s, X + 26*s, Y + 12*s);
+        g.DrawLine(&pen, X + 6*s, Y + 26*s, X + 10*s, Y + 22*s);
+        g.DrawEllipse(&pen, X + 22*s, Y + 23*s, 6*s, 6*s);
         break;
     }
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen); DeleteObject(pen);
 }
 
 static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* title,
@@ -1668,7 +1711,8 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
     double dpi = GetSystemDpiScale();
     DrawRoundRect(dc, row.left, row.top, row.right - row.left, row.bottom - row.top,
                   hover ? C_HOVER : C_KEY, hover ? C_HOT : C_KEY_BORDER, 8);
-    DrawSettingsIcon(dc, row.left + (int)(18 * dpi), row.top + (row.bottom - row.top - 32) / 2, icon);
+    int iconSize = (int)(32 * dpi);
+    DrawSettingsIcon(dc, row.left + (int)(18 * dpi), row.top + (row.bottom - row.top - iconSize) / 2, icon);
     int tx = row.left + (int)(66 * dpi);
     int tw = row.right - tx - (int)(240 * dpi);
     DrawTextL(dc, tx, row.top + (int)(7 * dpi), tw, (int)(20 * dpi), title, g_sf14b, C_WHITE);
@@ -1876,31 +1920,32 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   g_dropHl, g_sHov == S_HIT_HL_DROP);
 
         if (HlSel() == 2) {
-            r = SettingsRowRect(m, 2);
-            r.bottom = r.top + (int)(96 * m.dpi);
+            r = SettingsCustomColorRect(m);
             DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, C_KEY, C_KEY_BORDER, 8);
-            DrawSettingsIcon(dc, r.left + 18, r.top + 14, 8);
-            int tx = r.left + 66;
-            DrawTextL(dc, tx, r.top + 10, (int)(260 * m.dpi), 20,
+            DrawSettingsIcon(dc, r.left + (int)(18 * m.dpi), r.top + (int)(14 * m.dpi), 8);
+            int tx = r.left + (int)(66 * m.dpi);
+            RECT input = SettingsHexRect(m, r);
+            int textW = input.left - tx - (int)(16 * m.dpi);
+            DrawTextL(dc, tx, r.top + (int)(10 * m.dpi), textW, (int)(20 * m.dpi),
                       T(L"自定义颜色", L"Custom Color"), g_sf14b, C_WHITE);
-            DrawTextL(dc, tx, r.top + 32, (int)(320 * m.dpi), 20,
+            DrawTextL(dc, tx, r.top + (int)(32 * m.dpi), textW, (int)(20 * m.dpi),
                       T(L"输入 #RRGGBB 或选择下方色板", L"Enter #RRGGBB or choose a swatch below"), g_sf12, C_DIM);
 
-            int inputW = (int)(138 * m.dpi), inputH = m.comboH;
-            int inputX = r.right - (int)(20 * m.dpi) - inputW;
-            int inputY = r.top + (int)(13 * m.dpi);
-            DrawRoundRect(dc, inputX, inputY, inputW, inputH,
+            int inputW = input.right - input.left, inputH = input.bottom - input.top;
+            DrawRoundRect(dc, input.left, input.top, inputW, inputH,
                           g_hlEditFocus ? C_HOVER : C_DARK, g_hlEditFocus ? C_HOT : C_DIM, 6);
             int sw = inputH - (int)(10 * m.dpi);
-            DrawRoundRect(dc, inputX + (int)(6 * m.dpi), inputY + (inputH - sw) / 2,
+            DrawRoundRect(dc, input.left + (int)(6 * m.dpi), input.top + (inputH - sw) / 2,
                           sw, sw, (DWORD)g_hlColor, C_KEY_BORDER, 4);
             wchar_t hexbuf[8];
             if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(g_hlColor, hexbuf);
-            DrawTextL(dc, inputX + sw + (int)(14 * m.dpi), inputY,
-                      inputW - sw - (int)(20 * m.dpi), inputH, hexbuf, g_sf13, C_WHITE);
+            BOOL showHint = g_hlEditFocus && hexbuf[0] == 0;
+            DrawTextL(dc, input.left + sw + (int)(14 * m.dpi), input.top,
+                      inputW - sw - (int)(20 * m.dpi), inputH,
+                      showHint ? L"#RRGGBB" : hexbuf, g_sf13, showHint ? C_DIM : C_WHITE);
 
-            int palS = (int)(22 * m.dpi), palGap = (int)(9 * m.dpi);
-            int palX = tx, palY = r.top + (int)(62 * m.dpi);
+            int palX, palY, palS, palGap;
+            SettingsPaletteMetrics(m, r, &palX, &palY, &palS, &palGap);
             for (int i = 0; i < 10; i++) {
                 int px = palX + i * (palS + palGap);
                 DrawRoundRect(dc, px, palY, palS, palS, RgbToBgr(g_paletteRgb[i]),
@@ -1923,6 +1968,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawTextC(dc, x0, y, cw, (int)(20 * m.dpi), ver, g_sf12, C_DIM);
 
         int uy = m.H - m.margin - (int)(20 * m.dpi);
+        DrawTextC(dc, x0, uy - (int)(28 * m.dpi), cw, (int)(18 * m.dpi),
+                  L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sf12, C_DIM);
         int x1, w1, x2, w2, sx, sw2;
         AboutLinkLayout(x0, cw, &x1, &w1, &sx, &sw2, &x2, &w2);
         DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf12, C_HOT);
@@ -2137,14 +2184,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HL_DROP;
 
         if (HlSel() == 2) {
-            r = SettingsRowRect(m, 2);
-            r.bottom = r.top + (int)(96 * m.dpi);
-            int inputW = (int)(138 * m.dpi), inputH = m.comboH;
-            int inputX = r.right - (int)(20 * m.dpi) - inputW;
-            int inputY = r.top + (int)(13 * m.dpi);
-            if (x >= inputX && x < inputX + inputW && y >= inputY && y < inputY + inputH) return S_HIT_HL_BOX;
-            int palS = (int)(22 * m.dpi), palGap = (int)(9 * m.dpi);
-            int palX = r.left + 66, palY = r.top + (int)(62 * m.dpi);
+            r = SettingsCustomColorRect(m);
+            RECT input = SettingsHexRect(m, r);
+            if (x >= input.left && x < input.right && y >= input.top && y < input.bottom) return S_HIT_HL_BOX;
+            int palX, palY, palS, palGap;
+            SettingsPaletteMetrics(m, r, &palX, &palY, &palS, &palGap);
             for (int i = 0; i < 10; i++) {
                 int px = palX + i * (palS + palGap);
                 if (x >= px && x < px + palS && y >= palY && y < palY + palS) return S_HIT_HL_PAL0 + i;
@@ -2441,6 +2485,12 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
 
 static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
+    case WM_CREATE:
+        ApplyRoundedWindow(hWnd, 14);
+        return 0;
+    case WM_SIZE:
+        ApplyRoundedWindow(hWnd, 14);
+        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -2688,6 +2738,12 @@ static void PromptOnClick(HWND hWnd, int x, int y) {
 
 static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
+    case WM_CREATE:
+        ApplyRoundedWindow(hWnd, 14);
+        return 0;
+    case WM_SIZE:
+        ApplyRoundedWindow(hWnd, 14);
+        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -2959,6 +3015,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         RecreateFontsAndLayout();
         SetWindowLong(hWnd, GWL_EXSTYLE, GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
         SetLayeredWindowAttributes(hWnd, 0, 255, LWA_ALPHA);
+        ApplyRoundedWindow(hWnd, 10);
 
         g_winHook = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_SHOW, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         // 实体键盘状态监控：安装低级键盘钩子（只监控 Win/Shift/Caps，Fn 预留接口）
@@ -2992,6 +3049,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_wh = HIWORD(l);
         if (g_ww > 0 && g_wh > 0) {
             RecreateFontsAndLayout();
+            ApplyRoundedWindow(hWnd, 10);
             InvalidateRect(hWnd, NULL, TRUE);
         }
         return 0;

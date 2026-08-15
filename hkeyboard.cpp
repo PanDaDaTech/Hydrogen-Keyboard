@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "resource.h"
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
@@ -269,7 +270,7 @@ HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
 #define SLIDE_MS 8
 HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
-static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0;   // 设置/关闭窗口固定字号字体
+static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -689,6 +690,7 @@ static void InitFixedFonts() {
     g_sf13  = MakeFont(10 * dpi, 0);     // 行文本/开关标签
     g_sf13b = MakeFont(10 * dpi, 1);     // Tab / 按钮
     g_sf14b = MakeFont(12 * dpi, 1);     // 面板标题（深色大字）
+    g_sf20b = MakeFont(22 * dpi, 1);     // 设置页大标题
 }
 
 static void RecreateFontsAndLayout() {
@@ -1516,9 +1518,12 @@ static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
 }
 
 static void SettingsTab(HDC dc, int x, int y, int w, int h, const wchar_t* label, BOOL active, BOOL hover) {
-    DWORD bg = active ? C_HOT : (hover ? C_HOVER : C_KEY);
-    DrawRoundRect(dc, x, y, w, h, bg, C_KEY_BORDER, 6);
-    DrawTextC(dc, x, y, w, h, label, g_sf13b, IsLightColor(bg) ? 0x1A1A1A : C_WHITE);
+    DWORD text = active || hover ? C_WHITE : C_DIM;
+    DrawTextC(dc, x, y, w, h - 5, label, g_sf13b, text);
+    if (active) {
+        int uw = (int)(34 * GetSystemDpiScale());
+        DrawRoundRect(dc, x + (w - uw) / 2, y + h - 4, uw, 4, C_HOT, C_HOT, 2);
+    }
 }
 
 // 圆角方框面板（设置项容器）
@@ -1528,6 +1533,154 @@ static void DrawPanel(HDC dc, int x, int y, int w, int h) {
 // 可指定圆角半径的面板（键盘布局 / 主题页用大圆角）
 static void DrawPanelR(HDC dc, int x, int y, int w, int h, int r) {
     DrawRoundRect(dc, x, y, w, h, C_KEY, C_KEY_BORDER, r);
+}
+
+struct SettingsMetrics {
+    double dpi;
+    int W, H;
+    int margin;
+    int titleY, titleH;
+    int closeX, closeY, closeW, closeH;
+    int tabsY, tabH, tabW, tabGap;
+    int contentX, contentY, contentW;
+    int rowH, rowGap;
+    int comboW, comboH;
+    int switchW, switchH;
+};
+
+static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
+    RECT rc; GetClientRect(hWnd, &rc);
+    SettingsMetrics m = {};
+    m.dpi = GetSystemDpiScale();
+    m.W = rc.right; m.H = rc.bottom;
+    m.margin = (int)(36 * m.dpi);
+    m.titleY = (int)(20 * m.dpi);
+    m.titleH = (int)(34 * m.dpi);
+    m.closeW = m.closeH = (int)(30 * m.dpi);
+    m.closeX = m.W - m.margin - m.closeW;
+    m.closeY = (int)(18 * m.dpi);
+    m.tabsY = (int)(72 * m.dpi);
+    m.tabH = (int)(38 * m.dpi);
+    m.tabW = (int)(86 * m.dpi);
+    m.tabGap = (int)(10 * m.dpi);
+    m.contentX = m.margin;
+    m.contentY = (int)(126 * m.dpi);
+    m.contentW = m.W - m.margin * 2;
+    m.rowH = (int)(58 * m.dpi);
+    m.rowGap = (int)(8 * m.dpi);
+    m.comboW = (int)(184 * m.dpi);
+    m.comboH = (int)(32 * m.dpi);
+    m.switchW = (int)(44 * m.dpi);
+    m.switchH = (int)(22 * m.dpi);
+    return m;
+}
+
+static RECT SettingsRowRect(const SettingsMetrics& m, int index) {
+    int y = m.contentY + index * (m.rowH + m.rowGap);
+    RECT r = {m.contentX, y, m.contentX + m.contentW, y + m.rowH};
+    return r;
+}
+
+static int SettingsComboX(const SettingsMetrics& m, const RECT& row) {
+    return row.right - (int)(20 * m.dpi) - m.comboW;
+}
+
+static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {
+    return row.top + (row.bottom - row.top - m.comboH) / 2;
+}
+
+static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, int count) {
+    int listH = itemH * count + 4;
+    int below = comboY + m.comboH + 4;
+    if (below + listH <= m.H - (int)(12 * m.dpi)) return below;
+    int above = comboY - listH - 4;
+    int minY = m.tabsY + m.tabH + 4;
+    return above >= minY ? above : minY;
+}
+
+static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
+    HPEN pen = CreatePen(PS_SOLID, 2, C_WHITE);
+    HPEN oldPen = (HPEN)SelectObject(dc, pen);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+    int cx = x + 16, cy = y + 16;
+    switch (kind) {
+    case 0: // 自动呼出 / 输入框
+        RoundRect(dc, x + 2, y + 5, x + 25, y + 22, 4, 4);
+        MoveToEx(dc, x + 6, y + 26, NULL); LineTo(dc, x + 21, y + 26);
+        Ellipse(dc, x + 20, y + 14, x + 28, y + 22);
+        MoveToEx(dc, x + 30, y + 16, NULL); LineTo(dc, x + 34, y + 16);
+        MoveToEx(dc, x + 24, y + 10, NULL); LineTo(dc, x + 24, y + 6);
+        break;
+    case 1: // 关闭按钮
+        RoundRect(dc, x + 3, y + 4, x + 29, y + 26, 4, 4);
+        MoveToEx(dc, x + 18, y + 12, NULL); LineTo(dc, x + 25, y + 19);
+        MoveToEx(dc, x + 25, y + 12, NULL); LineTo(dc, x + 18, y + 19);
+        break;
+    case 2: // 键盘布局
+        RoundRect(dc, x + 1, y + 7, x + 31, y + 24, 4, 4);
+        for (int i = 0; i < 4; i++) {
+            MoveToEx(dc, x + 6 + i * 6, y + 12, NULL); LineTo(dc, x + 9 + i * 6, y + 12);
+            MoveToEx(dc, x + 6 + i * 6, y + 18, NULL); LineTo(dc, x + 9 + i * 6, y + 18);
+        }
+        break;
+    case 3: // 功能键
+        RoundRect(dc, x + 3, y + 5, x + 29, y + 26, 4, 4);
+        DrawTextC(dc, x + 3, y + 5, 26, 21, L"F", g_sf13b, C_WHITE);
+        break;
+    case 4: // Shift 符号
+        RoundRect(dc, x + 3, y + 5, x + 29, y + 26, 4, 4);
+        MoveToEx(dc, cx, y + 10, NULL); LineTo(dc, cx - 6, y + 16);
+        MoveToEx(dc, cx, y + 10, NULL); LineTo(dc, cx + 6, y + 16);
+        MoveToEx(dc, cx, y + 10, NULL); LineTo(dc, cx, y + 22);
+        break;
+    case 5: // 自动隐藏 / 时钟
+        Ellipse(dc, x + 3, y + 3, x + 29, y + 29);
+        MoveToEx(dc, cx, cy, NULL); LineTo(dc, cx, y + 9);
+        MoveToEx(dc, cx, cy, NULL); LineTo(dc, x + 23, y + 20);
+        break;
+    case 6: // 语言
+        Ellipse(dc, x + 3, y + 3, x + 29, y + 29);
+        MoveToEx(dc, x + 4, cy, NULL); LineTo(dc, x + 28, cy);
+        MoveToEx(dc, cx, y + 4, NULL); LineTo(dc, cx, y + 28);
+        Arc(dc, x + 8, y + 3, x + 24, y + 29, x + 16, y + 3, x + 16, y + 29);
+        break;
+    case 7: // 主题
+        Ellipse(dc, x + 5, y + 5, x + 27, y + 27);
+        for (int i = 0; i < 8; i++) {
+            double a = i * 3.1415926535 / 4.0;
+            int x1 = cx + (int)(14 * cos(a)), y1 = cy + (int)(14 * sin(a));
+            int x2 = cx + (int)(17 * cos(a)), y2 = cy + (int)(17 * sin(a));
+            MoveToEx(dc, x1, y1, NULL); LineTo(dc, x2, y2);
+        }
+        break;
+    case 8: // 高亮颜色
+        MoveToEx(dc, cx, y + 3, NULL); LineTo(dc, x + 28, y + 15);
+        Arc(dc, x + 8, y + 8, x + 24, y + 28, x + 8, y + 16, x + 16, y + 8);
+        LineTo(dc, x + 12, y + 27);
+        break;
+    }
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen); DeleteObject(pen);
+}
+
+static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* title,
+                           const wchar_t* desc, BOOL hover) {
+    double dpi = GetSystemDpiScale();
+    DrawRoundRect(dc, row.left, row.top, row.right - row.left, row.bottom - row.top,
+                  hover ? C_HOVER : C_KEY, hover ? C_HOT : C_KEY_BORDER, 8);
+    DrawSettingsIcon(dc, row.left + (int)(18 * dpi), row.top + (row.bottom - row.top - 32) / 2, icon);
+    int tx = row.left + (int)(66 * dpi);
+    int tw = row.right - tx - (int)(240 * dpi);
+    DrawTextL(dc, tx, row.top + (int)(7 * dpi), tw, (int)(20 * dpi), title, g_sf14b, C_WHITE);
+    DrawTextL(dc, tx, row.top + (int)(29 * dpi), tw, (int)(20 * dpi), desc, g_sf12, C_DIM);
+}
+
+static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL on) {
+    int x = row.right - (int)(20 * m.dpi) - m.switchW;
+    int y = row.top + (row.bottom - row.top - m.switchH) / 2;
+    DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), row.bottom - row.top,
+              on ? T(L"开", L"On") : T(L"关", L"Off"), g_sf13, C_WHITE);
+    DrawSwitch(dc, x, y, m.switchW, m.switchH, on);
 }
 
 // 高亮色板（RGB）：常用颜色供自定义时点选
@@ -1640,414 +1793,369 @@ static void AboutLinkLayout(int x0, int cw, int* px1, int* pw1, int* psep, int* 
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
-    RECT rc; GetClientRect(hWnd, &rc);
-    int W = rc.right, H = rc.bottom;
-    double dpi = GetSystemDpiScale();
-    int hdr = (int)(40 * dpi);
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    Fill(dc, 0, 0, m.W, m.H, C_BG);
 
-    Fill(dc, 0, 0, W, hdr, C_HDR);
-    DrawTextL(dc, 14, 0, W - 90, hdr, T(L"设置", L"Settings"), g_sf13, C_WHITE);
-    int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
-    int bx = W - bw - 8, by = (hdr - bh) / 2;
-    DrawRoundRect(dc, bx, by, bw, bh, (g_sHov == S_HIT_CLOSE) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
-    int mx = bx + bw / 2, my = by + bh / 2, r = (int)(5 * dpi);
-    HPEN pen = CreatePen(PS_SOLID, 2, C_DIM); HPEN op = (HPEN)SelectObject(dc, pen);
-    MoveToEx(dc, mx - r, my - r, NULL); LineTo(dc, mx + r, my + r);
-    MoveToEx(dc, mx + r, my - r, NULL); LineTo(dc, mx - r, my + r);
-    SelectObject(dc, op); DeleteObject(pen);
-
-    // 多个 Tab 页面：标题栏与内容区之间加一条横线过渡
+    DrawTextL(dc, m.margin, m.titleY, m.W - m.margin * 2 - m.closeW - 12,
+              m.titleH, T(L"设置", L"Settings"), g_sf20b, C_WHITE);
+    if (g_sHov == S_HIT_CLOSE) {
+        DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH, C_HOVER, C_KEY_BORDER, 6);
+    }
     {
-        HPEN pen2 = CreatePen(PS_SOLID, 1, C_KEY_BORDER);
-        HPEN op2 = (HPEN)SelectObject(dc, pen2);
-        MoveToEx(dc, 0, hdr, NULL);
-        LineTo(dc, W, hdr);
-        SelectObject(dc, op2); DeleteObject(pen2);
+        int cx = m.closeX + m.closeW / 2, cy = m.closeY + m.closeH / 2;
+        int r = (int)(5 * m.dpi);
+        HPEN pen = CreatePen(PS_SOLID, 2, C_DIM);
+        HPEN old = (HPEN)SelectObject(dc, pen);
+        MoveToEx(dc, cx - r, cy - r, NULL); LineTo(dc, cx + r, cy + r);
+        MoveToEx(dc, cx + r, cy - r, NULL); LineTo(dc, cx - r, cy + r);
+        SelectObject(dc, old); DeleteObject(pen);
     }
 
-    // 左侧 Tab（纵向），关于在最底
-    int tabX = 12, tabY = hdr + 12;
-    int tabW = (int)(110 * dpi), tabH = (int)(38 * dpi), tabGap = (int)(8 * dpi);
-    SettingsTab(dc, tabX, tabY, tabW, tabH, T(L"常规", L"General"), g_sTab == 0, g_sHov == S_HIT_TAB0); tabY += tabH + tabGap;
-    SettingsTab(dc, tabX, tabY, tabW, tabH, T(L"主题", L"Theme"), g_sTab == 1, g_sHov == S_HIT_TAB1); tabY += tabH + tabGap;
-    SettingsTab(dc, tabX, tabY, tabW, tabH, T(L"关于", L"About"), g_sTab == 2, g_sHov == S_HIT_TAB2);
+    int tabX = m.margin;
+    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"常规", L"General"), g_sTab == 0, g_sHov == S_HIT_TAB0);
+    tabX += m.tabW + m.tabGap;
+    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"主题", L"Theme"), g_sTab == 1, g_sHov == S_HIT_TAB1);
+    tabX += m.tabW + m.tabGap;
+    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"关于", L"About"), g_sTab == 2, g_sHov == S_HIT_TAB2);
+    Fill(dc, m.margin, m.tabsY + m.tabH + 8, m.contentW, 1, C_KEY_BORDER);
 
-    // 右侧内容
-    int x0 = tabX + tabW + 16, y = hdr + 16, cw = W - x0 - 16;
-    int rowH = (int)(26 * dpi);
-    int panelPad = 12, comboW = (int)(150 * dpi), comboH = (int)(24 * dpi);
-    int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
-    int swX = x0 + cw - panelPad - swW;
     if (g_sTab == 0) {
-        // ===== 常规：三个圆角面板 ======
-        int py = y;
-        // 面板 1：自动呼出
-        int p1h = 8 + 20 + 4 + rowH + 8;
-        DrawPanel(dc, x0, py, cw, p1h);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"自动呼出", L"Auto Pop-up"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_af);
-            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"点击输入框时自动弹出键盘", L"Auto show when clicking an input"), g_sf13, C_DIM);
-        }
-        py += p1h + 10;
-        // 面板 2：关闭按钮（下拉选择操作，记住选择保留在关闭提示窗）
-        int p2h = 8 + 20 + 4 + comboH + 8;
-        DrawPanel(dc, x0, py, cw, p2h);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"关闭按钮", L"Close Button"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;   // 下拉框统一居右
-            DrawTextL(dc, ix, comboY, (comboX - 12) - ix, comboH, T(L"关闭时的操作", L"Action on close"), g_sf13, C_DIM);
-            DrawCombo(dc, comboX, comboY, comboW, comboH, CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
-        }
-        py += p2h + 10;
-        // 面板 3：键盘布局
-        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 4 + rowH + 8;
-        DrawPanelR(dc, x0, py, cw, p3h, 10);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"键盘布局", L"Keyboard Layout"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            DrawCombo(dc, comboX, comboY, comboW, comboH, g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode], g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
-            iy += comboH + 6;
-            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_showFKeys);
-            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"顶部显示 F1~F12 键", L"Show F1~F12 row"), g_sf13, C_DIM);
-            iy += rowH + (int)(4 * dpi);
-            DrawSwitch(dc, swX, iy + (rowH - swH) / 2, swW, swH, g_shiftSymbols);
-            DrawTextL(dc, ix, iy, (swX - 12) - ix, rowH, T(L"按 Shift 时显示特殊符号（否则显示数字）", L"Show symbols on Shift (else numbers)"), g_sf13, C_DIM);
-        }
-        py += p3h + 10;
-        // 面板 4：自动隐藏延迟
-        int p4h = 8 + 20 + 4 + comboH + 8;
-        DrawPanel(dc, x0, py, cw, p4h);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"自动隐藏延迟", L"Auto-hide Delay"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            DrawCombo(dc, comboX, comboY, comboW, comboH, HideDelayName(), g_dropHideDelay, g_sHov == S_HIT_HIDEDELAY_DROP);
-        }
-        py += p4h + 10;
-        // 面板 5：语言
-        int p5h = 8 + 20 + 4 + comboH + 8;
-        DrawPanel(dc, x0, py, cw, p5h);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"语言", L"Language"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            DrawCombo(dc, comboX, comboY, comboW, comboH, g_lang ? g_langNamesEn[g_lang] : g_langNames[g_lang], g_dropLang, g_sHov == S_HIT_LANG_DROP);
-        }
-        py += p5h;
+        RECT r = SettingsRowRect(m, 0);
+        DrawSettingRow(dc, r, 0, T(L"自动呼出", L"Auto Pop-up"),
+                       T(L"点击输入框时自动弹出键盘", L"Show the keyboard when an input gets focus"), g_sHov == S_HIT_AUTO);
+        DrawSettingSwitch(dc, m, r, g_af);
+
+        r = SettingsRowRect(m, 1);
+        DrawSettingRow(dc, r, 1, T(L"关闭按钮", L"Close Button"),
+                       T(L"选择关闭窗口时执行的操作", L"Choose what happens when the window is closed"), FALSE);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
+
+        r = SettingsRowRect(m, 2);
+        DrawSettingRow(dc, r, 2, T(L"键盘布局", L"Keyboard Layout"),
+                       T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"), FALSE);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
+                  g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
+
+        r = SettingsRowRect(m, 3);
+        DrawSettingRow(dc, r, 3, T(L"功能键行", L"Function Key Row"),
+                       T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"), g_sHov == S_HIT_FKEYS);
+        DrawSettingSwitch(dc, m, r, g_showFKeys);
+
+        r = SettingsRowRect(m, 4);
+        DrawSettingRow(dc, r, 4, T(L"Shift 符号", L"Shift Symbols"),
+                       T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"), g_sHov == S_HIT_SHIFTSYM);
+        DrawSettingSwitch(dc, m, r, g_shiftSymbols);
+
+        r = SettingsRowRect(m, 5);
+        DrawSettingRow(dc, r, 5, T(L"自动隐藏", L"Auto-hide"),
+                       T(L"设置离开输入区域后的收起延迟", L"Set the delay before the keyboard is hidden"), FALSE);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  HideDelayName(), g_dropHideDelay, g_sHov == S_HIT_HIDEDELAY_DROP);
+
+        r = SettingsRowRect(m, 6);
+        DrawSettingRow(dc, r, 6, T(L"界面语言", L"Language"),
+                       T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"), FALSE);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  g_lang ? g_langNamesEn[g_lang] : g_langNames[g_lang],
+                  g_dropLang, g_sHov == S_HIT_LANG_DROP);
     } else if (g_sTab == 1) {
-        // ===== 主题：圆角面板 ======
-        int py = y;
-        int ph = 8 + 20 + 4 + comboH + 8;
-        DrawPanelR(dc, x0, py, cw, ph, 10);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"主题模式", L"Theme Mode"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            DrawCombo(dc, comboX, comboY, comboW, comboH, g_lang ? g_themeNamesEn[g_themeMode] : g_themeNames[g_themeMode], g_dropTheme, g_sHov == S_HIT_THEME_DROP);
-        }
-        py += ph + 10;
-        // 面板 2：高亮颜色（默认 / 跟随壁纸 / 自定义 + #HEX 输入 + 色板）
-        int p2h = 8 + 20 + 4 + comboH + 6 +
-                  (HlSel() == 2 ? (int)(24 * dpi) + 6 + (int)(16 * dpi) + 4 + (int)(18 * dpi) : 0) + 8;
-        DrawPanelR(dc, x0, py, cw, p2h, 10);
-        {
-            int ix = x0 + panelPad, iy = py + 8;
-            DrawTextL(dc, ix, iy, cw - 24, (int)(20 * dpi), T(L"高亮颜色", L"Highlight Color"), g_sf14b, C_WHITE);
-            iy += (int)(20 * dpi) + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            DrawCombo(dc, comboX, comboY, comboW, comboH, g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()], g_dropHl, g_sHov == S_HIT_HL_DROP);
-            iy += comboH + 6;
-            if (HlSel() == 2) {
-                int inputH = (int)(24 * dpi), hexW = (int)(96 * dpi), sw = (int)(20 * dpi);
-                DrawRoundRect(dc, ix, iy, hexW, inputH, g_hlEditFocus ? C_HOVER : C_DARK, C_DIM, 6);
-                wchar_t hexbuf[8];
-                if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf);
-                else HexFromBgr(g_hlColor, hexbuf);
-                DrawTextL(dc, ix + 8, iy, hexW - 16, inputH, hexbuf, g_sf13, C_WHITE);
-                DrawRoundRect(dc, ix + hexW + (int)(8 * dpi), iy + (inputH - sw) / 2, sw, sw, (DWORD)g_hlColor, C_KEY_BORDER, 4);
-                // 输入提示
-                int hintX = ix + hexW + (int)(8 * dpi) + sw + (int)(8 * dpi);
-                DrawTextL(dc, hintX, iy, cw - (hintX - x0) - panelPad, inputH,
-                          T(L"支持 #RRGGBB，或点色板", L"#RRGGBB or pick a swatch"), g_sf12, C_DIM);
-                iy += inputH + 6;
-                // 色板
-                int palS = (int)(18 * dpi), palGap = (int)(6 * dpi);
-                for (int i = 0; i < 10; i++) {
-                    int px = ix + i * (palS + palGap);
-                    DrawRoundRect(dc, px, iy, palS, palS, RgbToBgr(g_paletteRgb[i]),
-                                  (g_sHov == S_HIT_HL_PAL0 + i) ? C_WHITE : C_KEY_BORDER, 4);
-                }
+        RECT r = SettingsRowRect(m, 0);
+        DrawSettingRow(dc, r, 7, T(L"主题模式", L"Theme Mode"),
+                       T(L"跟随系统，或固定使用深色、浅色主题", L"Follow Windows or use a fixed dark or light theme"), FALSE);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  g_lang ? g_themeNamesEn[g_themeMode] : g_themeNames[g_themeMode],
+                  g_dropTheme, g_sHov == S_HIT_THEME_DROP);
+
+        r = SettingsRowRect(m, 1);
+        DrawSettingRow(dc, r, 8, T(L"高亮颜色", L"Highlight Color"),
+                       T(L"使用默认颜色、壁纸强调色或自定义颜色", L"Use the default, wallpaper accent, or a custom color"), FALSE);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
+                  g_dropHl, g_sHov == S_HIT_HL_DROP);
+
+        if (HlSel() == 2) {
+            r = SettingsRowRect(m, 2);
+            r.bottom = r.top + (int)(96 * m.dpi);
+            DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, C_KEY, C_KEY_BORDER, 8);
+            DrawSettingsIcon(dc, r.left + 18, r.top + 14, 8);
+            int tx = r.left + 66;
+            DrawTextL(dc, tx, r.top + 10, (int)(260 * m.dpi), 20,
+                      T(L"自定义颜色", L"Custom Color"), g_sf14b, C_WHITE);
+            DrawTextL(dc, tx, r.top + 32, (int)(320 * m.dpi), 20,
+                      T(L"输入 #RRGGBB 或选择下方色板", L"Enter #RRGGBB or choose a swatch below"), g_sf12, C_DIM);
+
+            int inputW = (int)(138 * m.dpi), inputH = m.comboH;
+            int inputX = r.right - (int)(20 * m.dpi) - inputW;
+            int inputY = r.top + (int)(13 * m.dpi);
+            DrawRoundRect(dc, inputX, inputY, inputW, inputH,
+                          g_hlEditFocus ? C_HOVER : C_DARK, g_hlEditFocus ? C_HOT : C_DIM, 6);
+            int sw = inputH - (int)(10 * m.dpi);
+            DrawRoundRect(dc, inputX + (int)(6 * m.dpi), inputY + (inputH - sw) / 2,
+                          sw, sw, (DWORD)g_hlColor, C_KEY_BORDER, 4);
+            wchar_t hexbuf[8];
+            if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(g_hlColor, hexbuf);
+            DrawTextL(dc, inputX + sw + (int)(14 * m.dpi), inputY,
+                      inputW - sw - (int)(20 * m.dpi), inputH, hexbuf, g_sf13, C_WHITE);
+
+            int palS = (int)(22 * m.dpi), palGap = (int)(9 * m.dpi);
+            int palX = tx, palY = r.top + (int)(62 * m.dpi);
+            for (int i = 0; i < 10; i++) {
+                int px = palX + i * (palS + palGap);
+                DrawRoundRect(dc, px, palY, palS, palS, RgbToBgr(g_paletteRgb[i]),
+                              (g_sHov == S_HIT_HL_PAL0 + i) ? C_HOT : C_KEY_BORDER, 5);
             }
         }
     } else {
-        // ===== 关于：Logo + 名称 + 版本(架构) + 底部项目地址 ======
-        int logo = (int)(72 * dpi);
+        int x0 = m.contentX, y = m.contentY + (int)(26 * m.dpi), cw = m.contentW;
+        int logo = (int)(82 * m.dpi);
         HICON hIcon = LoadMainIcon(logo);
         if (hIcon) {
             DrawIconEx(dc, x0 + (cw - logo) / 2, y, hIcon, logo, logo, 0, NULL, DI_NORMAL);
             DestroyIcon(hIcon);
         }
-        y += logo + (int)(22 * dpi);
-        // 项目名称（居中）
-        DrawTextC(dc, x0, y, cw, (int)(26 * dpi), T(L"HKeyboard 轻键", L"HKeyboard"), g_sf14b, C_WHITE);
-        y += (int)(34 * dpi);
-        // 版本号（架构，居中，小一号）
+        y += logo + (int)(24 * m.dpi);
+        DrawTextC(dc, x0, y, cw, (int)(30 * m.dpi), T(L"HKeyboard 轻键", L"HKeyboard"), g_sf20b, C_WHITE);
+        y += (int)(38 * m.dpi);
         wchar_t ver[64];
         swprintf(ver, 64, T(L"版本：v%hs (%ls)", L"Version: v%hs (%ls)"), VER_FILEVERSION_STR, ArchName());
-        DrawTextC(dc, x0, y, cw, (int)(18 * dpi), ver, g_sf12, C_WHITE);
-        // 底部项目地址 | 问题反馈：同一行居中，链接可点击（| 不参与超链接）
-        int uy = H - (int)(40 * dpi);
+        DrawTextC(dc, x0, y, cw, (int)(20 * m.dpi), ver, g_sf12, C_DIM);
+
+        int uy = m.H - m.margin - (int)(20 * m.dpi);
         int x1, w1, x2, w2, sx, sw2;
         AboutLinkLayout(x0, cw, &x1, &w1, &sx, &sw2, &x2, &w2);
-        const wchar_t* urlText = T(L"项目地址", L"Project URL");
-        const wchar_t* fbText = T(L"问题反馈", L"Feedback");
-        DrawTextL(dc, x1, uy, w1, (int)(18 * dpi), urlText, g_sf12, C_HOT);
-        DrawTextL(dc, sx, uy, sw2, (int)(18 * dpi), L"|", g_sf12, C_DIM);
-        DrawTextL(dc, x2, uy, w2, (int)(18 * dpi), fbText, g_sf12, C_HOT);
-        if (g_sHov == S_HIT_URL) {
-            HPEN pen2 = CreatePen(PS_SOLID, 1, C_HOT);
-            HPEN op2 = (HPEN)SelectObject(dc, pen2);
-            MoveToEx(dc, x1, uy + (int)(16 * dpi), NULL);
-            LineTo(dc, x1 + w1, uy + (int)(16 * dpi));
-            SelectObject(dc, op2); DeleteObject(pen2);
-        }
-        if (g_sHov == S_HIT_FEEDBACK) {
-            HPEN pen2 = CreatePen(PS_SOLID, 1, C_HOT);
-            HPEN op2 = (HPEN)SelectObject(dc, pen2);
-            MoveToEx(dc, x2, uy + (int)(16 * dpi), NULL);
-            LineTo(dc, x2 + w2, uy + (int)(16 * dpi));
-            SelectObject(dc, op2); DeleteObject(pen2);
+        DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf12, C_HOT);
+        DrawTextL(dc, sx, uy, sw2, (int)(18 * m.dpi), L"|", g_sf12, C_DIM);
+        DrawTextL(dc, x2, uy, w2, (int)(18 * m.dpi), T(L"问题反馈", L"Feedback"), g_sf12, C_HOT);
+        if (g_sHov == S_HIT_URL || g_sHov == S_HIT_FEEDBACK) {
+            int lx = g_sHov == S_HIT_URL ? x1 : x2;
+            int lw = g_sHov == S_HIT_URL ? w1 : w2;
+            HPEN pen = CreatePen(PS_SOLID, 1, C_HOT);
+            HPEN old = (HPEN)SelectObject(dc, pen);
+            MoveToEx(dc, lx, uy + (int)(16 * m.dpi), NULL); LineTo(dc, lx + lw, uy + (int)(16 * m.dpi));
+            SelectObject(dc, old); DeleteObject(pen);
         }
     }
 
-    // ===== 下拉列表最后绘制（避免被后续面板盖住） =====
+    // 下拉列表最后绘制，确保覆盖后续卡片。
     if (g_sTab == 0) {
-        int py = y;
-        int p1h = 8 + 20 + 4 + rowH + 8;
-        py += p1h + 10;
-        int p2h = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboX = swX - comboW;
-            if (g_dropClose) {
-                const wchar_t* names[2];
-                names[0] = T(L"直接退出程序", L"Exit program");
-                names[1] = T(L"隐藏到系统托盘", L"Hide to tray");
-                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 2, g_closeToTray ? 1 : 0, g_dropCloseHov);
-            }
+        RECT r;
+        if (g_dropClose) {
+            r = SettingsRowRect(m, 1);
+            const wchar_t* names[2] = {T(L"直接退出程序", L"Exit program"), T(L"隐藏到系统托盘", L"Hide to tray")};
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
+                          m.comboW, m.comboH, names, 2, g_closeToTray ? 1 : 0, g_dropCloseHov);
         }
-        py += p2h + 10;
-        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 4 + rowH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboX = swX - comboW;
-            if (g_dropLayout) {
-                const wchar_t* names[3];
-                for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
-                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 3, g_layoutMode, g_dropLayoutHov);
-            }
+        if (g_dropLayout) {
+            r = SettingsRowRect(m, 2);
+            const wchar_t* names[3];
+            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
+                          m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
         }
-        py += p3h + 10;
-        int p4h = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboX = swX - comboW;
-            if (g_dropHideDelay) {
-                const wchar_t* names[6];
-                for (int i = 0; i < 6; i++) names[i] = g_lang ? g_hideDelayNamesEn[i] : g_hideDelayNames[i];
-                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 6, HideDelayIndex(), g_dropHideDelayHov);
-            }
+        if (g_dropHideDelay) {
+            r = SettingsRowRect(m, 5);
+            const wchar_t* names[6];
+            for (int i = 0; i < 6; i++) names[i] = g_lang ? g_hideDelayNamesEn[i] : g_hideDelayNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 6),
+                          m.comboW, m.comboH, names, 6, HideDelayIndex(), g_dropHideDelayHov);
         }
-        py += p4h + 10;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboX = swX - comboW;
-            if (g_dropLang) {
-                const wchar_t* names[2];
-                for (int i = 0; i < 2; i++) names[i] = g_lang ? g_langNamesEn[i] : g_langNames[i];
-                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 2, g_lang, g_dropLangHov);
-            }
+        if (g_dropLang) {
+            r = SettingsRowRect(m, 6);
+            const wchar_t* names[2];
+            for (int i = 0; i < 2; i++) names[i] = g_lang ? g_langNamesEn[i] : g_langNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
+                          m.comboW, m.comboH, names, 2, g_lang, g_dropLangHov);
         }
     } else if (g_sTab == 1) {
-        int py = y;
-        int ph = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboX = swX - comboW;
-            if (g_dropTheme) {
-                const wchar_t* names[3];
-                for (int i = 0; i < 3; i++) names[i] = g_lang ? g_themeNamesEn[i] : g_themeNames[i];
-                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 3, g_themeMode, g_dropThemeHov);
-            }
+        RECT r;
+        if (g_dropTheme) {
+            r = SettingsRowRect(m, 0);
+            const wchar_t* names[3];
+            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_themeNamesEn[i] : g_themeNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
+                          m.comboW, m.comboH, names, 3, g_themeMode, g_dropThemeHov);
         }
-        py += ph + 10;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboX = swX - comboW;
-            if (g_dropHl) {
-                const wchar_t* names[3];
-                for (int i = 0; i < 3; i++) names[i] = g_lang ? g_hlModeNamesEn[i] : g_hlModeNames[i];
-                DrawComboList(dc, comboX, iy + comboH + 2, comboW, comboH, names, 3, HlSel(), g_dropHlHov);
-            }
+        if (g_dropHl) {
+            r = SettingsRowRect(m, 1);
+            const wchar_t* names[3];
+            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_hlModeNamesEn[i] : g_hlModeNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
+                          m.comboW, m.comboH, names, 3, HlSel(), g_dropHlHov);
         }
     }
 }
 
 static int SettingsHitTest(HWND hWnd, int x, int y) {
-    RECT rc; GetClientRect(hWnd, &rc);
-    int W = rc.right, H = rc.bottom;
-    double dpi = GetSystemDpiScale();
-    int hdr = (int)(40 * dpi);
-    int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
-    int bx = W - bw - 8, by = (hdr - bh) / 2;
-    if (x >= bx && x < bx + bw && y >= by && y < by + bh) return S_HIT_CLOSE;
-    // 左侧 Tab（纵向），关于在最底
-    int tabX = 12, tabY = hdr + 12, tabW = (int)(110 * dpi), tabH = (int)(38 * dpi), tabGap = (int)(8 * dpi);
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    if (x >= m.closeX && x < m.closeX + m.closeW && y >= m.closeY && y < m.closeY + m.closeH) return S_HIT_CLOSE;
+
+    int tabX = m.margin;
     for (int i = 0; i < 3; i++) {
-        if (x >= tabX && x < tabX + tabW && y >= tabY && y < tabY + tabH) return S_HIT_TAB0 + i;
-        tabY += tabH + tabGap;
+        if (x >= tabX && x < tabX + m.tabW && y >= m.tabsY && y < m.tabsY + m.tabH) return S_HIT_TAB0 + i;
+        tabX += m.tabW + m.tabGap;
     }
-    int x0 = tabX + tabW + 16, yy = hdr + 16, cw = W - x0 - 16;
-    int rowH = (int)(26 * dpi);
-    int panelPad = 12, comboW = (int)(150 * dpi), comboH = (int)(24 * dpi);
-    int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
-    int swX = x0 + cw - panelPad - swW;
+
     if (g_sTab == 0) {
-        int py = yy;
-        int p1h = 8 + 20 + 4 + rowH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_AUTO;
-        }
-        py += p1h + 10;
-        int p2h = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            if (g_dropClose) {
-                int ly = comboY + comboH + 2;
-                for (int i = 0; i < 2; i++) {
-                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_CLOSE_OPT0 + i;
-                    ly += comboH;
-                }
+        RECT r;
+        // 下拉列表优先命中，避免列表翻到上方或覆盖相邻卡片时被底层项目抢先处理。
+        if (g_dropClose) {
+            r = SettingsRowRect(m, 1);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
+            for (int i = 0; i < 2; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_CLOSE_OPT0 + i;
+                ly += m.comboH;
             }
-            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_CLOSE_DROP;
         }
-        py += p2h + 10;
-        int p3h = 8 + 20 + 4 + comboH + 6 + rowH + 4 + rowH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            if (g_dropLayout) {
-                int ly = comboY + comboH + 2;
-                for (int i = 0; i < 3; i++) {
-                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_LAYOUT_OPT0 + i;
-                    ly += comboH;
-                }
+        if (g_dropLayout) {
+            r = SettingsRowRect(m, 2);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
+            for (int i = 0; i < 3; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
+                ly += m.comboH;
             }
-            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_LAYOUT_DROP;
-            iy += comboH + 6;
-            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_FKEYS;
-            iy += rowH + (int)(4 * dpi);
-            if (x >= ix && x < ix + cw - 24 && y >= iy && y < iy + rowH) return S_HIT_SHIFTSYM;
         }
-        py += p3h + 10;
-        int p4h = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            if (g_dropHideDelay) {
-                int ly = comboY + comboH + 2;
-                for (int i = 0; i < 6; i++) {
-                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_HIDEDELAY_OPT0 + i;
-                    ly += comboH;
-                }
+        if (g_dropHideDelay) {
+            r = SettingsRowRect(m, 5);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
+            for (int i = 0; i < 6; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_HIDEDELAY_OPT0 + i;
+                ly += m.comboH;
             }
-            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_HIDEDELAY_DROP;
         }
-        py += p4h + 10;
-        int p5h = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            if (g_dropLang) {
-                int ly = comboY + comboH + 2;
-                for (int i = 0; i < 2; i++) {
-                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_LANG_OPT0 + i;
-                    ly += comboH;
-                }
+        if (g_dropLang) {
+            r = SettingsRowRect(m, 6);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
+            for (int i = 0; i < 2; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LANG_OPT0 + i;
+                ly += m.comboH;
             }
-            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_LANG_DROP;
         }
+
+        r = SettingsRowRect(m, 0);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTO;
+
+        r = SettingsRowRect(m, 1);
+        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+        if (g_dropClose) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
+            for (int i = 0; i < 2; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_CLOSE_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_CLOSE_DROP;
+
+        r = SettingsRowRect(m, 2);
+        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        if (g_dropLayout) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
+            for (int i = 0; i < 3; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LAYOUT_DROP;
+
+        r = SettingsRowRect(m, 3);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
+        r = SettingsRowRect(m, 4);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
+
+        r = SettingsRowRect(m, 5);
+        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        if (g_dropHideDelay) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
+            for (int i = 0; i < 6; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_HIDEDELAY_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HIDEDELAY_DROP;
+
+        r = SettingsRowRect(m, 6);
+        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        if (g_dropLang) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
+            for (int i = 0; i < 2; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LANG_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
     } else if (g_sTab == 1) {
-        int py = yy;
-        int ph = 8 + 20 + 4 + comboH + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            if (g_dropTheme) {
-                int ly = comboY + comboH + 2;
-                for (int i = 0; i < 3; i++) {
-                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_THEME_OPT0 + i;
-                    ly += comboH;
-                }
-            }
-            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_THEME_DROP;
-        }
-        py += ph + 10;
-        int p2h = 8 + 20 + 4 + comboH + 6 +
-                  (HlSel() == 2 ? (int)(24 * dpi) + 6 + (int)(16 * dpi) + 4 + (int)(18 * dpi) : 0) + 8;
-        {
-            int ix = x0 + panelPad, iy = py + 8 + 20 + 4;
-            int comboY = iy;
-            int comboX = swX - comboW;
-            if (g_dropHl) {
-                int ly = comboY + comboH + 2;
-                for (int i = 0; i < 3; i++) {
-                    if (x >= comboX && x < comboX + comboW && y >= ly && y < ly + comboH) return S_HIT_HL_OPT0 + i;
-                    ly += comboH;
-                }
-            }
-            if (x >= comboX && x < comboX + comboW && y >= comboY && y < comboY + comboH) return S_HIT_HL_DROP;
-            if (HlSel() == 2) {
-                iy += comboH + 6;
-                int inputH = (int)(24 * dpi), hexW = (int)(96 * dpi);
-                if (x >= ix && x < ix + hexW && y >= iy && y < iy + inputH) return S_HIT_HL_BOX;
-                iy += inputH + 6;
-                int palS = (int)(18 * dpi), palGap = (int)(6 * dpi);
-                for (int i = 0; i < 10; i++) {
-                    int px = ix + i * (palS + palGap);
-                    if (x >= px && x < px + palS && y >= iy && y < iy + palS) return S_HIT_HL_PAL0 + i;
-                }
+        RECT r = SettingsRowRect(m, 0);
+        if (g_dropTheme) {
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
+            for (int i = 0; i < 3; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_THEME_OPT0 + i;
+                ly += m.comboH;
             }
         }
-    } else if (g_sTab == 2) {
-        int uy = H - (int)(40 * dpi);
+        if (g_dropHl) {
+            r = SettingsRowRect(m, 1);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
+            for (int i = 0; i < 3; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_HL_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+
+        r = SettingsRowRect(m, 0);
+        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+        if (g_dropTheme) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
+            for (int i = 0; i < 3; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_THEME_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_THEME_DROP;
+
+        r = SettingsRowRect(m, 1);
+        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        if (g_dropHl) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
+            for (int i = 0; i < 3; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_HL_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HL_DROP;
+
+        if (HlSel() == 2) {
+            r = SettingsRowRect(m, 2);
+            r.bottom = r.top + (int)(96 * m.dpi);
+            int inputW = (int)(138 * m.dpi), inputH = m.comboH;
+            int inputX = r.right - (int)(20 * m.dpi) - inputW;
+            int inputY = r.top + (int)(13 * m.dpi);
+            if (x >= inputX && x < inputX + inputW && y >= inputY && y < inputY + inputH) return S_HIT_HL_BOX;
+            int palS = (int)(22 * m.dpi), palGap = (int)(9 * m.dpi);
+            int palX = r.left + 66, palY = r.top + (int)(62 * m.dpi);
+            for (int i = 0; i < 10; i++) {
+                int px = palX + i * (palS + palGap);
+                if (x >= px && x < px + palS && y >= palY && y < palY + palS) return S_HIT_HL_PAL0 + i;
+            }
+        }
+    } else {
+        int uy = m.H - m.margin - (int)(20 * m.dpi);
         int x1, w1, x2, w2, sx, sw2;
-        AboutLinkLayout(x0, cw, &x1, &w1, &sx, &sw2, &x2, &w2);
-        if (x >= x1 && x < x1 + w1 && y >= uy && y < uy + (int)(20 * dpi)) return S_HIT_URL;
-        if (x >= x2 && x < x2 + w2 && y >= uy && y < uy + (int)(20 * dpi)) return S_HIT_FEEDBACK;
+        AboutLinkLayout(m.contentX, m.contentW, &x1, &w1, &sx, &sw2, &x2, &w2);
+        if (x >= x1 && x < x1 + w1 && y >= uy && y < uy + (int)(20 * m.dpi)) return S_HIT_URL;
+        if (x >= x2 && x < x2 + w2 && y >= uy && y < uy + (int)(20 * m.dpi)) return S_HIT_FEEDBACK;
     }
     return S_HIT_NONE;
 }
@@ -2424,8 +2532,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ScreenToClient(hWnd, &pt);
-        int hdr = (int)(40 * GetSystemDpiScale());
-        if (pt.y >= 0 && pt.y < hdr) {
+        SettingsMetrics m = GetSettingsMetrics(hWnd);
+        if (pt.y >= 0 && pt.y < m.tabsY) {
             if (SettingsHitTest(hWnd, pt.x, pt.y) != S_HIT_CLOSE) return HTCAPTION;
         }
         return HTCLIENT;
@@ -2456,7 +2564,7 @@ static void OpenSettingsTab(int tab) {
         return;
     }
     double dpi = GetSystemDpiScale();
-    int w = (int)(520 * dpi), h = (int)(560 * dpi);
+    int w = (int)(740 * dpi), h = (int)(620 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;
@@ -3094,7 +3202,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f13b); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
-        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b);
+        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
         PostQuitMessage(0);
         return 0;
     }

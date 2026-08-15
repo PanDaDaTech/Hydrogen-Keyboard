@@ -870,6 +870,12 @@ static BOOL IsMaterialApplied(HWND hWnd) {
     return hWnd && GetPropW(hWnd, L"HKeyboardMaterial") != NULL;
 }
 
+static void ClearWindowBackBuffer(HDC dc, HWND hWnd, int w, int h) {
+    // DWM backdrop requires a clean glass surface. Copying the previous window DC
+    // reintroduces stale pixels and causes Tab/page ghosting after every repaint.
+    Fill(dc, 0, 0, w, h, IsMaterialApplied(hWnd) ? 0x000000 : C_BG);
+}
+
 static BOOL IsWindowsPE() {
     HKEY key = NULL;
     LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -885,35 +891,42 @@ static void ApplyWindowMaterial(HWND hWnd) {
     DwmExtendFrameIntoClientAreaProc extendFrame = GetDwmExtendFrameIntoClientArea();
     SetWindowCompositionAttributeProc setComposition = GetSetWindowCompositionAttribute();
     BOOL applied = FALSE;
+    BOOL extendBackdrop = FALSE;
+    BOOL acrylicAccent = FALSE;
 
     if (setAttr) {
         const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE = 20;
         BOOL dark = g_themeMode == 1 || (g_themeMode == 0 && IsSystemDarkMode());
-        setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE, &dark, sizeof(dark));
+        if (FAILED(setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE, &dark, sizeof(dark)))) {
+            const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE = 19;
+            setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE, &dark, sizeof(dark));
+        }
 
         const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int backdrop = g_materialMode == 1 ? 2 : (g_materialMode == 2 ? 3 : 1);
-        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop))) &&
-            g_materialMode != 0) {
+        int backdrop = g_materialMode == 1 ? 2 : 1;
+        if (g_materialMode == 1 &&
+            SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop)))) {
             applied = TRUE;
+            extendBackdrop = TRUE;
+        } else {
+            backdrop = 1;
+            setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop));
         }
     }
 
-    if (extendFrame) {
-        DwmMarginsLocal margins = {0, 0, 0, 0};
-        if (applied) margins.left = margins.right = margins.top = margins.bottom = -1;
-        extendFrame(hWnd, &margins);
-    }
-
-    // Windows 10 Acrylic fallback. Mica intentionally has no blur substitute.
+    // Acrylic uses an explicit theme-colored tint to preserve contrast in light mode.
     if (setComposition) {
         AccentPolicyLocal policy = {0, 0, 0, 0};
-        if (!applied && g_materialMode == 2) {
+        if (g_materialMode == 2) {
             policy.state = 4; // ACCENT_ENABLE_ACRYLICBLURBEHIND
             policy.flags = 2;
-            policy.gradientColor = 0xCC000000 | (C_BG & 0x00FFFFFF);
+            policy.gradientColor = 0xE8000000 | (C_BG & 0x00FFFFFF);
             WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
-            applied = setComposition(hWnd, &data);
+            if (setComposition(hWnd, &data)) {
+                applied = TRUE;
+                acrylicAccent = TRUE;
+                extendBackdrop = TRUE;
+            }
         } else {
             policy.state = 0; // ACCENT_DISABLED
             WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
@@ -921,9 +934,25 @@ static void ApplyWindowMaterial(HWND hWnd) {
         }
     }
 
+    // If Acrylic accent is unavailable, use the Win11 transient backdrop.
+    if (g_materialMode == 2 && !acrylicAccent && setAttr) {
+        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
+        int backdrop = 3;
+        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &backdrop, sizeof(backdrop)))) {
+            applied = TRUE;
+            extendBackdrop = TRUE;
+        }
+    }
+
+    if (extendFrame) {
+        DwmMarginsLocal margins = {0, 0, 0, 0};
+        if (extendBackdrop) margins.left = margins.right = margins.top = margins.bottom = -1;
+        extendFrame(hWnd, &margins);
+    }
+
     if (applied) SetPropW(hWnd, L"HKeyboardMaterial", (HANDLE)(INT_PTR)1);
     else RemovePropW(hWnd, L"HKeyboardMaterial");
-    InvalidateRect(hWnd, NULL, TRUE);
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
 }
 
 static void ApplyAllWindowMaterials() {
@@ -2029,7 +2058,6 @@ static void AboutLinkLayout(int x0, int cw, int* px1, int* pw1, int* psep, int* 
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
-    if (!IsMaterialApplied(hWnd)) Fill(dc, 0, 0, m.W, m.H, C_BG);
 
     DrawTextL(dc, m.margin, m.titleY, m.W - m.margin * 2 - m.closeW - 12,
               m.titleH, T(L"设置", L"Settings"), g_sf20b, C_WHITE);
@@ -2685,7 +2713,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         ApplyAllWindowMaterials();
     }
     if (layoutChanged) ApplyKeyboardLayout();           // 应用并保存布局
-    InvalidateRect(hWnd, NULL, TRUE);                   // 设置页立即刷新
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE); // 设置页立即刷新
 }
 
 static void SettingsOnClick(HWND hWnd, int x, int y) {
@@ -2701,7 +2729,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
-        InvalidateRect(hWnd, NULL, TRUE);
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }
     if (hit != S_HIT_NONE) {
@@ -2715,7 +2743,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
-        InvalidateRect(hWnd, NULL, TRUE);
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
     }
 }
 
@@ -2737,8 +2765,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-        if (IsMaterialApplied(hWnd)) BitBlt(mem, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
-        else Fill(mem, 0, 0, rc.right, rc.bottom, C_BG);
+        ClearWindowBackBuffer(mem, hWnd, rc.right, rc.bottom);
         SettingsDraw(mem, hWnd);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
@@ -3006,8 +3033,7 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-        if (IsMaterialApplied(hWnd)) BitBlt(mem, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
-        else Fill(mem, 0, 0, rc.right, rc.bottom, C_BG);
+        ClearWindowBackBuffer(mem, hWnd, rc.right, rc.bottom);
         PromptDraw(mem, hWnd);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
@@ -3359,8 +3385,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         HBITMAP bmp = CreateCompatibleBitmap(dc, g_ww, g_wh);
         HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
-        if (IsMaterialApplied(hWnd)) BitBlt(mem, 0, 0, g_ww, g_wh, dc, 0, 0, SRCCOPY);
-        else Fill(mem, 0, 0, g_ww, g_wh, C_BG);
+        ClearWindowBackBuffer(mem, hWnd, g_ww, g_wh);
         DrawHeader(mem);
         DrawKeys(mem);
 

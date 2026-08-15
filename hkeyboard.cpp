@@ -719,7 +719,7 @@ static HFONT MakeFont(double size, BOOL bold) {
     ReleaseDC(0, hdc);
     return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei");
 }
 
@@ -732,7 +732,7 @@ static HFONT MakeIconFont(double size) {
     const wchar_t* faces[2] = {L"Segoe Fluent Icons", L"Segoe MDL2 Assets"};
     for (int i = 0; i < 2; i++) {
         HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE, faces[i]);
         if (!font) continue;
         dc = GetDC(NULL);

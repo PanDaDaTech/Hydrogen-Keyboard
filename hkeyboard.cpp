@@ -269,7 +269,7 @@ HANDLE      g_mutex = 0;
 #define SLIDE_STEPS 8
 #define SLIDE_MS 8
 HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
-static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
+static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0, g_sfIcon = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -682,6 +682,30 @@ static HFONT MakeFont(double size, BOOL bold) {
         DEFAULT_PITCH | FF_DONTCARE, g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei");
 }
 
+static HFONT MakeIconFont(double size) {
+    HDC dc = GetDC(NULL);
+    int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    int height = -MulDiv((int)(size + 0.5), dpi, 72);
+    ReleaseDC(NULL, dc);
+
+    const wchar_t* faces[2] = {L"Segoe Fluent Icons", L"Segoe MDL2 Assets"};
+    for (int i = 0; i < 2; i++) {
+        HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE, faces[i]);
+        if (!font) continue;
+        dc = GetDC(NULL);
+        HFONT old = (HFONT)SelectObject(dc, font);
+        wchar_t actual[LF_FACESIZE] = {0};
+        GetTextFaceW(dc, LF_FACESIZE, actual);
+        SelectObject(dc, old);
+        ReleaseDC(NULL, dc);
+        if (_wcsicmp(actual, faces[i]) == 0) return font;
+        DeleteObject(font);
+    }
+    return MakeFont(size, FALSE);
+}
+
 // 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
@@ -690,6 +714,7 @@ static void InitFixedFonts() {
     g_sf13b = MakeFont(10 * dpi, 1);     // Tab / 按钮
     g_sf14b = MakeFont(12 * dpi, 1);     // 面板标题（深色大字）
     g_sf20b = MakeFont(22 * dpi, 1);     // 设置页大标题
+    g_sfIcon = MakeIconFont(20);         // Windows 11 Fluent 图标
 }
 
 static void RecreateFontsAndLayout() {
@@ -727,16 +752,56 @@ static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
 }
 
 static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD borderC, int radius) {
-    HPEN p = CreatePen(PS_SOLID, 1, borderC);
-    HPEN op = (HPEN)SelectObject(dc, p);
-    HBRUSH b = CreateSolidBrush(fillC);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, b);
-    RoundRect(dc, x, y, x + w, y + h, radius, radius);
-    SelectObject(dc, ob); DeleteObject(b);
-    SelectObject(dc, op); DeleteObject(p);
+    if (w <= 0 || h <= 0) return;
+    float r = (float)radius;
+    float maxR = ((float)(w < h ? w : h) - 1.0f) / 2.0f;
+    if (r < 1.0f) r = 1.0f;
+    if (r > maxR) r = maxR;
+
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::GraphicsPath path;
+    float d = r * 2.0f;
+    float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
+    float fw = (float)w - 1.0f, fh = (float)h - 1.0f;
+    path.AddArc(fx, fy, d, d, 180.0f, 90.0f);
+    path.AddArc(fx + fw - d, fy, d, d, 270.0f, 90.0f);
+    path.AddArc(fx + fw - d, fy + fh - d, d, d, 0.0f, 90.0f);
+    path.AddArc(fx, fy + fh - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+
+    Gdiplus::Color fill(255, GetRValue(fillC), GetGValue(fillC), GetBValue(fillC));
+    Gdiplus::Color border(255, GetRValue(borderC), GetGValue(borderC), GetBValue(borderC));
+    Gdiplus::SolidBrush brush(fill);
+    Gdiplus::Pen pen(border, 1.0f);
+    g.FillPath(&brush, &path);
+    g.DrawPath(&pen, &path);
+}
+
+typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND, DWORD, LPCVOID, DWORD);
+
+static BOOL TryApplyWin11RoundedWindow(HWND hWnd) {
+    static HMODULE dwm = NULL;
+    static DwmSetWindowAttributeProc setAttr = NULL;
+    static BOOL initialized = FALSE;
+    if (!initialized) {
+        initialized = TRUE;
+        dwm = LoadLibraryW(L"dwmapi.dll");
+        if (dwm) setAttr = (DwmSetWindowAttributeProc)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    }
+    if (!setAttr) return FALSE;
+    const DWORD DWMWA_WINDOW_CORNER_PREFERENCE_VALUE = 33;
+    const int DWMWCP_ROUND_VALUE = 2;
+    HRESULT hr = setAttr(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE_VALUE,
+                         &DWMWCP_ROUND_VALUE, sizeof(DWMWCP_ROUND_VALUE));
+    if (FAILED(hr)) return FALSE;
+    SetWindowRgn(hWnd, NULL, TRUE);   // 清除旧式区域裁剪，交由 DWM 平滑合成圆角
+    return TRUE;
 }
 
 static void ApplyRoundedWindow(HWND hWnd, int logicalRadius) {
+    if (TryApplyWin11RoundedWindow(hWnd)) return;
     RECT rc;
     if (!GetWindowRect(hWnd, &rc)) return;
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
@@ -1628,82 +1693,32 @@ static void SettingsPaletteMetrics(const SettingsMetrics& m, const RECT& row,
 }
 
 static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    float s = (float)GetSystemDpiScale();
-    Gdiplus::Color color(255, GetRValue(C_WHITE), GetGValue(C_WHITE), GetBValue(C_WHITE));
-    Gdiplus::Pen pen(color, 1.7f * s);
-    pen.SetStartCap(Gdiplus::LineCapRound);
-    pen.SetEndCap(Gdiplus::LineCapRound);
-    pen.SetLineJoin(Gdiplus::LineJoinRound);
-    float X = (float)x, Y = (float)y;
-    float cx = X + 16.0f * s, cy = Y + 16.0f * s;
-    switch (kind) {
-    case 0: // 自动呼出 / 输入框
-        g.DrawRectangle(&pen, X + 2*s, Y + 5*s, 23*s, 16*s);
-        g.DrawLine(&pen, X + 7*s, Y + 25*s, X + 20*s, Y + 25*s);
-        g.DrawLine(&pen, X + 12*s, Y + 21*s, X + 12*s, Y + 25*s);
-        g.DrawEllipse(&pen, X + 22*s, Y + 14*s, 8*s, 8*s);
-        g.DrawLine(&pen, X + 26*s, Y + 10*s, X + 26*s, Y + 7*s);
-        g.DrawLine(&pen, X + 30*s, Y + 12*s, X + 32*s, Y + 10*s);
-        break;
-    case 1: // 关闭按钮
-        g.DrawRectangle(&pen, X + 3*s, Y + 5*s, 27*s, 22*s);
-        g.DrawLine(&pen, X + 3*s, Y + 11*s, X + 30*s, Y + 11*s);
-        g.DrawLine(&pen, X + 20*s, Y + 15*s, X + 26*s, Y + 21*s);
-        g.DrawLine(&pen, X + 26*s, Y + 15*s, X + 20*s, Y + 21*s);
-        break;
-    case 2: // 键盘布局
-        g.DrawRectangle(&pen, X + 1*s, Y + 7*s, 31*s, 19*s);
-        for (int i = 0; i < 4; i++) {
-            g.DrawLine(&pen, X + (5 + i*7)*s, Y + 12*s, X + (8 + i*7)*s, Y + 12*s);
-            g.DrawLine(&pen, X + (5 + i*7)*s, Y + 18*s, X + (8 + i*7)*s, Y + 18*s);
-        }
-        g.DrawLine(&pen, X + 9*s, Y + 23*s, X + 24*s, Y + 23*s);
-        break;
-    case 3: // 功能键
-        g.DrawRectangle(&pen, X + 4*s, Y + 4*s, 25*s, 25*s);
-        g.DrawLine(&pen, X + 12*s, Y + 11*s, X + 12*s, Y + 23*s);
-        g.DrawLine(&pen, X + 12*s, Y + 11*s, X + 21*s, Y + 11*s);
-        g.DrawLine(&pen, X + 12*s, Y + 16*s, X + 19*s, Y + 16*s);
-        break;
-    case 4: // Shift 符号
-        g.DrawRectangle(&pen, X + 3*s, Y + 5*s, 27*s, 23*s);
-        g.DrawLine(&pen, cx, Y + 10*s, X + 10*s, Y + 16*s);
-        g.DrawLine(&pen, cx, Y + 10*s, X + 22*s, Y + 16*s);
-        g.DrawLine(&pen, cx, Y + 10*s, cx, Y + 23*s);
-        g.DrawLine(&pen, X + 12*s, Y + 23*s, X + 20*s, Y + 23*s);
-        break;
-    case 5: // 自动隐藏 / 时钟
-        g.DrawEllipse(&pen, X + 3*s, Y + 3*s, 27*s, 27*s);
-        g.DrawLine(&pen, cx, cy, cx, Y + 9*s);
-        g.DrawLine(&pen, cx, cy, X + 23*s, Y + 20*s);
-        break;
-    case 6: // 语言
-        g.DrawEllipse(&pen, X + 3*s, Y + 3*s, 27*s, 27*s);
-        g.DrawLine(&pen, X + 4*s, cy, X + 29*s, cy);
-        g.DrawArc(&pen, X + 9*s, Y + 3*s, 14*s, 27*s, 90.0f, 180.0f);
-        g.DrawArc(&pen, X + 9*s, Y + 3*s, 14*s, 27*s, 270.0f, 180.0f);
-        break;
-    case 7: // 主题
-        g.DrawEllipse(&pen, X + 8*s, Y + 8*s, 16*s, 16*s);
-        g.DrawLine(&pen, cx, Y + 2*s, cx, Y + 6*s);
-        g.DrawLine(&pen, cx, Y + 26*s, cx, Y + 30*s);
-        g.DrawLine(&pen, X + 2*s, cy, X + 6*s, cy);
-        g.DrawLine(&pen, X + 26*s, cy, X + 30*s, cy);
-        g.DrawLine(&pen, X + 6*s, Y + 6*s, X + 9*s, Y + 9*s);
-        g.DrawLine(&pen, X + 23*s, Y + 23*s, X + 26*s, Y + 26*s);
-        g.DrawLine(&pen, X + 23*s, Y + 9*s, X + 26*s, Y + 6*s);
-        g.DrawLine(&pen, X + 6*s, Y + 26*s, X + 9*s, Y + 23*s);
-        break;
-    case 8: // 高亮颜色
-        g.DrawLine(&pen, X + 8*s, Y + 24*s, X + 24*s, Y + 8*s);
-        g.DrawLine(&pen, X + 20*s, Y + 6*s, X + 26*s, Y + 12*s);
-        g.DrawLine(&pen, X + 6*s, Y + 26*s, X + 10*s, Y + 22*s);
-        g.DrawEllipse(&pen, X + 22*s, Y + 23*s, 6*s, 6*s);
-        break;
+    double dpi = GetSystemDpiScale();
+    int size = (int)(32 * dpi);
+    if (kind == 3) {
+        int pad = (int)(4 * dpi);
+        DrawRoundRect(dc, x + pad, y + pad, size - pad * 2, size - pad * 2,
+                      C_KEY, C_WHITE, (int)(3 * dpi));
+        DrawTextC(dc, x, y, size, size, L"F", g_sf13b, C_WHITE);
+        return;
     }
+
+    static const wchar_t* glyphs[9] = {
+        L"\xE7C9", // TouchPointer
+        L"\xE8BB", // ChromeClose
+        L"\xE765", // KeyboardClassic
+        L"",
+        L"\xE752", // UpArrowShiftKey
+        L"\xE823", // Clock
+        L"\xE774", // Globe
+        L"\xE771", // Personalize
+        L"\xE790"  // Color
+    };
+    RECT r = {x, y, x + size, y + size};
+    SelectObject(dc, g_sfIcon);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_WHITE);
+    DrawTextW(dc, glyphs[kind], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
 static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* title,
@@ -3013,8 +3028,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_hWnd = hWnd;
         InitWindowSizeForDpi();
         RecreateFontsAndLayout();
-        SetWindowLong(hWnd, GWL_EXSTYLE, GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
-        SetLayeredWindowAttributes(hWnd, 0, 255, LWA_ALPHA);
+        SetWindowLong(hWnd, GWL_EXSTYLE, GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
         ApplyRoundedWindow(hWnd, 10);
 
         g_winHook = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_SHOW, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
@@ -3260,7 +3274,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f13b); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
-        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
+        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b); DeleteObject(g_sfIcon);
         PostQuitMessage(0);
         return 0;
     }
@@ -3361,7 +3375,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    HWND hWnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,
+    HWND hWnd = CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,
         L"HKeyboard", T(L"\x8F7B\x952E", L"HKeyboard"), WS_POPUP,
         work.left + ((work.right - work.left) - g_ww) / 2,
         work.bottom - g_wh - 6,

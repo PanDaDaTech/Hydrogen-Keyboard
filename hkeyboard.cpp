@@ -139,8 +139,22 @@ static BOOL IsSystemDarkMode() {
     return (val == 0);
 }
 
+static BOOL IsSystemBackdropDarkMode() {
+    HKEY hKey;
+    DWORD val = 1, sz = sizeof(val);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"SystemUsesLightTheme", NULL, NULL, (LPBYTE)&val, &sz);
+        RegCloseKey(hKey);
+    }
+    return val == 0;
+}
+
 static BOOL IsDarkThemeActive() {
-    return g_themeMode == 1 || (g_themeMode == 0 && IsSystemDarkMode());
+    if (g_themeMode == 1) return TRUE;
+    if (g_themeMode == 2) return FALSE;
+    return g_materialMode != 0 ? IsSystemBackdropDarkMode() : IsSystemDarkMode();
 }
 
 // 读取系统壁纸自动派生的强调色并转为 GDI COLORREF (BGR)。
@@ -184,7 +198,7 @@ static void ApplyTheme() {
     } else if (g_themeMode == 2) {
         base = &g_lightTheme;
     } else {
-        base = IsSystemDarkMode() ? &g_darkTheme : &g_lightTheme;
+        base = IsDarkThemeActive() ? &g_darkTheme : &g_lightTheme;
     }
 
     g_themeBuf = *base;
@@ -223,11 +237,12 @@ static void RefreshThemeAndRepaint(HWND hWnd) {
 
 // DWM backdrop can resolve to a light surface independently of the Windows
 // theme query. Use the palette actually being rendered and force normal text
-// to pure black on light Mica/Acrylic surfaces.
+// to a non-zero near-black on light Mica/Acrylic surfaces. Pure black is the
+// transparent key color for an extended DWM glass frame and would disappear.
 static DWORD ResolveFontColor(DWORD color) {
     if (g_materialMode != 0 && g_theme->bg == g_lightTheme.bg &&
         (color == g_theme->text || color == g_theme->dim)) {
-        return RGB(0, 0, 0);
+        return RGB(32, 32, 32);
     }
     return color;
 }
@@ -2925,8 +2940,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     }
     if (materialChanged) {
+        ApplyTheme();
         SaveThemeConfig();
         ApplyAllWindowMaterials();
+        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     }
     if (layoutChanged) ApplyKeyboardLayout();           // 应用并保存布局
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE); // 设置页立即刷新

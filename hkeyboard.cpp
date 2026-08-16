@@ -333,6 +333,7 @@ BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
+static int  g_hdrHov = -1;            // 标题栏按钮悬停（HDR_*，-1=无）
 int         g_repeatKeyIdx = -1;
 BOOL        g_tracking = FALSE;
 BOOL        g_tray = FALSE;
@@ -1712,7 +1713,9 @@ static int HitHeader(int x, int y) {
 }
 
 static void DrawHeader(HDC dc) {
-    Fill(dc, 0, 0, g_ww, g_headerH, C_HDR);
+    // 材质模式下标题栏让 Mica/亚克力直接透出；关闭材质时保持原底色
+    if (!(IsMaterialApplied(g_hWnd) && g_alphaPaintActive))
+        Fill(dc, 0, 0, g_ww, g_headerH, C_HDR);
 
     double dpiScale = GetSystemDpiScale();
     double scaleY = (double)g_wh / (320.0 * dpiScale);
@@ -1740,29 +1743,24 @@ static void DrawHeader(HDC dc) {
         DrawTextC(dc, xTitle, 0, wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
-    // 最小化图标：直接绘制居中小横条（避免字体缺少 U+229F 字形时显示为 "-"）
+    // 最小化按钮：悬停时与设置页关闭按钮同款圆角底（C_HOVER + C_KEY_BORDER），图标为 AA 横线
+    if (g_hdrHov == HDR_MIN)
+        DrawRoundRect(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6);
     {
-        int barW = (int)(14 * dpiScale);
-        int barH = (int)(2 * dpiScale * scaleY); if (barH < 2) barH = 2;
-        int barX = xMin + (wMin - barW) / 2;
-        int barY = btnY + btnH / 2 - barH / 2;
-        DrawRoundRect(dc, barX, barY, barW, barH, C_DIM, C_DIM, barH / 2);
+        int cx = xMin + wMin / 2;
+        int cy = btnY + btnH / 2;
+        int half = (int)(7 * dpiScale);
+        DrawLineAA(dc, cx - half, cy, cx + half, cy, C_DIM, 2.0f);
     }
-    // 关闭图标：与最小化一样直接绘制（X），避免字体缺少字形时显示异常
+    // 关闭按钮：与设置页关闭按钮同款样式（悬停圆角底 + AA 的 X 图标）
+    if (g_hdrHov == HDR_CLOSE)
+        DrawRoundRect(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6);
     {
         int cx = xClose + wClose / 2;
-        int cy = g_headerH / 2;
-        int r  = (int)(7 * dpiScale); if (r < 5) r = 5;
-        HPEN pen = CreatePen(PS_SOLID, 2, C_DIM);
-        HPEN op = (HPEN)SelectObject(dc, pen);
-        HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        MoveToEx(dc, cx - r, cy - r, NULL);
-        LineTo(dc, cx + r, cy + r);
-        MoveToEx(dc, cx + r, cy - r, NULL);
-        LineTo(dc, cx - r, cy + r);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
-        DeleteObject(pen);
+        int cy = btnY + btnH / 2;
+        int r  = (int)(5 * dpiScale); if (r < 5) r = 5;
+        DrawLineAA(dc, cx - r, cy - r, cx + r, cy + r, C_DIM, 2.0f);
+        DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
     }
 }
 
@@ -1929,12 +1927,13 @@ static void ShowKB(BOOL show, BOOL isManual) {
     } else {
         if (!g_vis) return;
         g_manualShow = FALSE;
+        g_hdrHov = -1;
         g_lht = GetTickCount();
         RECT current = {0};
         int fromY = targetY;
         if (GetWindowRect(g_hWnd, &current)) fromY = current.top;
         g_vis = FALSE;
-        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, work.bottom, 180, MOTION_HIDE);
+        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, work.bottom, 150, MOTION_HIDE);
     }
 }
 
@@ -3029,8 +3028,8 @@ static void LoadConfig() {
     if (g_layoutMode < 0 || g_layoutMode > 2) g_layoutMode = 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
-    g_hideDelayMs = IniGetInt(L"General", L"HideDelay", 500);
-    if (g_hideDelayMs < 0 || g_hideDelayMs > 5000) g_hideDelayMs = 500;
+    g_hideDelayMs = IniGetInt(L"General", L"HideDelay", 300);
+    if (g_hideDelayMs < 0 || g_hideDelayMs > 5000) g_hideDelayMs = 300;
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_hlMode = IniGetInt(L"General", L"HighlightMode", 0);
@@ -3993,7 +3992,14 @@ static void UpdateAutoVisibility() {
         g_suppressedInputToken = 0;
     }
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
-    if (!g_vis || g_manualHide) return;
+    if (!g_vis) {
+        // 隐藏滑动被打断（如拖动标题栏）后窗口可能仍残留可见：直接收尾藏到任务栏底部
+        if (!(g_mainMotion.active && g_mainMotion.finish == MOTION_HIDE) &&
+            IsWindowVisible(g_hWnd))
+            ShowWindow(g_hWnd, SW_HIDE);
+        return;
+    }
+    if (g_manualHide) return;
     if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) return;
     if (g_manualShow) return;
 
@@ -4093,10 +4099,20 @@ static void OnLUp(HWND hWnd, int x, int y) {
 }
 
 static void OnMMove(HWND hWnd, int x, int y) {
+    int hh = HitHeader(x, y);
+    if (hh != g_hdrHov) {
+        g_hdrHov = hh;
+        InvalidateRect(hWnd, 0, TRUE);
+    }
     int nk = HitKey(x, y);
     if (nk != g_hk) {
         g_hk = nk;
         InvalidateRect(hWnd, 0, TRUE);
+    }
+    if (!g_tracking) {
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hWnd, 0};
+        TrackMouseEvent(&tme);
+        g_tracking = TRUE;
     }
 }
 static BOOL IsTouchDevice() {
@@ -4122,7 +4138,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // 实体键盘状态监控：安装低级键盘钩子（只监控 Win/Shift/Caps，Fn 预留接口）
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, PhysKeyHookProc, g_hInst, 0);
         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;  // 启动时同步 CapsLock 状态
-        SetTimer(hWnd, TIMER_FOCUS, 100, 0);
+        SetTimer(hWnd, TIMER_FOCUS, 50, 0);
         return 0;
     }
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
@@ -4202,11 +4218,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_CAPTURECHANGED:
         // 鼠标捕获被夺走（如开始菜单弹出）时清除按下状态，避免键一直高亮
         g_pk = -1;
+        g_hdrHov = -1;
+        g_tracking = FALSE;
         KillTimer(hWnd, TIMER_REPEAT);
         g_repeatKeyIdx = -1;
         InvalidateRect(hWnd, 0, TRUE);
         return 0;
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
+    case WM_MOUSELEAVE:
+        g_tracking = FALSE;
+        if (g_hdrHov != -1 || g_hk != -1) {
+            g_hdrHov = -1;
+            g_hk = -1;
+            InvalidateRect(hWnd, 0, TRUE);
+        }
+        return 0;
     case WM_FOCUS_EVENT:
         UpdateAutoVisibility();
         return 0;

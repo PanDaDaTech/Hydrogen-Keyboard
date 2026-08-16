@@ -57,9 +57,11 @@ int g_keyHeight = 46;
 #define TIMER_FOCUS     8820
 #define TIMER_EXIT      8822
 #define TIMER_REPEAT    8826
+#define TIMER_SETTINGS_ANIM 8827
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
+#define WM_REAPPLY_MATERIAL (WM_APP + 103)
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -1789,27 +1791,25 @@ static int HitKey(int x, int y) {
     return -1;
 }
 
-static BOOL SystemWindowAnimationsEnabled() {
-    const UINT SPI_GETCLIENTAREAANIMATION_VALUE = 0x1042;
-    BOOL enabled = TRUE;
-    if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION_VALUE, 0, &enabled, 0))
-        enabled = TRUE;
-    return enabled;
-}
-
 static void ShowPopupAnimated(HWND hWnd, DWORD animation, UINT duration) {
     if (!hWnd || !IsWindow(hWnd)) return;
     ApplyWindowMaterial(hWnd);
-    if (!SystemWindowAnimationsEnabled() || !AnimateWindow(hWnd, duration, animation))
+    // AnimateWindow is independent of the client-area animation preference.
+    // Always attempt it first, then fall back only when this Windows build
+    // rejects animation for the current window style.
+    if (!AnimateWindow(hWnd, duration, animation))
         ShowWindow(hWnd, SW_SHOWNOACTIVATE);
-    ApplyWindowMaterial(hWnd); // DWM may recreate the backdrop during the show transition.
+    // Reapply now and once more from the message queue. DWM can recreate the
+    // backdrop after AnimateWindow returns, especially when restoring a hidden
+    // Mica/Acrylic popup from a second process invocation.
+    ApplyWindowMaterial(hWnd);
+    PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
 }
 
 static void HidePopupAnimated(HWND hWnd, DWORD animation, UINT duration) {
     if (!hWnd || !IsWindow(hWnd) || !IsWindowVisible(hWnd)) return;
-    if (!SystemWindowAnimationsEnabled() ||
-        !AnimateWindow(hWnd, duration, AW_HIDE | animation))
+    if (!AnimateWindow(hWnd, duration, AW_HIDE | animation))
         ShowWindow(hWnd, SW_HIDE);
 }
 
@@ -1836,14 +1836,14 @@ static void ShowKB(BOOL show, BOOL isManual) {
             return;
         }
         g_vis = TRUE;
-        ShowPopupAnimated(g_hWnd, AW_SLIDE | AW_VER_NEGATIVE, 140);
+        ShowPopupAnimated(g_hWnd, AW_SLIDE | AW_VER_NEGATIVE, 220);
         SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
         if (!g_vis) return;
         g_manualShow = FALSE;
         g_lht = GetTickCount();
-        HidePopupAnimated(g_hWnd, AW_SLIDE | AW_VER_POSITIVE, 120);
+        HidePopupAnimated(g_hWnd, AW_SLIDE | AW_VER_POSITIVE, 180);
         ShowWindow(g_hWnd, SW_HIDE);
         g_vis = FALSE;
     }
@@ -1854,7 +1854,7 @@ static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 static void ExitApplicationAnimated() {
     if (!g_hWnd || !IsWindow(g_hWnd)) return;
     if (g_vis) {
-        HidePopupAnimated(g_hWnd, AW_BLEND, 100);
+        HidePopupAnimated(g_hWnd, AW_BLEND, 140);
         g_vis = FALSE;
     }
     DestroyWindow(g_hWnd);
@@ -1981,6 +1981,7 @@ static int  g_sTab = 0;        // 0=常规 1=主题 2=关于
 static int  g_sHov = -1;       // 悬停元素，-1=无
 static BOOL g_sTracking = FALSE;
 static BOOL g_settingsClosing = FALSE;
+static BOOL g_settingsMoving = FALSE;
 static BOOL g_dropTheme = FALSE;    // 主题下拉是否展开
 static BOOL g_dropLayout = FALSE;   // 布局下拉是否展开
 static int  g_dropThemeHov = -1;
@@ -2011,6 +2012,11 @@ static const wchar_t* g_materialNames[3] = { L"关闭", L"Mica", L"亚克力" };
 static const wchar_t* g_materialNamesEn[3] = { L"Off", L"Mica", L"Acrylic" };
 static const wchar_t* g_layoutNames[3] = { L"全尺寸", L"小键盘", L"常用" };
 static const wchar_t* g_layoutNamesEn[3] = { L"Full", L"Numpad", L"Common" };
+
+static int g_switchAnimHit = S_HIT_NONE;
+static DWORD g_switchAnimStart = 0;
+static BOOL g_switchAnimFrom = FALSE;
+static BOOL g_switchAnimTo = FALSE;
 
 static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
     if (DrawMaterialText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear)) return;
@@ -2210,17 +2216,49 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
     DrawTextL(dc, tx, row.top + (int)(27 * dpi), tw, (int)(18 * dpi), desc, g_sf12, C_DIM);
 }
 
+static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
+    int rowIndex = hit == S_HIT_AUTO ? 0 : (hit == S_HIT_FKEYS ? 3 : 4);
+    RECT row = SettingsRowRect(m, rowIndex);
+    row.left = row.right - (int)(105 * m.dpi);
+    return row;
+}
+
+static void BeginSwitchAnimation(HWND hWnd, int hit, BOOL from, BOOL to) {
+    if (g_settingsMoving) return;
+    g_switchAnimHit = hit;
+    g_switchAnimStart = GetTickCount();
+    g_switchAnimFrom = from;
+    g_switchAnimTo = to;
+    SetTimer(hWnd, TIMER_SETTINGS_ANIM, 16, NULL);
+}
+
+static DWORD BlendColor(DWORD from, DWORD to, double value) {
+    int r = (int)(GetRValue(from) + (GetRValue(to) - GetRValue(from)) * value + 0.5);
+    int g = (int)(GetGValue(from) + (GetGValue(to) - GetGValue(from)) * value + 0.5);
+    int b = (int)(GetBValue(from) + (GetBValue(to) - GetBValue(from)) * value + 0.5);
+    return RGB(r, g, b);
+}
+
 static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL on, int hit) {
-    (void)hit;
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
     int y = row.top + (row.bottom - row.top - m.switchH) / 2;
     DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), row.bottom - row.top,
               on ? T(L"开", L"On") : T(L"关", L"Off"), g_sf13, C_WHITE);
-    DWORD track = on ? C_HOT : C_DARK;
+    double value = on ? 1.0 : 0.0;
+    if (g_switchAnimHit == hit && !g_settingsMoving) {
+        double t = (double)(GetTickCount() - g_switchAnimStart) / 180.0;
+        if (t > 1.0) t = 1.0;
+        t = t * t * (3.0 - 2.0 * t);
+        double from = g_switchAnimFrom ? 1.0 : 0.0;
+        double to = g_switchAnimTo ? 1.0 : 0.0;
+        value = from + (to - from) * t;
+    }
+    DWORD track = BlendColor(C_DARK, C_HOT, value);
     DrawRoundRect(dc, x, y, m.switchW, m.switchH, track, C_KEY_BORDER, m.switchH / 2);
     int knob = m.switchH - 6;
-    int kx = on ? x + m.switchW - knob - 3 : x + 3;
-    DWORD knobColor = on ? 0xFFFFFF : C_DIM;
+    int travel = m.switchW - knob - 6;
+    int kx = x + 3 + (int)(travel * value + 0.5);
+    DWORD knobColor = BlendColor(C_DIM, 0xFFFFFF, value);
     DrawRoundRect(dc, kx, y + 3, knob, knob, knobColor, knobColor, knob / 2);
 }
 
@@ -2992,6 +3030,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     BOOL layoutChanged = FALSE;
     switch (hit) {
     case S_HIT_AUTO:
+        BeginSwitchAnimation(hWnd, hit, g_af, !g_af);
         g_af = !g_af;
         IniSetInt(L"General", L"AutoPopup", g_af ? 1 : 0);
         if (g_af) UpdateAutoVisibility();
@@ -3018,10 +3057,12 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         layoutChanged = TRUE;
         break;
     case S_HIT_FKEYS:
+        BeginSwitchAnimation(hWnd, hit, g_showFKeys, !g_showFKeys);
         g_showFKeys = !g_showFKeys;
         layoutChanged = TRUE;
         break;
     case S_HIT_SHIFTSYM:
+        BeginSwitchAnimation(hWnd, hit, g_shiftSymbols, !g_shiftSymbols);
         g_shiftSymbols = !g_shiftSymbols;
         IniSetInt(L"General", L"ShiftSymbols", g_shiftSymbols ? 1 : 0);
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
@@ -3147,7 +3188,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 static void CloseSettingsAnimated(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd) || g_settingsClosing) return;
     g_settingsClosing = TRUE;
-    HidePopupAnimated(hWnd, AW_BLEND, 100);
+    HidePopupAnimated(hWnd, AW_BLEND, 140);
     DestroyWindow(hWnd);
 }
 
@@ -3193,6 +3234,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_CREATE:
         ApplyRoundedWindow(hWnd, 14);
         ApplyWindowMaterial(hWnd);
+        return 0;
+    case WM_REAPPLY_MATERIAL:
+        if (IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
@@ -3271,6 +3315,31 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_CAPTURECHANGED:
         g_hlSliderDrag = S_HIT_NONE;
         return 0;
+    case WM_ENTERSIZEMOVE:
+        g_settingsMoving = TRUE;
+        KillTimer(hWnd, TIMER_SETTINGS_ANIM);
+        g_switchAnimHit = S_HIT_NONE;
+        return 0;
+    case WM_EXITSIZEMOVE:
+        g_settingsMoving = FALSE;
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    case WM_TIMER:
+        if (w == TIMER_SETTINGS_ANIM) {
+            int hit = g_switchAnimHit;
+            if (hit == S_HIT_NONE || g_settingsMoving ||
+                GetTickCount() - g_switchAnimStart >= 180) {
+                KillTimer(hWnd, TIMER_SETTINGS_ANIM);
+                g_switchAnimHit = S_HIT_NONE;
+            }
+            if (hit != S_HIT_NONE) {
+                SettingsMetrics m = GetSettingsMetrics(hWnd);
+                RECT dirty = SettingsSwitchRect(m, hit);
+                InvalidateRect(hWnd, &dirty, FALSE);
+            }
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
         if (w == VK_ESCAPE) {
             if (g_hlEditFocus) { g_hlEditFocus = FALSE; InvalidateRect(hWnd, NULL, TRUE); }
@@ -3312,8 +3381,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     }
     case WM_CLOSE: CloseSettingsAnimated(hWnd); return 0;
     case WM_DESTROY:
+        KillTimer(hWnd, TIMER_SETTINGS_ANIM);
         g_settingsHwnd = NULL;
         g_settingsClosing = FALSE;
+        g_settingsMoving = FALSE;
         g_sHov = -1;
         g_sTracking = FALSE;
         g_dropTheme = FALSE;
@@ -3334,7 +3405,7 @@ static void OpenSettingsTab(int tab) {
     g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
         if (!IsWindowVisible(g_settingsHwnd))
-            ShowPopupAnimated(g_settingsHwnd, AW_BLEND, 120);
+            ShowPopupAnimated(g_settingsHwnd, AW_BLEND, 170);
         else
             ApplyWindowMaterial(g_settingsHwnd);
         SetForegroundWindow(g_settingsHwnd);
@@ -3350,7 +3421,7 @@ static void OpenSettingsTab(int tab) {
     g_settingsHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardSettings", T(L"设置", L"Settings"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_settingsHwnd) {
-        ShowPopupAnimated(g_settingsHwnd, AW_BLEND, 120);
+        ShowPopupAnimated(g_settingsHwnd, AW_BLEND, 170);
         SetForegroundWindow(g_settingsHwnd);
     }
 }
@@ -3370,6 +3441,14 @@ static int  g_pChoice = 0;       // 0=直接退出 1=隐藏到托盘
 static BOOL g_pRemember = FALSE;
 static int  g_pHov = -1;
 static BOOL g_pTracking = FALSE;
+static BOOL g_promptClosing = FALSE;
+
+static void ClosePromptAnimated(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd) || g_promptClosing) return;
+    g_promptClosing = TRUE;
+    HidePopupAnimated(hWnd, AW_BLEND, 120);
+    DestroyWindow(hWnd);
+}
 
 static void PromptDraw(HDC dc, HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
@@ -3438,7 +3517,7 @@ static void PromptOnClick(HWND hWnd, int x, int y) {
     switch (hit) {
     case P_HIT_CLOSE:
     case P_HIT_CANCEL:
-        DestroyWindow(hWnd);
+        ClosePromptAnimated(hWnd);
         return;
     case P_HIT_DIRECT:   g_pChoice = 0; break;
     case P_HIT_TRAY:     g_pChoice = 1; break;
@@ -3447,7 +3526,7 @@ static void PromptOnClick(HWND hWnd, int x, int y) {
         g_closeToTray = (g_pChoice == 1);
         g_rememberClose = g_pRemember;
         SaveCloseSettings();          // 持久化选择与“记住我的选择”标志
-        DestroyWindow(hWnd);
+        ClosePromptAnimated(hWnd);
         if (g_closeToTray) {
             g_manualHide = TRUE;      // 显式隐藏到托盘后不再自动弹出
             ShowKB(FALSE, FALSE);
@@ -3466,6 +3545,9 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_CREATE:
         ApplyRoundedWindow(hWnd, 14);
         ApplyWindowMaterial(hWnd);
+        return 0;
+    case WM_REAPPLY_MATERIAL:
+        if (IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
@@ -3499,7 +3581,7 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (g_pHov != -1) { g_pHov = -1; InvalidateRect(hWnd, NULL, TRUE); }
         return 0;
     case WM_KEYDOWN:
-        if (w == VK_ESCAPE) { DestroyWindow(hWnd); return 0; }
+        if (w == VK_ESCAPE) { ClosePromptAnimated(hWnd); return 0; }
         break;
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -3510,9 +3592,10 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return HTCLIENT;
     }
-    case WM_CLOSE: DestroyWindow(hWnd); return 0;
+    case WM_CLOSE: ClosePromptAnimated(hWnd); return 0;
     case WM_DESTROY:
         g_closePromptHwnd = NULL;
+        g_promptClosing = FALSE;
         g_pHov = -1;
         g_pTracking = FALSE;
         return 0;
@@ -3536,7 +3619,7 @@ static void OpenClosePrompt() {
     g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"关闭轻键", L"Close HKeyboard"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
-        ShowWindow(g_closePromptHwnd, SW_SHOW);
+        ShowPopupAnimated(g_closePromptHwnd, AW_BLEND, 140);
         SetForegroundWindow(g_closePromptHwnd);
     }
 }
@@ -4009,6 +4092,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_FOCUS_EVENT:
         UpdateAutoVisibility();
+        return 0;
+    case WM_REAPPLY_MATERIAL:
+        if (IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SHOW_KEYBOARD:
         if (w) {

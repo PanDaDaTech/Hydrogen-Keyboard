@@ -57,6 +57,7 @@ int g_keyHeight = 46;
 #define TIMER_FOCUS     8820
 #define TIMER_EXIT      8822
 #define TIMER_REPEAT    8826
+#define TIMER_WINDOW_ANIM 8828
 #define TIMER_SETTINGS_ANIM 8827
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
@@ -271,6 +272,21 @@ HINSTANCE   g_hInst = 0;
 HWND        g_hWnd = 0;
 static HWND g_settingsHwnd = 0;
 static HWND g_closePromptHwnd = 0;
+enum WindowMotionFinish { MOTION_NONE, MOTION_HIDE, MOTION_DESTROY };
+struct WindowMotion {
+    HWND hWnd;
+    int x;
+    int fromY;
+    int toY;
+    UINT duration;
+    DWORD started;
+    WindowMotionFinish finish;
+    BOOL active;
+};
+static WindowMotion g_mainMotion = {};
+static WindowMotion g_settingsMotion = {};
+static WindowMotion g_promptMotion = {};
+static BOOL g_exiting = FALSE;
 HICON       g_hTrayIcon = 0;
 BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
@@ -1791,30 +1807,79 @@ static int HitKey(int x, int y) {
     return -1;
 }
 
-static void ShowPopupAnimated(HWND hWnd, DWORD animation, UINT duration) {
-    if (!hWnd || !IsWindow(hWnd)) return;
-    ApplyWindowMaterial(hWnd);
-    // AnimateWindow is independent of the client-area animation preference.
-    // Always attempt it first, then fall back only when this Windows build
-    // rejects animation for the current window style.
-    if (!AnimateWindow(hWnd, duration, animation))
-        ShowWindow(hWnd, SW_SHOWNOACTIVATE);
-    // Reapply now and once more from the message queue. DWM can recreate the
-    // backdrop after AnimateWindow returns, especially when restoring a hidden
-    // Mica/Acrylic popup from a second process invocation.
-    ApplyWindowMaterial(hWnd);
-    PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
-    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
+static void StopWindowMotion(WindowMotion* motion) {
+    if (!motion || !motion->active) return;
+    if (motion->hWnd && IsWindow(motion->hWnd))
+        KillTimer(motion->hWnd, TIMER_WINDOW_ANIM);
+    motion->active = FALSE;
 }
 
-static void HidePopupAnimated(HWND hWnd, DWORD animation, UINT duration) {
-    if (!hWnd || !IsWindow(hWnd) || !IsWindowVisible(hWnd)) return;
-    if (!AnimateWindow(hWnd, duration, AW_HIDE | animation))
+static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
+                              int fromY, int toY, UINT duration,
+                              WindowMotionFinish finish) {
+    if (!motion || !hWnd || !IsWindow(hWnd)) return;
+    StopWindowMotion(motion);
+
+    motion->hWnd = hWnd;
+    motion->x = x;
+    motion->fromY = fromY;
+    motion->toY = toY;
+    motion->duration = duration ? duration : 1;
+    motion->started = GetTickCount();
+    motion->finish = finish;
+    motion->active = TRUE;
+
+    if (!IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
+    SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RedrawWindow(hWnd, NULL, NULL,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
+    UpdateWindow(hWnd);
+    if (!SetTimer(hWnd, TIMER_WINDOW_ANIM, 16, NULL)) {
+        SetWindowPos(hWnd, HWND_TOPMOST, x, toY, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE);
+        motion->active = FALSE;
+        if (finish == MOTION_HIDE) ShowWindow(hWnd, SW_HIDE);
+        else if (finish == MOTION_DESTROY) DestroyWindow(hWnd);
+        else PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
+    }
+}
+
+static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
+    if (!motion || !motion->active || motion->hWnd != hWnd) return FALSE;
+
+    DWORD elapsed = GetTickCount() - motion->started;
+    double t = (double)elapsed / (double)motion->duration;
+    if (t > 1.0) t = 1.0;
+    double eased = t * t * (3.0 - 2.0 * t);
+    int y = motion->fromY + (int)((motion->toY - motion->fromY) * eased + 0.5);
+    SetWindowPos(hWnd, HWND_TOPMOST, motion->x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE);
+    UpdateWindow(hWnd);
+    // Commit each animation frame to DWM. Without this, a material-backed
+    // popup may coalesce the timer-driven moves and appear to jump directly
+    // to its final position. This path runs only during the short animation.
+    DwmFlushProc flush = GetDwmFlush();
+    if (flush) flush();
+
+    if (t < 1.0) return TRUE;
+
+    WindowMotionFinish finish = motion->finish;
+    KillTimer(hWnd, TIMER_WINDOW_ANIM);
+    motion->active = FALSE;
+    if (finish == MOTION_HIDE) {
         ShowWindow(hWnd, SW_HIDE);
+    } else if (finish == MOTION_DESTROY) {
+        DestroyWindow(hWnd);
+    } else {
+        PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
+    }
+    return TRUE;
 }
 
 static void ShowKB(BOOL show, BOOL isManual) {
     if (!g_hWnd) return;
+    if (g_exiting && show) return;
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int sx = work.left + ((work.right - work.left) - g_ww) / 2;
@@ -1828,24 +1893,28 @@ static void ShowKB(BOOL show, BOOL isManual) {
             g_suppressedInputToken = 0;
             g_inputLostTick = 0;
         }
-        SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
-                     SWP_NOACTIVATE | (g_vis ? SWP_SHOWWINDOW : 0));
         if (g_vis) {
+            StopWindowMotion(&g_mainMotion);
+            SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
+                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
             ApplyWindowMaterial(g_hWnd);
             RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
             return;
         }
+        RECT current = {0};
+        int fromY = work.bottom;
+        if (g_mainMotion.active && GetWindowRect(g_hWnd, &current)) fromY = current.top;
         g_vis = TRUE;
-        ShowPopupAnimated(g_hWnd, AW_SLIDE | AW_VER_NEGATIVE, 220);
-        SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, targetY, 220, MOTION_NONE);
     } else {
         if (!g_vis) return;
         g_manualShow = FALSE;
         g_lht = GetTickCount();
-        HidePopupAnimated(g_hWnd, AW_SLIDE | AW_VER_POSITIVE, 180);
-        ShowWindow(g_hWnd, SW_HIDE);
+        RECT current = {0};
+        int fromY = targetY;
+        if (GetWindowRect(g_hWnd, &current)) fromY = current.top;
         g_vis = FALSE;
+        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, work.bottom, 180, MOTION_HIDE);
     }
 }
 
@@ -1853,11 +1922,18 @@ static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
 static void ExitApplicationAnimated() {
     if (!g_hWnd || !IsWindow(g_hWnd)) return;
-    if (g_vis) {
-        HidePopupAnimated(g_hWnd, AW_BLEND, 140);
-        g_vis = FALSE;
+    if (g_exiting) return;
+    g_exiting = TRUE;
+    if (!IsWindowVisible(g_hWnd)) {
+        DestroyWindow(g_hWnd);
+        return;
     }
-    DestroyWindow(g_hWnd);
+    RECT work = {0}, current = {0};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    GetWindowRect(g_hWnd, &current);
+    g_vis = FALSE;
+    StartWindowMotion(&g_mainMotion, g_hWnd, current.left, current.top,
+                      work.bottom, 160, MOTION_DESTROY);
 }
 
 // × 关闭：已记住选择则直接按所记方式执行，否则弹出关闭方式提示窗口
@@ -3188,8 +3264,9 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 static void CloseSettingsAnimated(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd) || g_settingsClosing) return;
     g_settingsClosing = TRUE;
-    HidePopupAnimated(hWnd, AW_BLEND, 140);
-    DestroyWindow(hWnd);
+    RECT rc = {0};
+    GetWindowRect(hWnd, &rc);
+    StartWindowMotion(&g_settingsMotion, hWnd, rc.left, rc.top, rc.top + (int)(32 * GetSystemDpiScale()), 170, MOTION_DESTROY);
 }
 
 static void SettingsOnClick(HWND hWnd, int x, int y) {
@@ -3316,6 +3393,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_hlSliderDrag = S_HIT_NONE;
         return 0;
     case WM_ENTERSIZEMOVE:
+        StopWindowMotion(&g_settingsMotion);
         g_settingsMoving = TRUE;
         KillTimer(hWnd, TIMER_SETTINGS_ANIM);
         g_switchAnimHit = S_HIT_NONE;
@@ -3325,6 +3403,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         InvalidateRect(hWnd, NULL, FALSE);
         return 0;
     case WM_TIMER:
+        if (w == TIMER_WINDOW_ANIM) {
+            TickWindowMotion(&g_settingsMotion, hWnd);
+            return 0;
+        }
         if (w == TIMER_SETTINGS_ANIM) {
             int hit = g_switchAnimHit;
             if (hit == S_HIT_NONE || g_settingsMoving ||
@@ -3335,7 +3417,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
             if (hit != S_HIT_NONE) {
                 SettingsMetrics m = GetSettingsMetrics(hWnd);
                 RECT dirty = SettingsSwitchRect(m, hit);
-                InvalidateRect(hWnd, &dirty, FALSE);
+                RedrawWindow(hWnd, &dirty, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
             }
             return 0;
         }
@@ -3381,6 +3463,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     }
     case WM_CLOSE: CloseSettingsAnimated(hWnd); return 0;
     case WM_DESTROY:
+        StopWindowMotion(&g_settingsMotion);
         KillTimer(hWnd, TIMER_SETTINGS_ANIM);
         g_settingsHwnd = NULL;
         g_settingsClosing = FALSE;
@@ -3404,10 +3487,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
 static void OpenSettingsTab(int tab) {
     g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
-        if (!IsWindowVisible(g_settingsHwnd))
-            ShowPopupAnimated(g_settingsHwnd, AW_BLEND, 170);
-        else
+        if (!IsWindowVisible(g_settingsHwnd)) {
+            RECT rc = {0};
+            GetWindowRect(g_settingsHwnd, &rc);
+            StartWindowMotion(&g_settingsMotion, g_settingsHwnd, rc.left, rc.top + (int)(32 * GetSystemDpiScale()), rc.top, 190, MOTION_NONE);
+        } else {
             ApplyWindowMaterial(g_settingsHwnd);
+        }
         SetForegroundWindow(g_settingsHwnd);
         InvalidateRect(g_settingsHwnd, NULL, TRUE);   // 切到指定 Tab 后刷新
         return;
@@ -3421,7 +3507,7 @@ static void OpenSettingsTab(int tab) {
     g_settingsHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardSettings", T(L"设置", L"Settings"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_settingsHwnd) {
-        ShowPopupAnimated(g_settingsHwnd, AW_BLEND, 170);
+        StartWindowMotion(&g_settingsMotion, g_settingsHwnd, x, y + (int)(32 * dpi), y, 190, MOTION_NONE);
         SetForegroundWindow(g_settingsHwnd);
     }
 }
@@ -3446,8 +3532,9 @@ static BOOL g_promptClosing = FALSE;
 static void ClosePromptAnimated(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd) || g_promptClosing) return;
     g_promptClosing = TRUE;
-    HidePopupAnimated(hWnd, AW_BLEND, 120);
-    DestroyWindow(hWnd);
+    RECT rc = {0};
+    GetWindowRect(hWnd, &rc);
+    StartWindowMotion(&g_promptMotion, hWnd, rc.left, rc.top, rc.top + (int)(24 * GetSystemDpiScale()), 150, MOTION_DESTROY);
 }
 
 static void PromptDraw(HDC dc, HWND hWnd) {
@@ -3580,6 +3667,12 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_pTracking = FALSE;
         if (g_pHov != -1) { g_pHov = -1; InvalidateRect(hWnd, NULL, TRUE); }
         return 0;
+    case WM_TIMER:
+        if (w == TIMER_WINDOW_ANIM) {
+            TickWindowMotion(&g_promptMotion, hWnd);
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
         if (w == VK_ESCAPE) { ClosePromptAnimated(hWnd); return 0; }
         break;
@@ -3594,6 +3687,7 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     }
     case WM_CLOSE: ClosePromptAnimated(hWnd); return 0;
     case WM_DESTROY:
+        StopWindowMotion(&g_promptMotion);
         g_closePromptHwnd = NULL;
         g_promptClosing = FALSE;
         g_pHov = -1;
@@ -3619,7 +3713,7 @@ static void OpenClosePrompt() {
     g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"关闭轻键", L"Close HKeyboard"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
-        ShowPopupAnimated(g_closePromptHwnd, AW_BLEND, 140);
+        StartWindowMotion(&g_promptMotion, g_closePromptHwnd, x, y + (int)(24 * dpi), y, 150, MOTION_NONE);
         SetForegroundWindow(g_closePromptHwnd);
     }
 }
@@ -4041,6 +4135,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_ENTERSIZEMOVE:
+        StopWindowMotion(&g_mainMotion);
+        return 0;
     case WM_EXITSIZEMOVE:
         // 记录上次调整过的窗口大小
         IniSetInt(L"Window", L"Width", g_ww);
@@ -4128,7 +4225,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_TIMER:
-        if (w == TIMER_REPEAT) {
+        if (w == TIMER_WINDOW_ANIM) {
+            TickWindowMotion(&g_mainMotion, hWnd);
+            return 0;
+        } else if (w == TIMER_REPEAT) {
             SetTimer(hWnd, TIMER_REPEAT, 40, NULL);
             if (g_pk >= 0 && g_pk == g_repeatKeyIdx) {
                 const KeyDef* k = &g_keys[g_pk];
@@ -4193,6 +4293,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_CLOSE: HandleCloseAction(hWnd); return 0;
     case WM_DESTROY:
+        StopWindowMotion(&g_mainMotion);
         KillTimer(hWnd, TIMER_FOCUS);
         KillTimer(hWnd, TIMER_REPEAT);
         if (g_winHook) { UnhookWinEvent(g_winHook); g_winHook = 0; }
@@ -4279,6 +4380,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
             SendMessageTimeoutW(ew, WM_SHOW_KEYBOARD, fHide ? FALSE : TRUE, 0,
                                 SMTO_ABORTIFHUNG, 1500, &result);
         }
+        g_exiting = FALSE;
         return 0;
     }
 

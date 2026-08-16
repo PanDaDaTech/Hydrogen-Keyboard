@@ -235,14 +235,12 @@ static void RefreshThemeAndRepaint(HWND hWnd) {
 #define C_WHITE        (g_theme->text)
 #define C_DIM          (g_theme->dim)
 
-// Keep material-mode text deterministic: Follow System and Light Theme use
-// near-black text, while only an explicitly selected Dark Theme uses its
-// original light text colors. Pure black is avoided for extended DWM glass.
+// Keep light material text readable without making every text tier the same
+// near-black color. Explicitly selected Dark Theme keeps its original palette.
 static DWORD ResolveFontColor(DWORD color) {
-    // In material mode, Follow System and Light Theme use a light glass
-    // surface in practice. Only an explicit Dark Theme keeps white text.
     if (g_materialMode != 0 && g_themeMode != 1) {
-        return RGB(32, 32, 32);
+        if (color == C_DIM) return RGB(112, 112, 112);
+        if (color == C_WHITE) return RGB(48, 48, 48);
     }
     return color;
 }

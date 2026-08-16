@@ -4,6 +4,7 @@
 #define _WIN32_WINNT 0x0501
 #include <windows.h>
 #include <windowsx.h>
+#include <mmsystem.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <objbase.h>
@@ -14,6 +15,7 @@
 #include "resource.h"
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winmm.lib")
 
 // 当前编译架构（关于页显示用）
 #ifdef _M_ARM64
@@ -279,13 +281,28 @@ struct WindowMotion {
     int fromY;
     int toY;
     UINT duration;
-    DWORD started;
+    LONGLONG started;
     WindowMotionFinish finish;
     BOOL active;
+    BOOL periodHeld;
 };
 static WindowMotion g_mainMotion = {};
 static WindowMotion g_settingsMotion = {};
 static WindowMotion g_promptMotion = {};
+
+// 高精度毫秒时钟：动画进度改用 QueryPerformanceCounter 计算，
+// 避免 GetTickCount() 约 15.6ms 的粗粒度让位移一顿一顿。
+static LONGLONG QpcNowMs() {
+    static LONGLONG freq = 0;
+    if (freq == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (LONGLONG)((c.QuadPart * 1000) / freq);
+}
 static BOOL g_exiting = FALSE;
 HICON       g_hTrayIcon = 0;
 BOOL        g_vis = FALSE;
@@ -1811,6 +1828,7 @@ static void StopWindowMotion(WindowMotion* motion) {
     if (!motion || !motion->active) return;
     if (motion->hWnd && IsWindow(motion->hWnd))
         KillTimer(motion->hWnd, TIMER_WINDOW_ANIM);
+    if (motion->periodHeld) { timeEndPeriod(1); motion->periodHeld = FALSE; }
     motion->active = FALSE;
 }
 
@@ -1825,9 +1843,10 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     motion->fromY = fromY;
     motion->toY = toY;
     motion->duration = duration ? duration : 1;
-    motion->started = GetTickCount();
+    motion->started = QpcNowMs();
     motion->finish = finish;
     motion->active = TRUE;
+    if (!motion->periodHeld) { timeBeginPeriod(1); motion->periodHeld = TRUE; }
 
     if (!IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
     SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
@@ -1835,10 +1854,11 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     RedrawWindow(hWnd, NULL, NULL,
                  RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
     UpdateWindow(hWnd);
-    if (!SetTimer(hWnd, TIMER_WINDOW_ANIM, 16, NULL)) {
+    if (!SetTimer(hWnd, TIMER_WINDOW_ANIM, 8, NULL)) {
         SetWindowPos(hWnd, HWND_TOPMOST, x, toY, 0, 0,
                      SWP_NOSIZE | SWP_NOACTIVATE);
         motion->active = FALSE;
+        if (motion->periodHeld) { timeEndPeriod(1); motion->periodHeld = FALSE; }
         if (finish == MOTION_HIDE) ShowWindow(hWnd, SW_HIDE);
         else if (finish == MOTION_DESTROY) DestroyWindow(hWnd);
         else PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
@@ -1848,17 +1868,16 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
 static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
     if (!motion || !motion->active || motion->hWnd != hWnd) return FALSE;
 
-    DWORD elapsed = GetTickCount() - motion->started;
+    LONGLONG elapsed = QpcNowMs() - motion->started;
     double t = (double)elapsed / (double)motion->duration;
     if (t > 1.0) t = 1.0;
     double eased = t * t * (3.0 - 2.0 * t);
     int y = motion->fromY + (int)((motion->toY - motion->fromY) * eased + 0.5);
     SetWindowPos(hWnd, HWND_TOPMOST, motion->x, y, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE);
-    UpdateWindow(hWnd);
-    // Commit each animation frame to DWM. Without this, a material-backed
-    // popup may coalesce the timer-driven moves and appear to jump directly
-    // to its final position. This path runs only during the short animation.
+    // 位移期间窗口内容不变，无需每帧 UpdateWindow 强制整窗 GDI+ 重绘
+    // （整窗重绘是动画卡顿的最大来源）。DWM 会直接合成移动后的窗口。
+    // 每帧用 DwmFlush 提交本次位移，防止移动被 DWM 合并成直接跳到终点。
     DwmFlushProc flush = GetDwmFlush();
     if (flush) flush();
 
@@ -1867,6 +1886,7 @@ static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
     WindowMotionFinish finish = motion->finish;
     KillTimer(hWnd, TIMER_WINDOW_ANIM);
     motion->active = FALSE;
+    if (motion->periodHeld) { timeEndPeriod(1); motion->periodHeld = FALSE; }
     if (finish == MOTION_HIDE) {
         ShowWindow(hWnd, SW_HIDE);
     } else if (finish == MOTION_DESTROY) {
@@ -2090,7 +2110,7 @@ static const wchar_t* g_layoutNames[3] = { L"全尺寸", L"小键盘", L"常用"
 static const wchar_t* g_layoutNamesEn[3] = { L"Full", L"Numpad", L"Common" };
 
 static int g_switchAnimHit = S_HIT_NONE;
-static DWORD g_switchAnimStart = 0;
+static LONGLONG g_switchAnimStart = 0;
 static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
@@ -2302,7 +2322,7 @@ static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
 static void BeginSwitchAnimation(HWND hWnd, int hit, BOOL from, BOOL to) {
     if (g_settingsMoving) return;
     g_switchAnimHit = hit;
-    g_switchAnimStart = GetTickCount();
+    g_switchAnimStart = QpcNowMs();
     g_switchAnimFrom = from;
     g_switchAnimTo = to;
     SetTimer(hWnd, TIMER_SETTINGS_ANIM, 16, NULL);
@@ -2322,7 +2342,7 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
               on ? T(L"开", L"On") : T(L"关", L"Off"), g_sf13, C_WHITE);
     double value = on ? 1.0 : 0.0;
     if (g_switchAnimHit == hit && !g_settingsMoving) {
-        double t = (double)(GetTickCount() - g_switchAnimStart) / 180.0;
+        double t = (double)(QpcNowMs() - g_switchAnimStart) / 180.0;
         if (t > 1.0) t = 1.0;
         t = t * t * (3.0 - 2.0 * t);
         double from = g_switchAnimFrom ? 1.0 : 0.0;
@@ -3410,7 +3430,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         if (w == TIMER_SETTINGS_ANIM) {
             int hit = g_switchAnimHit;
             if (hit == S_HIT_NONE || g_settingsMoving ||
-                GetTickCount() - g_switchAnimStart >= 180) {
+                QpcNowMs() - g_switchAnimStart >= 180) {
                 KillTimer(hWnd, TIMER_SETTINGS_ANIM);
                 g_switchAnimHit = S_HIT_NONE;
             }

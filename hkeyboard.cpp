@@ -1119,6 +1119,12 @@ static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
     if (GetObjectW(font, sizeof(lf), &lf) == 0) return FALSE;
 
     Gdiplus::Graphics graphics(dc);
+    // BufferedPaint provides a transparent ARGB surface for DWM materials.
+    // SourceOver can leave the destination alpha at zero, making the backdrop
+    // shine through dark glyphs so they appear white. Copy glyph color and
+    // coverage into the surface together.
+    if (g_alphaPaintActive)
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     Gdiplus::Font gpFont(dc, &lf);
     if (gpFont.GetLastStatus() != Gdiplus::Ok) return FALSE;
@@ -1132,8 +1138,7 @@ static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
     format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
     Gdiplus::RectF bounds((Gdiplus::REAL)x, (Gdiplus::REAL)y,
                           (Gdiplus::REAL)w, (Gdiplus::REAL)h);
-    graphics.DrawString(text, -1, &gpFont, bounds, &format, &brush);
-    return TRUE;
+    return graphics.DrawString(text, -1, &gpFont, bounds, &format, &brush) == Gdiplus::Ok;
 }
 
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {

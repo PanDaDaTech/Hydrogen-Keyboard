@@ -4,7 +4,6 @@
 #define _WIN32_WINNT 0x0501
 #include <windows.h>
 #include <windowsx.h>
-#include <mmsystem.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <objbase.h>
@@ -15,7 +14,6 @@
 #include "resource.h"
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "winmm.lib")
 
 // 当前编译架构（关于页显示用）
 #ifdef _M_ARM64
@@ -282,9 +280,9 @@ struct WindowMotion {
     int toY;
     UINT duration;
     LONGLONG started;
+    int lastY;
     WindowMotionFinish finish;
     BOOL active;
-    BOOL periodHeld;
 };
 static WindowMotion g_mainMotion = {};
 static WindowMotion g_settingsMotion = {};
@@ -830,7 +828,8 @@ static void DrawLineAA(HDC dc, int x1, int y1, int x2, int y2, DWORD color, floa
     graphics.DrawLine(&pen, x1, y1, x2, y2);
 }
 
-static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD borderC, int radius) {
+static void DrawRoundRectAlpha(HDC dc, int x, int y, int w, int h, DWORD fillC,
+                               DWORD borderC, int radius, BYTE fillAlpha, BYTE borderAlpha) {
     if (w <= 0 || h <= 0) return;
     float r = (float)radius;
     float maxR = ((float)(w < h ? w : h) - 1.0f) / 2.0f;
@@ -850,12 +849,24 @@ static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD
     path.AddArc(fx, fy + fh - d, d, d, 90.0f, 90.0f);
     path.CloseFigure();
 
-    Gdiplus::Color fill(255, GetRValue(fillC), GetGValue(fillC), GetBValue(fillC));
-    Gdiplus::Color border(255, GetRValue(borderC), GetGValue(borderC), GetBValue(borderC));
+    Gdiplus::Color fill(fillAlpha, GetRValue(fillC), GetGValue(fillC), GetBValue(fillC));
+    Gdiplus::Color border(borderAlpha, GetRValue(borderC), GetGValue(borderC), GetBValue(borderC));
     Gdiplus::SolidBrush brush(fill);
     Gdiplus::Pen pen(border, 1.0f);
     g.FillPath(&brush, &path);
     g.DrawPath(&pen, &path);
+}
+
+static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD borderC, int radius) {
+    DrawRoundRectAlpha(dc, x, y, w, h, fillC, borderC, radius, 255, 255);
+}
+
+static void DrawAlphaSurface(HDC dc, int x, int y, int w, int h, DWORD color, BYTE alpha) {
+    if (w <= 0 || h <= 0 || alpha == 0) return;
+    Gdiplus::Graphics g(dc);
+    Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, GetRValue(color),
+                                             GetGValue(color), GetBValue(color)));
+    g.FillRectangle(&brush, x, y, w, h);
 }
 
 typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND, DWORD, LPCVOID, DWORD);
@@ -1698,43 +1709,62 @@ static int HitHeader(int x, int y) {
     double dpiScale = GetSystemDpiScale();
     int rMargin = (int)(6 * dpiScale);
     int gap     = (int)(6 * dpiScale);
-    int wClose = (int)(36 * dpiScale);
-    int wMin   = (int)(36 * dpiScale);
+    int wClose = (int)(28 * dpiScale);
+    int wMin   = (int)(28 * dpiScale);
     int wMenu  = (int)(48 * dpiScale);
+    int btnH   = (int)(28 * dpiScale);
+    if (btnH > g_headerH - 4) btnH = g_headerH - 4;
+    int btnY = (g_headerH - btnH) / 2;
+
+    if (y < btnY || y >= btnY + btnH) return -1;
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
     int xMenu  = (int)(6 * dpiScale);
 
-    if (x >= xClose && x < g_ww) return HDR_CLOSE;
-    if (x >= xMin && x < xClose) return HDR_MIN;
-    if (x >= xMenu && x < xMenu + wMenu + gap) return HDR_DOCK;
+    if (x >= xClose && x < xClose + wClose) return HDR_CLOSE;
+    if (x >= xMin && x < xMin + wMin) return HDR_MIN;
+    if (x >= xMenu && x < xMenu + wMenu) return HDR_DOCK;
     return -1;
 }
 
+static BOOL IsMainMaterialPaintActive() {
+    return IsMaterialApplied(g_hWnd) && g_alphaPaintActive;
+}
+
+static void DrawMainMaterialSurface(HDC dc) {
+    if (!IsMainMaterialPaintActive()) return;
+    BOOL dark = g_theme->bg == g_darkTheme.bg;
+    BYTE alpha = g_materialMode == 1 ? (dark ? 104 : 132)
+                                      : (dark ? 76 : 104);
+    DrawAlphaSurface(dc, 0, 0, g_ww, g_wh, C_BG, alpha);
+}
+
 static void DrawHeader(HDC dc) {
-    // 材质模式下标题栏让 Mica/亚克力直接透出；关闭材质时保持原底色
+    // 主窗口材质模式使用统一半透明覆盖层；关闭材质时保持原底色。
     if (!(IsMaterialApplied(g_hWnd) && g_alphaPaintActive))
         Fill(dc, 0, 0, g_ww, g_headerH, C_HDR);
 
     double dpiScale = GetSystemDpiScale();
-    double scaleY = (double)g_wh / (320.0 * dpiScale);
-
     int rMargin = (int)(6 * dpiScale);
     int gap     = (int)(6 * dpiScale);
-    int btnH    = g_headerH - (int)(12 * dpiScale * scaleY);
-    if (btnH < 22) btnH = 22;
+    int btnH    = (int)(28 * dpiScale);
+    if (btnH > g_headerH - 4) btnH = g_headerH - 4;
     int btnY = (g_headerH - btnH) / 2;
 
-    int wClose = (int)(36 * dpiScale);
-    int wMin   = (int)(36 * dpiScale);
+    int wClose = (int)(28 * dpiScale);
+    int wMin   = (int)(28 * dpiScale);
     int wMenu  = (int)(48 * dpiScale);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
     int xMenu  = (int)(6 * dpiScale);
 
-    DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
+    if (IsMainMaterialPaintActive())
+        DrawRoundRectAlpha(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER,
+                           btnH / 2, 188, 150);
+    else
+        DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
     DrawTextC(dc, xMenu, btnY, wMenu, btnH, T(L"\x8BBE\x7F6E", L"Settings"), g_f12, C_WHITE);   // 菜单按钮 → 打开设置页
 
     int xTitle = xMenu + wMenu + gap;
@@ -1744,21 +1774,29 @@ static void DrawHeader(HDC dc) {
     }
 
     // 最小化按钮：悬停时与设置页关闭按钮同款圆角底（C_HOVER + C_KEY_BORDER），图标为 AA 横线
-    if (g_hdrHov == HDR_MIN)
-        DrawRoundRect(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6);
+    if (g_hdrHov == HDR_MIN) {
+        if (IsMainMaterialPaintActive())
+            DrawRoundRectAlpha(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6, 196, 150);
+        else
+            DrawRoundRect(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6);
+    }
     {
         int cx = xMin + wMin / 2;
         int cy = btnY + btnH / 2;
-        int half = (int)(7 * dpiScale);
+        int half = (int)(5 * dpiScale);
         DrawLineAA(dc, cx - half, cy, cx + half, cy, C_DIM, 2.0f);
     }
     // 关闭按钮：与设置页关闭按钮同款样式（悬停圆角底 + AA 的 X 图标）
-    if (g_hdrHov == HDR_CLOSE)
-        DrawRoundRect(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6);
+    if (g_hdrHov == HDR_CLOSE) {
+        if (IsMainMaterialPaintActive())
+            DrawRoundRectAlpha(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6, 196, 150);
+        else
+            DrawRoundRect(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6);
+    }
     {
         int cx = xClose + wClose / 2;
         int cy = btnY + btnH / 2;
-        int r  = (int)(5 * dpiScale); if (r < 5) r = 5;
+        int r  = (int)(5 * dpiScale); if (r < 4) r = 4;
         DrawLineAA(dc, cx - r, cy - r, cx + r, cy + r, C_DIM, 2.0f);
         DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
     }
@@ -1781,7 +1819,13 @@ static void DrawKeys(HDC dc) {
             }
         }
 
-        DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, C_KEY_BORDER, 8);
+        if (IsMainMaterialPaintActive()) {
+            BYTE fillAlpha = (active || pressed) ? 232 : (hover ? 204 : 180);
+            DrawRoundRectAlpha(dc, k->x, k->y, k->w, k->h, bg, C_KEY_BORDER,
+                               8, fillAlpha, 145);
+        } else {
+            DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, C_KEY_BORDER, 8);
+        }
 
         const wchar_t* txt = KeyText(k);
         HFONT f = g_f14b;
@@ -1826,7 +1870,6 @@ static void StopWindowMotion(WindowMotion* motion) {
     if (!motion || !motion->active) return;
     if (motion->hWnd && IsWindow(motion->hWnd))
         KillTimer(motion->hWnd, TIMER_WINDOW_ANIM);
-    if (motion->periodHeld) { timeEndPeriod(1); motion->periodHeld = FALSE; }
     motion->active = FALSE;
 }
 
@@ -1842,9 +1885,9 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     motion->toY = toY;
     motion->duration = duration ? duration : 1;
     motion->started = QpcNowMs();
+    motion->lastY = fromY;
     motion->finish = finish;
     motion->active = TRUE;
-    if (!motion->periodHeld) { timeBeginPeriod(1); motion->periodHeld = TRUE; }
 
     if (!IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
     SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
@@ -1852,11 +1895,10 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     RedrawWindow(hWnd, NULL, NULL,
                  RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
     UpdateWindow(hWnd);
-    if (!SetTimer(hWnd, TIMER_WINDOW_ANIM, 8, NULL)) {
+    if (!SetTimer(hWnd, TIMER_WINDOW_ANIM, 15, NULL)) {
         SetWindowPos(hWnd, HWND_TOPMOST, x, toY, 0, 0,
                      SWP_NOSIZE | SWP_NOACTIVATE);
         motion->active = FALSE;
-        if (motion->periodHeld) { timeEndPeriod(1); motion->periodHeld = FALSE; }
         if (finish == MOTION_HIDE) ShowWindow(hWnd, SW_HIDE);
         else if (finish == MOTION_DESTROY) DestroyWindow(hWnd);
         else PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
@@ -1871,20 +1913,17 @@ static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
     if (t > 1.0) t = 1.0;
     double eased = t * t * (3.0 - 2.0 * t);
     int y = motion->fromY + (int)((motion->toY - motion->fromY) * eased + 0.5);
-    SetWindowPos(hWnd, HWND_TOPMOST, motion->x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE);
-    // 位移期间窗口内容不变，无需每帧 UpdateWindow 强制整窗 GDI+ 重绘
-    // （整窗重绘是动画卡顿的最大来源）。DWM 会直接合成移动后的窗口。
-    // 每帧用 DwmFlush 提交本次位移，防止移动被 DWM 合并成直接跳到终点。
-    DwmFlushProc flush = GetDwmFlush();
-    if (flush) flush();
+    if (y != motion->lastY) {
+        SetWindowPos(hWnd, HWND_TOPMOST, motion->x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+        motion->lastY = y;
+    }
 
     if (t < 1.0) return TRUE;
 
     WindowMotionFinish finish = motion->finish;
     KillTimer(hWnd, TIMER_WINDOW_ANIM);
     motion->active = FALSE;
-    if (motion->periodHeld) { timeEndPeriod(1); motion->periodHeld = FALSE; }
     if (finish == MOTION_HIDE) {
         ShowWindow(hWnd, SW_HIDE);
     } else if (finish == MOTION_DESTROY) {
@@ -4185,6 +4224,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         RECT rc = {0, 0, g_ww, g_wh};
         WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
         ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
+        DrawMainMaterialSurface(surface.dc);
         DrawHeader(surface.dc);
         DrawKeys(surface.dc);
         if (!surface.buffered)

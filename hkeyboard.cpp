@@ -836,6 +836,7 @@ typedef HRESULT (WINAPI *BufferedPaintInitProc)();
 typedef PaintBufferHandleLocal (WINAPI *BeginBufferedPaintProc)(HDC, const RECT*, int, const void*, HDC*);
 typedef HRESULT (WINAPI *EndBufferedPaintProc)(PaintBufferHandleLocal, BOOL);
 typedef HRESULT (WINAPI *BufferedPaintClearProc)(PaintBufferHandleLocal, const RECT*);
+typedef HRESULT (WINAPI *GetBufferedPaintBitsProc)(PaintBufferHandleLocal, RGBQUAD**, int*);
 
 struct AccentPolicyLocal {
     int state;
@@ -891,6 +892,7 @@ struct BufferedPaintApiLocal {
     BeginBufferedPaintProc begin;
     EndBufferedPaintProc end;
     BufferedPaintClearProc clear;
+    GetBufferedPaintBitsProc bits;
 };
 
 static const BufferedPaintApiLocal* GetBufferedPaintApi() {
@@ -905,6 +907,7 @@ static const BufferedPaintApiLocal* GetBufferedPaintApi() {
             api.begin = (BeginBufferedPaintProc)GetProcAddress(module, "BeginBufferedPaint");
             api.end = (EndBufferedPaintProc)GetProcAddress(module, "EndBufferedPaint");
             api.clear = (BufferedPaintClearProc)GetProcAddress(module, "BufferedPaintClear");
+            api.bits = (GetBufferedPaintBitsProc)GetProcAddress(module, "GetBufferedPaintBits");
             if (!api.init || !api.begin || !api.end || FAILED(api.init())) {
                 ZeroMemory(&api, sizeof(api));
             }
@@ -954,6 +957,9 @@ static BOOL IsMaterialApplied(HWND hWnd) {
 }
 
 static BOOL g_alphaPaintActive = FALSE;
+static RGBQUAD* g_alphaPaintBits = NULL;
+static int g_alphaPaintRowPixels = 0;
+static RECT g_alphaPaintRect = {0, 0, 0, 0};
 
 struct WindowPaintSurfaceLocal {
     HDC dc;
@@ -963,11 +969,17 @@ struct WindowPaintSurfaceLocal {
     HBITMAP oldBitmap;
     BOOL alpha;
     BOOL previousAlpha;
+    RGBQUAD* previousBits;
+    int previousRowPixels;
+    RECT previousRect;
 };
 
 static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, const RECT& rc) {
     WindowPaintSurfaceLocal surface = {};
     surface.previousAlpha = g_alphaPaintActive;
+    surface.previousBits = g_alphaPaintBits;
+    surface.previousRowPixels = g_alphaPaintRowPixels;
+    surface.previousRect = g_alphaPaintRect;
 
     if (IsMaterialApplied(hWnd)) {
         const BufferedPaintApiLocal* api = GetBufferedPaintApi();
@@ -979,6 +991,18 @@ static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, co
                 surface.alpha = TRUE;
                 g_alphaPaintActive = TRUE;
                 api->clear(surface.buffered, NULL);
+                g_alphaPaintBits = NULL;
+                g_alphaPaintRowPixels = 0;
+                g_alphaPaintRect = rc;
+                if (api->bits) {
+                    RGBQUAD* bits = NULL;
+                    int rowPixels = 0;
+                    if (SUCCEEDED(api->bits(surface.buffered, &bits, &rowPixels)) &&
+                        bits && rowPixels > 0) {
+                        g_alphaPaintBits = bits;
+                        g_alphaPaintRowPixels = rowPixels;
+                    }
+                }
                 return surface;
             }
         }
@@ -998,6 +1022,9 @@ static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit)
         const BufferedPaintApiLocal* api = GetBufferedPaintApi();
         if (api) api->end(surface->buffered, commit);
         g_alphaPaintActive = surface->previousAlpha;
+        g_alphaPaintBits = surface->previousBits;
+        g_alphaPaintRowPixels = surface->previousRowPixels;
+        g_alphaPaintRect = surface->previousRect;
         return;
     }
     if (surface->memory) {
@@ -1006,6 +1033,9 @@ static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit)
         DeleteDC(surface->memory);
     }
     g_alphaPaintActive = surface->previousAlpha;
+    g_alphaPaintBits = surface->previousBits;
+    g_alphaPaintRowPixels = surface->previousRowPixels;
+    g_alphaPaintRect = surface->previousRect;
 }
 
 static void ClearWindowBackBuffer(HDC dc, HWND hWnd, int w, int h) {
@@ -1114,31 +1144,79 @@ static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
                              const wchar_t* text, HFONT font, DWORD color,
                              Gdiplus::StringAlignment alignment) {
     if (g_materialMode == 0 || !text || !font || w <= 0 || h <= 0) return FALSE;
+    if (!g_alphaPaintActive || !g_alphaPaintBits || g_alphaPaintRowPixels <= 0)
+        return FALSE;
 
-    LOGFONTW lf = {};
-    if (GetObjectW(font, sizeof(lf), &lf) == 0) return FALSE;
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-    Gdiplus::Graphics graphics(dc);
-    // BufferedPaint provides a transparent ARGB surface for DWM materials.
-    // SourceOver can leave the destination alpha at zero, making the backdrop
-    // shine through dark glyphs so they appear white. Copy glyph color and
-    // coverage into the surface together.
-    if (g_alphaPaintActive)
-        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    Gdiplus::Font gpFont(dc, &lf);
-    if (gpFont.GetLastStatus() != Gdiplus::Ok) return FALSE;
+    void* rawMask = NULL;
+    HBITMAP maskBitmap = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &rawMask, NULL, 0);
+    if (!maskBitmap || !rawMask) {
+        if (maskBitmap) DeleteObject(maskBitmap);
+        return FALSE;
+    }
+    ZeroMemory(rawMask, (SIZE_T)w * (SIZE_T)h * sizeof(RGBQUAD));
 
-    DWORD resolved = ResolveFontColor(color);
-    Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(resolved),
-                                             GetGValue(resolved), GetBValue(resolved)));
-    Gdiplus::StringFormat format;
-    format.SetAlignment(alignment);
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    Gdiplus::RectF bounds((Gdiplus::REAL)x, (Gdiplus::REAL)y,
-                          (Gdiplus::REAL)w, (Gdiplus::REAL)h);
-    return graphics.DrawString(text, -1, &gpFont, bounds, &format, &brush) == Gdiplus::Ok;
+    HDC maskDc = CreateCompatibleDC(dc);
+    if (!maskDc) {
+        DeleteObject(maskBitmap);
+        return FALSE;
+    }
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(maskDc, maskBitmap);
+    HFONT oldFont = (HFONT)SelectObject(maskDc, font);
+    SetBkMode(maskDc, TRANSPARENT);
+    SetTextColor(maskDc, RGB(255, 255, 255));
+    RECT maskRect = {0, 0, w, h};
+    UINT flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+    flags |= alignment == Gdiplus::StringAlignmentCenter ? DT_CENTER : DT_LEFT;
+    int drawn = DrawTextW(maskDc, text, -1, &maskRect, flags);
+
+    if (drawn > 0) {
+        RGBQUAD* mask = (RGBQUAD*)rawMask;
+        DWORD resolved = ResolveFontColor(color);
+        int red = GetRValue(resolved);
+        int green = GetGValue(resolved);
+        int blue = GetBValue(resolved);
+        int dstX = x - g_alphaPaintRect.left;
+        int dstY = y - g_alphaPaintRect.top;
+        int paintW = g_alphaPaintRect.right - g_alphaPaintRect.left;
+        int paintH = g_alphaPaintRect.bottom - g_alphaPaintRect.top;
+        if (paintW > g_alphaPaintRowPixels) paintW = g_alphaPaintRowPixels;
+
+        int startX = dstX < 0 ? -dstX : 0;
+        int startY = dstY < 0 ? -dstY : 0;
+        int endX = w;
+        int endY = h;
+        if (dstX + endX > paintW) endX = paintW - dstX;
+        if (dstY + endY > paintH) endY = paintH - dstY;
+
+        for (int py = startY; py < endY; py++) {
+            RGBQUAD* srcRow = mask + py * w;
+            RGBQUAD* dstRow = g_alphaPaintBits + (dstY + py) * g_alphaPaintRowPixels;
+            for (int px = startX; px < endX; px++) {
+                BYTE alpha = srcRow[px].rgbBlue;
+                if (alpha == 0) continue;
+                RGBQUAD* dst = dstRow + dstX + px;
+                int inverse = 255 - alpha;
+                dst->rgbRed = (BYTE)((red * alpha + dst->rgbRed * inverse + 127) / 255);
+                dst->rgbGreen = (BYTE)((green * alpha + dst->rgbGreen * inverse + 127) / 255);
+                dst->rgbBlue = (BYTE)((blue * alpha + dst->rgbBlue * inverse + 127) / 255);
+                dst->rgbReserved = (BYTE)(alpha + (dst->rgbReserved * inverse + 127) / 255);
+            }
+        }
+    }
+
+    SelectObject(maskDc, oldFont);
+    SelectObject(maskDc, oldBitmap);
+    DeleteDC(maskDc);
+    DeleteObject(maskBitmap);
+    return drawn > 0;
 }
 
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {

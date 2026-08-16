@@ -235,13 +235,13 @@ static void RefreshThemeAndRepaint(HWND hWnd) {
 #define C_WHITE        (g_theme->text)
 #define C_DIM          (g_theme->dim)
 
-// DWM backdrop can resolve to a light surface independently of the Windows
-// theme query. Use the palette actually being rendered and force normal text
-// to a non-zero near-black on light Mica/Acrylic surfaces. Pure black is the
-// transparent key color for an extended DWM glass frame and would disappear.
+// Keep material-mode text deterministic: Follow System and Light Theme use
+// near-black text, while only an explicitly selected Dark Theme uses its
+// original light text colors. Pure black is avoided for extended DWM glass.
 static DWORD ResolveFontColor(DWORD color) {
-    if (g_materialMode != 0 && g_theme->bg == g_lightTheme.bg &&
-        (color == g_theme->text || color == g_theme->dim)) {
+    // In material mode, Follow System and Light Theme use a light glass
+    // surface in practice. Only an explicit Dark Theme keeps white text.
+    if (g_materialMode != 0 && g_themeMode != 1) {
         return RGB(32, 32, 32);
     }
     return color;

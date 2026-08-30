@@ -51,8 +51,8 @@ int g_headerH = 36;
 int g_keyGap = 4;
 int g_keyHeight = 46;
 
-#define KEY_AREA_X   6
-#define KEY_AREA_W   (g_ww - 12)
+#define KEY_AREA_X   g_keyAreaX
+#define KEY_AREA_W   (g_ww - g_keyAreaX * 2)
 
 #define TIMER_FOCUS     8820
 #define TIMER_EXIT      8822
@@ -306,12 +306,9 @@ HICON       g_hTrayIcon = 0;
 BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
-BOOL        g_autoMinimized = FALSE;   // 标题栏最小化后抑制当前输入框再次自动呼出
-ULONG_PTR   g_suppressedInputToken = 0; // 最小化时仍保持焦点的输入控件标识
 ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
-int         g_hideDelayMs = 500;       // 自动隐藏延迟（毫秒）
+int         g_hideDelayMs = 0;         // 自动隐藏延迟（毫秒，0=立即隐藏）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
-DWORD       g_inputLostTick = 0;       // 最小化抑制仅在稳定离开输入框后解除
 
 // 语言切换：g_lang=0 简体中文，1 English；返回当前语言对应的文案
 static const wchar_t* T(const wchar_t* zh, const wchar_t* en) { return g_lang ? en : zh; }
@@ -326,7 +323,8 @@ BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多
 BOOL        g_af = TRUE;
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
-int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘
+int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘 2=常用
+BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
 DWORD       g_lht = 0;
@@ -362,12 +360,24 @@ static void DrawCircleAA(HDC dc, int x, int y, int r, DWORD fill) {
                   (Gdiplus::REAL)(r * 2), (Gdiplus::REAL)(r * 2));
 }
 
-// Fn 功能键层：TRUE 时数字行显示为 F1~F12
+// 抗锯齿实心三角形（下拉框箭头等小图形）
+static void DrawTriangleAA(HDC dc, int ax, int ay, int bx, int by, int cx, int cy, DWORD fill) {
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::Point pts[3] = { Gdiplus::Point(ax, ay), Gdiplus::Point(bx, by), Gdiplus::Point(cx, cy) };
+    Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
+    g.FillPolygon(&br, pts, 3);
+}
+
+// Fn 功能键层：TRUE 时数字行显示为 F1~F12（或按设置切换到上网布局）
 BOOL        g_fnLayer = FALSE;
 
-#define MAX_KEYS 120
+#define MAX_KEYS 160
 KeyDef g_keys[MAX_KEYS];
 int g_nk = 0;
+int g_keyAreaX = 6;               // 键区左右边距（随 DPI，圆角窗口防裁切）
+UINT g_taskbarCreatedMsg = 0;     // TaskbarCreated：任务栏重建后恢复托盘图标
 
 static double GetSystemDpiScale() {
     HDC hdc = GetDC(NULL);
@@ -443,7 +453,8 @@ static void BuildNumpad(int y) {
     }
 }
 
-// 常用布局（标准 87 键 TKL：无数字小键盘、无 Fn，可选 F1~F12 顶行）
+// 常用布局（标准 87 键 TKL：无数字小键盘，可选 F1~F12 顶行）
+// 始终保留 Esc 与 Fn：F 行开启时 Esc 位于顶行、Fn 隐藏；关闭时 Esc 在主键区行首、Fn 在底排
 static void BuildCommon(int y, double dpiScale, double scaleX) {
     // F 行（可选）：Esc, F1~F12
     if (g_showFKeys) {
@@ -458,18 +469,34 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 1: `, 1-0, -, =, Backspace (14 keys)
+    // Row 1: (Esc), `, 1-0, -, =, Backspace
     {
+        int wEsc = (int)(50 * dpiScale * scaleX);
         int wBksp = (int)(80 * dpiScale * scaleX);
-        int aw = (KEY_AREA_W - wBksp - 13 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - wBksp - 13 * g_keyGap - aw * 13;
-        short v[14] = {0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
-        KeyType t[14] = {K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 14; i++) {
-            int w = (i == 13) ? wBksp : (aw + (i < rem ? 1 : 0));
-            AddKey(x, y, w, g_keyHeight, v[i], t[i]);
-            x += w + g_keyGap;
+        if (!g_showFKeys) {
+            // F 行关闭：Esc 保留在行首（15 键）
+            int fixed = wEsc + wBksp;
+            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
+            int w[15]; w[0] = wEsc;
+            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+            w[14] = wBksp;
+            short v[15] = {0x1B,0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
+            KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            // F 行开启：Esc 已在顶行（14 键）
+            int aw = (KEY_AREA_W - wBksp - 13 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - wBksp - 13 * g_keyGap - aw * 13;
+            short v[14] = {0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
+            KeyType t[14] = {K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 14; i++) {
+                int w = (i == 13) ? wBksp : (aw + (i < rem ? 1 : 0));
+                AddKey(x, y, w, g_keyHeight, v[i], t[i]);
+                x += w + g_keyGap;
+            }
         }
     }
     y += g_keyHeight + g_keyGap;
@@ -525,21 +552,126 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
     }
     y += g_keyHeight + g_keyGap;
 
-    // Row 5: Ctrl, Win, Alt, Space, Alt, Menu, Ctrl, ←, ↓, → (10 keys)
+    // Row 5: (Fn), Ctrl, Win, Alt, Space, Alt, Menu, Ctrl, ←, ↓, →
+    // F 行开启时隐藏 Fn（Esc 已在顶行保留）
     {
+        int wFn  = (int)(46 * dpiScale * scaleX);
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(46 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
-        int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
-        if (spaceW < 60) spaceW = 60;
-        int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
-        short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-        KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+        if (g_showFKeys) {
+            int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+            short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 10 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+            short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        }
+    }
+}
+
+// Fn 网页布局层：上网/聊天常用布局（Esc+F 行、符号区、网址后缀、底排修饰键）
+static void BuildFnSurf(int y, double dpiScale, double scaleX) {
+    // Row 1: Esc, `, F1~F12, Backspace (15 keys)
+    {
+        int wEsc = (int)(50 * dpiScale * scaleX);
+        int wBksp = (int)(60 * dpiScale * scaleX);
+        int fixed = wEsc + wBksp;
+        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
         int x = KEY_AREA_X;
-        for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        AddKey(x, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); x += wEsc + g_keyGap;
+        for (int i = 0; i < 13; i++) {
+            int w = aw + (i < rem ? 1 : 0);
+            if (i == 0) AddKey(x, y, w, g_keyHeight, 0xC0, K_NORMAL);
+            else AddKey(x, y, w, g_keyHeight, (short)(0x70 + i - 1), K_NORMAL);   // F1~F12
+            x += w + g_keyGap;
+        }
+        AddKey(x, y, wBksp, g_keyHeight, 0x08, K_SPECIAL);
+        y += g_keyHeight + g_keyGap;
+    }
+
+    // Row 2: Tab, 数字行(双符号), [, ], \, Del (15 keys)
+    {
+        int wTab = (int)(60 * dpiScale * scaleX);
+        int wDel = (int)(60 * dpiScale * scaleX);
+        int fixed = wTab + wDel;
+        int aw = (KEY_AREA_W - fixed - 13 * g_keyGap) / 13;
+        int rem = KEY_AREA_W - fixed - 13 * g_keyGap - aw * 13;
+        int w[15]; w[0] = wTab;
+        for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+        w[14] = wDel;
+        short v[15] = {0x09,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xDB,0xDD,0xDC,0x2E};
+        KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        y += g_keyHeight + g_keyGap;
+    }
+
+    // Row 3: Caps, - = [ ] \ ; ' , . /, Enter (12 keys)
+    {
+        int wCaps = (int)(80 * dpiScale * scaleX);
+        int wEnter = (int)(90 * dpiScale * scaleX);
+        int fixed = wCaps + wEnter;
+        int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 10;
+        int rem = KEY_AREA_W - fixed - 11 * g_keyGap - aw * 10;
+        int w[12]; w[0] = wCaps;
+        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
+        w[11] = wEnter;
+        short v[12] = {0x14,0xBD,0xBB,0xDB,0xDD,0xDC,0xBA,0xDE,0xBC,0xBE,0xBF,0x0D};
+        KeyType t[12] = {K_CAPS,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 12; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        y += g_keyHeight + g_keyGap;
+    }
+
+    // Row 4: Shift, 网址后缀×6, ? , . /, ↑, Shift (13 keys)
+    {
+        int wLSh = (int)(95 * dpiScale * scaleX);
+        int wUp = (int)(52 * dpiScale * scaleX);
+        int wRSh = wUp;
+        int fixed = wLSh + wRSh + wUp;
+        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
+        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
+        int w[13]; w[0] = wLSh;
+        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
+        w[11] = wUp; w[12] = wRSh;
+        short v[13] = {0xA0, 0x200,0x201,0x202,0x203,0x204,0x205, 0xBF,0xBC,0xBE, 0x26, 0xA1};
+        KeyType t[13] = {K_MOD, K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL, K_NORMAL,K_NORMAL,K_NORMAL, K_ARROW, K_MOD};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 13; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        y += g_keyHeight + g_keyGap;
+    }
+
+    // Row 5: Fn, Ctrl, Win, Alt, Space, Alt, Menu, Ctrl, ←, ↓, → (11 keys)
+    {
+        int wFn  = (int)(46 * dpiScale * scaleX);
+        int wCtl = (int)(56 * dpiScale * scaleX);
+        int wWin = (int)(46 * dpiScale * scaleX);
+        int wAlt = (int)(58 * dpiScale * scaleX);
+        int wMenu = (int)(46 * dpiScale * scaleX);
+        int wArw = (int)(52 * dpiScale * scaleX);
+        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 10 * g_keyGap;
+        if (spaceW < 60) spaceW = 60;
+        int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+        short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+        KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
     }
 }
 
@@ -555,16 +687,26 @@ static void BuildKeys() {
 
     g_headerH = (int)(36.0 * dpiScale * scaleY); if (g_headerH < 28) g_headerH = 28;
     g_keyGap = (int)(4.0 * dpiScale * scaleX); if (g_keyGap < 2) g_keyGap = 2;
+    // 圆角窗口四角会裁掉内容：键区左右与底部留出安全边距
+    g_keyAreaX = (int)(10 * dpiScale); if (g_keyAreaX < 6) g_keyAreaX = 6;
+    int bottomPad = (int)(16 * dpiScale); if (bottomPad < 8) bottomPad = 8;
 
-    // 行数：全尺寸 5 行 + 可选 F1~F12 顶行；小键盘 5 行
-    int rows = 5 + (g_layoutMode != 1 && g_showFKeys ? 1 : 0);   // 全尺寸/常用可选 F1~F12 顶行
-    g_keyHeight = (g_wh - g_headerH - 8 - (rows - 1) * g_keyGap) / rows;
+    // 行数：全尺寸 5 行 + 可选 F1~F12 顶行；小键盘 5 行；Fn 网页布局固定 5 行
+    BOOL webSurf = g_fnLayer && g_fnWebLayout && g_layoutMode != 1;
+    int rows = 5 + (g_layoutMode != 1 && g_showFKeys && !webSurf ? 1 : 0);
+    g_keyHeight = (g_wh - g_headerH - bottomPad - (rows - 1) * g_keyGap) / rows;
     if (g_keyHeight < 20) g_keyHeight = 20;
 
     int y = g_headerH + g_keyGap + 2;
 
     if (g_layoutMode == 1) {   // 小键盘
         BuildNumpad(y);
+        return;
+    }
+
+    // Fn 网页布局层（按 Fn 键切换，全尺寸/常用布局下生效）
+    if (g_fnLayer && g_fnWebLayout) {
+        BuildFnSurf(y, dpiScale, scaleX);
         return;
     }
 
@@ -742,14 +884,42 @@ static void LoadEmbeddedFonts() {
     }
 }
 
+// 检查内嵌字体族中是否存在真 Bold 字面。
+// 若系统安装了官方版阿里巴巴普惠体（族名结构不同），GDI 可能只匹配到 400 字重的
+// Regular 字面并触发仿真加粗（重复描边，浅色下尤其难看）；此时应退回 Regular。
+static int CALLBACK EnumBoldFaceProc(const LOGFONTW* plf, const TEXTMETRICW*, DWORD, LPARAM lp) {
+    if (plf && plf->lfWeight >= 600) {
+        *(int*)lp = 1;
+        return 0;   // 已找到，停止枚举
+    }
+    return 1;
+}
+
+static BOOL FamilyHasRealBoldFace() {
+    static int state = 0;   // 0=未知 1=有 -1=无
+    if (state == 0) {
+        state = -1;
+        LOGFONTW lf = {};
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy(lf.lfFaceName, L"Alibaba PuHuiTi 3.0 55 Regular");
+        HDC dc = GetDC(0);
+        EnumFontFamiliesExW(dc, &lf, EnumBoldFaceProc, (LPARAM)&state, 0);
+        ReleaseDC(0, dc);
+    }
+    return state == 1;
+}
+
 static HFONT MakeFont(double size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
-    return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
+    const wchar_t* face = g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei";
+    // 内嵌族无真 Bold 字面时请求 Regular，避免 GDI 仿真加粗产生的重影粗体
+    BOOL realBold = !bold || !g_fontReady || FamilyHasRealBoldFace();
+    return CreateFontW(h, 0, 0, 0, (bold && realBold) ? FW_BOLD : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei");
+        DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
 static HFONT MakeIconFont(double size) {
@@ -999,6 +1169,7 @@ static BOOL IsMaterialApplied(HWND hWnd) {
 }
 
 static BOOL g_alphaPaintActive = FALSE;
+static BOOL g_bufferedPaintActive = FALSE;   // 当前画布是否为 DWM 缓冲透明画布（材质模式）
 static RGBQUAD* g_alphaPaintBits = NULL;
 static int g_alphaPaintRowPixels = 0;
 static RECT g_alphaPaintRect = {0, 0, 0, 0};
@@ -1011,6 +1182,7 @@ struct WindowPaintSurfaceLocal {
     HBITMAP oldBitmap;
     BOOL alpha;
     BOOL previousAlpha;
+    BOOL previousBuffered;
     RGBQUAD* previousBits;
     int previousRowPixels;
     RECT previousRect;
@@ -1019,6 +1191,7 @@ struct WindowPaintSurfaceLocal {
 static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, const RECT& rc) {
     WindowPaintSurfaceLocal surface = {};
     surface.previousAlpha = g_alphaPaintActive;
+    surface.previousBuffered = g_bufferedPaintActive;
     surface.previousBits = g_alphaPaintBits;
     surface.previousRowPixels = g_alphaPaintRowPixels;
     surface.previousRect = g_alphaPaintRect;
@@ -1032,6 +1205,7 @@ static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, co
                 surface.dc = bufferedDc;
                 surface.alpha = TRUE;
                 g_alphaPaintActive = TRUE;
+                g_bufferedPaintActive = TRUE;
                 api->clear(surface.buffered, NULL);
                 g_alphaPaintBits = NULL;
                 g_alphaPaintRowPixels = 0;
@@ -1050,11 +1224,47 @@ static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, co
         }
     }
 
+    // 无材质模式：同样使用 32bpp 顶向下 DIB，使文字统一走 alpha 混合路径，
+    // 保证浅色/深色/材质各模式下的文字渲染观感完全一致。
+    {
+        int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        if (w > 0 && h > 0) {
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void* bits = NULL;
+            surface.memory = CreateCompatibleDC(target);
+            surface.bitmap = CreateDIBSection(target, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+            if (surface.memory && surface.bitmap && bits) {
+                surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
+                surface.dc = surface.memory;
+                surface.alpha = FALSE;
+                g_alphaPaintActive = TRUE;
+                g_bufferedPaintActive = FALSE;
+                g_alphaPaintBits = (RGBQUAD*)bits;
+                g_alphaPaintRowPixels = w;
+                g_alphaPaintRect = rc;
+                return surface;
+            }
+            // DIB 创建失败：回退普通兼容位图（GDI 直绘文字）
+            if (surface.memory) { DeleteDC(surface.memory); surface.memory = NULL; }
+            if (surface.bitmap) { DeleteObject(surface.bitmap); surface.bitmap = NULL; }
+        }
+    }
+
     surface.memory = CreateCompatibleDC(target);
     surface.bitmap = CreateCompatibleBitmap(target, rc.right - rc.left, rc.bottom - rc.top);
     surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
     surface.dc = surface.memory;
     surface.alpha = FALSE;
+    g_alphaPaintActive = FALSE;
+    g_bufferedPaintActive = FALSE;
+    g_alphaPaintBits = NULL;
+    g_alphaPaintRowPixels = 0;
     return surface;
 }
 
@@ -1064,6 +1274,7 @@ static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit)
         const BufferedPaintApiLocal* api = GetBufferedPaintApi();
         if (api) api->end(surface->buffered, commit);
         g_alphaPaintActive = surface->previousAlpha;
+        g_bufferedPaintActive = surface->previousBuffered;
         g_alphaPaintBits = surface->previousBits;
         g_alphaPaintRowPixels = surface->previousRowPixels;
         g_alphaPaintRect = surface->previousRect;
@@ -1075,6 +1286,7 @@ static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit)
         DeleteDC(surface->memory);
     }
     g_alphaPaintActive = surface->previousAlpha;
+    g_bufferedPaintActive = surface->previousBuffered;
     g_alphaPaintBits = surface->previousBits;
     g_alphaPaintRowPixels = surface->previousRowPixels;
     g_alphaPaintRect = surface->previousRect;
@@ -1083,7 +1295,8 @@ static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit)
 static void ClearWindowBackBuffer(HDC dc, HWND hWnd, int w, int h) {
     // DWM backdrop requires a clean glass surface. Copying the previous window DC
     // reintroduces stale pixels and causes Tab/page ghosting after every repaint.
-    if (IsMaterialApplied(hWnd) && g_alphaPaintActive) return;
+    // 仅缓冲透明画布（材质模式）跳过填充；无材质 DIB 画布必须填不透明底色。
+    if (IsMaterialApplied(hWnd) && g_bufferedPaintActive) return;
     Fill(dc, 0, 0, w, h, IsMaterialApplied(hWnd) ? 0x000000 : C_BG);
 }
 
@@ -1185,7 +1398,7 @@ static void ApplyAllWindowMaterials() {
 static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
                              const wchar_t* text, HFONT font, DWORD color,
                              Gdiplus::StringAlignment alignment) {
-    if (g_materialMode == 0 || !text || !font || w <= 0 || h <= 0) return FALSE;
+    if (!text || !font || w <= 0 || h <= 0) return FALSE;
     if (!g_alphaPaintActive || !g_alphaPaintBits || g_alphaPaintRowPixels <= 0)
         return FALSE;
 
@@ -1338,13 +1551,17 @@ static const wchar_t* LetterKeyText(short vk) {
     return buf;
 }
 
+// 网页布局的网址后缀键（vk 0x200 起为索引哨兵）
+static const wchar_t* g_domainTexts[6] = { L"www.", L".com", L".cn", L".org", L".cc", L".net" };
+
 static const wchar_t* KeyText(const KeyDef* k) {
     static wchar_t buf[16];
+    if (k->vk >= 0x200 && k->vk <= 0x205) return g_domainTexts[k->vk - 0x200];
     if (k->type == K_LETTER) {
         return LetterKeyText(k->vk);
     }
     if (k->type == K_NORMAL) {
-        if (g_fnLayer) {
+        if (g_fnLayer && !g_fnWebLayout) {
             int fn = FnMap(k->vk);
             if (fn) { swprintf(buf, 16, L"F%d", fn); return buf; }
         }
@@ -1603,6 +1820,24 @@ static BOOL IsStartMenuOpen() {
     return (SUCCEEDED(s_av->lpVtbl->IsLauncherVisible(s_av, &vis)) && vis);
 }
 
+// 逐字符输入网址文本（仅支持域名用到的字母与“.”）
+static void TypeDomainText(const wchar_t* s) {
+    for (; *s; ++s) {
+        wchar_t c = *s;
+        short vk;
+        BOOL sh = FALSE;
+        if (c >= L'a' && c <= L'z') {
+            vk = (short)(c - L'a' + 0x41);
+            sh = (GetKeyState(VK_CAPITAL) & 1) != 0;   // 大写锁定时字母需按 Shift 还原小写
+        } else if (c == L'.') {
+            vk = 0xBE;
+        } else {
+            continue;
+        }
+        SendKey((BYTE)vk, sh, FALSE, FALSE);
+    }
+}
+
 static void DoKeyAction(const KeyDef* k) {
     if (!k) return;
     switch (k->type) {
@@ -1618,7 +1853,7 @@ static void DoKeyAction(const KeyDef* k) {
         }
         break;
     case K_NORMAL:
-        if (g_fnLayer) {
+        if (g_fnLayer && !g_fnWebLayout) {
             int fn = FnMap(k->vk);
             if (fn) {
                 SendKey((BYTE)(0x6F + fn), g_sh, g_ct, g_al, g_winKey);  // VK_F1=0x70
@@ -1632,7 +1867,12 @@ static void DoKeyAction(const KeyDef* k) {
         g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_SPECIAL:
-        if (k->vk == 0) {  // Fn 键：切换 F1~F12 功能层
+        if (k->vk >= 0x200 && k->vk <= 0x205) {   // 网址后缀键
+            TypeDomainText(g_domainTexts[k->vk - 0x200]);
+            g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+            break;
+        }
+        if (k->vk == 0) {  // Fn 键：切换 F1~F12 功能层（或网页布局层）
             g_fnLayer = !g_fnLayer;
             if (g_fnLayer) g_sh = FALSE;
             InvalidateRect(g_hWnd, 0, TRUE);
@@ -1741,10 +1981,8 @@ static void DrawMainMaterialSurface(HDC dc) {
 }
 
 static void DrawHeader(HDC dc) {
-    // 主窗口材质模式使用统一半透明覆盖层；关闭材质时保持原底色。
-    if (!(IsMaterialApplied(g_hWnd) && g_alphaPaintActive))
-        Fill(dc, 0, 0, g_ww, g_headerH, C_HDR);
-
+    // 标题栏与主界面一体化：不再单独铺 C_HDR 底色，
+    // 背景统一由 ClearWindowBackBuffer（纯色）或 DWM 材质（Mica/亚克力）呈现。
     double dpiScale = GetSystemDpiScale();
     int rMargin = (int)(6 * dpiScale);
     int gap     = (int)(6 * dpiScale);
@@ -1812,7 +2050,7 @@ static void DrawKeys(HDC dc) {
         DWORD bg = C_KEY;
         if (active || pressed) bg = C_HOT;
         else if (hover) bg = C_HOVER;
-        else {
+        else if (!(k->vk >= 0x200 && k->vk <= 0x205)) {   // 网址后缀键显示为普通键
             int dt[] = {K_SPECIAL, K_CAPS, K_MOD, K_ARROW, K_HIDE};
             for (size_t j = 0; j < sizeof(dt)/sizeof(dt[0]); j++) {
                 if (k->type == dt[j]) { bg = C_DARK; break; }
@@ -1836,9 +2074,9 @@ static void DrawKeys(HDC dc) {
         DWORD textC = (active || pressed) && IsLightColor(bg) ? 0x1A1A1A : C_WHITE;
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
-        // Fn 层时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
+        // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
         wchar_t baseCh = 0, shiftCh = 0;
-        if (k->type == K_NORMAL && !(g_fnLayer && FnMap(k->vk) != 0)) {
+        if (k->type == K_NORMAL && !(g_fnLayer && !g_fnWebLayout && FnMap(k->vk) != 0)) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }
@@ -1889,7 +2127,8 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     motion->finish = finish;
     motion->active = TRUE;
 
-    if (!IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
+    // 未显示过才应用材质；WM_CREATE 已应用时跳过，避免启动动画首帧重复切换背景卡顿
+    if (!IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
     SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(hWnd, NULL, NULL,
@@ -1946,9 +2185,6 @@ static void ShowKB(BOOL show, BOOL isManual) {
         if (isManual) {
             g_manualShow = TRUE;
             g_manualHide = FALSE;
-            g_autoMinimized = FALSE;
-            g_suppressedInputToken = 0;
-            g_inputLostTick = 0;
         }
         if (g_vis) {
             StopWindowMotion(&g_mainMotion);
@@ -2082,6 +2318,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_LAYOUT_OPT1    16
 #define S_HIT_LAYOUT_OPT2    17
 #define S_HIT_FKEYS          18
+#define S_HIT_FNWEB          94
 #define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
 #define S_HIT_THEME_OPT0     21
@@ -2351,7 +2588,8 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
-    int rowIndex = hit == S_HIT_AUTO ? 0 : (hit == S_HIT_FKEYS ? 3 : 4);
+    // 常规 Tab 行序：0=自动呼出 1=关闭按钮 2=键盘布局 3=功能键行 4=Fn网页布局 5=Shift符号 6=自动隐藏 7=界面语言
+    int rowIndex = hit == S_HIT_AUTO ? 0 : (hit == S_HIT_FKEYS ? 3 : (hit == S_HIT_FNWEB ? 4 : 5));
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(105 * m.dpi);
     return row;
@@ -2511,29 +2749,19 @@ static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, B
     DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_DARK, C_DIM, 6);
     DrawTextL(dc, x + 10, y, w - 30, h, text, g_sf13, C_WHITE);
     int ax = x + w - 14, ay = y + h / 2;
-    HPEN pen = CreatePen(PS_SOLID, 1, C_DIM);
-    HPEN op = (HPEN)SelectObject(dc, pen);
-    HBRUSH br = CreateSolidBrush(C_DIM);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
-    POINT tri[3] = { {ax - 5, ay - 3}, {ax + 5, ay - 3}, {ax, ay + 3} };
-    Polygon(dc, tri, 3);
-    SelectObject(dc, ob); DeleteObject(br);
-    SelectObject(dc, op); DeleteObject(pen);
+    DrawTriangleAA(dc, ax - 5, ay - 3, ax + 5, ay - 3, ax, ay + 3, C_DIM);
 }
 
-// 下拉列表（选中项带勾，浅/深色模式一致）
+// 下拉列表（选中项带勾，浅/深色模式一致，勾为抗锯齿线条）
 static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
     DrawRoundRect(dc, x, y, w, itemH * count + 4, C_DARK, C_DIM, 6);
     for (int i = 0; i < count; i++) {
         int iy = y + 2 + i * itemH;
         if (i == hov) Fill(dc, x + 2, iy, w - 4, itemH, C_HOVER);
         if (i == sel) {
-            HPEN pen = CreatePen(PS_SOLID, 2, C_HOT);
-            HPEN op = (HPEN)SelectObject(dc, pen);
-            MoveToEx(dc, x + 10, iy + itemH / 2, NULL);
-            LineTo(dc, x + 15, iy + itemH / 2 + 4);
-            LineTo(dc, x + 22, iy + itemH / 2 - 4);
-            SelectObject(dc, op); DeleteObject(pen);
+            int cy = iy + itemH / 2;
+            DrawLineAA(dc, x + 11, cy, x + 15, cy + 4, C_HOT, 2.0f);
+            DrawLineAA(dc, x + 15, cy + 4, x + 22, cy - 4, C_HOT, 2.0f);
             DrawTextL(dc, x + 28, iy, w - 34, itemH, items[i], g_sf13, C_HOT);
         } else {
             DrawTextL(dc, x + 28, iy, w - 34, itemH, items[i], g_sf13, C_WHITE);
@@ -2654,17 +2882,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r, g_showFKeys, S_HIT_FKEYS);
 
         r = SettingsRowRect(m, 4);
+        DrawSettingRow(dc, r, 2, T(L"Fn 网页布局", L"Fn Web Layout"),
+                       T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"), g_sHov == S_HIT_FNWEB);
+        DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
+
+        r = SettingsRowRect(m, 5);
         DrawSettingRow(dc, r, 4, T(L"Shift 符号", L"Shift Symbols"),
                        T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"), g_sHov == S_HIT_SHIFTSYM);
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
 
-        r = SettingsRowRect(m, 5);
+        r = SettingsRowRect(m, 6);
         DrawSettingRow(dc, r, 5, T(L"自动隐藏", L"Auto-hide"),
                        T(L"设置离开输入区域后的收起延迟", L"Set the delay before the keyboard is hidden"), FALSE);
         DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
                   HideDelayName(), g_dropHideDelay, g_sHov == S_HIT_HIDEDELAY_DROP);
 
-        r = SettingsRowRect(m, 6);
+        r = SettingsRowRect(m, 7);
         DrawSettingRow(dc, r, 6, T(L"界面语言", L"Language"),
                        T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"), FALSE);
         DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
@@ -2800,7 +3033,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                           m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
         }
         if (g_dropHideDelay) {
-            r = SettingsRowRect(m, 5);
+            r = SettingsRowRect(m, 6);
             const wchar_t* names[6];
             for (int i = 0; i < 6; i++) names[i] = g_lang ? g_hideDelayNamesEn[i] : g_hideDelayNames[i];
             int cy = SettingsComboY(m, r);
@@ -2808,7 +3041,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                           m.comboW, m.comboH, names, 6, HideDelayIndex(), g_dropHideDelayHov);
         }
         if (g_dropLang) {
-            r = SettingsRowRect(m, 6);
+            r = SettingsRowRect(m, 7);
             const wchar_t* names[2];
             for (int i = 0; i < 2; i++) names[i] = g_lang ? g_langNamesEn[i] : g_langNames[i];
             int cy = SettingsComboY(m, r);
@@ -2876,7 +3109,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             }
         }
         if (g_dropHideDelay) {
-            r = SettingsRowRect(m, 5);
+            r = SettingsRowRect(m, 6);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
             for (int i = 0; i < 6; i++) {
@@ -2885,7 +3118,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             }
         }
         if (g_dropLang) {
-            r = SettingsRowRect(m, 6);
+            r = SettingsRowRect(m, 7);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
             for (int i = 0; i < 2; i++) {
@@ -2922,9 +3155,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         r = SettingsRowRect(m, 3);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
         r = SettingsRowRect(m, 4);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+        r = SettingsRowRect(m, 5);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
 
-        r = SettingsRowRect(m, 5);
+        r = SettingsRowRect(m, 6);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
         if (g_dropHideDelay) {
             int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
@@ -2935,7 +3170,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HIDEDELAY_DROP;
 
-        r = SettingsRowRect(m, 6);
+        r = SettingsRowRect(m, 7);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
         if (g_dropLang) {
             int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
@@ -3041,8 +3276,9 @@ static void EnsureConfigFile() {
     IniSetInt(L"Theme", L"Material", 0);
     IniSetInt(L"Keyboard", L"Layout", 0);
     IniSetInt(L"Keyboard", L"FKeys", 0);
+    IniSetInt(L"Keyboard", L"FnWebLayout", 0);
     IniSetInt(L"General", L"ShiftSymbols", 1);
-    IniSetInt(L"General", L"HideDelay", 500);
+    IniSetInt(L"General", L"HideDelay", 0);
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"HighlightMode", 0);
     IniSetInt(L"General", L"HighlightColor", 0xD47800);
@@ -3066,9 +3302,10 @@ static void LoadConfig() {
     g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
     if (g_layoutMode < 0 || g_layoutMode > 2) g_layoutMode = 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
+    g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
-    g_hideDelayMs = IniGetInt(L"General", L"HideDelay", 300);
-    if (g_hideDelayMs < 0 || g_hideDelayMs > 5000) g_hideDelayMs = 300;
+    g_hideDelayMs = IniGetInt(L"General", L"HideDelay", 0);
+    if (g_hideDelayMs < 0 || g_hideDelayMs > 5000) g_hideDelayMs = 0;
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_hlMode = IniGetInt(L"General", L"HighlightMode", 0);
@@ -3094,15 +3331,18 @@ static void SaveThemeConfig() {
 static void SaveLayoutConfig() {
     IniSetInt(L"Keyboard", L"Layout", g_layoutMode);
     IniSetInt(L"Keyboard", L"FKeys", g_showFKeys ? 1 : 0);
+    IniSetInt(L"Keyboard", L"FnWebLayout", g_fnWebLayout ? 1 : 0);
 }
 
-// 应用键盘布局：保存设置、重建按键并调整窗口默认大小
-static void ApplyKeyboardLayout() {
+// 应用键盘布局：保存设置、重建按键；resetSize=TRUE 时按布局与 DPI 重置窗口大小
+// （仅布局模式切换调用；功能键行等只增减键行的开关保持当前窗口大小）
+static void ApplyKeyboardLayout(BOOL resetSize) {
     SaveLayoutConfig();
-    InitWindowSizeForDpi();
+    if (resetSize) InitWindowSizeForDpi();
     if (g_hWnd && IsWindow(g_hWnd)) {
         RecreateFontsAndLayout();
-        SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, g_ww, g_wh, SWP_NOMOVE | SWP_NOACTIVATE);
+        if (resetSize)
+            SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, g_ww, g_wh, SWP_NOMOVE | SWP_NOACTIVATE);
         InvalidateRect(g_hWnd, NULL, TRUE);
     }
 }
@@ -3161,7 +3401,8 @@ static void UpdateHighlightSlider(HWND hWnd, int hit, int mouseX) {
 static void SettingsApplyHit(HWND hWnd, int hit) {
     BOOL themeChanged = FALSE;
     BOOL materialChanged = FALSE;
-    BOOL layoutChanged = FALSE;
+    BOOL layoutChanged = FALSE;        // 布局模式切换：按布局重置窗口大小
+    BOOL keyRowsChanged = FALSE;       // 仅增减键行（功能键行）：保持窗口大小
     switch (hit) {
     case S_HIT_AUTO:
         BeginSwitchAnimation(hWnd, hit, g_af, !g_af);
@@ -3193,7 +3434,17 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     case S_HIT_FKEYS:
         BeginSwitchAnimation(hWnd, hit, g_showFKeys, !g_showFKeys);
         g_showFKeys = !g_showFKeys;
-        layoutChanged = TRUE;
+        keyRowsChanged = TRUE;
+        break;
+    case S_HIT_FNWEB:
+        BeginSwitchAnimation(hWnd, hit, g_fnWebLayout, !g_fnWebLayout);
+        g_fnWebLayout = !g_fnWebLayout;
+        if (!g_fnWebLayout && g_fnLayer) {
+            // 关闭网页布局时若停留在该层则退出 Fn 层
+            g_fnLayer = FALSE;
+        }
+        IniSetInt(L"Keyboard", L"FnWebLayout", g_fnWebLayout ? 1 : 0);
+        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
         break;
     case S_HIT_SHIFTSYM:
         BeginSwitchAnimation(hWnd, hit, g_shiftSymbols, !g_shiftSymbols);
@@ -3315,7 +3566,8 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         ApplyAllWindowMaterials();
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     }
-    if (layoutChanged) ApplyKeyboardLayout();           // 应用并保存布局
+    if (layoutChanged) ApplyKeyboardLayout(TRUE);       // 应用布局并按布局重置窗口大小
+    if (keyRowsChanged) ApplyKeyboardLayout(FALSE);     // 仅重建键行，保持当前窗口大小
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE); // 设置页立即刷新
 }
 
@@ -3600,7 +3852,8 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int W = rc.right, H = rc.bottom;
     double dpi = GetSystemDpiScale();
     int hdr = (int)(36 * dpi);
-    Fill(dc, 0, 0, W, hdr, C_HDR);
+    (void)hWnd;
+    // 标题区不再铺独立底色，与窗口背景/材质一体化
     DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sf13, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
@@ -3944,18 +4197,34 @@ static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
     return result;
 }
 
+// 系统外壳界面：任务栏、开始菜单、搜索、托盘折叠弹窗（^）等，
+// 一律不视为输入区域，也跳过代价较高的跨进程 Accessibility 探测。
+// 注意：CoreWindow 同时是 UWP 应用窗口类，不能排除，否则 UWP 输入框失效。
+static BOOL IsShellSurfaceClass(const char* cls) {
+    if (!cls) return FALSE;
+    return strstr(cls, "Shell_") || strstr(cls, "Progman") || strstr(cls, "WorkerW") ||
+           strstr(cls, "Taskbar") || strstr(cls, "TrayNotify") || strstr(cls, "MSTaskSwWClass") ||
+           strstr(cls, "NotifyIconOverflowWindow") || strstr(cls, "XamlExplorerHost") ||
+           strstr(cls, "ShellExperienceHost") ||
+           strstr(cls, "SearchHost") || strstr(cls, "StartMenu") ||
+           strstr(cls, "TopLevelWindowForOverflowXamlIsland");
+}
+
 static BOOL IsInputControl(HWND hw) {
     if (!hw || !IsWindow(hw)) return FALSE;
     char buf[128] = {0};
     GetClassNameA(hw, buf, 128);
 
-    if (strstr(buf, "Shell_") || strstr(buf, "Progman") || strstr(buf, "WorkerW") ||
-        strstr(buf, "Taskbar") || strstr(buf, "TrayNotify") || strstr(buf, "MSTaskSwWClass"))
-        return FALSE;
+    if (IsShellSurfaceClass(buf)) return FALSE;
 
     if (strstr(buf, "Edit") || strstr(buf, "Rich") || strstr(buf, "Scintilla") ||
         strstr(buf, "TextBox") || strstr(buf, "Console") || strstr(buf, "Omnibox") ||
         strstr(buf, "Search") || strstr(buf, "InputSite") || strstr(buf, "TXGuiFoundation"))
+        return TRUE;
+
+    // Chromium/Electron（NTQQ、Chrome、Edge 等）：网页内容获得键盘焦点时
+    // Win32 焦点落在渲染宿主/组件窗口上，视为输入区域
+    if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin"))
         return TRUE;
 
     return FALSE;
@@ -3974,6 +4243,14 @@ static HWND GetFocusedInputControl() {
     g_detectedInputToken = 0;
     HWND fg = GetForegroundWindow();
     if (!fg || IsOwnForegroundWindow(fg)) return NULL;
+
+    // 系统外壳界面（桌面/任务栏/开始菜单/托盘弹窗等）直接跳过，
+    // 避免每 50ms 轮询都发起跨进程 COM 调用（动画卡顿的主要来源）
+    {
+        char fgClass[128] = {0};
+        GetClassNameA(fg, fgClass, 128);
+        if (IsShellSurfaceClass(fgClass)) return NULL;
+    }
 
     DWORD tid = GetWindowThreadProcessId(fg, NULL);
     GUITHREADINFO gi = {sizeof(gi)};
@@ -4005,17 +4282,14 @@ static HWND GetFocusedInputControl() {
 
 static void UpdateAutoVisibility() {
     if (!g_af || !g_hWnd) return;
+    // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
+    // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
+    if (g_mainMotion.active) return;
 
     HWND input = GetFocusedInputControl();
     if (input) {
         g_lastNonInput = 0;
-        g_inputLostTick = 0;
         g_manualShow = FALSE;
-        if (g_autoMinimized) {
-            if (g_detectedInputToken == g_suppressedInputToken) return;
-            g_autoMinimized = FALSE;
-            g_suppressedInputToken = 0;
-        }
         if (!g_manualHide && !g_vis) ShowKB(TRUE, FALSE);
         return;
     }
@@ -4023,13 +4297,6 @@ static void UpdateAutoVisibility() {
     HWND fg = GetForegroundWindow();
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return;
 
-    DWORD now = GetTickCount();
-    if (g_autoMinimized) {
-        if (g_inputLostTick == 0) g_inputLostTick = now;
-        if (now - g_inputLostTick < 350) return;
-        g_autoMinimized = FALSE;
-        g_suppressedInputToken = 0;
-    }
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
     if (!g_vis) {
         // 隐藏滑动被打断（如拖动标题栏）后窗口可能仍残留可见：直接收尾藏到任务栏底部
@@ -4099,10 +4366,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
         case HDR_MIN:
-            GetFocusedInputControl();
-            g_suppressedInputToken = g_detectedInputToken;
-            g_autoMinimized = TRUE;
-            g_inputLostTick = 0;
+            // 最小化仅收起键盘，不做抑制：输入框再次获得焦点时正常自动呼出
             ShowKB(FALSE, FALSE);
             break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
@@ -4163,15 +4427,24 @@ static BOOL IsTouchDevice() {
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+    // 任务栏重建（explorer 重启 / 托盘图标被系统折叠清理）后恢复托盘图标
+    if (g_taskbarCreatedMsg && msg == g_taskbarCreatedMsg) {
+        if (g_tray) {
+            Shell_NotifyIconW(NIM_DELETE, &g_nid);
+            g_tray = FALSE;
+        }
+        AddTray();
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE: {
         g_hWnd = hWnd;
-        InitWindowSizeForDpi();
         RecreateFontsAndLayout();
         SetWindowLong(hWnd, GWL_EXSTYLE, GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
         ApplyRoundedWindow(hWnd, 10);
         ApplyWindowMaterial(hWnd);
 
+        g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
         g_winHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_FOCUS, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         // 实体键盘状态监控：安装低级键盘钩子（只监控 Win/Shift/Caps，Fn 预留接口）
@@ -4414,6 +4687,24 @@ static BOOL HasArg(const char* cmd, const char* arg) {
     return FALSE;
 }
 
+// 高精度计时器分辨率（动态加载 winmm，避免新增链接依赖）
+// SetTimer 默认受 ~15.6ms 系统计时粒度限制，动画会一顿一顿；
+// 进程级调到 1ms 让窗口滑动定时器按请求间隔触发。
+struct TimePeriodApi {
+    HMODULE module;
+    ULONG (WINAPI *begin)(UINT);
+    ULONG (WINAPI *end)(UINT);
+};
+static TimePeriodApi g_timePeriod = {};
+
+static void InitTimePeriodApi() {
+    g_timePeriod.module = LoadLibraryW(L"winmm.dll");
+    if (g_timePeriod.module) {
+        g_timePeriod.begin = (ULONG (WINAPI*)(UINT))GetProcAddress(g_timePeriod.module, "timeBeginPeriod");
+        g_timePeriod.end = (ULONG (WINAPI*)(UINT))GetProcAddress(g_timePeriod.module, "timeEndPeriod");
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_hInst = hI;
 
@@ -4423,6 +4714,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         SetDpiAwareProc pSetDPIAware = (SetDpiAwareProc)GetProcAddress(hUser32, "SetProcessDPIAware");
         if (pSetDPIAware) pSetDPIAware();
     }
+
+    InitTimePeriodApi();
+    if (g_timePeriod.begin) g_timePeriod.begin(1);   // 提升动画定时器精度
 
     InitGdiPlus();       // 初始化 GDI+ （抗锯齿圆形绘图）
     LoadEmbeddedFonts();   // 注册内嵌字体（阿里巴巴普惠体精简版），失败自动回退系统字体
@@ -4489,7 +4783,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     else if (fAuto) g_af = TRUE;
     if (fThemeCli) g_themeMode = fDark ? 1 : (fLight ? 2 : 0);   // 命令行主题优先
     if (fWall) g_wallpaperAccent = TRUE;
-    InitWindowSizeForDpi();   // 布局决定默认窗口大小（在 LoadConfig 之后）
+    // 窗口尺寸：LoadConfig 已恢复 ini 保存的大小；无有效保存尺寸时才按布局与 DPI 计算默认值
+    if (!(IniGetInt(L"Window", L"Width", 0) >= 300 && IniGetInt(L"Window", L"Height", 0) >= 150))
+        InitWindowSizeForDpi();
     ApplyTheme();
 
     RECT work = {0};
@@ -4517,6 +4813,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
     if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
     if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
+    if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;
 }

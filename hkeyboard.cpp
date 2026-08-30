@@ -280,6 +280,8 @@ static void InitWindowSizeForDpi();
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
 static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
+static BOOL LoadLayoutWindowRect(RECT* out);
+static BOOL LayoutRectOnScreen(const RECT& rc);
 
 // Global state
 HINSTANCE   g_hInst = 0;
@@ -2056,7 +2058,8 @@ static void DrawWindowMaterialTint(HDC dc, HWND hWnd, int w, int h) {
     BOOL isMain = (hWnd == g_hWnd);
     BYTE alpha;
     if (g_materialMode == 1) {
-        alpha = isMain ? (dark ? 72 : 96) : (dark ? 104 : 132);
+        // Mica：主界面仅保留极轻色调，让壁纸强调色透出，与桌面连成一体
+        alpha = isMain ? (dark ? 56 : 72) : (dark ? 104 : 132);
     } else {
         alpha = dark ? 76 : 104;
     }
@@ -2261,8 +2264,15 @@ static void ShowKB(BOOL show, BOOL isManual) {
     if (g_exiting && show) return;
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    int sx = work.left + ((work.right - work.left) - g_ww) / 2;
-    int targetY = work.bottom - g_wh - 6;
+    int sx, targetY;
+    RECT saved;
+    if (LoadLayoutWindowRect(&saved) && LayoutRectOnScreen(saved)) {
+        sx = saved.left;        // 智能记忆上次打开的位置
+        targetY = saved.top;
+    } else {
+        sx = work.left + ((work.right - work.left) - g_ww) / 2;
+        targetY = work.bottom - g_wh - 6;
+    }
 
     if (show) {
         if (isManual) {
@@ -2664,7 +2674,8 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
     DrawRoundRect(dc, row.left, row.top, row.right - row.left, row.bottom - row.top,
                   hover ? C_HOVER : C_KEY, hover ? C_HOT : C_KEY_BORDER, 8);
     int iconSize = (int)(24 * dpi);
-    DrawSettingsIcon(dc, row.left + (int)(14 * dpi), row.top + (row.bottom - row.top - iconSize) / 2, icon);
+    if (icon >= 0)   // icon < 0：无图标行（文本/描述位置与其他行保持一致）
+        DrawSettingsIcon(dc, row.left + (int)(14 * dpi), row.top + (row.bottom - row.top - iconSize) / 2, icon);
     int tx = row.left + (int)(52 * dpi);
     int tw = row.right - tx - (int)(220 * dpi);
     DrawTextL(dc, tx, row.top + (int)(5 * dpi), tw, (int)(20 * dpi), title, g_sf14b, C_WHITE);
@@ -2673,7 +2684,12 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     // 常规 Tab 行序：0=自动呼出 1=关闭按钮 2=记住我的选择 3=键盘布局 4=功能键行 5=Fn网页布局 6=Shift符号 7=界面语言
-    int rowIndex = hit == S_HIT_AUTO ? 0 : (hit == S_HIT_FKEYS ? 4 : (hit == S_HIT_FNWEB ? 5 : 6));
+    int rowIndex;
+    if (hit == S_HIT_AUTO) rowIndex = 0;
+    else if (hit == S_HIT_REMEMBER) rowIndex = 2;
+    else if (hit == S_HIT_FKEYS) rowIndex = 4;
+    else if (hit == S_HIT_FNWEB) rowIndex = 5;
+    else rowIndex = 6;
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(105 * m.dpi);
     return row;
@@ -2836,20 +2852,26 @@ static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, B
     DrawTriangleAA(dc, ax - 5, ay - 3, ax + 5, ay - 3, ax, ay + 3, C_DIM);
 }
 
-// 下拉列表（选中项带勾，浅/深色模式一致，勾为抗锯齿线条）
+// 下拉列表（参考下拉菜单样式：悬停圆角高亮 + 选中项左侧强调条）
 static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
+    double dpi = GetSystemDpiScale();
     DrawRoundRect(dc, x, y, w, itemH * count + 4, C_DARK, C_DIM, 6);
     for (int i = 0; i < count; i++) {
         int iy = y + 2 + i * itemH;
-        if (i == hov) Fill(dc, x + 2, iy, w - 4, itemH, C_HOVER);
-        if (i == sel) {
-            int cy = iy + itemH / 2;
-            DrawLineAA(dc, x + 11, cy, x + 15, cy + 4, C_HOT, 2.0f);
-            DrawLineAA(dc, x + 15, cy + 4, x + 22, cy - 4, C_HOT, 2.0f);
-            DrawTextL(dc, x + 28, iy, w - 34, itemH, items[i], g_sf13, C_HOT);
-        } else {
-            DrawTextL(dc, x + 28, iy, w - 34, itemH, items[i], g_sf13, C_WHITE);
+        if (i == hov || i == sel) {
+            // 圆角悬停高亮
+            DrawRoundRectAlpha(dc, x + 3, iy + 1, w - 6, itemH - 2,
+                               C_HOVER, C_HOVER, (int)(5 * dpi), 255, 255);
         }
+        if (i == sel) {
+            // 选中项左侧强调条
+            int barH = (int)(14 * dpi);
+            int barW = (int)(3 * dpi);
+            int cy = iy + itemH / 2;
+            DrawRoundRectAlpha(dc, x + (int)(8 * dpi), cy - barH / 2, barW, barH,
+                               C_HOT, C_HOT, barW / 2, 255, 255);
+        }
+        DrawTextL(dc, x + (int)(17 * dpi), iy, w - (int)(24 * dpi), itemH, items[i], g_sf13, C_WHITE);
     }
 }
 
@@ -2966,7 +2988,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
 
         r = SettingsRowRect(m, 2);
-        DrawSettingRow(dc, r, 1, T(L"记住我的选择", L"Remember My Choice"),
+        DrawSettingRow(dc, r, -1, T(L"记住我的选择", L"Remember My Choice"),
                        T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"), g_sHov == S_HIT_REMEMBER);
         DrawSettingSwitch(dc, m, r, g_rememberClose, S_HIT_REMEMBER);
 
@@ -3363,6 +3385,45 @@ static int IniGetInt(const wchar_t* section, const wchar_t* key, int def) {
     return _wtoi(buf);
 }
 
+// ===== 各布局独立记忆窗口大小与位置（避免切换布局后界面错乱） =====
+// [Window] Layout{n}X / Layout{n}Y / Layout{n}Width / Layout{n}Height，n=布局序号
+static BOOL LoadLayoutWindowRect(RECT* out) {
+    wchar_t key[40];
+    swprintf(key, 40, L"Layout%dWidth", g_layoutMode);
+    int w = IniGetInt(L"Window", key, 0);
+    swprintf(key, 40, L"Layout%dHeight", g_layoutMode);
+    int h = IniGetInt(L"Window", key, 0);
+    if (w < 300 || h < 150) return FALSE;
+    swprintf(key, 40, L"Layout%dX", g_layoutMode);
+    int x = IniGetInt(L"Window", key, -32000);
+    swprintf(key, 40, L"Layout%dY", g_layoutMode);
+    int y = IniGetInt(L"Window", key, -32000);
+    if (x <= -32000 || y <= -32000) return FALSE;
+    out->left = x; out->top = y; out->right = x + w; out->bottom = y + h;
+    return TRUE;
+}
+
+static BOOL LayoutRectOnScreen(const RECT& rc) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vr = vx + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vb = vy + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    // 至少大部分区域在虚拟屏幕内，防止记忆了失效坐标
+    return rc.right > vx + 60 && rc.left < vr - 60 &&
+           rc.bottom > vy + 20 && rc.top < vb - 20;
+}
+
+static void SaveWindowState() {
+    if (!g_hWnd || !IsWindow(g_hWnd)) return;
+    RECT rc;
+    if (!GetWindowRect(g_hWnd, &rc)) return;
+    wchar_t key[40];
+    swprintf(key, 40, L"Layout%dX", g_layoutMode);        IniSetInt(L"Window", key, rc.left);
+    swprintf(key, 40, L"Layout%dY", g_layoutMode);        IniSetInt(L"Window", key, rc.top);
+    swprintf(key, 40, L"Layout%dWidth", g_layoutMode);    IniSetInt(L"Window", key, rc.right - rc.left);
+    swprintf(key, 40, L"Layout%dHeight", g_layoutMode);   IniSetInt(L"Window", key, rc.bottom - rc.top);
+}
+
 // 首次启动自动生成 HKeyboard.ini（含默认值），之后按需写入。
 // 已存在的旧配置执行一次性升级：清除早期版本写入的未缩放默认窗口尺寸，
 // 交给 InitWindowSizeForDpi 按 DPI 重算（避免高 DPI 首启窗口过小）。
@@ -3404,9 +3465,7 @@ static void LoadConfig() {
     g_rememberClose = (IniGetInt(L"General", L"RememberClose", 0) != 0);
     if (g_rememberClose)
         g_closeToTray = (IniGetInt(L"General", L"CloseToTray", 0) != 0);
-    int w = IniGetInt(L"Window", L"Width", 0);
-    int h = IniGetInt(L"Window", L"Height", 0);
-    if (w >= 300 && h >= 150) { g_ww = w; g_wh = h; }   // 上次调整过的窗口大小
+    // 窗口大小与位置按布局记忆恢复（见 WinMain / ApplyKeyboardLayout）
     int tm = IniGetInt(L"Theme", L"Mode", -1);
     if (tm >= 0 && tm <= 2) g_themeMode = tm;
     int material = IniGetInt(L"Theme", L"Material", 0);
@@ -3454,7 +3513,15 @@ static void SaveLayoutConfig() {
 // （仅布局模式切换调用；功能键行等只增减键行的开关保持当前窗口大小）
 static void ApplyKeyboardLayout(BOOL resetSize) {
     SaveLayoutConfig();
-    if (resetSize) InitWindowSizeForDpi();
+    if (resetSize) {
+        RECT saved;
+        if (LoadLayoutWindowRect(&saved) && LayoutRectOnScreen(saved)) {
+            g_ww = saved.right - saved.left;    // 恢复该布局记忆的大小
+            g_wh = saved.bottom - saved.top;
+        } else {
+            InitWindowSizeForDpi();
+        }
+    }
     if (g_hWnd && IsWindow(g_hWnd)) {
         RecreateFontsAndLayout();
         if (resetSize)
@@ -4644,9 +4711,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         StopWindowMotion(&g_mainMotion);
         return 0;
     case WM_EXITSIZEMOVE:
-        // 记录上次调整过的窗口大小
-        IniSetInt(L"Window", L"Width", g_ww);
-        IniSetInt(L"Window", L"Height", g_wh);
+        SaveWindowState();   // 按当前布局记忆窗口大小与位置
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -4990,9 +5055,16 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     else if (fAuto) g_af = TRUE;
     if (fThemeCli) g_themeMode = fDark ? 1 : (fLight ? 2 : 0);   // 命令行主题优先
     if (fWall) g_wallpaperAccent = TRUE;
-    // 窗口尺寸：LoadConfig 已恢复 ini 保存的大小；无有效保存尺寸时才按布局与 DPI 计算默认值
-    if (!(IniGetInt(L"Window", L"Width", 0) >= 300 && IniGetInt(L"Window", L"Height", 0) >= 150))
-        InitWindowSizeForDpi();
+    // 窗口尺寸：优先恢复当前布局记忆的大小；无有效记忆时按布局与 DPI 计算默认值
+    {
+        RECT saved;
+        if (LoadLayoutWindowRect(&saved) && LayoutRectOnScreen(saved)) {
+            g_ww = saved.right - saved.left;
+            g_wh = saved.bottom - saved.top;
+        } else {
+            InitWindowSizeForDpi();
+        }
+    }
     ApplyTheme();
 
     RECT work = {0};

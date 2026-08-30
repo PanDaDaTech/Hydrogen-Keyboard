@@ -122,7 +122,12 @@ static const ThemeColors g_lightTheme = {
 static int g_themeMode = 0;
 // Background material: 0 = off, 1 = Mica, 2 = Acrylic
 static int g_materialMode = 0;
+// 主界面透明度（%，100=不透明）：仅不支持系统 backdrop 的旧系统（PE/Win10 1803-）可用
+static int g_mainOpacity = 100;
 static BOOL g_isWinPE = FALSE;
+static DWORD g_winBuild = 0;      // 系统Build号（RtlGetVersion，0=未知）
+static BOOL g_isWin11 = FALSE;    // Win11（Build>=22000）：支持 Mica
+static BOOL g_supportsMaterial = FALSE;  // Win10 1809+（Build>=17763）且非 PE：支持系统 backdrop
 static void ApplyAllWindowMaterials();
 // 是否启用“高亮按钮跟随系统壁纸强调色”（仅通过 -wallpaper 命令行参数开启，默认关闭）
 static BOOL g_wallpaperAccent = FALSE;
@@ -316,7 +321,7 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
 ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
-int         g_hideDelayMs = 0;         // 自动隐藏延迟（毫秒，0=立即隐藏）
+int         g_hideDelayMs = 1000;      // 自动隐藏延迟（固定 1 秒，不提供设置）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
 
 // 语言切换：g_lang=0 简体中文，1 English；返回当前语言对应的文案
@@ -398,9 +403,13 @@ static double GetSystemDpiScale() {
 
 static void InitWindowSizeForDpi() {
     double dpiScale = GetSystemDpiScale();
-    // 全尺寸/常用/小键盘统一初始窗口大小（随 DPI 缩放）
-    g_ww = (int)(980 * dpiScale);
-    g_wh = (int)(320 * dpiScale);
+    if (g_layoutMode == 1) {        // 小键盘：紧凑尺寸
+        g_ww = (int)(430 * dpiScale);
+        g_wh = (int)(320 * dpiScale);
+    } else {                        // 全尺寸/常用
+        g_ww = (int)(980 * dpiScale);
+        g_wh = (int)(320 * dpiScale);
+    }
 }
 
 static int AddKey(int x, int y, int w, int h, short vk, KeyType type) {
@@ -588,9 +597,10 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
     }
 }
 
-// Fn 网页布局层：整体结构对齐全尺寸布局（行2/3/5 与原布局一致），
+// Fn 网页布局层：整体结构跟随当前布局样式（全尺寸/常用），
 // 仅行1 数字键换为 F1~F12、行4 字母键换为网址后缀键
 static void BuildFnSurf(int y, double dpiScale, double scaleX) {
+    BOOL commonStyle = (g_layoutMode == 2);   // 常用布局：行2 无 Del、行5 带 Menu
     // Row 1: Esc, `, F1~F12, Backspace (15 keys)
     {
         int wEsc = (int)(50 * dpiScale * scaleX);
@@ -610,20 +620,31 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 2: Tab, q-p, [, ], \, Del (15 keys)，与全尺寸布局一致
+    // Row 2: Tab, q-p, [, ], \, Del (15 keys)；常用布局无 Del (14 keys)
     {
         int wTab = (int)(68 * dpiScale * scaleX);
         int wDel = (int)(68 * dpiScale * scaleX);
-        int fixed = wTab + wDel;
-        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-        int w[15]; w[0] = wTab;
-        for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[14] = wDel;
-        short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
-        KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        if (commonStyle) {
+            int aw = (KEY_AREA_W - wTab - 13 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - wTab - 13 * g_keyGap - aw * 13;
+            int w[14]; w[0] = wTab;
+            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+            short v[14] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC};
+            KeyType t[14] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 14; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            int fixed = wTab + wDel;
+            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
+            int w[15]; w[0] = wTab;
+            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+            w[14] = wDel;
+            short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
+            KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        }
         y += g_keyHeight + g_keyGap;
     }
 
@@ -662,21 +683,34 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 5: Fn, Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, → (10 keys)，与全尺寸布局一致
+    // Row 5: Fn, Ctrl, Win, Alt, 空格, Alt, (Menu), Ctrl, ←, ↓, →
+    // 常用布局带 Menu 键（11 keys）；全尺寸与原布局一致（10 keys）
     {
         int wFn  = (int)(46 * dpiScale * scaleX);
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
+        int wMenu = (int)(46 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
-        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
-        if (spaceW < 60) spaceW = 60;
-        int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
-        short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
-        KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        if (commonStyle) {
+            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 10 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+            short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+            short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        }
     }
 }
 
@@ -1313,6 +1347,27 @@ static BOOL IsWindowsPE() {
     return result == ERROR_SUCCESS;
 }
 
+// 检测系统版本（RtlGetVersion 不受兼容性清单影响）
+// Win11 = Build 22000+（支持 Mica）；Win10 1809+ = Build 17763+（支持亚克力 backdrop）
+typedef LONG (WINAPI *RtlGetVersionFn)(OSVERSIONINFOW *);
+static void DetectWinVersion() {
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn fn = nt ? (RtlGetVersionFn)GetProcAddress(nt, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW vi;
+    ZeroMemory(&vi, sizeof(vi));
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fn && fn(&vi) == 0 && vi.dwBuildNumber > 0) {
+        g_winBuild = vi.dwBuildNumber;
+    } else {
+        OSVERSIONINFOW fallback;
+        ZeroMemory(&fallback, sizeof(fallback));
+        fallback.dwOSVersionInfoSize = sizeof(fallback);
+        if (GetVersionExW(&fallback)) g_winBuild = fallback.dwBuildNumber;
+    }
+    g_isWin11 = g_winBuild >= 22000;
+    g_supportsMaterial = !g_isWinPE && g_winBuild >= 17763;
+}
+
 static void ApplyWindowMaterial(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd)) return;
 
@@ -1352,6 +1407,14 @@ static void ApplyWindowMaterial(HWND hWnd) {
     }
 
     if (g_materialMode == 0) {
+        // 旧系统（PE / XP~Win10 1803）无系统 backdrop：用主界面透明度代替材质
+        if (!g_supportsMaterial && hWnd == g_hWnd && setComposition && g_mainOpacity < 100) {
+            AccentPolicyLocal policy = {3, 2, 0, 0};   // ACCENT_ENABLE_TRANSPARENTGRADIENT
+            BYTE a = (BYTE)(g_mainOpacity * 255 / 100);
+            policy.gradientColor = ((DWORD)a << 24) | (((DWORD)C_BG) & 0x00FFFFFF);
+            WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
+            setComposition(hWnd, &data);
+        }
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
         return;
     }
@@ -1985,12 +2048,18 @@ static BOOL IsMainMaterialPaintActive() {
 }
 
 // 材质模式的半透明色调层：让窗口内容与 DWM Mica/亚克力背景融合为一体。
-// 所有窗口（主键盘/设置/关闭提示）统一使用同一色调，观感一致。
+// 所有窗口（主键盘/设置/关闭提示）统一使用同一色调，观感一致；
+// 主界面的 Mica 色调更轻，让壁纸色调透出更明显（亚克力本身效果强，无需减弱）。
 static void DrawWindowMaterialTint(HDC dc, HWND hWnd, int w, int h) {
     if (!IsMaterialApplied(hWnd) || !g_alphaPaintActive) return;
     BOOL dark = g_theme->bg == g_darkTheme.bg;
-    BYTE alpha = g_materialMode == 1 ? (dark ? 104 : 132)
-                                      : (dark ? 76 : 104);
+    BOOL isMain = (hWnd == g_hWnd);
+    BYTE alpha;
+    if (g_materialMode == 1) {
+        alpha = isMain ? (dark ? 72 : 96) : (dark ? 104 : 132);
+    } else {
+        alpha = dark ? 76 : 104;
+    }
     DrawAlphaSurface(dc, 0, 0, w, h, C_BG, alpha);
 }
 
@@ -2343,8 +2412,6 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_CLOSE_DROP     70
 #define S_HIT_CLOSE_OPT0     71
 #define S_HIT_CLOSE_OPT1     72
-#define S_HIT_HIDEDELAY_DROP  40
-#define S_HIT_HIDEDELAY_OPT0  41
 #define S_HIT_LANG_DROP       50
 #define S_HIT_LANG_OPT0       51
 #define S_HIT_LANG_OPT1       52
@@ -2361,6 +2428,9 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_MATERIAL_OPT0   91
 #define S_HIT_MATERIAL_OPT1   92
 #define S_HIT_MATERIAL_OPT2   93
+#define S_HIT_REMEMBER        95
+#define S_HIT_OPACITY_DROP    96
+#define S_HIT_OPACITY_OPT0    97   // ~ OPT5（6 档透明度）
 
 static int  g_sTab = 0;        // 0=常规 1=主题 2=关于
 static int  g_sHov = -1;       // 悬停元素，-1=无
@@ -2371,8 +2441,7 @@ static BOOL g_dropTheme = FALSE;    // 主题下拉是否展开
 static BOOL g_dropLayout = FALSE;   // 布局下拉是否展开
 static int  g_dropThemeHov = -1;
 static int  g_dropLayoutHov = -1;
-static BOOL g_dropHideDelay = FALSE;   // 自动隐藏延迟下拉
-static int  g_dropHideDelayHov = -1;
+static BOOL   // 已废弃：自动隐藏延迟固定 1 秒（保留行位兼容旧引用）
 static BOOL g_dropLang = FALSE;        // 语言下拉
 static int  g_dropLangHov = -1;
 static BOOL g_dropHl = FALSE;          // 高亮颜色下拉
@@ -2381,12 +2450,11 @@ static BOOL g_dropClose = FALSE;        // 关闭按钮操作下拉
 static int  g_dropCloseHov = -1;
 static BOOL g_dropMaterial = FALSE;     // 背景材质下拉
 static int  g_dropMaterialHov = -1;
+static BOOL g_dropOpacity = FALSE;      // 主界面透明度下拉（旧系统）
+static int  g_dropOpacityHov = -1;
 static BOOL g_hlEditFocus = FALSE;     // HEX 输入框是否处于编辑态
 static wchar_t g_hlEditBuf[8] = {0};   // 编辑中的 HEX 文本（#RRGGBB）
 static int g_hlSliderDrag = S_HIT_NONE;
-static const int g_hideDelayValues[6] = {0, 300, 500, 1000, 2000, 5000};
-static const wchar_t* g_hideDelayNames[6] = { L"立即隐藏", L"0.3 秒", L"0.5 秒", L"1 秒", L"2 秒", L"5 秒" };
-static const wchar_t* g_hideDelayNamesEn[6] = { L"Immediately", L"0.3 s", L"0.5 s", L"1 s", L"2 s", L"5 s" };
 static const wchar_t* g_langNames[2] = { L"简体中文", L"English" };
 static const wchar_t* g_langNamesEn[2] = { L"Simplified Chinese", L"English" };
 static const wchar_t* g_hlModeNames[3] = { L"默认", L"跟随壁纸", L"自定义" };
@@ -2395,6 +2463,9 @@ static const wchar_t* g_themeNames[3] = { L"跟随系统", L"深色主题", L"�
 static const wchar_t* g_themeNamesEn[3] = { L"Follow System", L"Dark Theme", L"Light Theme" };
 static const wchar_t* g_materialNames[3] = { L"关闭", L"Mica", L"亚克力" };
 static const wchar_t* g_materialNamesEn[3] = { L"Off", L"Mica", L"Acrylic" };
+static const int g_opacityValues[6] = { 100, 90, 80, 70, 60, 50 };
+static const wchar_t* g_opacityNames[6] = { L"100%（不透明）", L"90%", L"80%", L"70%", L"60%", L"50%" };
+static const wchar_t* g_opacityNamesEn[6] = { L"100% (Opaque)", L"90%", L"80%", L"70%", L"60%", L"50%" };
 static const wchar_t* g_layoutNames[3] = { L"全尺寸", L"小键盘", L"常用" };
 static const wchar_t* g_layoutNamesEn[3] = { L"Full", L"Numpad", L"Common" };
 
@@ -2602,8 +2673,8 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
-    // 常规 Tab 行序：0=自动呼出 1=关闭按钮 2=键盘布局 3=功能键行 4=Fn网页布局 5=Shift符号 6=自动隐藏 7=界面语言
-    int rowIndex = hit == S_HIT_AUTO ? 0 : (hit == S_HIT_FKEYS ? 3 : (hit == S_HIT_FNWEB ? 4 : 5));
+    // 常规 Tab 行序：0=自动呼出 1=关闭按钮 2=记住我的选择 3=键盘布局 4=功能键行 5=Fn网页布局 6=Shift符号 7=界面语言
+    int rowIndex = hit == S_HIT_AUTO ? 0 : (hit == S_HIT_FKEYS ? 4 : (hit == S_HIT_FNWEB ? 5 : 6));
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(105 * m.dpi);
     return row;
@@ -2809,13 +2880,25 @@ static void HexFromBgr(DWORD bgr, wchar_t* out) {
     int r = bgr & 0xFF, g = (bgr >> 8) & 0xFF, b = (bgr >> 16) & 0xFF;
     swprintf(out, 8, L"#%02X%02X%02X", r, g, b);
 }
-static int HideDelayIndex() {
-    for (int i = 0; i < 6; i++) if (g_hideDelayValues[i] == g_hideDelayMs) return i;
-    return 1;
+// 材质选项随系统版本变化：Win11 = 关闭/Mica/亚克力，Win10 1809+ = 关闭/亚克力
+static int MaterialOptionCount() {
+    return g_isWin11 ? 3 : 2;
 }
-static const wchar_t* HideDelayName() {
-    int idx = HideDelayIndex();
-    return g_lang ? g_hideDelayNamesEn[idx] : g_hideDelayNames[idx];
+static int MaterialModeOf(int idx) {
+    if (idx == 1 && !g_isWin11) return 2;   // 非 Win11 无 Mica，第二项为亚克力
+    return idx;
+}
+static int MaterialIndexOf(int mode) {
+    if (!g_isWin11 && mode == 2) return 1;
+    return mode;
+}
+static const wchar_t* MaterialNameOf(int idx) {
+    if (!g_isWin11 && idx == 1) return g_lang ? g_materialNamesEn[2] : g_materialNames[2];
+    return g_lang ? g_materialNamesEn[idx] : g_materialNames[idx];
+}
+static int OpacityIndex() {
+    for (int i = 0; i < 6; i++) if (g_opacityValues[i] == g_mainOpacity) return i;
+    return 0;
 }
 // 高亮颜色下拉当前选项：0=默认 1=跟随壁纸 2=自定义
 static int HlSel() {
@@ -2884,32 +2967,31 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
 
         r = SettingsRowRect(m, 2);
+        DrawSettingRow(dc, r, 1, T(L"记住我的选择", L"Remember My Choice"),
+                       T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"), g_sHov == S_HIT_REMEMBER);
+        DrawSettingSwitch(dc, m, r, g_rememberClose, S_HIT_REMEMBER);
+
+        r = SettingsRowRect(m, 3);
         DrawSettingRow(dc, r, 2, T(L"键盘布局", L"Keyboard Layout"),
                        T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"), FALSE);
         DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
                   g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
                   g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
 
-        r = SettingsRowRect(m, 3);
+        r = SettingsRowRect(m, 4);
         DrawSettingRow(dc, r, 3, T(L"功能键行", L"Function Key Row"),
                        T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"), g_sHov == S_HIT_FKEYS);
         DrawSettingSwitch(dc, m, r, g_showFKeys, S_HIT_FKEYS);
 
-        r = SettingsRowRect(m, 4);
+        r = SettingsRowRect(m, 5);
         DrawSettingRow(dc, r, 2, T(L"Fn 网页布局", L"Fn Web Layout"),
                        T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"), g_sHov == S_HIT_FNWEB);
         DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
 
-        r = SettingsRowRect(m, 5);
+        r = SettingsRowRect(m, 6);
         DrawSettingRow(dc, r, 4, T(L"Shift 符号", L"Shift Symbols"),
                        T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"), g_sHov == S_HIT_SHIFTSYM);
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
-
-        r = SettingsRowRect(m, 6);
-        DrawSettingRow(dc, r, 5, T(L"自动隐藏", L"Auto-hide"),
-                       T(L"设置离开输入区域后的收起延迟", L"Set the delay before the keyboard is hidden"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
-                  HideDelayName(), g_dropHideDelay, g_sHov == S_HIT_HIDEDELAY_DROP);
 
         r = SettingsRowRect(m, 7);
         DrawSettingRow(dc, r, 6, T(L"界面语言", L"Language"),
@@ -2926,11 +3008,21 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   g_dropTheme, g_sHov == S_HIT_THEME_DROP);
 
         r = SettingsRowRect(m, 1);
-        DrawSettingRow(dc, r, 9, T(L"背景材质", L"Background Material"),
-                       T(L"选择 Mica、亚克力或纯色背景", L"Choose Mica, Acrylic, or a solid background"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_materialNamesEn[g_materialMode] : g_materialNames[g_materialMode],
-                  g_dropMaterial, g_sHov == S_HIT_MATERIAL_DROP);
+        if (g_supportsMaterial) {
+            DrawSettingRow(dc, r, 9, T(L"背景材质", L"Background Material"),
+                           T(L"选择 Mica、亚克力或纯色背景", L"Choose Mica, Acrylic, or a solid background"), FALSE);
+            DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                      MaterialNameOf(MaterialIndexOf(g_materialMode)),
+                      g_dropMaterial, g_sHov == S_HIT_MATERIAL_DROP);
+        } else {
+            // PE / XP~Win10 1803：无系统 backdrop，改为主界面透明度调整
+            DrawSettingRow(dc, r, 9, T(L"主界面透明度", L"Keyboard Opacity"),
+                           T(L"调整主界面的不透明度", L"Adjust the keyboard window opacity"), FALSE);
+            int oi = OpacityIndex();
+            DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                      g_lang ? g_opacityNamesEn[oi] : g_opacityNames[oi],
+                      g_dropOpacity, g_sHov == S_HIT_OPACITY_DROP);
+        }
 
         BOOL customColor = HlSel() == 2;
         r = SettingsHighlightRect(m, customColor);
@@ -3039,20 +3131,12 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                           m.comboW, m.comboH, names, 2, g_closeToTray ? 1 : 0, g_dropCloseHov);
         }
         if (g_dropLayout) {
-            r = SettingsRowRect(m, 2);
+            r = SettingsRowRect(m, 3);
             const wchar_t* names[3];
             for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
             int cy = SettingsComboY(m, r);
             DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
                           m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
-        }
-        if (g_dropHideDelay) {
-            r = SettingsRowRect(m, 6);
-            const wchar_t* names[6];
-            for (int i = 0; i < 6; i++) names[i] = g_lang ? g_hideDelayNamesEn[i] : g_hideDelayNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 6),
-                          m.comboW, m.comboH, names, 6, HideDelayIndex(), g_dropHideDelayHov);
         }
         if (g_dropLang) {
             r = SettingsRowRect(m, 7);
@@ -3072,13 +3156,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
                           m.comboW, m.comboH, names, 3, g_themeMode, g_dropThemeHov);
         }
-        if (g_dropMaterial) {
+        if (g_dropMaterial && g_supportsMaterial) {
             r = SettingsRowRect(m, 1);
+            int count = MaterialOptionCount();
             const wchar_t* names[3];
-            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_materialNamesEn[i] : g_materialNames[i];
+            for (int i = 0; i < count; i++) names[i] = MaterialNameOf(i);
             int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
-                          m.comboW, m.comboH, names, 3, g_materialMode, g_dropMaterialHov);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, count),
+                          m.comboW, m.comboH, names, count, MaterialIndexOf(g_materialMode), g_dropMaterialHov);
+        }
+        if (g_dropOpacity && !g_supportsMaterial) {
+            r = SettingsRowRect(m, 1);
+            const wchar_t* names[6];
+            for (int i = 0; i < 6; i++) names[i] = g_lang ? g_opacityNamesEn[i] : g_opacityNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 6),
+                          m.comboW, m.comboH, names, 6, OpacityIndex(), g_dropOpacityHov);
         }
         if (g_dropHl) {
             r = SettingsRowRect(m, 2);
@@ -3114,20 +3207,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             }
         }
         if (g_dropLayout) {
-            r = SettingsRowRect(m, 2);
+            r = SettingsRowRect(m, 3);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
             for (int i = 0; i < 3; i++) {
                 if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
-        if (g_dropHideDelay) {
-            r = SettingsRowRect(m, 6);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
-            for (int i = 0; i < 6; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_HIDEDELAY_OPT0 + i;
                 ly += m.comboH;
             }
         }
@@ -3156,6 +3240,9 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_CLOSE_DROP;
 
         r = SettingsRowRect(m, 2);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_REMEMBER;
+
+        r = SettingsRowRect(m, 3);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
         if (g_dropLayout) {
             int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
@@ -3166,23 +3253,12 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LAYOUT_DROP;
 
-        r = SettingsRowRect(m, 3);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
         r = SettingsRowRect(m, 4);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
         r = SettingsRowRect(m, 5);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
-
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
         r = SettingsRowRect(m, 6);
-        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
-        if (g_dropHideDelay) {
-            int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
-            for (int i = 0; i < 6; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_HIDEDELAY_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HIDEDELAY_DROP;
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
 
         r = SettingsRowRect(m, 7);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
@@ -3196,12 +3272,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
     } else if (g_sTab == 1) {
         RECT r;
-        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[3] = {
+        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[2] = {
             {g_dropTheme, 0, 3, S_HIT_THEME_OPT0},
-            {g_dropMaterial, 1, 3, S_HIT_MATERIAL_OPT0},
-            {g_dropHl, 2, 3, S_HIT_HL_OPT0}
+            {g_dropMaterial, 1, g_supportsMaterial ? MaterialOptionCount() : 0, S_HIT_MATERIAL_OPT0}
         };
-        for (int d = 0; d < 3; d++) {
+        for (int d = 0; d < 2; d++) {
             if (!drops[d].open) continue;
             r = SettingsRowRect(m, drops[d].row);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
@@ -3212,6 +3287,15 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 ly += m.comboH;
             }
         }
+        if (g_dropOpacity && !g_supportsMaterial) {
+            r = SettingsRowRect(m, 1);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
+            int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
+            for (int i = 0; i < 6; i++) {
+                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_OPACITY_OPT0 + i;
+                ly += m.comboH;
+            }
+        }
 
         r = SettingsRowRect(m, 0);
         int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
@@ -3219,7 +3303,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
         r = SettingsRowRect(m, 1);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_MATERIAL_DROP;
+        if (g_supportsMaterial) {
+            if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_MATERIAL_DROP;
+        } else {
+            if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_OPACITY_DROP;
+        }
 
         r = SettingsRowRect(m, 2);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
@@ -3283,24 +3371,29 @@ static void EnsureConfigFile() {
     wchar_t path[MAX_PATH];
     GetConfigPath(path, MAX_PATH);
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {   // 已存在
-        if (IniGetInt(L"General", L"ConfigVersion", 0) < 2) {
+        int ver = IniGetInt(L"General", L"ConfigVersion", 0);
+        if (ver < 2) {
             IniSetInt(L"Window", L"Width", 0);
             IniSetInt(L"Window", L"Height", 0);
-            IniSetInt(L"General", L"ConfigVersion", 2);
+        }
+        if (ver < 3) {
+            // 删除已废弃的自动隐藏延迟键（值传 NULL 即删除）
+            WritePrivateProfileStringW(L"General", L"HideDelay", NULL, path);
+            IniSetInt(L"General", L"ConfigVersion", 3);
         }
         return;
     }
     IniSetInt(L"General", L"RememberClose", 0);
     IniSetInt(L"General", L"CloseToTray", 0);
-    IniSetInt(L"General", L"ConfigVersion", 2);
+    IniSetInt(L"General", L"ConfigVersion", 3);
     IniSetInt(L"Theme", L"Mode", 0);
     IniSetInt(L"Theme", L"Wallpaper", 0);
     IniSetInt(L"Theme", L"Material", 0);
+    IniSetInt(L"Theme", L"Opacity", 100);
     IniSetInt(L"Keyboard", L"Layout", 0);
     IniSetInt(L"Keyboard", L"FKeys", 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", 0);
     IniSetInt(L"General", L"ShiftSymbols", 1);
-    IniSetInt(L"General", L"HideDelay", 0);
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"HighlightMode", 0);
     IniSetInt(L"General", L"HighlightColor", 0xD47800);
@@ -3319,15 +3412,17 @@ static void LoadConfig() {
     if (tm >= 0 && tm <= 2) g_themeMode = tm;
     int material = IniGetInt(L"Theme", L"Material", 0);
     if (material < 0 || material > 2) material = 0;
-    g_materialMode = g_isWinPE ? 0 : material;
+    if (!g_isWin11 && material == 1) material = 2;   // 非 Win11 无 Mica，回退亚克力
+    g_materialMode = (g_isWinPE || !g_supportsMaterial) ? 0 : material;
+    g_mainOpacity = IniGetInt(L"Theme", L"Opacity", 100);
+    if (g_mainOpacity < 50 || g_mainOpacity > 100) g_mainOpacity = 100;
     g_wallpaperAccent = (IniGetInt(L"Theme", L"Wallpaper", 0) != 0);
     g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
     if (g_layoutMode < 0 || g_layoutMode > 2) g_layoutMode = 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
-    g_hideDelayMs = IniGetInt(L"General", L"HideDelay", 0);
-    if (g_hideDelayMs < 0 || g_hideDelayMs > 5000) g_hideDelayMs = 0;
+    g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_hlMode = IniGetInt(L"General", L"HighlightMode", 0);
@@ -3434,7 +3529,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_CLOSE_DROP:
         g_dropClose = !g_dropClose;
-        if (g_dropClose) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropCloseHov = -1; }
+        if (g_dropClose) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropCloseHov = -1; }
         break;
     case S_HIT_CLOSE_OPT0:
     case S_HIT_CLOSE_OPT1:
@@ -3442,9 +3537,14 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         g_dropClose = FALSE;
         if (g_rememberClose) SaveCloseSettings();
         break;
+    case S_HIT_REMEMBER:
+        BeginSwitchAnimation(hWnd, hit, g_rememberClose, !g_rememberClose);
+        g_rememberClose = !g_rememberClose;
+        SaveCloseSettings();   // 持久化“记住我的选择”
+        break;
     case S_HIT_LAYOUT_DROP:
         g_dropLayout = !g_dropLayout;
-        if (g_dropLayout) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLayoutHov = -1; }
+        if (g_dropLayout) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLayoutHov = -1; }
         break;
     case S_HIT_LAYOUT_OPT0:
     case S_HIT_LAYOUT_OPT1:
@@ -3479,7 +3579,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_THEME_DROP:
         g_dropTheme = !g_dropTheme;
-        if (g_dropTheme) { g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropThemeHov = -1; }
+        if (g_dropTheme) { g_dropMaterial = FALSE; g_dropOpacity = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropThemeHov = -1; }
         break;
     case S_HIT_THEME_OPT0:
     case S_HIT_THEME_OPT1:
@@ -3489,34 +3589,38 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_MATERIAL_DROP:
         g_dropMaterial = !g_dropMaterial;
-        if (g_dropMaterial) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropMaterialHov = -1; }
+        if (g_dropMaterial) { g_dropTheme = FALSE; g_dropOpacity = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropMaterialHov = -1; }
         break;
     case S_HIT_MATERIAL_OPT0:
     case S_HIT_MATERIAL_OPT1:
     case S_HIT_MATERIAL_OPT2:
-        if (g_materialMode != hit - S_HIT_MATERIAL_OPT0) {
-            g_materialMode = hit - S_HIT_MATERIAL_OPT0;
+    {
+        int mode = MaterialModeOf(hit - S_HIT_MATERIAL_OPT0);
+        if (hit - S_HIT_MATERIAL_OPT0 < MaterialOptionCount() && g_materialMode != mode) {
+            g_materialMode = mode;
             materialChanged = TRUE;
         }
         g_dropMaterial = FALSE;
         break;
-    case S_HIT_HIDEDELAY_DROP:
-        g_dropHideDelay = !g_dropHideDelay;
-        if (g_dropHideDelay) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropHideDelayHov = -1; }
+    }
+    case S_HIT_OPACITY_DROP:
+        g_dropOpacity = !g_dropOpacity;
+        if (g_dropOpacity) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropOpacityHov = -1; }
         break;
-    case S_HIT_HIDEDELAY_OPT0:
-    case S_HIT_HIDEDELAY_OPT0 + 1:
-    case S_HIT_HIDEDELAY_OPT0 + 2:
-    case S_HIT_HIDEDELAY_OPT0 + 3:
-    case S_HIT_HIDEDELAY_OPT0 + 4:
-    case S_HIT_HIDEDELAY_OPT0 + 5:
-        g_hideDelayMs = g_hideDelayValues[hit - S_HIT_HIDEDELAY_OPT0];
-        g_dropHideDelay = FALSE;
-        IniSetInt(L"General", L"HideDelay", g_hideDelayMs);
+    case S_HIT_OPACITY_OPT0:
+    case S_HIT_OPACITY_OPT0 + 1:
+    case S_HIT_OPACITY_OPT0 + 2:
+    case S_HIT_OPACITY_OPT0 + 3:
+    case S_HIT_OPACITY_OPT0 + 4:
+    case S_HIT_OPACITY_OPT0 + 5:
+        g_mainOpacity = g_opacityValues[hit - S_HIT_OPACITY_OPT0];
+        g_dropOpacity = FALSE;
+        IniSetInt(L"Theme", L"Opacity", g_mainOpacity);
+        ApplyAllWindowMaterials();   // 立即应用透明度
         break;
     case S_HIT_LANG_DROP:
         g_dropLang = !g_dropLang;
-        if (g_dropLang) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLangHov = -1; }
+        if (g_dropLang) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLangHov = -1; }
         break;
     case S_HIT_LANG_OPT0:
     case S_HIT_LANG_OPT1:
@@ -3527,7 +3631,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_HL_DROP:
         g_dropHl = !g_dropHl;
-        if (g_dropHl) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropHideDelay = FALSE; g_dropLang = FALSE; g_dropClose = FALSE; g_dropHlHov = -1; }
+        if (g_dropHl) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropClose = FALSE; g_dropHlHov = -1; }
         break;
     case S_HIT_HL_OPT0:
     case S_HIT_HL_OPT1:
@@ -3619,7 +3723,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
-        g_dropHideDelay = FALSE;
+        g_dropOpacity = FALSE;
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
@@ -3628,12 +3732,11 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     }
     if (hit != S_HIT_NONE) {
         SettingsApplyHit(hWnd, hit);
-    } else if (g_dropTheme || g_dropMaterial || g_dropLayout || g_dropHideDelay || g_dropLang || g_dropHl || g_dropClose) {
         // 点击空白处关闭下拉
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
-        g_dropHideDelay = FALSE;
+        g_dropOpacity = FALSE;
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
@@ -3691,19 +3794,20 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         int thov = (hov >= S_HIT_THEME_OPT0 && hov <= S_HIT_THEME_OPT2) ? hov - S_HIT_THEME_OPT0 : -1;
         int mhov = (hov >= S_HIT_MATERIAL_OPT0 && hov <= S_HIT_MATERIAL_OPT2) ? hov - S_HIT_MATERIAL_OPT0 : -1;
         int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT2) ? hov - S_HIT_LAYOUT_OPT0 : -1;
-        int hhov = (hov >= S_HIT_HIDEDELAY_OPT0 && hov <= S_HIT_HIDEDELAY_OPT0 + 5) ? hov - S_HIT_HIDEDELAY_OPT0 : -1;
         int langov = (hov >= S_HIT_LANG_OPT0 && hov <= S_HIT_LANG_OPT1) ? hov - S_HIT_LANG_OPT0 : -1;
         int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT0 + 2) ? hov - S_HIT_HL_OPT0 : -1;
         int clov = (hov >= S_HIT_CLOSE_OPT0 && hov <= S_HIT_CLOSE_OPT1) ? hov - S_HIT_CLOSE_OPT0 : -1;
-        if (thov != g_dropThemeHov || mhov != g_dropMaterialHov || lhov != g_dropLayoutHov || hhov != g_dropHideDelayHov ||
-            langov != g_dropLangHov || hlov != g_dropHlHov || clov != g_dropCloseHov) {
+        int ohov = (hov >= S_HIT_OPACITY_OPT0 && hov <= S_HIT_OPACITY_OPT0 + 5) ? hov - S_HIT_OPACITY_OPT0 : -1;
+        if (thov != g_dropThemeHov || mhov != g_dropMaterialHov || lhov != g_dropLayoutHov ||
+            langov != g_dropLangHov || hlov != g_dropHlHov || clov != g_dropCloseHov ||
+            ohov != g_dropOpacityHov) {
             g_dropThemeHov = thov;
             g_dropMaterialHov = mhov;
             g_dropLayoutHov = lhov;
-            g_dropHideDelayHov = hhov;
             g_dropLangHov = langov;
             g_dropHlHov = hlov;
             g_dropCloseHov = clov;
+            g_dropOpacityHov = ohov;
             InvalidateRect(hWnd, NULL, TRUE);
         }
         return 0;
@@ -3809,7 +3913,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
-        g_dropHideDelay = FALSE;
+        g_dropOpacity = FALSE;
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
@@ -4056,29 +4160,54 @@ static void OpenClosePrompt() {
     }
 }
 
+// ===== 托盘菜单自绘（圆角悬停高亮 + 左侧强调条，参考 UU 远程样式） =====
+static void MenuGetText(int id, wchar_t* buf, int cch) {
+    const wchar_t* t = L"";
+    switch (id) {
+    case ID_MENU_TOGGLE:   t = T(L"\x663E\x793A\x8F7B\x952E", L"Show Keyboard"); break;
+    case ID_MENU_AUTO:     t = T(L"\x81EA\x52A8\x547C\x51FA", L"Auto Pop-up"); break;
+    case ID_MENU_SETTINGS: t = T(L"\x8BBE\x7F6E", L"Settings"); break;
+    case ID_MENU_ABOUT:    t = T(L"\x5173\x4E8E", L"About"); break;
+    case ID_MENU_EXIT:     t = T(L"\x5173\x95ED\x8F7B\x952E", L"Close HKeyboard"); break;
+    }
+    lstrcpynW(buf, t, cch);
+}
+static BOOL MenuIsChecked(int id) {
+    return id == ID_MENU_AUTO && g_af;
+}
+// 主题子菜单项文字（子菜单保持系统绘制）
+static const wchar_t* MenuThemeText(int themeMode) {
+    switch (themeMode) {
+    case 1: return T(L"\x6DF1\x8272\x4E3B\x9898", L"Dark Theme");
+    case 2: return T(L"\x6D45\x8272\x4E3B\x9898", L"Light Theme");
+    default: return T(L"\x8DDF\x968F\x7CFB\x7EDF", L"Follow System");
+    }
+}
+
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
+    // 顶层项全部自绘（MF_OWNERDRAW，itemData 传菜单 ID）；主题子菜单保持系统绘制
     // 隐藏/收起交给标题栏“最小化”按钮，菜单只保留隐藏状态下的“显示轻键”
     if (!g_vis) {
-        AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, T(L"\x663E\x793A\x8F7B\x952E", L"Show Keyboard"));
+        AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_TOGGLE, (LPCWSTR)(UINT_PTR)ID_MENU_TOGGLE);
     }
 
     // 自动呼出：菜单勾选项（主界面不再显示开关按钮）
-    AppendMenuW(m, MF_STRING | (g_af ? MF_CHECKED : 0), ID_MENU_AUTO, T(L"\x81EA\x52A8\x547C\x51FA", L"Auto Pop-up"));
+    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_AUTO, (LPCWSTR)(UINT_PTR)ID_MENU_AUTO);
 
     // 主题切换子菜单
     HMENU themeMenu = CreatePopupMenu();
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 0 ? MF_CHECKED : 0), ID_MENU_THEME + 1, T(L"\x8DDF\x968F\x7CFB\x7EDF", L"Follow System"));
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 1 ? MF_CHECKED : 0), ID_MENU_THEME + 2, T(L"\x6DF1\x8272\x4E3B\x9898", L"Dark Theme"));
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 2 ? MF_CHECKED : 0), ID_MENU_THEME + 3, T(L"\x6D45\x8272\x4E3B\x9898", L"Light Theme"));
+    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 0 ? MF_CHECKED : 0), ID_MENU_THEME + 1, MenuThemeText(0));
+    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 1 ? MF_CHECKED : 0), ID_MENU_THEME + 2, MenuThemeText(1));
+    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 2 ? MF_CHECKED : 0), ID_MENU_THEME + 3, MenuThemeText(2));
     AppendMenuW(m, MF_POPUP, (UINT_PTR)themeMenu, T(L"\x4E3B\x9898", L"Theme"));
-    AppendMenuW(m, MF_STRING, ID_MENU_SETTINGS, T(L"\x8BBE\x7F6E", L"Settings"));
+    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_SETTINGS, (LPCWSTR)(UINT_PTR)ID_MENU_SETTINGS);
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_MENU_ABOUT, T(L"\x5173\x4E8E", L"About"));
+    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_ABOUT, (LPCWSTR)(UINT_PTR)ID_MENU_ABOUT);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_MENU_EXIT, T(L"\x5173\x95ED\x8F7B\x952E", L"Close HKeyboard"));   // 关闭轻键
+    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_EXIT, (LPCWSTR)(UINT_PTR)ID_MENU_EXIT);   // 关闭轻键
 
     SetForegroundWindow(hWnd);
     int id = TrackPopupMenu(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, NULL);
@@ -4485,8 +4614,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO mmi = (LPMINMAXINFO)l;
         double dpiScale = GetSystemDpiScale();
-        mmi->ptMinTrackSize.x = (int)(500 * dpiScale);
-        mmi->ptMinTrackSize.y = (int)(200 * dpiScale);
+        // 允许自由缩小（小键盘布局等），仅挡住过小尺寸
+        mmi->ptMinTrackSize.x = (int)(300 * dpiScale);
+        mmi->ptMinTrackSize.y = (int)(150 * dpiScale);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -4677,6 +4807,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             ShowMenu(hWnd);
         }
         return 0;
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)l;
+        if (!w || mi->CtlType != ODT_MENU) break;
+        wchar_t text[64];
+        MenuGetText((int)(INT_PTR)mi->itemData, text, 64);
+        HDC dc = GetDC(hWnd);
+        HFONT of = (HFONT)SelectObject(dc, g_sf13);
+        SIZE sz = {0, 0};
+        GetTextExtentPoint32W(dc, text, (int)wcslen(text), &sz);
+        SelectObject(dc, of);
+        ReleaseDC(hWnd, dc);
+        double dpi = GetSystemDpiScale();
+        mi->itemHeight = (int)(34 * dpi);
+        mi->itemWidth = sz.cx + (int)(66 * dpi);
+        return TRUE;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)l;
+        if (!w || di->CtlType != ODT_MENU) break;
+        int id = (int)(INT_PTR)di->itemData;
+        wchar_t text[64];
+        MenuGetText(id, text, 64);
+        RECT rc = di->rcItem;
+        HDC dc = di->hDC;
+        double dpi = GetSystemDpiScale();
+        BOOL selected = (di->itemState & ODS_SELECTED) != 0;
+        BOOL checked = MenuIsChecked(id);
+        SetBkMode(dc, TRANSPARENT);
+        // 圆角悬停高亮
+        if (selected) {
+            DrawRoundRectAlpha(dc, rc.left + (int)(4 * dpi), rc.top + (int)(3 * dpi),
+                               rc.right - rc.left - (int)(8 * dpi), rc.bottom - rc.top - (int)(6 * dpi),
+                               C_HOVER, C_HOVER, (int)(6 * dpi), 255, 255);
+        }
+        // 左侧强调条（悬停或勾选状态显示）
+        if (selected || checked) {
+            int barH = (int)(18 * dpi);
+            int barW = (int)(4 * dpi);
+            int cy = (rc.top + rc.bottom) / 2;
+            DrawRoundRectAlpha(dc, rc.left + (int)(7 * dpi), cy - barH / 2, barW, barH,
+                               C_HOT, C_HOT, (int)(2 * dpi), 255, 255);
+        }
+        HFONT of = (HFONT)SelectObject(dc, g_sf13);
+        SetTextColor(dc, C_WHITE);
+        RECT tr = { rc.left + (int)(24 * dpi), rc.top, rc.right, rc.bottom };
+        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, of);
+        return TRUE;
+    }
     case WM_CLOSE: HandleCloseAction(hWnd); return 0;
     case WM_DESTROY:
         StopWindowMotion(&g_mainMotion);
@@ -4804,6 +4983,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     // 配置：首次启动自动生成 HKeyboard.ini；WinPE 默认关闭窗口材质。
     g_isWinPE = IsWindowsPE();
+    DetectWinVersion();
     EnsureConfigFile();
     LoadConfig();
     if (fNoAuto) g_af = FALSE;

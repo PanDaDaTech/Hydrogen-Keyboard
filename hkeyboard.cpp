@@ -389,13 +389,9 @@ static double GetSystemDpiScale() {
 
 static void InitWindowSizeForDpi() {
     double dpiScale = GetSystemDpiScale();
-    if (g_layoutMode == 1) {        // 小键盘默认更窄
-        g_ww = (int)(430 * dpiScale);
-        g_wh = (int)(320 * dpiScale);
-    } else {                        // 全尺寸
-        g_ww = (int)(980 * dpiScale);
-        g_wh = (int)(320 * dpiScale);
-    }
+    // 全尺寸/常用/小键盘统一初始窗口大小（随 DPI 缩放）
+    g_ww = (int)(980 * dpiScale);
+    g_wh = (int)(320 * dpiScale);
 }
 
 static int AddKey(int x, int y, int w, int h, short vk, KeyType type) {
@@ -1875,6 +1871,7 @@ static void DoKeyAction(const KeyDef* k) {
         if (k->vk == 0) {  // Fn 键：切换 F1~F12 功能层（或网页布局层）
             g_fnLayer = !g_fnLayer;
             if (g_fnLayer) g_sh = FALSE;
+            BuildKeys();   // 网页布局层是独立键位表，必须重建
             InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
@@ -1895,6 +1892,7 @@ static void DoKeyAction(const KeyDef* k) {
             }
             g_lastWinTick = GetTickCount();
             g_fnLayer = FALSE;
+            BuildKeys();   // 若正处网页布局层，退出后需重建键位表
             InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
@@ -1907,6 +1905,7 @@ static void DoKeyAction(const KeyDef* k) {
             //  - 未处于 Shift 状态：点击进入 Shift 锁定（后续按键为 Shift+组合键）；
             //  - 已处于 Shift 状态：再次点击切换中/英输入法，并退出 Shift 锁定。
             // 任意 Shift+组合键使用后会退出 Shift 状态，因此下次点击 Shift 可再次正常进入，不会失步。
+            BOOL wasFn = g_fnLayer;
             if (g_sh) {
                 g_sh = FALSE;
                 g_fnLayer = FALSE;
@@ -1914,6 +1913,10 @@ static void DoKeyAction(const KeyDef* k) {
             } else {
                 g_sh = TRUE;
                 g_fnLayer = FALSE;
+            }
+            if (wasFn) {
+                BuildKeys();   // 若正处网页布局层，退出后需重建键位表
+                InvalidateRect(g_hWnd, 0, TRUE);
             }
         } else if (k->vk == 0x11) {
             g_ct = !g_ct;
@@ -3262,15 +3265,23 @@ static int IniGetInt(const wchar_t* section, const wchar_t* key, int def) {
     return _wtoi(buf);
 }
 
-// 首次启动自动生成 HKeyboard.ini（含默认值），之后按需写入
+// 首次启动自动生成 HKeyboard.ini（含默认值），之后按需写入。
+// 已存在的旧配置执行一次性升级：清除早期版本写入的未缩放默认窗口尺寸，
+// 交给 InitWindowSizeForDpi 按 DPI 重算（避免高 DPI 首启窗口过小）。
 static void EnsureConfigFile() {
     wchar_t path[MAX_PATH];
     GetConfigPath(path, MAX_PATH);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;   // 已存在
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {   // 已存在
+        if (IniGetInt(L"General", L"ConfigVersion", 0) < 2) {
+            IniSetInt(L"Window", L"Width", 0);
+            IniSetInt(L"Window", L"Height", 0);
+            IniSetInt(L"General", L"ConfigVersion", 2);
+        }
+        return;
+    }
     IniSetInt(L"General", L"RememberClose", 0);
     IniSetInt(L"General", L"CloseToTray", 0);
-    IniSetInt(L"Window", L"Width", g_ww);
-    IniSetInt(L"Window", L"Height", g_wh);
+    IniSetInt(L"General", L"ConfigVersion", 2);
     IniSetInt(L"Theme", L"Mode", 0);
     IniSetInt(L"Theme", L"Wallpaper", 0);
     IniSetInt(L"Theme", L"Material", 0);
@@ -3444,7 +3455,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
             g_fnLayer = FALSE;
         }
         IniSetInt(L"Keyboard", L"FnWebLayout", g_fnWebLayout ? 1 : 0);
-        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
+        if (g_hWnd && IsWindow(g_hWnd)) {
+            BuildKeys();   // 网页布局层切换需重建键位表
+            InvalidateRect(g_hWnd, NULL, TRUE);
+        }
         break;
     case S_HIT_SHIFTSYM:
         BeginSwitchAnimation(hWnd, hit, g_shiftSymbols, !g_shiftSymbols);

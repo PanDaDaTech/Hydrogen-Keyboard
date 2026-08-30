@@ -159,37 +159,46 @@ static BOOL IsDarkThemeActive() {
     return g_materialMode != 0 ? IsSystemBackdropDarkMode() : IsSystemDarkMode();
 }
 
-// 读取系统壁纸自动派生的强调色并转为 GDI COLORREF (BGR)。
-// 优先读 DWM AccentColor（Windows“自动从壁纸取色”时即为壁纸派生的强调色），
-// 不可用时回退 ColorizationColor（DWM 现用取色颜色）。
-// 注册表值均为 ABGR (0xAABBGGRR)；alpha 位仅用于透明度提示，对强调色无意义，直接忽略。
+// 读取系统 DWM 强调色并转为 GDI COLORREF (BGR)。
+// 注册表值为 ABGR (0xAABBGGRR) 布局，注意与 COLORREF (0x00BBGGRR) 的字节序转换。
+// 优先级（Win11 实测）：
+//   1. HKCU\...\DWM\AccentColor        —— Win11 22H2+ 当前强调色（与 AccentColorMenu 一致）
+//   2. HKCU\...\Explorer\Accent\AccentColorMenu —— 资源管理器强调色备用源
+//   3. HKCU\...\DWM\ColorizationColor  —— 旧系统回退（可能残留旧主题色）
+static DWORD AbgrToBgr(DWORD val) {
+    return (((val >> 16) & 0xFF) << 16) | (val & 0xFF00) | (val & 0xFF);
+}
+
 static DWORD GetWallpaperAccentBgr() {
     HKEY hKey;
-    LONG ok = ERROR_SUCCESS;
     DWORD val = 0, sz = sizeof(val);
 
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\DWM",
         0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        ok = RegQueryValueExW(hKey, L"AccentColor", NULL, NULL, (LPBYTE)&val, &sz);
+        RegQueryValueExW(hKey, L"AccentColor", NULL, NULL, (LPBYTE)&val, &sz);
         RegCloseKey(hKey);
     }
-    if (ok == ERROR_SUCCESS && (val & 0xFFFFFF) != 0) {
-        // ABGR -> COLORREF BGR
-        return ((val & 0xFF) << 16) | (val & 0x00FF00) | ((val >> 16) & 0xFF);
-    }
+    if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
 
-    // 备用：ColorizationColor
-    ok = ERROR_SUCCESS; val = 0; sz = sizeof(val);
+    val = 0; sz = sizeof(val);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"AccentColorMenu", NULL, NULL, (LPBYTE)&val, &sz);
+        RegCloseKey(hKey);
+    }
+    if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
+
+    // 备用：ColorizationColor（Win10 等）
+    val = 0; sz = sizeof(val);
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\DWM",
         0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        ok = RegQueryValueExW(hKey, L"ColorizationColor", NULL, NULL, (LPBYTE)&val, &sz);
+        RegQueryValueExW(hKey, L"ColorizationColor", NULL, NULL, (LPBYTE)&val, &sz);
         RegCloseKey(hKey);
     }
-    if (ok == ERROR_SUCCESS && (val & 0xFFFFFF) != 0) {
-        return ((val & 0xFF) << 16) | (val & 0x00FF00) | ((val >> 16) & 0xFF);
-    }
+    if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
     return 0;
 }
 
@@ -579,12 +588,13 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
     }
 }
 
-// Fn 网页布局层：上网/聊天常用布局（Esc+F 行、符号区、网址后缀、底排修饰键）
+// Fn 网页布局层：整体结构对齐全尺寸布局（行2/3/5 与原布局一致），
+// 仅行1 数字键换为 F1~F12、行4 字母键换为网址后缀键
 static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     // Row 1: Esc, `, F1~F12, Backspace (15 keys)
     {
         int wEsc = (int)(50 * dpiScale * scaleX);
-        int wBksp = (int)(60 * dpiScale * scaleX);
+        int wBksp = (int)(68 * dpiScale * scaleX);
         int fixed = wEsc + wBksp;
         int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
         int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
@@ -600,74 +610,73 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 2: Tab, 数字行(双符号), [, ], \, Del (15 keys)
+    // Row 2: Tab, q-p, [, ], \, Del (15 keys)，与全尺寸布局一致
     {
-        int wTab = (int)(60 * dpiScale * scaleX);
-        int wDel = (int)(60 * dpiScale * scaleX);
+        int wTab = (int)(68 * dpiScale * scaleX);
+        int wDel = (int)(68 * dpiScale * scaleX);
         int fixed = wTab + wDel;
-        int aw = (KEY_AREA_W - fixed - 13 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - fixed - 13 * g_keyGap - aw * 13;
+        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
         int w[15]; w[0] = wTab;
         for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
         w[14] = wDel;
-        short v[15] = {0x09,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xDB,0xDD,0xDC,0x2E};
-        KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+        short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
+        KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
         int x = KEY_AREA_X;
         for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 3: Caps, - = [ ] \ ; ' , . /, Enter (12 keys)
+    // Row 3: Caps, a-l, ;, ', Enter (13 keys)，与全尺寸布局一致
     {
         int wCaps = (int)(80 * dpiScale * scaleX);
         int wEnter = (int)(90 * dpiScale * scaleX);
         int fixed = wCaps + wEnter;
-        int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 10;
-        int rem = KEY_AREA_W - fixed - 11 * g_keyGap - aw * 10;
-        int w[12]; w[0] = wCaps;
-        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[11] = wEnter;
-        short v[12] = {0x14,0xBD,0xBB,0xDB,0xDD,0xDC,0xBA,0xDE,0xBC,0xBE,0xBF,0x0D};
-        KeyType t[12] = {K_CAPS,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 12; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        y += g_keyHeight + g_keyGap;
-    }
-
-    // Row 4: Shift, 网址后缀×6, ? , . /, ↑, Shift (13 keys)
-    {
-        int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = wUp;
-        int fixed = wLSh + wRSh + wUp;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
-        int w[13]; w[0] = wLSh;
-        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[11] = wUp; w[12] = wRSh;
-        short v[13] = {0xA0, 0x200,0x201,0x202,0x203,0x204,0x205, 0xBF,0xBC,0xBE, 0x26, 0xA1};
-        KeyType t[13] = {K_MOD, K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL, K_NORMAL,K_NORMAL,K_NORMAL, K_ARROW, K_MOD};
+        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 11;
+        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 11;
+        int w[13]; w[0] = wCaps;
+        for (int i = 1; i <= 11; i++) w[i] = aw + (i <= rem ? 1 : 0);
+        w[12] = wEnter;
+        short v[13] = {0x14,0x41,0x53,0x44,0x46,0x47,0x48,0x4A,0x4B,0x4C,0xBA,0xDE,0x0D};
+        KeyType t[13] = {K_CAPS,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_SPECIAL};
         int x = KEY_AREA_X;
         for (int i = 0; i < 13; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 5: Fn, Ctrl, Win, Alt, Space, Alt, Menu, Ctrl, ←, ↓, → (11 keys)
+    // Row 4: Shift, 网址后缀×6, ? , ., ↑, Shift (12 keys)
+    {
+        int wLSh = (int)(95 * dpiScale * scaleX);
+        int wUp = (int)(52 * dpiScale * scaleX);
+        int wRSh = wUp;
+        int fixed = wLSh + wRSh + wUp;
+        int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 9;
+        int rem = KEY_AREA_W - fixed - 11 * g_keyGap - aw * 9;
+        int w[12]; w[0] = wLSh;
+        for (int i = 1; i <= 9; i++) w[i] = aw + (i <= rem ? 1 : 0);
+        w[10] = wUp; w[11] = wRSh;
+        short v[12] = {0xA0, 0x200,0x201,0x202,0x203,0x204,0x205, 0xBF,0xBC,0xBE, 0x26, 0xA1};
+        KeyType t[12] = {K_MOD, K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL, K_NORMAL,K_NORMAL,K_NORMAL, K_ARROW, K_MOD};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 12; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        y += g_keyHeight + g_keyGap;
+    }
+
+    // Row 5: Fn, Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, → (10 keys)，与全尺寸布局一致
     {
         int wFn  = (int)(46 * dpiScale * scaleX);
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(46 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
-        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 10 * g_keyGap;
+        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
+        int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
-        int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
-        short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-        KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+        int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+        short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
+        KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
         int x = KEY_AREA_X;
-        for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
     }
 }
 
@@ -1975,12 +1984,14 @@ static BOOL IsMainMaterialPaintActive() {
     return IsMaterialApplied(g_hWnd) && g_alphaPaintActive;
 }
 
-static void DrawMainMaterialSurface(HDC dc) {
-    if (!IsMainMaterialPaintActive()) return;
+// 材质模式的半透明色调层：让窗口内容与 DWM Mica/亚克力背景融合为一体。
+// 所有窗口（主键盘/设置/关闭提示）统一使用同一色调，观感一致。
+static void DrawWindowMaterialTint(HDC dc, HWND hWnd, int w, int h) {
+    if (!IsMaterialApplied(hWnd) || !g_alphaPaintActive) return;
     BOOL dark = g_theme->bg == g_darkTheme.bg;
     BYTE alpha = g_materialMode == 1 ? (dark ? 104 : 132)
                                       : (dark ? 76 : 104);
-    DrawAlphaSurface(dc, 0, 0, g_ww, g_wh, C_BG, alpha);
+    DrawAlphaSurface(dc, 0, 0, w, h, C_BG, alpha);
 }
 
 static void DrawHeader(HDC dc) {
@@ -3649,6 +3660,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         RECT rc; GetClientRect(hWnd, &rc);
         WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         SettingsDraw(surface.dc, hWnd);
         if (!surface.buffered)
             BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
@@ -3971,6 +3983,7 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         RECT rc; GetClientRect(hWnd, &rc);
         WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         PromptDraw(surface.dc, hWnd);
         if (!surface.buffered)
             BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
@@ -4511,7 +4524,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         RECT rc = {0, 0, g_ww, g_wh};
         WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
         ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
-        DrawMainMaterialSurface(surface.dc);
+        DrawWindowMaterialTint(surface.dc, hWnd, g_ww, g_wh);
         DrawHeader(surface.dc);
         DrawKeys(surface.dc);
         if (!surface.buffered)

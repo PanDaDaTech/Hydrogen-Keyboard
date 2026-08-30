@@ -2668,18 +2668,30 @@ static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
     DrawTextW(dc, glyphs[kind], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
-static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* title,
-                           const wchar_t* desc, BOOL hover) {
+// 行内容（不含面板背景）：供独立行与分组面板内的子行复用
+// icon < 0 表示无图标行（文本/描述位置与有图标的行保持一致）
+static void DrawSettingRowContent(HDC dc, const RECT& row, int icon, const wchar_t* title,
+                                  const wchar_t* desc, BOOL hover) {
     double dpi = GetSystemDpiScale();
-    DrawRoundRect(dc, row.left, row.top, row.right - row.left, row.bottom - row.top,
-                  hover ? C_HOVER : C_KEY, hover ? C_HOT : C_KEY_BORDER, 8);
+    if (hover) {
+        DrawRoundRectAlpha(dc, row.left + 1, row.top + 1,
+                           row.right - row.left - 2, row.bottom - row.top - 2,
+                           C_HOVER, C_HOVER, 8, 255, 255);
+    }
     int iconSize = (int)(24 * dpi);
-    if (icon >= 0)   // icon < 0：无图标行（文本/描述位置与其他行保持一致）
+    if (icon >= 0)
         DrawSettingsIcon(dc, row.left + (int)(14 * dpi), row.top + (row.bottom - row.top - iconSize) / 2, icon);
     int tx = row.left + (int)(52 * dpi);
     int tw = row.right - tx - (int)(220 * dpi);
     DrawTextL(dc, tx, row.top + (int)(5 * dpi), tw, (int)(20 * dpi), title, g_sf14b, C_WHITE);
     DrawTextL(dc, tx, row.top + (int)(27 * dpi), tw, (int)(18 * dpi), desc, g_sf12, C_DIM);
+}
+
+static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* title,
+                           const wchar_t* desc, BOOL hover) {
+    DrawRoundRect(dc, row.left, row.top, row.right - row.left, row.bottom - row.top,
+                  hover ? C_HOVER : C_KEY, hover ? C_HOT : C_KEY_BORDER, 8);
+    DrawSettingRowContent(dc, row, icon, title, desc, FALSE);
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
@@ -2981,16 +2993,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                        T(L"点击输入框时自动弹出键盘", L"Show the keyboard when an input gets focus"), g_sHov == S_HIT_AUTO);
         DrawSettingSwitch(dc, m, r, g_af, S_HIT_AUTO);
 
-        r = SettingsRowRect(m, 1);
-        DrawSettingRow(dc, r, 1, T(L"关闭按钮", L"Close Button"),
-                       T(L"选择关闭窗口时执行的操作", L"Choose what happens when the window is closed"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+        // 分组面板：关闭按钮 + 记住我的选择（子项无图标，参考分组设置样式）
+        RECT r1 = SettingsRowRect(m, 1);
+        RECT r2 = SettingsRowRect(m, 2);
+        DrawRoundRect(dc, r1.left, r1.top, r1.right - r1.left, r2.bottom - r1.top,
+                      C_KEY, C_KEY_BORDER, 8);
+        // 分隔线（横跨面板）
+        Fill(dc, r1.left + 1, r2.top - m.rowGap / 2 - 1, r1.right - r1.left - 2, 1, C_KEY_BORDER);
+        DrawSettingRowContent(dc, r1, 1, T(L"关闭按钮", L"Close Button"),
+                              T(L"选择关闭窗口时执行的操作", L"Choose what happens when the window is closed"),
+                              g_sHov == S_HIT_CLOSE_DROP);
+        DrawSettingRowContent(dc, r2, -1, T(L"记住我的选择", L"Remember My Choice"),
+                              T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"),
+                              g_sHov == S_HIT_REMEMBER);
+        DrawCombo(dc, SettingsComboX(m, r1), SettingsComboY(m, r1), m.comboW, m.comboH,
                   CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
-
-        r = SettingsRowRect(m, 2);
-        DrawSettingRow(dc, r, -1, T(L"记住我的选择", L"Remember My Choice"),
-                       T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"), g_sHov == S_HIT_REMEMBER);
-        DrawSettingSwitch(dc, m, r, g_rememberClose, S_HIT_REMEMBER);
+        DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
         r = SettingsRowRect(m, 3);
         DrawSettingRow(dc, r, 2, T(L"键盘布局", L"Keyboard Layout"),
@@ -3258,7 +3276,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 ly += m.comboH;
             }
         }
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_CLOSE_DROP;
+        // 整行命中：悬停高亮分组主行，点击任意处展开下拉
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_CLOSE_DROP;
 
         r = SettingsRowRect(m, 2);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_REMEMBER;
@@ -3293,11 +3312,12 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
     } else if (g_sTab == 1) {
         RECT r;
-        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[2] = {
+        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[3] = {
             {g_dropTheme, 0, 3, S_HIT_THEME_OPT0},
-            {g_dropMaterial, 1, g_supportsMaterial ? MaterialOptionCount() : 0, S_HIT_MATERIAL_OPT0}
+            {g_dropMaterial, 1, g_supportsMaterial ? MaterialOptionCount() : 0, S_HIT_MATERIAL_OPT0},
+            {g_dropHl, 2, 3, S_HIT_HL_OPT0}
         };
-        for (int d = 0; d < 2; d++) {
+        for (int d = 0; d < 3; d++) {
             if (!drops[d].open) continue;
             r = SettingsRowRect(m, drops[d].row);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);

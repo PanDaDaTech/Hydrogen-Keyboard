@@ -4227,54 +4227,30 @@ static void OpenClosePrompt() {
     }
 }
 
-// ===== 托盘菜单自绘（圆角悬停高亮 + 左侧强调条，参考 UU 远程样式） =====
-static void MenuGetText(int id, wchar_t* buf, int cch) {
-    const wchar_t* t = L"";
-    switch (id) {
-    case ID_MENU_TOGGLE:   t = T(L"\x663E\x793A\x8F7B\x952E", L"Show Keyboard"); break;
-    case ID_MENU_AUTO:     t = T(L"\x81EA\x52A8\x547C\x51FA", L"Auto Pop-up"); break;
-    case ID_MENU_SETTINGS: t = T(L"\x8BBE\x7F6E", L"Settings"); break;
-    case ID_MENU_ABOUT:    t = T(L"\x5173\x4E8E", L"About"); break;
-    case ID_MENU_EXIT:     t = T(L"\x5173\x95ED\x8F7B\x952E", L"Close HKeyboard"); break;
-    }
-    lstrcpynW(buf, t, cch);
-}
-static BOOL MenuIsChecked(int id) {
-    return id == ID_MENU_AUTO && g_af;
-}
-// 主题子菜单项文字（子菜单保持系统绘制）
-static const wchar_t* MenuThemeText(int themeMode) {
-    switch (themeMode) {
-    case 1: return T(L"\x6DF1\x8272\x4E3B\x9898", L"Dark Theme");
-    case 2: return T(L"\x6D45\x8272\x4E3B\x9898", L"Light Theme");
-    default: return T(L"\x8DDF\x968F\x7CFB\x7EDF", L"Follow System");
-    }
-}
-
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    // 顶层项全部自绘（MF_OWNERDRAW，itemData 传菜单 ID）；主题子菜单保持系统绘制
-    // 隐藏/收起交给标题栏“最小化”按钮，菜单只保留隐藏状态下的“显示轻键”
-    if (!g_vis) {
-        AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_TOGGLE, (LPCWSTR)(UINT_PTR)ID_MENU_TOGGLE);
+    // “显示轻键”仅在自动呼出关闭且键盘隐藏时提供：
+    // 自动呼出开启时键盘由呼出逻辑自动管理，无需手动呼出入口
+    if (!g_af && !g_vis) {
+        AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, T(L"\x663E\x793A\x8F7B\x952E", L"Show Keyboard"));
     }
 
     // 自动呼出：菜单勾选项（主界面不再显示开关按钮）
-    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_AUTO, (LPCWSTR)(UINT_PTR)ID_MENU_AUTO);
+    AppendMenuW(m, MF_STRING | (g_af ? MF_CHECKED : 0), ID_MENU_AUTO, T(L"\x81EA\x52A8\x547C\x51FA", L"Auto Pop-up"));
 
     // 主题切换子菜单
     HMENU themeMenu = CreatePopupMenu();
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 0 ? MF_CHECKED : 0), ID_MENU_THEME + 1, MenuThemeText(0));
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 1 ? MF_CHECKED : 0), ID_MENU_THEME + 2, MenuThemeText(1));
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 2 ? MF_CHECKED : 0), ID_MENU_THEME + 3, MenuThemeText(2));
+    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 0 ? MF_CHECKED : 0), ID_MENU_THEME + 1, T(L"\x8DDF\x968F\x7CFB\x7EDF", L"Follow System"));
+    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 1 ? MF_CHECKED : 0), ID_MENU_THEME + 2, T(L"\x6DF1\x8272\x4E3B\x9898", L"Dark Theme"));
+    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 2 ? MF_CHECKED : 0), ID_MENU_THEME + 3, T(L"\x6D45\x8272\x4E3B\x9898", L"Light Theme"));
     AppendMenuW(m, MF_POPUP, (UINT_PTR)themeMenu, T(L"\x4E3B\x9898", L"Theme"));
-    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_SETTINGS, (LPCWSTR)(UINT_PTR)ID_MENU_SETTINGS);
+    AppendMenuW(m, MF_STRING, ID_MENU_SETTINGS, T(L"\x8BBE\x7F6E", L"Settings"));
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_ABOUT, (LPCWSTR)(UINT_PTR)ID_MENU_ABOUT);
+    AppendMenuW(m, MF_STRING, ID_MENU_ABOUT, T(L"\x5173\x4E8E", L"About"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | MF_OWNERDRAW, ID_MENU_EXIT, (LPCWSTR)(UINT_PTR)ID_MENU_EXIT);   // 关闭轻键
+    AppendMenuW(m, MF_STRING, ID_MENU_EXIT, T(L"\x5173\x95ED\x8F7B\x952E", L"Close HKeyboard"));   // 关闭轻键
 
     SetForegroundWindow(hWnd);
     int id = TrackPopupMenu(m, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, NULL);
@@ -4872,55 +4848,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             ShowMenu(hWnd);
         }
         return 0;
-    case WM_MEASUREITEM: {
-        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)l;
-        if (!w || mi->CtlType != ODT_MENU) break;
-        wchar_t text[64];
-        MenuGetText((int)(INT_PTR)mi->itemData, text, 64);
-        HDC dc = GetDC(hWnd);
-        HFONT of = (HFONT)SelectObject(dc, g_sf13);
-        SIZE sz = {0, 0};
-        GetTextExtentPoint32W(dc, text, (int)wcslen(text), &sz);
-        SelectObject(dc, of);
-        ReleaseDC(hWnd, dc);
-        double dpi = GetSystemDpiScale();
-        mi->itemHeight = (int)(34 * dpi);
-        mi->itemWidth = sz.cx + (int)(66 * dpi);
-        return TRUE;
-    }
-    case WM_DRAWITEM: {
-        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)l;
-        if (!w || di->CtlType != ODT_MENU) break;
-        int id = (int)(INT_PTR)di->itemData;
-        wchar_t text[64];
-        MenuGetText(id, text, 64);
-        RECT rc = di->rcItem;
-        HDC dc = di->hDC;
-        double dpi = GetSystemDpiScale();
-        BOOL selected = (di->itemState & ODS_SELECTED) != 0;
-        BOOL checked = MenuIsChecked(id);
-        SetBkMode(dc, TRANSPARENT);
-        // 圆角悬停高亮
-        if (selected) {
-            DrawRoundRectAlpha(dc, rc.left + (int)(4 * dpi), rc.top + (int)(3 * dpi),
-                               rc.right - rc.left - (int)(8 * dpi), rc.bottom - rc.top - (int)(6 * dpi),
-                               C_HOVER, C_HOVER, (int)(6 * dpi), 255, 255);
-        }
-        // 左侧强调条（悬停或勾选状态显示）
-        if (selected || checked) {
-            int barH = (int)(18 * dpi);
-            int barW = (int)(4 * dpi);
-            int cy = (rc.top + rc.bottom) / 2;
-            DrawRoundRectAlpha(dc, rc.left + (int)(7 * dpi), cy - barH / 2, barW, barH,
-                               C_HOT, C_HOT, (int)(2 * dpi), 255, 255);
-        }
-        HFONT of = (HFONT)SelectObject(dc, g_sf13);
-        SetTextColor(dc, C_WHITE);
-        RECT tr = { rc.left + (int)(24 * dpi), rc.top, rc.right, rc.bottom };
-        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, of);
-        return TRUE;
-    }
     case WM_CLOSE: HandleCloseAction(hWnd); return 0;
     case WM_DESTROY:
         StopWindowMotion(&g_mainMotion);

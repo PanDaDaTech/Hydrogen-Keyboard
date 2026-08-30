@@ -2441,7 +2441,6 @@ static BOOL g_dropTheme = FALSE;    // 主题下拉是否展开
 static BOOL g_dropLayout = FALSE;   // 布局下拉是否展开
 static int  g_dropThemeHov = -1;
 static int  g_dropLayoutHov = -1;
-static BOOL   // 已废弃：自动隐藏延迟固定 1 秒（保留行位兼容旧引用）
 static BOOL g_dropLang = FALSE;        // 语言下拉
 static int  g_dropLangHov = -1;
 static BOOL g_dropHl = FALSE;          // 高亮颜色下拉
@@ -3732,6 +3731,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     }
     if (hit != S_HIT_NONE) {
         SettingsApplyHit(hWnd, hit);
+    } else if (g_dropTheme || g_dropMaterial || g_dropLayout || g_dropOpacity || g_dropLang || g_dropHl || g_dropClose) {
         // 点击空白处关闭下拉
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;

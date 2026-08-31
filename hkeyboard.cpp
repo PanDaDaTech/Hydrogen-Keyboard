@@ -361,7 +361,9 @@ HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0,
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0, g_sfIcon = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
+static HANDLE g_fontRegMdl2 = 0;       // 内嵌 Segoe MDL2（Win10 以下系统图标字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
+static BOOL   g_mdl2Ready = FALSE;     // 内嵌 MDL2 注册成功（系统无 MDL2 时可用）
 NOTIFYICONDATAW g_nid;
 
 // ===== GDI+ 平滑绘图（抗锯齿圆形，避免 GDI Ellipse 锯齿） =====
@@ -909,27 +911,30 @@ static void BuildKeys() {
 
 // 注册内嵌字体（阿里巴巴普惠体精简版）到当前进程；失败则回退系统字体
 static void LoadEmbeddedFonts() {
-    struct { int id; HANDLE* slot; } fonts[2] = {
+    struct { int id; HANDLE* slot; } fonts[3] = {
         { IDR_FONT_REGULAR, &g_fontRegRegular },
         { IDR_FONT_BOLD,    &g_fontRegBold },
+        { IDR_FONT_MDL2,    &g_fontRegMdl2 },
     };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
+        // Win10 及以上系统自带 Segoe MDL2/Fluent，跳过内嵌图标字体（省内存）
+        if (fonts[i].id == IDR_FONT_MDL2 && g_winBuild >= 10240) continue;
         HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), MAKEINTRESOURCEW(10));  // RT_RCDATA
         if (!hr) continue;
         HGLOBAL hg = LoadResource(g_hInst, hr);
         if (!hg) continue;
-        void* data = LockResource(hg);
+        void* data = LockResource(g_hInst, hr);
         DWORD sz = SizeofResource(g_hInst, hr);
         if (!data || sz == 0) continue;
         DWORD n = 0;
         HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
         if (h && n > 0) {
             *fonts[i].slot = h;
-            g_fontReady = TRUE;
+            if (fonts[i].id == IDR_FONT_MDL2) g_mdl2Ready = TRUE;
+            else g_fontReady = TRUE;
         }
     }
 }
-
 // 检查内嵌字体族中是否存在真 Bold 字面。
 // 若系统安装了官方版阿里巴巴普惠体（族名结构不同），GDI 可能只匹配到 400 字重的
 // Regular 字面并触发仿真加粗（重复描边，浅色下尤其难看）；此时应退回 Regular。
@@ -976,7 +981,8 @@ static HFONT MakeIconFont(double size) {
 
     // 图标字体按系统环境选择：
     //   Win10 及以上：Fluent Icons（Win11）/ MDL2（Win10）
-    //   Win10 以下（Win7/8.x）：默认优先 MDL2，Segoe UI Symbol 作为系统自带兜底
+    //   Win10 以下（Win7/8.x）：MDL2 优先——系统未自带时由内嵌副本注册提供，
+    //   Segoe UI Symbol 作为未注册成功的兜底
     const wchar_t* faces[4];
     int n = 0;
     if (g_winBuild >= 10240) {
@@ -986,7 +992,7 @@ static HFONT MakeIconFont(double size) {
         faces[n++] = L"Segoe MDL2 Assets";
         faces[n++] = L"Segoe UI Symbol";
     }
-    faces[n++] = L"Segoe UI Symbol";
+    if (g_winBuild < 10240 && g_mdl2Ready) n = 1;   // 内嵌 MDL2 已注册，仅保留首选
     for (int i = 0; i < n; i++) {
         HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
@@ -1003,7 +1009,6 @@ static HFONT MakeIconFont(double size) {
     }
     return MakeFont(size, FALSE);
 }
-
 // 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
@@ -5072,6 +5077,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
     if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
     if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
+    if (g_fontRegMdl2) RemoveFontMemResourceEx(g_fontRegMdl2);
     if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;

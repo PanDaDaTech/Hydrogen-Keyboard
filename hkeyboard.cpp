@@ -174,6 +174,11 @@ static DWORD AbgrToBgr(DWORD val) {
     return (((val >> 16) & 0xFF) << 16) | (val & 0xFF00) | (val & 0xFF);
 }
 
+// 旧 DWM（Win7/8 与 Win10+ 的 ColorizationColor）为 ARGB (0xAARRGGBB) 布局
+static DWORD ArgbToBgr(DWORD val) {
+    return ((val & 0xFF) << 16) | (val & 0xFF00) | ((val >> 16) & 0xFF);
+}
+
 static DWORD GetWallpaperAccentBgr() {
     HKEY hKey;
     DWORD val = 0, sz = sizeof(val);
@@ -195,7 +200,7 @@ static DWORD GetWallpaperAccentBgr() {
     }
     if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
 
-    // 备用：ColorizationColor（Win10 等）
+    // 备用：ColorizationColor（Win7 起即存在，ARGB 布局；Win7 无 AccentColor 系列键，壁纸派生强调色由此获得）
     val = 0; sz = sizeof(val);
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\DWM",
@@ -203,7 +208,7 @@ static DWORD GetWallpaperAccentBgr() {
         RegQueryValueExW(hKey, L"ColorizationColor", NULL, NULL, (LPBYTE)&val, &sz);
         RegCloseKey(hKey);
     }
-    if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
+    if ((val & 0xFFFFFF) != 0) return ArgbToBgr(val);
     return 0;
 }
 
@@ -969,8 +974,20 @@ static HFONT MakeIconFont(double size) {
     int height = -MulDiv((int)(size + 0.5), dpi, 72);
     ReleaseDC(NULL, dc);
 
-    const wchar_t* faces[2] = {L"Segoe Fluent Icons", L"Segoe MDL2 Assets"};
-    for (int i = 0; i < 2; i++) {
+    // 图标字体按系统环境选择：
+    //   Win10 及以上：Fluent Icons（Win11）/ MDL2（Win10）
+    //   Win10 以下（Win7/8.x）：默认优先 MDL2，Segoe UI Symbol 作为系统自带兜底
+    const wchar_t* faces[4];
+    int n = 0;
+    if (g_winBuild >= 10240) {
+        faces[n++] = L"Segoe Fluent Icons";
+        faces[n++] = L"Segoe MDL2 Assets";
+    } else {
+        faces[n++] = L"Segoe MDL2 Assets";
+        faces[n++] = L"Segoe UI Symbol";
+    }
+    faces[n++] = L"Segoe UI Symbol";
+    for (int i = 0; i < n; i++) {
         HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE, faces[i]);
@@ -1370,6 +1387,21 @@ static void DetectWinVersion() {
     g_supportsMaterial = !g_isWinPE && g_winBuild >= 17763;
 }
 
+// 主界面透明度（分层窗口统一透明）：Win2000+ 均支持，
+// 用于无系统 backdrop 的环境（Win7/8.x、精简版 Win10/11 PE 等）
+static void ApplyWindowOpacity(HWND hWnd, BOOL enable) {
+    if (!hWnd || !IsWindow(hWnd)) return;
+    LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
+    BOOL layered = (ex & WS_EX_LAYERED) != 0;
+    if (enable) {
+        if (!layered) SetWindowLongW(hWnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        BYTE a = (BYTE)(g_mainOpacity * 255 / 100);
+        SetLayeredWindowAttributes(hWnd, 0, a, LWA_ALPHA);
+    } else if (layered) {
+        SetWindowLongW(hWnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+    }
+}
+
 static void ApplyWindowMaterial(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd)) return;
 
@@ -1409,14 +1441,9 @@ static void ApplyWindowMaterial(HWND hWnd) {
     }
 
     if (g_materialMode == 0) {
-        // 旧系统（PE / XP~Win10 1803）无系统 backdrop：用主界面透明度代替材质
-        if (!g_supportsMaterial && hWnd == g_hWnd && setComposition && g_mainOpacity < 100) {
-            AccentPolicyLocal policy = {3, 2, 0, 0};   // ACCENT_ENABLE_TRANSPARENTGRADIENT
-            BYTE a = (BYTE)(g_mainOpacity * 255 / 100);
-            policy.gradientColor = ((DWORD)a << 24) | (((DWORD)C_BG) & 0x00FFFFFF);
-            WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
-            setComposition(hWnd, &data);
-        }
+        // 无系统 backdrop 的环境（Win7/8.x、PE、Win10 1803-）：
+        // 主界面透明度用分层窗口实现，兼容性最好
+        ApplyWindowOpacity(hWnd, !g_supportsMaterial && hWnd == g_hWnd && g_mainOpacity < 100);
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
         return;
     }
@@ -1454,8 +1481,12 @@ static void ApplyWindowMaterial(HWND hWnd) {
         extendFrame(hWnd, &margins);
     }
 
-    if (applied) SetPropW(hWnd, L"HKeyboardMaterial", (HANDLE)(INT_PTR)1);
-    else RemovePropW(hWnd, L"HKeyboardMaterial");
+    if (applied) {
+        SetPropW(hWnd, L"HKeyboardMaterial", (HANDLE)(INT_PTR)1);
+        ApplyWindowOpacity(hWnd, FALSE);   // 材质与分层透明互斥，切材质时清除
+    } else {
+        RemovePropW(hWnd, L"HKeyboardMaterial");
+    }
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
 }
 
@@ -4936,6 +4967,10 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     InitTimePeriodApi();
     if (g_timePeriod.begin) g_timePeriod.begin(1);   // 提升动画定时器精度
 
+    // 系统环境检测需在字体初始化前完成（图标字体按系统版本选择）
+    g_isWinPE = IsWindowsPE();
+    DetectWinVersion();
+
     InitGdiPlus();       // 初始化 GDI+ （抗锯齿圆形绘图）
     LoadEmbeddedFonts();   // 注册内嵌字体（阿里巴巴普惠体精简版），失败自动回退系统字体
     InitFixedFonts();      // 设置/关闭窗口固定字号字体
@@ -4993,9 +5028,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         hAppIcon, LoadCursor(0, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), 0, L"HKeyboardClosePrompt", hAppIcon};
     RegisterClassExW(&wcp);
 
-    // 配置：首次启动自动生成 HKeyboard.ini；WinPE 默认关闭窗口材质。
-    g_isWinPE = IsWindowsPE();
-    DetectWinVersion();
+    // 配置：首次启动自动生成 HKeyboard.ini（系统环境已在前置检测）
     EnsureConfigFile();
     LoadConfig();
     if (fNoAuto) g_af = FALSE;

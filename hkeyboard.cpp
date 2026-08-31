@@ -2176,11 +2176,18 @@ static void DrawKeys(HDC dc) {
         }
 
         const wchar_t* txt = KeyText(k);
-        HFONT f = g_f14b;
-        if (k->type == K_HIDE || k->type == K_ARROW) f = g_f14b;
-        if (k->vk == 0x08) f = g_f18b;
-        if (k->vk == 0x0D) f = g_f13b;
-        if (k->vk == 0x20 || k->type == K_SPACE) f = g_f14b;
+        // 字体粗细跟随键面底色：白色普通键（字母/数字/标点/空格/网址后缀）用常规字重，
+        // 深色修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体
+        BOOL darkKey = FALSE;
+        if (!(k->vk >= 0x200 && k->vk <= 0x205)) {   // 网址后缀键按普通键处理
+            int dt[] = {K_SPECIAL, K_CAPS, K_MOD, K_ARROW, K_HIDE};
+            for (size_t j = 0; j < sizeof(dt)/sizeof(dt[0]); j++) {
+                if (k->type == dt[j]) { darkKey = TRUE; break; }
+            }
+        }
+        HFONT f = darkKey ? g_f14b : g_f14;
+        if (k->vk == 0x08) f = g_f18b;   // 退格：深色键，大号粗体箭头
+        if (k->vk == 0x0D) f = g_f13b;   // Enter：深色键
         DWORD textC = (active || pressed) && IsLightColor(bg) ? 0x1A1A1A : C_WHITE;
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
@@ -2971,7 +2978,7 @@ static const wchar_t* CloseActionName() {
 // “项目地址 | 问题反馈”同一行居中，分隔符 | 不参与超链接
 static void AboutLinkLayout(int x0, int cw, int* px1, int* pw1, int* psep, int* psepW, int* px2, int* pw2) {
     HDC dc = GetDC(0);
-    HFONT of = (HFONT)SelectObject(dc, g_sf13b);   // 与绘制字体一致（粗体），保证点击区域匹配
+    HFONT of = (HFONT)SelectObject(dc, g_sf12);
     SIZE s1, s2, ss;
     const wchar_t* t1 = T(L"项目地址", L"Project URL");
     const wchar_t* t2 = T(L"问题反馈", L"Feedback");
@@ -3170,9 +3177,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sf12, C_DIM);
         int x1, w1, x2, w2, sx, sw2;
         AboutLinkLayout(x0, cw, &x1, &w1, &sx, &sw2, &x2, &w2);
-        DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf13b, C_HOT);
+        DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf12, C_HOT);
         DrawTextL(dc, sx, uy, sw2, (int)(18 * m.dpi), L"|", g_sf12, C_DIM);
-        DrawTextL(dc, x2, uy, w2, (int)(18 * m.dpi), T(L"问题反馈", L"Feedback"), g_sf13b, C_HOT);
+        DrawTextL(dc, x2, uy, w2, (int)(18 * m.dpi), T(L"问题反馈", L"Feedback"), g_sf12, C_HOT);
         if (g_sHov == S_HIT_URL || g_sHov == S_HIT_FEEDBACK) {
             int lx = g_sHov == S_HIT_URL ? x1 : x2;
             int lw = g_sHov == S_HIT_URL ? w1 : w2;
@@ -4105,7 +4112,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
 
     int x0 = 20, y = hdr + 12, cw = W - 40;
     int rowH = (int)(24 * dpi);
-    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), T(L"请选择关闭方式：", L"Choose how to close:"), g_sf13b, C_DIM); y += (int)(22 * dpi);
+    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), T(L"请选择关闭方式：", L"Choose how to close:"), g_sf13, C_DIM); y += (int)(22 * dpi);
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0, C_BG);
     DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sf13, C_WHITE);
     y += rowH;
@@ -4121,9 +4128,9 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sf13b, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
+    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sf13, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
     DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sf13b, C_WHITE);
+    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sf13, C_WHITE);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {

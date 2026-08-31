@@ -1,0 +1,4 @@
+.workbuddy/
+build/
+dist/
+deps/

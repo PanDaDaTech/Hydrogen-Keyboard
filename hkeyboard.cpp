@@ -582,7 +582,7 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(46 * dpiScale * scaleX);
+        int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
         if (g_showFKeys) {
             int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
@@ -590,7 +590,7 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
             if (spaceW < 60) spaceW = 60;
             int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
             short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         } else {
@@ -599,7 +599,7 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
             if (spaceW < 60) spaceW = 60;
             int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
             short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         }
@@ -699,7 +699,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(46 * dpiScale * scaleX);
+        int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
         if (commonStyle) {
             int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
@@ -707,7 +707,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
             if (spaceW < 60) spaceW = 60;
             int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
             short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_NORMAL, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         } else {
@@ -1215,16 +1215,12 @@ static BOOL TryApplyWin11RoundedWindow(HWND hWnd) {
 }
 
 static void ApplyRoundedWindow(HWND hWnd, int logicalRadius) {
-    if (TryApplyWin11RoundedWindow(hWnd)) return;
-    RECT rc;
-    if (!GetWindowRect(hWnd, &rc)) return;
-    int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) return;
-    int radius = (int)(logicalRadius * GetSystemDpiScale());
-    if (radius < 6) radius = 6;
-    HRGN region = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
-    if (!region) return;
-    if (!SetWindowRgn(hWnd, region, TRUE)) DeleteObject(region);
+    (void)logicalRadius;
+    // Win11+：保留系统原生 DWM 圆角；Win10 及以下（含对应版本 PE）强制直角窗口
+    if (g_winBuild >= 22000) {
+        if (TryApplyWin11RoundedWindow(hWnd)) return;
+    }
+    SetWindowRgn(hWnd, NULL, TRUE);
 }
 
 static BOOL IsMaterialApplied(HWND hWnd) {

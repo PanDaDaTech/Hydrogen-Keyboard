@@ -923,7 +923,7 @@ static void LoadEmbeddedFonts() {
         if (!hr) continue;
         HGLOBAL hg = LoadResource(g_hInst, hr);
         if (!hg) continue;
-        void* data = LockResource(g_hInst, hr);
+        void* data = LockResource(hg);
         DWORD sz = SizeofResource(g_hInst, hr);
         if (!data || sz == 0) continue;
         DWORD n = 0;

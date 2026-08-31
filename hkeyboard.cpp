@@ -935,42 +935,34 @@ static void LoadEmbeddedFonts() {
         }
     }
 }
-// 检查内嵌字体族中是否存在真 Bold 字面。
-// 若系统安装了官方版 MiSans（族名结构不同），GDI 可能只匹配到常规字重的
-// Regular 字面并触发仿真加粗（重复描边，浅色下尤其难看）；此时应退回 Regular。
-static int CALLBACK EnumBoldFaceProc(const LOGFONTW* plf, const TEXTMETRICW*, DWORD, LPARAM lp) {
-    if (plf && plf->lfWeight >= 600) {
-        *(int*)lp = 1;
-        return 0;   // 已找到，停止枚举
-    }
-    return 1;
-}
-
-static BOOL FamilyHasRealBoldFace() {
-    static int state = 0;   // 0=未知 1=有 -1=无
-    if (state == 0) {
-        state = -1;
-        LOGFONTW lf = {};
-        lf.lfCharSet = DEFAULT_CHARSET;
-        wcscpy(lf.lfFaceName, L"MiSans");
-        HDC dc = GetDC(0);
-        EnumFontFamiliesExW(dc, &lf, EnumBoldFaceProc, (LPARAM)&state, 0);
-        ReleaseDC(0, dc);
-    }
-    return state == 1;
-}
-
+// 创建 UI 字体。粗体请求后用 GetTextMetrics 校验实际匹配到的字重：
+// 内嵌 MiSans Bold（或系统安装版的 Bold 字面）可用时得到真粗体；
+// 只匹配到 Regular 字面时退回 FW_NORMAL，避免 GDI 仿真加粗产生的重影粗体。
 static HFONT MakeFont(double size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
     const wchar_t* face = g_fontReady ? L"MiSans" : L"Microsoft YaHei";
-    // 内嵌族无真 Bold 字面时请求 Regular，避免 GDI 仿真加粗产生的重影粗体
-    BOOL realBold = !bold || !g_fontReady || FamilyHasRealBoldFace();
-    return CreateFontW(h, 0, 0, 0, (bold && realBold) ? FW_BOLD : FW_NORMAL,
+    HFONT f = CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, face);
+    if (bold) {
+        HDC dc = GetDC(0);
+        HFONT of = (HFONT)SelectObject(dc, f);
+        TEXTMETRICW tm;
+        BOOL ok = GetTextMetricsW(dc, &tm);
+        SelectObject(dc, of);
+        ReleaseDC(0, dc);
+        if (!ok || tm.tmWeight < 550) {   // 实际匹配到 Regular 字面：放弃仿真加粗
+            DeleteObject(f);
+            f = CreateFontW(h, 0, 0, 0, FW_NORMAL,
+                FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE, face);
+        }
+    }
+    return f;
 }
 
 static HFONT MakeIconFont(double size) {
@@ -2979,7 +2971,7 @@ static const wchar_t* CloseActionName() {
 // “项目地址 | 问题反馈”同一行居中，分隔符 | 不参与超链接
 static void AboutLinkLayout(int x0, int cw, int* px1, int* pw1, int* psep, int* psepW, int* px2, int* pw2) {
     HDC dc = GetDC(0);
-    HFONT of = (HFONT)SelectObject(dc, g_sf12);
+    HFONT of = (HFONT)SelectObject(dc, g_sf13b);   // 与绘制字体一致（粗体），保证点击区域匹配
     SIZE s1, s2, ss;
     const wchar_t* t1 = T(L"项目地址", L"Project URL");
     const wchar_t* t2 = T(L"问题反馈", L"Feedback");
@@ -3178,9 +3170,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sf12, C_DIM);
         int x1, w1, x2, w2, sx, sw2;
         AboutLinkLayout(x0, cw, &x1, &w1, &sx, &sw2, &x2, &w2);
-        DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf12, C_HOT);
+        DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf13b, C_HOT);
         DrawTextL(dc, sx, uy, sw2, (int)(18 * m.dpi), L"|", g_sf12, C_DIM);
-        DrawTextL(dc, x2, uy, w2, (int)(18 * m.dpi), T(L"问题反馈", L"Feedback"), g_sf12, C_HOT);
+        DrawTextL(dc, x2, uy, w2, (int)(18 * m.dpi), T(L"问题反馈", L"Feedback"), g_sf13b, C_HOT);
         if (g_sHov == S_HIT_URL || g_sHov == S_HIT_FEEDBACK) {
             int lx = g_sHov == S_HIT_URL ? x1 : x2;
             int lw = g_sHov == S_HIT_URL ? w1 : w2;

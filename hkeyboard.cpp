@@ -909,7 +909,7 @@ static void BuildKeys() {
     }
 }
 
-// 注册内嵌字体（阿里巴巴普惠体精简版）到当前进程；失败则回退系统字体
+// 注册内嵌字体（MiSans 精简版）到当前进程；失败则回退系统字体
 static void LoadEmbeddedFonts() {
     struct { int id; HANDLE* slot; } fonts[3] = {
         { IDR_FONT_REGULAR, &g_fontRegRegular },
@@ -936,7 +936,7 @@ static void LoadEmbeddedFonts() {
     }
 }
 // 检查内嵌字体族中是否存在真 Bold 字面。
-// 若系统安装了官方版阿里巴巴普惠体（族名结构不同），GDI 可能只匹配到 400 字重的
+// 若系统安装了官方版 MiSans（族名结构不同），GDI 可能只匹配到常规字重的
 // Regular 字面并触发仿真加粗（重复描边，浅色下尤其难看）；此时应退回 Regular。
 static int CALLBACK EnumBoldFaceProc(const LOGFONTW* plf, const TEXTMETRICW*, DWORD, LPARAM lp) {
     if (plf && plf->lfWeight >= 600) {
@@ -952,7 +952,7 @@ static BOOL FamilyHasRealBoldFace() {
         state = -1;
         LOGFONTW lf = {};
         lf.lfCharSet = DEFAULT_CHARSET;
-        wcscpy(lf.lfFaceName, L"Alibaba PuHuiTi 3.0 55 Regular");
+        wcscpy(lf.lfFaceName, L"MiSans");
         HDC dc = GetDC(0);
         EnumFontFamiliesExW(dc, &lf, EnumBoldFaceProc, (LPARAM)&state, 0);
         ReleaseDC(0, dc);
@@ -964,7 +964,7 @@ static HFONT MakeFont(double size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
-    const wchar_t* face = g_fontReady ? L"Alibaba PuHuiTi 3.0 55 Regular" : L"Microsoft YaHei";
+    const wchar_t* face = g_fontReady ? L"MiSans" : L"Microsoft YaHei";
     // 内嵌族无真 Bold 字面时请求 Regular，避免 GDI 仿真加粗产生的重影粗体
     BOOL realBold = !bold || !g_fontReady || FamilyHasRealBoldFace();
     return CreateFontW(h, 0, 0, 0, (bold && realBold) ? FW_BOLD : FW_NORMAL,
@@ -4973,7 +4973,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     DetectWinVersion();
 
     InitGdiPlus();       // 初始化 GDI+ （抗锯齿圆形绘图）
-    LoadEmbeddedFonts();   // 注册内嵌字体（阿里巴巴普惠体精简版），失败自动回退系统字体
+    LoadEmbeddedFonts();   // 注册内嵌字体（MiSans 精简版），失败自动回退系统字体
     InitFixedFonts();      // 设置/关闭窗口固定字号字体
 
     BOOL fShow   = (strstr(cmd, "-show") != NULL);

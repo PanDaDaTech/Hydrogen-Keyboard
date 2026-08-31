@@ -4,8 +4,8 @@
 
 IDI_MAIN_ICON ICON "winres/main.ico"
 
-IDR_FONT_REGULAR RCDATA "winres/AlibabaPuHuiTi-3-55-Regular.ttf"
-IDR_FONT_BOLD    RCDATA "winres/AlibabaPuHuiTi-3-85-Bold.ttf"
+IDR_FONT_REGULAR RCDATA "winres/MiSans-Regular.ttf"
+IDR_FONT_BOLD    RCDATA "winres/MiSans-Bold.ttf"
 
 // Win10 以下系统的图标字体（Segoe MDL2 Assets，系统未自带时由内嵌资源提供）
 IDR_FONT_MDL2    RCDATA "winres/segmdl2.ttf"

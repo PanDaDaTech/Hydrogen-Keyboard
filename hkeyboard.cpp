@@ -3979,10 +3979,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 }
 
 static void CloseSettingsAnimated(HWND hWnd) {
-    // 系统级淡出后销毁（AnimateWindow 为官方动画 API，材质窗口表现稳定）
+    // 系统滑动动画：向下滑出后销毁（与主键盘收起方向一致）
     if (!hWnd || !IsWindow(hWnd) || g_settingsClosing) return;
     g_settingsClosing = TRUE;
-    AnimateWindow(hWnd, 200, AW_BLEND | AW_HIDE);
+    AnimateWindow(hWnd, 200, AW_SLIDE | AW_VER_POSITIVE | AW_HIDE);
     DestroyWindow(hWnd);
 }
 
@@ -4228,10 +4228,10 @@ static void OpenSettingsTab(int tab) {
     g_settingsHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardSettings", T(L"设置", L"Settings"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_settingsHwnd) {
-        // 隐藏状态先完成首帧绘制，避免淡入时空白
+        // 隐藏状态先完成首帧绘制，避免动画时空白
         RedrawWindow(g_settingsHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-        // 系统级淡入（AnimateWindow，置顶/无边框窗口均可用的官方动画 API）
-        if (!AnimateWindow(g_settingsHwnd, 200, AW_BLEND))
+        // 系统滑动动画：自底部向上滑入（与主键盘呼出方向一致）
+        if (!AnimateWindow(g_settingsHwnd, 200, AW_SLIDE | AW_VER_NEGATIVE))
             ShowWindow(g_settingsHwnd, SW_SHOW);
         SetForegroundWindow(g_settingsHwnd);
     }
@@ -4255,10 +4255,10 @@ static BOOL g_pTracking = FALSE;
 static BOOL g_promptClosing = FALSE;
 
 static void ClosePromptAnimated(HWND hWnd) {
-    // 系统级淡出后销毁（AnimateWindow 为官方动画 API，材质窗口表现稳定）
+    // 系统滑动动画：向下滑出后销毁
     if (!hWnd || !IsWindow(hWnd) || g_promptClosing) return;
     g_promptClosing = TRUE;
-    AnimateWindow(hWnd, 200, AW_BLEND | AW_HIDE);
+    AnimateWindow(hWnd, 200, AW_SLIDE | AW_VER_POSITIVE | AW_HIDE);
     DestroyWindow(hWnd);
 }
 
@@ -4441,10 +4441,10 @@ static void OpenClosePrompt() {
     g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"关闭轻键", L"Close HKeyboard"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
-        // 隐藏状态先完成首帧绘制，避免淡入时空白
+        // 隐藏状态先完成首帧绘制，避免动画时空白
         RedrawWindow(g_closePromptHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-        // 系统级淡入（AnimateWindow，置顶/无边框窗口均可用的官方动画 API）
-        if (!AnimateWindow(g_closePromptHwnd, 200, AW_BLEND))
+        // 系统滑动动画：自底部向上滑入
+        if (!AnimateWindow(g_closePromptHwnd, 200, AW_SLIDE | AW_VER_NEGATIVE))
             ShowWindow(g_closePromptHwnd, SW_SHOW);
         SetForegroundWindow(g_closePromptHwnd);
     }

@@ -3979,10 +3979,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 }
 
 static void CloseSettingsAnimated(HWND hWnd) {
-    // 系统滑动动画：向下滑出后销毁（与主键盘收起方向一致）
+    // 标准淡出（DWM 风格渐隐）后销毁
     if (!hWnd || !IsWindow(hWnd) || g_settingsClosing) return;
     g_settingsClosing = TRUE;
-    AnimateWindow(hWnd, 200, AW_SLIDE | AW_VER_POSITIVE | AW_HIDE);
+    AnimateWindow(hWnd, 400, AW_BLEND | AW_HIDE);
     DestroyWindow(hWnd);
 }
 
@@ -4029,6 +4029,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_CREATE:
         ApplyRoundedWindow(hWnd, 14);
         ApplyWindowMaterial(hWnd);
+        {
+            // 显式确保 DWM 窗口过渡未被禁用（属性 3 默认开启，防御性设置）
+            DwmSetWindowAttributeProc setAttr = GetDwmSetWindowAttribute();
+            if (setAttr) {
+                const DWORD DWMWA_TRANSITIONS_FORCEDISABLED = 3;
+                BOOL disable = FALSE;
+                setAttr(hWnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
+            }
+        }
         return 0;
     case WM_REAPPLY_MATERIAL:
         // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
@@ -4209,8 +4218,8 @@ static void OpenSettingsTab(int tab) {
     g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
         if (!IsWindowVisible(g_settingsHwnd)) {
-            // 系统级淡入
-            if (!AnimateWindow(g_settingsHwnd, 200, AW_BLEND))
+            // 标准淡入（DWM 风格渐显）
+            if (!AnimateWindow(g_settingsHwnd, 400, AW_BLEND))
                 ShowWindow(g_settingsHwnd, SW_SHOW);
         } else {
             if (!IsMaterialApplied(g_settingsHwnd)) ApplyWindowMaterial(g_settingsHwnd);
@@ -4230,8 +4239,8 @@ static void OpenSettingsTab(int tab) {
     if (g_settingsHwnd) {
         // 隐藏状态先完成首帧绘制，避免动画时空白
         RedrawWindow(g_settingsHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-        // 系统滑动动画：自底部向上滑入（与主键盘呼出方向一致）
-        if (!AnimateWindow(g_settingsHwnd, 200, AW_SLIDE | AW_VER_NEGATIVE))
+        // 标准淡入（DWM 风格渐显）
+        if (!AnimateWindow(g_settingsHwnd, 400, AW_BLEND))
             ShowWindow(g_settingsHwnd, SW_SHOW);
         SetForegroundWindow(g_settingsHwnd);
     }
@@ -4255,10 +4264,10 @@ static BOOL g_pTracking = FALSE;
 static BOOL g_promptClosing = FALSE;
 
 static void ClosePromptAnimated(HWND hWnd) {
-    // 系统滑动动画：向下滑出后销毁
+    // 标准淡出（DWM 风格渐隐）后销毁
     if (!hWnd || !IsWindow(hWnd) || g_promptClosing) return;
     g_promptClosing = TRUE;
-    AnimateWindow(hWnd, 200, AW_SLIDE | AW_VER_POSITIVE | AW_HIDE);
+    AnimateWindow(hWnd, 400, AW_BLEND | AW_HIDE);
     DestroyWindow(hWnd);
 }
 
@@ -4358,6 +4367,15 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_CREATE:
         ApplyRoundedWindow(hWnd, 14);
         ApplyWindowMaterial(hWnd);
+        {
+            // 显式确保 DWM 窗口过渡未被禁用（属性 3 默认开启，防御性设置）
+            DwmSetWindowAttributeProc setAttr = GetDwmSetWindowAttribute();
+            if (setAttr) {
+                const DWORD DWMWA_TRANSITIONS_FORCEDISABLED = 3;
+                BOOL disable = FALSE;
+                setAttr(hWnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
+            }
+        }
         return 0;
     case WM_REAPPLY_MATERIAL:
         // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
@@ -4443,8 +4461,8 @@ static void OpenClosePrompt() {
     if (g_closePromptHwnd) {
         // 隐藏状态先完成首帧绘制，避免动画时空白
         RedrawWindow(g_closePromptHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-        // 系统滑动动画：自底部向上滑入
-        if (!AnimateWindow(g_closePromptHwnd, 200, AW_SLIDE | AW_VER_NEGATIVE))
+        // 标准淡入（DWM 风格渐显）
+        if (!AnimateWindow(g_closePromptHwnd, 400, AW_BLEND))
             ShowWindow(g_closePromptHwnd, SW_SHOW);
         SetForegroundWindow(g_closePromptHwnd);
     }

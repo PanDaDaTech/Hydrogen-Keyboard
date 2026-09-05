@@ -347,7 +347,9 @@ BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示�
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
-BOOL        g_afAutoHide = TRUE;       // 自动呼出开启时，离开输入状态自动收起键盘（ini: General/AutoHideOnBlur）
+BOOL        g_afAutoHide = TRUE;       // 自动呼出开启时，收起键盘后同一输入框内不自动回弹（ini: General/AutoHide）
+static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收起（自动收起开启时不回弹）
+static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘 2=常用
@@ -2041,7 +2043,7 @@ static void DoKeyAction(const KeyDef* k) {
         SendKey(0x20, g_sh, g_ct, g_al, g_winKey);
         g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
-    case K_HIDE: ShowKB(FALSE); break;
+    case K_HIDE: UserHideKeyboard(); break;
     default: break;
     }
 }
@@ -2422,12 +2424,14 @@ static void ShowKB(BOOL show, BOOL isManual) {
         if (isManual) {
             g_manualShow = TRUE;
             g_manualHide = FALSE;
+            g_userHidInInput = FALSE;   // 手动重新显示后恢复常规自动呼出逻辑
         }
         if (g_vis) {
             StopWindowMotion(&g_mainMotion);
             SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
                          SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            ApplyWindowMaterial(g_hWnd);
+            // 材质已应用时不再重置重套，避免可见的“材质切换”闪烁
+            if (!IsMaterialApplied(g_hWnd)) ApplyWindowMaterial(g_hWnd);
             RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
             return;
         }
@@ -2450,6 +2454,20 @@ static void ShowKB(BOOL show, BOOL isManual) {
 }
 
 static void ToggleKB() { ShowKB(!g_vis, TRUE); }
+
+// 用户主动收起（键盘“收起”键 / 标题栏最小化按钮）：
+// 自动收起开启时，若当前焦点在输入框中，记录该输入控件，
+// UpdateAutoVisibility 在同一输入框内不再自动回弹（焦点换框后恢复自动呼出）。
+static void UserHideKeyboard() {
+    if (g_afAutoHide) {
+        HWND input = GetFocusedInputControl();
+        if (input) {
+            g_userHidInInput = TRUE;
+            g_hiddenInputToken = g_detectedInputToken;
+        }
+    }
+    ShowKB(FALSE, TRUE);
+}
 
 static void ExitApplicationAnimated() {
     if (!g_hWnd || !IsWindow(g_hWnd)) return;
@@ -3154,7 +3172,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r0, g_af, S_HIT_AUTO);
         if (g_af) {
             DrawSettingRowContent(dc, rAutoHide, -1, T(L"自动收起", L"Auto Hide"),
-                                  T(L"离开输入框后自动最小化键盘", L"Minimize the keyboard after leaving the input"),
+                                  T(L"收起键盘后在同一输入框内不自动弹出", L"Stay hidden after minimizing in the same input"),
                                   g_sHov == S_HIT_AUTOHIDE);
             DrawSettingSwitch(dc, m, rAutoHide, g_afAutoHide, S_HIT_AUTOHIDE);
         }
@@ -3620,11 +3638,16 @@ static void EnsureConfigFile() {
             WritePrivateProfileStringW(L"General", L"HideDelay", NULL, path);
             IniSetInt(L"General", L"ConfigVersion", 3);
         }
+        if (ver < 4) {
+            // “自动收起”键名调整：AutoHideOnBlur -> AutoHide（语义：收起后同输入框内不回弹）
+            WritePrivateProfileStringW(L"General", L"AutoHideOnBlur", NULL, path);
+            IniSetInt(L"General", L"AutoHide", g_afAutoHide ? 1 : 0);
+            IniSetInt(L"General", L"ConfigVersion", 4);
+        }
         return;
     }
     IniSetInt(L"General", L"RememberClose", 0);
     IniSetInt(L"General", L"CloseToTray", 0);
-    IniSetInt(L"General", L"ConfigVersion", 3);
     IniSetInt(L"Theme", L"Mode", 0);
     IniSetInt(L"Theme", L"Wallpaper", 0);
     IniSetInt(L"Theme", L"Material", 0);
@@ -3637,7 +3660,8 @@ static void EnsureConfigFile() {
     IniSetInt(L"General", L"HighlightMode", 0);
     IniSetInt(L"General", L"HighlightColor", 0xD47800);
     IniSetInt(L"General", L"AutoPopup", 1);
-    IniSetInt(L"General", L"AutoHideOnBlur", 1);
+    IniSetInt(L"General", L"AutoHide", 1);
+    IniSetInt(L"General", L"ConfigVersion", 4);
 }
 
 // 读取上次的窗口大小 / 主题 / 关闭行为
@@ -3667,7 +3691,7 @@ static void LoadConfig() {
     if (g_hlMode < 0 || g_hlMode > 1) g_hlMode = 0;
     g_hlColor = IniGetInt(L"General", L"HighlightColor", 0xD47800);
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
-    g_afAutoHide = (IniGetInt(L"General", L"AutoHideOnBlur", 1) != 0);
+    g_afAutoHide = (IniGetInt(L"General", L"AutoHide", 1) != 0);
 }
 
 // 持久化“× 关闭行为”选择
@@ -3777,8 +3801,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     case S_HIT_AUTOHIDE:
         BeginSwitchAnimation(hWnd, hit, g_afAutoHide, !g_afAutoHide);
         g_afAutoHide = !g_afAutoHide;
-        IniSetInt(L"General", L"AutoHideOnBlur", g_afAutoHide ? 1 : 0);
-        if (g_afAutoHide) UpdateAutoVisibility();
+        IniSetInt(L"General", L"AutoHide", g_afAutoHide ? 1 : 0);
         break;
     case S_HIT_CLOSE_DROP:
         g_dropClose = !g_dropClose;
@@ -4178,7 +4201,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ApplyWindowMaterial(hWnd);
         return 0;
     case WM_REAPPLY_MATERIAL:
-        if (IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
+        // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
+        if (IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
@@ -4517,7 +4541,8 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         ApplyWindowMaterial(hWnd);
         return 0;
     case WM_REAPPLY_MATERIAL:
-        if (IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
+        // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
+        if (IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
@@ -4864,6 +4889,12 @@ static void UpdateAutoVisibility() {
     if (input) {
         g_lastNonInput = 0;
         g_manualShow = FALSE;
+        // 自动收起开启：用户刚在该输入框中手动收起时不回弹；
+        // 焦点换到其它输入控件后恢复正常自动呼出（token 同源比较）
+        if (g_afAutoHide && g_userHidInInput &&
+            g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken)
+            return;
+        g_userHidInInput = FALSE;
         if (!g_manualHide && !g_vis) ShowKB(TRUE, FALSE);
         return;
     }
@@ -4871,6 +4902,7 @@ static void UpdateAutoVisibility() {
     HWND fg = GetForegroundWindow();
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return;
 
+    g_userHidInInput = FALSE;   // 焦点已离开输入框，清除手动收起标记
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
     if (!g_vis) {
         // 隐藏滑动被打断（如拖动标题栏）后窗口可能仍残留可见：直接收尾藏到任务栏底部
@@ -4880,7 +4912,6 @@ static void UpdateAutoVisibility() {
         return;
     }
     if (g_manualHide) return;
-    if (!g_afAutoHide) return;   // 关闭“自动收起”后，键盘保持显示直到手动关闭
     if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) return;
     if (g_manualShow) return;
 
@@ -4940,10 +4971,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
-        case HDR_MIN:
-            // 最小化仅收起键盘，不做抑制：输入框再次获得焦点时正常自动呼出
-            ShowKB(FALSE, FALSE);
-            break;
+        case HDR_MIN: UserHideKeyboard(); break;   // 手动收起（自动收起开启时同输入框内不回弹）
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         }
         return;
@@ -5150,12 +5178,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         UpdateAutoVisibility();
         return 0;
     case WM_REAPPLY_MATERIAL:
-        if (IsWindowVisible(hWnd)) ApplyWindowMaterial(hWnd);
+        // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
+        if (IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SHOW_KEYBOARD:
         if (w) {
             ApplyTheme();
-            ApplyWindowMaterial(hWnd);
+            if (!IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
             ShowKB(TRUE, TRUE);
         } else {
             ShowKB(FALSE, TRUE);

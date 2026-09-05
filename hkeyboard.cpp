@@ -281,6 +281,7 @@ struct KeyDef { int x, y, w, h; short vk; KeyType type; };
 // C++ 函数前置声明
 static void ShowKB(BOOL show, BOOL isManual = FALSE);
 static void ToggleKB();
+static void UserHideKeyboard();   // 手动收起（自动收起开启时同输入框内不回弹）
 static void HandleCloseAction(HWND hWnd);
 static void ExitApplicationAnimated();
 static void OpenClosePrompt();

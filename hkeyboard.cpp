@@ -3980,9 +3980,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 }
 
 // ========== 窗口渐显/渐隐（记事本风格 fade） ==========
-// AnimateWindow 的 AW_BLEND 在 Win8+ 的 DWM 合成窗口上无效，改为自驱动
-// 渐变：每帧按正常管线整页绘制后，将表面内容 alpha 整体缩放。材质背景
-// （Mica/亚克力）全程不动，只有内容层淡入/淡出，观感与原生关闭一致。
+// AnimateWindow 的 AW_BLEND 在 Win8+ 的 DWM 合成窗口上无效。改用所有
+// "窗口淡入淡出"工具的标准做法：临时给窗口加 WS_EX_LAYERED，用
+// SetLayeredWindowAttributes 对整个窗口（含材质背景）做整体透明度渐变，
+// 任何主题/材质/模式下都必然可见；动画结束移除分层属性恢复正常呈现。
 struct WinFade {
     BOOL     active;
     BOOL     closing;    // TRUE=渐隐（结束后销毁窗口）
@@ -3990,43 +3991,54 @@ struct WinFade {
 };
 static WinFade g_settingsFade = {};
 static WinFade g_promptFade = {};
-#define WIN_FADE_MS 160
+#define WIN_FADE_MS 180
 
 static void StartWindowFade(HWND hWnd, WinFade& f, BOOL closing) {
     f.active = TRUE;
     f.closing = closing;
     f.start = QpcNowMs();
-    SetTimer(hWnd, TIMER_WIN_FADE, 15, NULL);
+    LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
+    if (!(ex & WS_EX_LAYERED)) {
+        SetWindowLongW(hWnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hWnd, 0, closing ? 255 : 0, LWA_ALPHA);
+    }
+    SetTimer(hWnd, TIMER_WIN_FADE, 10, NULL);
 }
 
-static double WindowFadeValue(const WinFade& f) {
-    double t = (QpcNowMs() - f.start) / (double)WIN_FADE_MS;
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    double e = t * t * (3.0 - 2.0 * t);
-    return f.closing ? 1.0 - e : e;
+// 渐变结束/取消后的恢复：透明度模式恢复设定透明度，其余移除分层属性
+static void FinishWindowFade(HWND hWnd, WinFade& f) {
+    f.active = FALSE;
+    KillTimer(hWnd, TIMER_WIN_FADE);
+    if (f.closing) {
+        DestroyWindow(hWnd);   // 渐隐至全透明后销毁
+        return;
+    }
+    if (!g_supportsMaterial && g_mainOpacity < 100) {
+        SetLayeredWindowAttributes(hWnd, 0, (BYTE)(g_mainOpacity * 255 / 100), LWA_ALPHA);
+    } else {
+        LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
+        SetWindowLongW(hWnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+    }
+}
+
+static void CancelWindowFade(HWND hWnd, WinFade& f) {
+    BOOL wasClosing = f.closing;
+    f.active = FALSE;
+    KillTimer(hWnd, TIMER_WIN_FADE);
+    f.closing = FALSE;
+    FinishWindowFade(hWnd, f);
+    (void)wasClosing;
 }
 
 static void TickWindowFade(HWND hWnd, WinFade& f) {
     double t = (QpcNowMs() - f.start) / (double)WIN_FADE_MS;
-    if (t >= 1.0) {
-        f.active = FALSE;
-        KillTimer(hWnd, TIMER_WIN_FADE);
-        if (f.closing) {
-            DestroyWindow(hWnd);
-            return;
-        }
-    }
-    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-}
-
-// 将表面内容整体 alpha 缩放 m（0~255），实现渐显/渐隐呈现
-static void ScaleSurfaceAlpha(WindowPaintSurfaceLocal& surface, const RECT& rc, BYTE m) {
-    if (m >= 255 || !g_alphaPaintBits) return;
-    size_t total = (size_t)g_alphaPaintRowPixels * rc.bottom;
-    RGBQUAD* p = g_alphaPaintBits;
-    for (size_t i = 0; i < total; i++)
-        p[i].rgbReserved = (BYTE)(p[i].rgbReserved * m / 255);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    double e = t * t * (3.0 - 2.0 * t);
+    BYTE a = f.closing ? (BYTE)(255 * (1.0 - e) + 0.5) : (BYTE)(255 * e + 0.5);
+    SetLayeredWindowAttributes(hWnd, 0, a, LWA_ALPHA);
+    if (t >= 1.0) FinishWindowFade(hWnd, f);
 }
 
 static void CloseSettingsAnimated(HWND hWnd) {
@@ -4037,6 +4049,7 @@ static void CloseSettingsAnimated(HWND hWnd) {
 }
 
 static void SettingsOnClick(HWND hWnd, int x, int y) {
+    if (g_settingsClosing) return;   // 渐隐关闭中不再响应点击
     int hit = SettingsHitTest(hWnd, x, y);
     if (g_hlEditFocus && hit != S_HIT_HL_BOX) CommitHexEdit(hWnd);   // 点击其它位置时提交 HEX 编辑
     if (hit >= S_HIT_HL_HUE && hit <= S_HIT_HL_VAL) {
@@ -4105,8 +4118,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
         DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         SettingsDraw(surface.dc, hWnd);
-        if (g_settingsFade.active)
-            ScaleSurfaceAlpha(surface, rc, (BYTE)(WindowFadeValue(g_settingsFade) * 255 + 0.5));
         if (!surface.buffered)
             BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
         EndWindowPaintSurface(&surface, TRUE);
@@ -4275,13 +4286,13 @@ static void OpenSettingsTab(int tab) {
     g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
         if (g_settingsFade.active) {
-            // 淡出中途重新打开：取消渐隐
-            g_settingsFade = {};
-            KillTimer(g_settingsHwnd, TIMER_WIN_FADE);
+            // 渐隐中途重新打开：取消渐隐并恢复不透明
+            CancelWindowFade(g_settingsHwnd, g_settingsFade);
         }
         if (!IsWindowVisible(g_settingsHwnd)) {
-            ShowWindow(g_settingsHwnd, SW_SHOW);
+            // 先置为全透明，再显示并渐显
             StartWindowFade(g_settingsHwnd, g_settingsFade, FALSE);
+            ShowWindow(g_settingsHwnd, SW_SHOW);
         } else {
             if (!IsMaterialApplied(g_settingsHwnd)) ApplyWindowMaterial(g_settingsHwnd);
         }
@@ -4298,9 +4309,9 @@ static void OpenSettingsTab(int tab) {
     g_settingsHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardSettings", T(L"设置", L"Settings"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_settingsHwnd) {
-        // 显示后渐显（记事本式 fade）
-        ShowWindow(g_settingsHwnd, SW_SHOW);
+        // 先置为全透明，再显示并渐显（避免闪现一帧不透明内容）
         StartWindowFade(g_settingsHwnd, g_settingsFade, FALSE);
+        ShowWindow(g_settingsHwnd, SW_SHOW);
         SetForegroundWindow(g_settingsHwnd);
     }
 }
@@ -4393,6 +4404,7 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
 }
 
 static void PromptOnClick(HWND hWnd, int x, int y) {
+    if (g_promptClosing) return;   // 渐隐关闭中不再响应点击
     int hit = PromptHitTest(hWnd, x, y);
     switch (hit) {
     case P_HIT_CLOSE:
@@ -4451,8 +4463,6 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
         DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         PromptDraw(surface.dc, hWnd);
-        if (g_promptFade.active)
-            ScaleSurfaceAlpha(surface, rc, (BYTE)(WindowFadeValue(g_promptFade) * 255 + 0.5));
         if (!surface.buffered)
             BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
         EndWindowPaintSurface(&surface, TRUE);
@@ -4512,8 +4522,7 @@ static void OpenClosePrompt() {
     if (g_closePromptHwnd && IsWindow(g_closePromptHwnd)) {
         if (g_promptFade.active) {
             // 渐隐中途重新打开：取消渐隐并恢复不透明
-            g_promptFade = {};
-            KillTimer(g_closePromptHwnd, TIMER_WIN_FADE);
+            CancelWindowFade(g_closePromptHwnd, g_promptFade);
             RedrawWindow(g_closePromptHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
         }
         SetForegroundWindow(g_closePromptHwnd);
@@ -4530,9 +4539,9 @@ static void OpenClosePrompt() {
     g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"关闭轻键", L"Close HKeyboard"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
-        // 显示后渐显（记事本式 fade）
-        ShowWindow(g_closePromptHwnd, SW_SHOW);
+        // 先置为全透明，再显示并渐显（避免闪现一帧不透明内容）
         StartWindowFade(g_closePromptHwnd, g_promptFade, FALSE);
+        ShowWindow(g_closePromptHwnd, SW_SHOW);
         SetForegroundWindow(g_closePromptHwnd);
     }
 }

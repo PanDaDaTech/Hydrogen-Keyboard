@@ -59,7 +59,6 @@ int g_keyHeight = 46;
 #define TIMER_REPEAT    8826
 #define TIMER_WINDOW_ANIM 8828
 #define TIMER_SETTINGS_ANIM 8827
-#define TIMER_TAB_ANIM 8830
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
@@ -3978,79 +3977,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 }
 
 static void CloseSettingsAnimated(HWND hWnd) {
+    // 关闭走 DWM 原生窗口动画：直接销毁窗口，由 DWM 合成标准关闭过渡
     if (!hWnd || !IsWindow(hWnd) || g_settingsClosing) return;
     g_settingsClosing = TRUE;
-    RECT rc = {0};
-    GetWindowRect(hWnd, &rc);
-    StartWindowMotion(&g_settingsMotion, hWnd, rc.left, rc.top, rc.top + (int)(32 * GetSystemDpiScale()), 170, MOTION_DESTROY);
-}
-
-// ========== Tab 切换动画（类 WinUI3：新页自下方 24px 上滑入场） ==========
-// 动画帧走与静止帧完全相同的正常整页绘制管线（材质底/色调/内容同源，
-// 材质与颜色天然正确），绘制完成后把内容区逐行下移 dy 制造滑入效果，
-// 顶部空隙以背景色（材质模式为半透明色调层）填充。不引入任何缓存旁路。
-static BOOL     g_tabAnim = FALSE;
-static LONGLONG g_tabAnimStart = 0;
-static int      g_tabContentTop = 0;
-#define TAB_ANIM_DURATION_MS 200
-
-static void ReleaseTabAnimCaches() {
-    g_tabAnim = FALSE;
-}
-
-// 设置页内容区上滑空隙行的背景色调 alpha（与 DrawWindowMaterialTint 非主窗口分支一致）
-static BYTE SettingsTintAlpha() {
-    BOOL dark = g_theme->bg == g_darkTheme.bg;
-    if (g_materialMode == 1) return dark ? 104 : 132;
-    return dark ? 76 : 104;
-}
-
-// 动画帧：按正常管线整页绘制（与静止帧同源），绘制完成后把内容区整体
-// 下移 dy 制造“自下方滑入”效果；标题/Tab 栏保持静止，顶部空隙行以
-// 背景色（材质模式为半透明色调层）填充。
-static void SettingsTabAnimPaint(HDC dc, HWND hWnd, const RECT& rc) {
-    double t = (double)(QpcNowMs() - g_tabAnimStart) / TAB_ANIM_DURATION_MS;
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    double eased = t * t * (3.0 - 2.0 * t);
-    SettingsMetrics m = GetSettingsMetrics(hWnd);
-    int dy = (int)((1.0 - eased) * 24 * m.dpi + 0.5);
-
-    WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
-    ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
-    DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
-    SettingsDraw(surface.dc, hWnd);
-
-    if (g_alphaPaintBits && dy > 0) {
-        int w = rc.right, h = rc.bottom;
-        int row = g_alphaPaintRowPixels;
-        int top = g_tabContentTop;
-        if (top < 0) top = 0;
-        if (top > h) top = h;
-        if (dy > h - top) dy = h - top;
-        // 内容区自底向上逐行下移（避免覆盖未搬运的行）
-        for (int y = h - 1; y >= top + dy; y--)
-            memcpy(g_alphaPaintBits + (size_t)y * row,
-                   g_alphaPaintBits + (size_t)(y - dy) * row, (size_t)w * sizeof(RGBQUAD));
-        // 顶部空隙行：背景色（材质模式为半透明色调层，与正常绘制的底色一致）
-        if (IsMaterialApplied(hWnd))
-            DrawAlphaSurface(surface.dc, 0, top, w, dy, C_BG, SettingsTintAlpha());
-        else
-            Fill(surface.dc, 0, top, w, dy, C_BG);
-    }
-    if (!surface.buffered)
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
-    EndWindowPaintSurface(&surface, TRUE);
-}
-
-// Tab 切换时启动动画（每帧走正常绘制管线，无需预缓存页面内容）
-static void StartTabSwitchAnimation(HWND hWnd) {
-    if (!hWnd || !IsWindow(hWnd) || g_settingsMoving) return;
-    SettingsMetrics m = GetSettingsMetrics(hWnd);
-    g_tabContentTop = m.contentY;
-    g_tabAnimStart = QpcNowMs();
-    g_tabAnim = TRUE;
-    SetTimer(hWnd, TIMER_TAB_ANIM, 15, NULL);
+    DestroyWindow(hWnd);
 }
 
 static void SettingsOnClick(HWND hWnd, int x, int y) {
@@ -4064,10 +3994,8 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     }
     if (hit == S_HIT_CLOSE) { SendMessageW(hWnd, WM_CLOSE, 0, 0); return; }
     if (hit == S_HIT_TABL || (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2)) {
-        int newTab = (hit == S_HIT_TABL) ? 3 : (hit - S_HIT_TAB0);
-        BOOL tabChanged = (newTab != g_sTab);
-        if (tabChanged) StartTabSwitchAnimation(hWnd);
-        g_sTab = newTab;
+        // Tab 即时切换（不做逐帧过渡，避免材质/配色异常）
+        g_sTab = (hit == S_HIT_TABL) ? 3 : (hit - S_HIT_TAB0);
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
@@ -4111,17 +4039,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
-        if (g_tabAnim) {
-            SettingsTabAnimPaint(dc, hWnd, rc);
-        } else {
-            WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
-            ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
-            DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
-            SettingsDraw(surface.dc, hWnd);
-            if (!surface.buffered)
-                BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
-            EndWindowPaintSurface(&surface, TRUE);
-        }
+        WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+        ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
+        SettingsDraw(surface.dc, hWnd);
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface, TRUE);
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -4201,15 +4125,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
             TickWindowMotion(&g_settingsMotion, hWnd);
             return 0;
         }
-        if (w == TIMER_TAB_ANIM) {
-            if (!g_tabAnim || g_settingsMoving ||
-                QpcNowMs() - g_tabAnimStart >= TAB_ANIM_DURATION_MS) {
-                KillTimer(hWnd, TIMER_TAB_ANIM);
-                g_tabAnim = FALSE;
-            }
-            RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-            return 0;
-        }
         if (w == TIMER_SETTINGS_ANIM) {
             int hit = g_switchAnimHit;
             if (hit == S_HIT_NONE || g_settingsMoving ||
@@ -4268,8 +4183,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_DESTROY:
         StopWindowMotion(&g_settingsMotion);
         KillTimer(hWnd, TIMER_SETTINGS_ANIM);
-        KillTimer(hWnd, TIMER_TAB_ANIM);
-        ReleaseTabAnimCaches();
         g_settingsHwnd = NULL;
         g_settingsClosing = FALSE;
         g_settingsMoving = FALSE;
@@ -4335,11 +4248,10 @@ static BOOL g_pTracking = FALSE;
 static BOOL g_promptClosing = FALSE;
 
 static void ClosePromptAnimated(HWND hWnd) {
+    // 关闭走 DWM 原生窗口动画：直接销毁窗口，由 DWM 合成标准关闭过渡
     if (!hWnd || !IsWindow(hWnd) || g_promptClosing) return;
     g_promptClosing = TRUE;
-    RECT rc = {0};
-    GetWindowRect(hWnd, &rc);
-    StartWindowMotion(&g_promptMotion, hWnd, rc.left, rc.top, rc.top + (int)(24 * GetSystemDpiScale()), 150, MOTION_DESTROY);
+    DestroyWindow(hWnd);
 }
 
 static void PromptDraw(HDC dc, HWND hWnd) {

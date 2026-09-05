@@ -59,6 +59,7 @@ int g_keyHeight = 46;
 #define TIMER_REPEAT    8826
 #define TIMER_WINDOW_ANIM 8828
 #define TIMER_SETTINGS_ANIM 8827
+#define TIMER_TAB_ANIM 8830
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
@@ -78,6 +79,10 @@ int g_keyHeight = 46;
 #define ID_MENU_ABOUT  10008
 #define ID_MENU_EXIT   10009
 #define ID_MENU_SETTINGS 10010
+
+// 布局 Tab 命中码（S_HIT_TAB0=常规 TAB1=主题 TAB2=关于，视觉顺序：常规/布局/主题/关于）
+#define S_HIT_TABL 5
+#define S_HIT_AUTOHIDE 110   // 注意：97~102 已被透明度下拉占用
 
 // ========== Theme System ==========
 struct ThemeColors {
@@ -342,6 +347,7 @@ BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示�
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
+BOOL        g_afAutoHide = TRUE;       // 自动呼出开启时，离开输入状态自动收起键盘（ini: General/AutoHideOnBlur）
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘 2=常用
@@ -2221,6 +2227,110 @@ static int HitKey(int x, int y) {
     return -1;
 }
 
+// ========== 主窗口帧缓存（首帧预热 + 动画/重绘零开销呈现） ==========
+// 每次重绘都全量 GDI+ 绘制（几十个圆角矩形 + 文字 alpha 混合）是启动动画
+// 卡顿与材质首帧黑屏的根源：首帧绘制发生在窗口可见之后，DWM 先合成出
+// 一帧空/黑内容，且首帧绘制耗时直接表现为“顿一下”。
+// 引入 32bpp 顶向下 DIB 帧缓存：绘制状态签名未变时直接 memcpy/BitBlt
+// 呈现；窗口显示前即可预热渲染完成，首帧与动画期间无可见绘制开销。
+static HBITMAP   g_kbCacheBmp = 0;
+static HDC       g_kbCacheDc = 0;
+static RGBQUAD*  g_kbCacheBits = 0;
+static int       g_kbCacheRow = 0;
+static int       g_kbCacheW = 0, g_kbCacheH = 0;
+
+struct KbFrameSig {
+    int w, h, hk, pk, hdrHov, layoutMode, nk;
+    DWORD themeBg;
+    float dpi;
+    BOOL sh, ct, al, cp, winKey, physShift, physWin, fnLayer, showFKeys,
+         fnWebLayout, shiftSymbols, lang, material;
+    BOOL operator!=(const KbFrameSig& o) const { return memcmp(this, &o, sizeof(*this)) != 0; }
+};
+static KbFrameSig g_kbSig = {};
+
+static void RenderKbFrameInto(HDC refDc, int w, int h) {
+    BOOL material = IsMaterialApplied(g_hWnd) != FALSE;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP bmp = CreateDIBSection(refDc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bmp || !bits) { if (bmp) DeleteObject(bmp); return; }
+    HDC mem = CreateCompatibleDC(refDc);
+    if (!mem) { DeleteObject(bmp); return; }
+    HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
+
+    // 将 DrawMaterialText 的 alpha 合成目标指向缓存 DIB（与画布路径一致）
+    BOOL prevAlpha = g_alphaPaintActive;
+    BOOL prevBuffered = g_bufferedPaintActive;
+    RGBQUAD* prevBits = g_alphaPaintBits;
+    int prevRow = g_alphaPaintRowPixels;
+    RECT prevRect = g_alphaPaintRect;
+    g_alphaPaintActive = TRUE;
+    g_bufferedPaintActive = material;   // 材质模式跳过不透明底填充，保留 alpha 供 DWM 合成
+    g_alphaPaintBits = (RGBQUAD*)bits;
+    g_alphaPaintRowPixels = w;
+    RECT rc = {0, 0, w, h};
+    g_alphaPaintRect = rc;
+
+    if (!material) Fill(mem, 0, 0, w, h, C_BG);
+    DrawWindowMaterialTint(mem, g_hWnd, w, h);
+    DrawHeader(mem);
+    DrawKeys(mem);
+
+    g_alphaPaintActive = prevAlpha;
+    g_bufferedPaintActive = prevBuffered;
+    g_alphaPaintBits = prevBits;
+    g_alphaPaintRowPixels = prevRow;
+    g_alphaPaintRect = prevRect;
+
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    if (g_kbCacheBmp) DeleteObject(g_kbCacheBmp);
+    if (g_kbCacheDc) DeleteDC(g_kbCacheDc);
+    g_kbCacheBmp = bmp;
+    g_kbCacheDc = CreateCompatibleDC(refDc);
+    if (g_kbCacheDc) SelectObject(g_kbCacheDc, bmp);
+    g_kbCacheBits = (RGBQUAD*)bits;
+    g_kbCacheRow = w;
+    g_kbCacheW = w;
+    g_kbCacheH = h;
+}
+
+static void EnsureKbFrameCache(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd) || g_ww <= 0 || g_wh <= 0) return;
+    KbFrameSig sig;
+    sig.w = g_ww; sig.h = g_wh;
+    sig.hk = g_hk; sig.pk = g_pk; sig.hdrHov = g_hdrHov;
+    sig.layoutMode = g_layoutMode; sig.nk = g_nk;
+    sig.themeBg = g_themeBuf.bg;
+    sig.dpi = (float)GetSystemDpiScale();
+    sig.sh = g_sh; sig.ct = g_ct; sig.al = g_al; sig.cp = g_cp;
+    sig.winKey = g_winKey; sig.physShift = g_physShift; sig.physWin = g_physWin;
+    sig.fnLayer = g_fnLayer; sig.showFKeys = g_showFKeys; sig.fnWebLayout = g_fnWebLayout;
+    sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
+    sig.material = IsMaterialApplied(hWnd);
+    if (g_kbCacheBmp && g_kbCacheW == g_ww && g_kbCacheH == g_wh && !(sig != g_kbSig)) return;
+
+    HDC dc = GetDC(hWnd);
+    RenderKbFrameInto(dc, g_ww, g_wh);
+    ReleaseDC(hWnd, dc);
+    g_kbSig = sig;
+}
+
+static void ReleaseKbFrameCache() {
+    if (g_kbCacheBmp) { DeleteObject(g_kbCacheBmp); g_kbCacheBmp = 0; }
+    if (g_kbCacheDc) { DeleteDC(g_kbCacheDc); g_kbCacheDc = 0; }
+    g_kbCacheBits = 0;
+    g_kbCacheRow = g_kbCacheW = g_kbCacheH = 0;
+}
+
 static void StopWindowMotion(WindowMotion* motion) {
     if (!motion || !motion->active) return;
     if (motion->hWnd && IsWindow(motion->hWnd))
@@ -2246,6 +2356,9 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
 
     // 未显示过才应用材质；WM_CREATE 已应用时跳过，避免启动动画首帧重复切换背景卡顿
     if (!IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
+    // 显示前先在隐藏状态下同步完成首帧绘制：DWM 首次合成时窗口内容已就绪，
+    // 消除材质模式“黑一帧”与首帧全量绘制造成的可见顿挫
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(hWnd, NULL, NULL,
@@ -2726,13 +2839,17 @@ static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* tit
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
-    // 常规 Tab 行序：0=自动呼出 1=关闭按钮 2=记住我的选择 3=键盘布局 4=功能键行 5=Fn网页布局 6=Shift符号 7=界面语言
+    // 常规 Tab 行序（自动收起行仅在自动呼出开启时存在）：
+    //   g_af 开：0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
+    //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=界面语言
+    // 布局 Tab 行序：0=键盘布局 1=Fn 网页布局
     int rowIndex;
     if (hit == S_HIT_AUTO) rowIndex = 0;
-    else if (hit == S_HIT_REMEMBER) rowIndex = 2;
-    else if (hit == S_HIT_FKEYS) rowIndex = 4;
-    else if (hit == S_HIT_FNWEB) rowIndex = 5;
-    else rowIndex = 6;
+    else if (hit == S_HIT_AUTOHIDE) rowIndex = 1;
+    else if (hit == S_HIT_FNWEB) rowIndex = 1;   // 布局 Tab 第 1 行
+    else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
+    else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
+    else rowIndex = g_af ? 5 : 4;
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(105 * m.dpi);
     return row;
@@ -3013,20 +3130,38 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     int tabX = m.margin;
     SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"常规", L"General"), g_sTab == 0, g_sHov == S_HIT_TAB0);
     tabX += m.tabW + m.tabGap;
+    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"布局", L"Layout"), g_sTab == 3, g_sHov == S_HIT_TABL);
+    tabX += m.tabW + m.tabGap;
     SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"主题", L"Theme"), g_sTab == 1, g_sHov == S_HIT_TAB1);
     tabX += m.tabW + m.tabGap;
     SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"关于", L"About"), g_sTab == 2, g_sHov == S_HIT_TAB2);
     Fill(dc, m.margin, m.tabsY + m.tabH + 8, m.contentW, 1, C_KEY_BORDER);
 
     if (g_sTab == 0) {
-        RECT r = SettingsRowRect(m, 0);
-        DrawSettingRow(dc, r, 0, T(L"自动呼出", L"Auto Pop-up"),
-                       T(L"点击输入框时自动弹出键盘", L"Show the keyboard when an input gets focus"), g_sHov == S_HIT_AUTO);
-        DrawSettingSwitch(dc, m, r, g_af, S_HIT_AUTO);
+        // 行序（自动收起行仅在自动呼出开启时存在，隐藏时后续行上移一行）：
+        //   0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
+        int closeRow = g_af ? 2 : 1;
+
+        // 分组面板：自动呼出 + 自动收起（参考“关闭按钮”分组样式）
+        RECT r0 = SettingsRowRect(m, 0);
+        RECT rAutoHide = SettingsRowRect(m, 1);
+        DrawRoundRect(dc, r0.left, r0.top, r0.right - r0.left, rAutoHide.bottom - r0.top,
+                      C_KEY, C_KEY_BORDER, 8);
+        Fill(dc, r0.left + 1, rAutoHide.top - m.rowGap / 2 - 1, r0.right - r0.left - 2, 1, C_KEY_BORDER);
+        DrawSettingRowContent(dc, r0, 0, T(L"自动呼出", L"Auto Pop-up"),
+                              T(L"点击输入框时自动弹出键盘", L"Show the keyboard when an input gets focus"),
+                              g_sHov == S_HIT_AUTO);
+        DrawSettingSwitch(dc, m, r0, g_af, S_HIT_AUTO);
+        if (g_af) {
+            DrawSettingRowContent(dc, rAutoHide, -1, T(L"自动收起", L"Auto Hide"),
+                                  T(L"离开输入框后自动最小化键盘", L"Minimize the keyboard after leaving the input"),
+                                  g_sHov == S_HIT_AUTOHIDE);
+            DrawSettingSwitch(dc, m, rAutoHide, g_afAutoHide, S_HIT_AUTOHIDE);
+        }
 
         // 分组面板：关闭按钮 + 记住我的选择（子项无图标，参考分组设置样式）
-        RECT r1 = SettingsRowRect(m, 1);
-        RECT r2 = SettingsRowRect(m, 2);
+        RECT r1 = SettingsRowRect(m, closeRow);
+        RECT r2 = SettingsRowRect(m, closeRow + 1);
         DrawRoundRect(dc, r1.left, r1.top, r1.right - r1.left, r2.bottom - r1.top,
                       C_KEY, C_KEY_BORDER, 8);
         // 分隔线（横跨面板）
@@ -3041,34 +3176,35 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
-        r = SettingsRowRect(m, 3);
-        DrawSettingRow(dc, r, 2, T(L"键盘布局", L"Keyboard Layout"),
-                       T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
-                  g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
-
-        r = SettingsRowRect(m, 4);
+        RECT r = SettingsRowRect(m, closeRow + 2);
         DrawSettingRow(dc, r, 3, T(L"功能键行", L"Function Key Row"),
                        T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"), g_sHov == S_HIT_FKEYS);
         DrawSettingSwitch(dc, m, r, g_showFKeys, S_HIT_FKEYS);
 
-        r = SettingsRowRect(m, 5);
-        DrawSettingRow(dc, r, 2, T(L"Fn 网页布局", L"Fn Web Layout"),
-                       T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"), g_sHov == S_HIT_FNWEB);
-        DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
-
-        r = SettingsRowRect(m, 6);
+        r = SettingsRowRect(m, closeRow + 3);
         DrawSettingRow(dc, r, 4, T(L"Shift 符号", L"Shift Symbols"),
                        T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"), g_sHov == S_HIT_SHIFTSYM);
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
 
-        r = SettingsRowRect(m, 7);
+        r = SettingsRowRect(m, closeRow + 4);
         DrawSettingRow(dc, r, 6, T(L"界面语言", L"Language"),
                        T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"), FALSE);
         DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
                   g_lang ? g_langNamesEn[g_lang] : g_langNames[g_lang],
                   g_dropLang, g_sHov == S_HIT_LANG_DROP);
+    } else if (g_sTab == 3) {
+        // 布局 Tab：键盘布局 + Fn 网页布局
+        RECT r = SettingsRowRect(m, 0);
+        DrawSettingRow(dc, r, 2, T(L"键盘布局", L"Keyboard Layout"),
+                       T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"), g_sHov == S_HIT_LAYOUT_DROP);
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
+                  g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
+
+        r = SettingsRowRect(m, 1);
+        DrawSettingRow(dc, r, 6, T(L"Fn 网页布局", L"Fn Web Layout"),
+                       T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"), g_sHov == S_HIT_FNWEB);
+        DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
     } else if (g_sTab == 1) {
         RECT r = SettingsRowRect(m, 0);
         DrawSettingRow(dc, r, 7, T(L"主题模式", L"Theme Mode"),
@@ -3194,27 +3330,31 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     if (g_sTab == 0) {
         RECT r;
         if (g_dropClose) {
-            r = SettingsRowRect(m, 1);
+            int closeRow = g_af ? 2 : 1;
+            r = SettingsRowRect(m, closeRow);
             const wchar_t* names[2] = {T(L"直接退出程序", L"Exit program"), T(L"隐藏到系统托盘", L"Hide to tray")};
             int cy = SettingsComboY(m, r);
             DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
                           m.comboW, m.comboH, names, 2, g_closeToTray ? 1 : 0, g_dropCloseHov);
         }
-        if (g_dropLayout) {
-            r = SettingsRowRect(m, 3);
-            const wchar_t* names[3];
-            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
-                          m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
-        }
         if (g_dropLang) {
-            r = SettingsRowRect(m, 7);
+            int langRow = g_af ? 6 : 5;
+            r = SettingsRowRect(m, langRow);
             const wchar_t* names[2];
             for (int i = 0; i < 2; i++) names[i] = g_lang ? g_langNamesEn[i] : g_langNames[i];
             int cy = SettingsComboY(m, r);
             DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
                           m.comboW, m.comboH, names, 2, g_lang, g_dropLangHov);
+        }
+    } else if (g_sTab == 3) {
+        RECT r;
+        if (g_dropLayout) {
+            r = SettingsRowRect(m, 0);
+            const wchar_t* names[3];
+            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
+            int cy = SettingsComboY(m, r);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
+                          m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
         }
     } else if (g_sTab == 1) {
         RECT r;
@@ -3259,16 +3399,18 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     if (x >= m.closeX && x < m.closeX + m.closeW && y >= m.closeY && y < m.closeY + m.closeH) return S_HIT_CLOSE;
 
     int tabX = m.margin;
-    for (int i = 0; i < 3; i++) {
-        if (x >= tabX && x < tabX + m.tabW && y >= m.tabsY && y < m.tabsY + m.tabH) return S_HIT_TAB0 + i;
+    const int tabHits[4] = {S_HIT_TAB0, S_HIT_TABL, S_HIT_TAB1, S_HIT_TAB2};   // 视觉顺序：常规/布局/主题/关于
+    for (int i = 0; i < 4; i++) {
+        if (x >= tabX && x < tabX + m.tabW && y >= m.tabsY && y < m.tabsY + m.tabH) return tabHits[i];
         tabX += m.tabW + m.tabGap;
     }
 
     if (g_sTab == 0) {
         RECT r;
+        int closeRow = g_af ? 2 : 1;   // 自动收起行仅在自动呼出开启时存在
         // 下拉列表优先命中，避免列表翻到上方或覆盖相邻卡片时被底层项目抢先处理。
         if (g_dropClose) {
-            r = SettingsRowRect(m, 1);
+            r = SettingsRowRect(m, closeRow);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
             for (int i = 0; i < 2; i++) {
@@ -3276,17 +3418,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 ly += m.comboH;
             }
         }
-        if (g_dropLayout) {
-            r = SettingsRowRect(m, 3);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
-            for (int i = 0; i < 3; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
         if (g_dropLang) {
-            r = SettingsRowRect(m, 7);
+            r = SettingsRowRect(m, closeRow + 4);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
             for (int i = 0; i < 2; i++) {
@@ -3297,50 +3430,45 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
         r = SettingsRowRect(m, 0);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTO;
-
-        r = SettingsRowRect(m, 1);
-        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-        if (g_dropClose) {
-            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
-            for (int i = 0; i < 2; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_CLOSE_OPT0 + i;
-                ly += m.comboH;
-            }
+        if (g_af) {
+            r = SettingsRowRect(m, 1);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTOHIDE;
         }
+
+        r = SettingsRowRect(m, closeRow);
+        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
         // 整行命中：悬停高亮分组主行，点击任意处展开下拉
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_CLOSE_DROP;
 
-        r = SettingsRowRect(m, 2);
+        r = SettingsRowRect(m, closeRow + 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_REMEMBER;
 
-        r = SettingsRowRect(m, 3);
+        r = SettingsRowRect(m, closeRow + 2);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
+        r = SettingsRowRect(m, closeRow + 3);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
+
+        r = SettingsRowRect(m, closeRow + 4);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
+    } else if (g_sTab == 3) {
+        RECT r;
+        // 下拉列表优先命中
         if (g_dropLayout) {
+            r = SettingsRowRect(m, 0);
+            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
             for (int i = 0; i < 3; i++) {
                 if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
                 ly += m.comboH;
             }
         }
+        r = SettingsRowRect(m, 0);
+        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LAYOUT_DROP;
 
-        r = SettingsRowRect(m, 4);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
-        r = SettingsRowRect(m, 5);
+        r = SettingsRowRect(m, 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
-        r = SettingsRowRect(m, 6);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
-
-        r = SettingsRowRect(m, 7);
-        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
-        if (g_dropLang) {
-            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
-            for (int i = 0; i < 2; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LANG_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
     } else if (g_sTab == 1) {
         RECT r;
         struct DropHit { BOOL open; int row; int count; int firstHit; } drops[3] = {
@@ -3509,6 +3637,7 @@ static void EnsureConfigFile() {
     IniSetInt(L"General", L"HighlightMode", 0);
     IniSetInt(L"General", L"HighlightColor", 0xD47800);
     IniSetInt(L"General", L"AutoPopup", 1);
+    IniSetInt(L"General", L"AutoHideOnBlur", 1);
 }
 
 // 读取上次的窗口大小 / 主题 / 关闭行为
@@ -3538,6 +3667,7 @@ static void LoadConfig() {
     if (g_hlMode < 0 || g_hlMode > 1) g_hlMode = 0;
     g_hlColor = IniGetInt(L"General", L"HighlightColor", 0xD47800);
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
+    g_afAutoHide = (IniGetInt(L"General", L"AutoHideOnBlur", 1) != 0);
 }
 
 // 持久化“× 关闭行为”选择
@@ -3643,6 +3773,12 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         g_af = !g_af;
         IniSetInt(L"General", L"AutoPopup", g_af ? 1 : 0);
         if (g_af) UpdateAutoVisibility();
+        break;
+    case S_HIT_AUTOHIDE:
+        BeginSwitchAnimation(hWnd, hit, g_afAutoHide, !g_afAutoHide);
+        g_afAutoHide = !g_afAutoHide;
+        IniSetInt(L"General", L"AutoHideOnBlur", g_afAutoHide ? 1 : 0);
+        if (g_afAutoHide) UpdateAutoVisibility();
         break;
     case S_HIT_CLOSE_DROP:
         g_dropClose = !g_dropClose;
@@ -3825,6 +3961,175 @@ static void CloseSettingsAnimated(HWND hWnd) {
     StartWindowMotion(&g_settingsMotion, hWnd, rc.left, rc.top, rc.top + (int)(32 * GetSystemDpiScale()), 170, MOTION_DESTROY);
 }
 
+// ========== Tab 切换动画（类 WinUI3：旧页淡出，新页上滑淡入） ==========
+// 内容页整页缓存为 32bpp DIB，动画期间逐帧仅做“逐像素 alpha 混合”，
+// 无任何 GDI+ 矢量重绘，避免逐帧全量绘制造成的掉帧。
+struct SettingsPageCache {
+    HBITMAP  bmp;
+    HDC      dc;
+    RGBQUAD* bits;
+    int      row;
+    int      w, h;
+};
+static SettingsPageCache g_tabFrom = {};
+static SettingsPageCache g_tabTo = {};
+static BOOL     g_tabAnim = FALSE;
+static LONGLONG g_tabAnimStart = 0;
+static int      g_tabContentTop = 0;
+#define TAB_ANIM_DURATION_MS 240
+
+static void ReleasePageCache(SettingsPageCache& c) {
+    if (c.bmp) { DeleteObject(c.bmp); c.bmp = 0; }
+    if (c.dc) { DeleteDC(c.dc); c.dc = 0; }
+    c.bits = 0;
+    c.row = c.w = c.h = 0;
+}
+
+static void ReleaseTabAnimCaches() {
+    ReleasePageCache(g_tabFrom);
+    ReleasePageCache(g_tabTo);
+    g_tabAnim = FALSE;
+}
+
+// 将当前设置页完整渲染进缓存 DIB（材质模式的透明底/色调层一并烘焙）
+static void RenderPageCache(SettingsPageCache& c, HWND hWnd) {
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    if (m.W <= 0 || m.H <= 0) return;
+    if (!c.bmp || c.w != m.W || c.h != m.H) {
+        ReleasePageCache(c);
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = m.W;
+        bmi.bmiHeader.biHeight = -m.H;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        c.bmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (!c.bmp) return;
+        c.dc = CreateCompatibleDC(NULL);
+        if (!c.dc) { ReleasePageCache(c); return; }
+        SelectObject(c.dc, c.bmp);
+        c.bits = (RGBQUAD*)bits;
+        c.row = m.W;
+        c.w = m.W;
+        c.h = m.H;
+    }
+
+    BOOL material = IsMaterialApplied(hWnd) != FALSE;
+    BOOL prevAlpha = g_alphaPaintActive;
+    BOOL prevBuffered = g_bufferedPaintActive;
+    RGBQUAD* prevBits = g_alphaPaintBits;
+    int prevRow = g_alphaPaintRowPixels;
+    RECT prevRect = g_alphaPaintRect;
+    g_alphaPaintActive = TRUE;
+    g_bufferedPaintActive = material;
+    g_alphaPaintBits = c.bits;
+    g_alphaPaintRowPixels = c.row;
+    RECT rc = {0, 0, m.W, m.H};
+    g_alphaPaintRect = rc;
+
+    int prevHov = g_sHov;
+    g_sHov = -1;   // 缓存中不烘焙悬停态
+    if (!material) Fill(c.dc, 0, 0, m.W, m.H, C_BG);
+    DrawWindowMaterialTint(c.dc, hWnd, m.W, m.H);
+    SettingsDraw(c.dc, hWnd);
+    g_sHov = prevHov;
+
+    g_alphaPaintActive = prevAlpha;
+    g_bufferedPaintActive = prevBuffered;
+    g_alphaPaintBits = prevBits;
+    g_alphaPaintRowPixels = prevRow;
+    g_alphaPaintRect = prevRect;
+}
+
+// 动画帧：从两份页缓存逐像素合成（旧页淡出 + 新页上滑淡入）
+static void SettingsTabAnimPaint(HDC dc, HWND hWnd, const RECT& rc) {
+    double t = (double)(QpcNowMs() - g_tabAnimStart) / TAB_ANIM_DURATION_MS;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    double eased = t * t * (3.0 - 2.0 * t);
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    int slide = (int)((1.0 - eased) * 22 * m.dpi + 0.5);
+    int fade = (int)(eased * 255.0 + 0.5);
+    int back = 255 - fade;
+
+    WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+    if (g_alphaPaintBits && g_tabFrom.bits && g_tabTo.bits &&
+        g_tabFrom.w >= rc.right && g_tabTo.w >= rc.right &&
+        g_tabFrom.h >= rc.bottom && g_tabTo.h >= rc.bottom) {
+        int w = rc.right, h = rc.bottom;
+        int row = g_alphaPaintRowPixels;
+        int top = g_tabContentTop;
+        if (top < 0) top = 0;
+        if (top > h) top = h;
+        BOOL material = IsMaterialApplied(hWnd) != FALSE;
+        DWORD bgC = C_BG;
+        int bgR = GetRValue(bgC), bgG = GetGValue(bgC), bgB = GetBValue(bgC);
+
+        // 内容区：底层旧页（透明度随进度衰减），上层新页（下移 slide 像素，随进度上滑归位）
+        for (int y = top; y < h; y++) {
+            RGBQUAD* dst = g_alphaPaintBits + (size_t)y * row;
+            const RGBQUAD* srcF = g_tabFrom.bits + (size_t)y * g_tabFrom.row;
+            const RGBQUAD* srcT = (y - slide >= top)
+                ? g_tabTo.bits + (size_t)(y - slide) * g_tabTo.row : NULL;
+            for (int x = 0; x < w; x++) {
+                int a1 = (material ? srcF[x].rgbReserved : 255) * back / 255;
+                int r, g, b, a;
+                if (material) {
+                    r = srcF[x].rgbRed * a1;
+                    g = srcF[x].rgbGreen * a1;
+                    b = srcF[x].rgbBlue * a1;
+                    a = a1;
+                } else {
+                    r = (srcF[x].rgbRed * a1 + bgR * (255 - a1)) / 255;
+                    g = (srcF[x].rgbGreen * a1 + bgG * (255 - a1)) / 255;
+                    b = (srcF[x].rgbBlue * a1 + bgB * (255 - a1)) / 255;
+                    a = 255;
+                }
+                if (srcT) {
+                    int a2 = (material ? srcT[x].rgbReserved : 255) * fade / 255;
+                    if (a2 > 0) {
+                        r = (srcT[x].rgbRed * a2 + r * (255 - a2)) / 255;
+                        g = (srcT[x].rgbGreen * a2 + g * (255 - a2)) / 255;
+                        b = (srcT[x].rgbBlue * a2 + b * (255 - a2)) / 255;
+                        a = a2 + a * (255 - a2) / 255;
+                    }
+                }
+                dst[x].rgbRed = (BYTE)r;
+                dst[x].rgbGreen = (BYTE)g;
+                dst[x].rgbBlue = (BYTE)b;
+                dst[x].rgbReserved = (BYTE)a;
+            }
+        }
+        // 内容区之上（标题/Tab 栏静止）：直接复制新页缓存
+        for (int y = 0; y < top; y++)
+            memcpy(g_alphaPaintBits + (size_t)y * row, g_tabTo.bits + (size_t)y * g_tabTo.row,
+                   (size_t)w * sizeof(RGBQUAD));
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+    } else {
+        // 缓存缺失：回退普通整页绘制
+        ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
+        SettingsDraw(surface.dc, hWnd);
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+    }
+    EndWindowPaintSurface(&surface, TRUE);
+}
+
+// Tab 切换时启动动画：先缓存旧页，调用方切换 g_sTab 后缓存新页
+static void StartTabSwitchAnimation(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd) || g_settingsMoving) return;
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    g_tabContentTop = m.contentY;
+    RenderPageCache(g_tabFrom, hWnd);   // 旧页（g_sTab 尚未切换）
+    g_tabAnimStart = QpcNowMs();
+    g_tabAnim = TRUE;
+    SetTimer(hWnd, TIMER_TAB_ANIM, 15, NULL);
+}
+
 static void SettingsOnClick(HWND hWnd, int x, int y) {
     int hit = SettingsHitTest(hWnd, x, y);
     if (g_hlEditFocus && hit != S_HIT_HL_BOX) CommitHexEdit(hWnd);   // 点击其它位置时提交 HEX 编辑
@@ -3835,8 +4140,11 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         return;
     }
     if (hit == S_HIT_CLOSE) { SendMessageW(hWnd, WM_CLOSE, 0, 0); return; }
-    if (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2) {
-        g_sTab = hit - S_HIT_TAB0;
+    if (hit == S_HIT_TABL || (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2)) {
+        int newTab = (hit == S_HIT_TABL) ? 3 : (hit - S_HIT_TAB0);
+        BOOL tabChanged = (newTab != g_sTab);
+        if (tabChanged) StartTabSwitchAnimation(hWnd);   // 缓存旧页（切换前）
+        g_sTab = newTab;
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
@@ -3844,6 +4152,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
+        if (tabChanged && g_tabAnim) RenderPageCache(g_tabTo, hWnd);   // 缓存新页
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }
@@ -3879,13 +4188,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
-        WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
-        ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
-        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
-        SettingsDraw(surface.dc, hWnd);
-        if (!surface.buffered)
-            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
-        EndWindowPaintSurface(&surface, TRUE);
+        if (g_tabAnim) {
+            SettingsTabAnimPaint(dc, hWnd, rc);
+        } else {
+            WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+            ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+            DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
+            SettingsDraw(surface.dc, hWnd);
+            if (!surface.buffered)
+                BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+            EndWindowPaintSurface(&surface, TRUE);
+        }
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -3965,6 +4278,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
             TickWindowMotion(&g_settingsMotion, hWnd);
             return 0;
         }
+        if (w == TIMER_TAB_ANIM) {
+            if (!g_tabAnim || g_settingsMoving ||
+                QpcNowMs() - g_tabAnimStart >= TAB_ANIM_DURATION_MS) {
+                KillTimer(hWnd, TIMER_TAB_ANIM);
+                g_tabAnim = FALSE;
+            }
+            RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+            return 0;
+        }
         if (w == TIMER_SETTINGS_ANIM) {
             int hit = g_switchAnimHit;
             if (hit == S_HIT_NONE || g_settingsMoving ||
@@ -4023,6 +4345,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_DESTROY:
         StopWindowMotion(&g_settingsMotion);
         KillTimer(hWnd, TIMER_SETTINGS_ANIM);
+        KillTimer(hWnd, TIMER_TAB_ANIM);
+        ReleaseTabAnimCaches();
         g_settingsHwnd = NULL;
         g_settingsClosing = FALSE;
         g_settingsMoving = FALSE;
@@ -4556,6 +4880,7 @@ static void UpdateAutoVisibility() {
         return;
     }
     if (g_manualHide) return;
+    if (!g_afAutoHide) return;   // 关闭“自动收起”后，键盘保持显示直到手动关闭
     if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) return;
     if (g_manualShow) return;
 
@@ -4693,7 +5018,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         SetWindowLong(hWnd, GWL_EXSTYLE, GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
         ApplyRoundedWindow(hWnd, 10);
         ApplyWindowMaterial(hWnd);
-
+        EnsureKbFrameCache(hWnd);   // 窗口可见前预热渲染首帧，消除启动黑帧与首帧卡顿
         g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
         g_winHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_FOCUS, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
@@ -4744,14 +5069,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc = {0, 0, g_ww, g_wh};
-        WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
-        ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
-        DrawWindowMaterialTint(surface.dc, hWnd, g_ww, g_wh);
-        DrawHeader(surface.dc);
-        DrawKeys(surface.dc);
-        if (!surface.buffered)
-            BitBlt(dc, 0, 0, g_ww, g_wh, surface.dc, 0, 0, SRCCOPY);
-        EndWindowPaintSurface(&surface, TRUE);
+        EnsureKbFrameCache(hWnd);
+        BOOL useKbCache = g_kbCacheBmp && g_kbCacheBits &&
+                          g_kbCacheW == g_ww && g_kbCacheH == g_wh &&
+                          (IsMaterialApplied(hWnd) ? TRUE : g_kbCacheDc != 0);
+        if (useKbCache) {
+            if (IsMaterialApplied(hWnd)) {
+                // 材质模式：缓冲透明画布 + 逐位复制缓存（保留 alpha 供 DWM 合成）
+                const BufferedPaintApiLocal* api = GetBufferedPaintApi();
+                HDC bufferedDc = NULL;
+                HANDLE bp = api ? api->begin(dc, &rc, 2, NULL, &bufferedDc) : NULL;
+                if (bp && bufferedDc && api->bits) {
+                    RGBQUAD* bits = NULL; int row = 0;
+                    if (SUCCEEDED(api->bits(bp, &bits, &row)) && bits && row > 0) {
+                        int copyW = g_kbCacheRow < row ? g_kbCacheRow : row;
+                        for (int y = 0; y < g_kbCacheH; y++)
+                            memcpy(bits + y * row, g_kbCacheBits + y * g_kbCacheRow,
+                                   (size_t)copyW * sizeof(RGBQUAD));
+                    }
+                }
+                if (bp) api->end(bp, TRUE);
+            } else {
+                BitBlt(dc, 0, 0, g_ww, g_wh, g_kbCacheDc, 0, 0, SRCCOPY);
+            }
+        } else {
+            // 缓存创建失败时回退到逐帧全量绘制
+            WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
+            ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
+            DrawWindowMaterialTint(surface.dc, hWnd, g_ww, g_wh);
+            DrawHeader(surface.dc);
+            DrawKeys(surface.dc);
+            if (!surface.buffered)
+                BitBlt(dc, 0, 0, g_ww, g_wh, surface.dc, 0, 0, SRCCOPY);
+            EndWindowPaintSurface(&surface, TRUE);
+        }
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -4904,6 +5255,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         StopWindowMotion(&g_mainMotion);
         KillTimer(hWnd, TIMER_FOCUS);
         KillTimer(hWnd, TIMER_REPEAT);
+        ReleaseKbFrameCache();
         if (g_winHook) { UnhookWinEvent(g_winHook); g_winHook = 0; }
         if (g_fgHook) { UnhookWinEvent(g_fgHook); g_fgHook = 0; }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = 0; }

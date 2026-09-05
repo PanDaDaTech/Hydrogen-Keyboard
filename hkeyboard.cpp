@@ -3985,9 +3985,9 @@ static void CloseSettingsAnimated(HWND hWnd) {
     StartWindowMotion(&g_settingsMotion, hWnd, rc.left, rc.top, rc.top + (int)(32 * GetSystemDpiScale()), 170, MOTION_DESTROY);
 }
 
-// ========== Tab 切换动画（类 WinUI3：旧页淡出，新页上滑淡入） ==========
-// 内容页整页缓存为 32bpp DIB，动画期间逐帧仅做“逐像素 alpha 混合”，
-// 无任何 GDI+ 矢量重绘，避免逐帧全量绘制造成的掉帧。
+// ========== Tab 切换动画（类 WinUI3 push：旧页上移推出，新页自下方推入） ==========
+// 内容页整页缓存为 32bpp DIB，动画期间逐帧仅做“按行 memcpy”的推挤合成，
+// 无任何 GDI+ 矢量重绘、无两页交叠，避免掉帧与文字重影。
 struct SettingsPageCache {
     HBITMAP  bmp;
     HDC      dc;
@@ -4067,16 +4067,20 @@ static void RenderPageCache(SettingsPageCache& c, HWND hWnd) {
     g_alphaPaintRect = prevRect;
 }
 
-// 动画帧：从两份页缓存逐像素合成（旧页淡出 + 新页上滑淡入）
+// 动画帧：旧页整页上移推出、新页自下方推入（类 WinUI3 push 转场）。
+// 每行像素完整来自其中一页（按行 memcpy，无交叠/无混合），杜绝两页文字
+// 同位置交叠的重影，同时逐帧成本极低不掉帧。
 static void SettingsTabAnimPaint(HDC dc, HWND hWnd, const RECT& rc) {
     double t = (double)(QpcNowMs() - g_tabAnimStart) / TAB_ANIM_DURATION_MS;
     if (t < 0) t = 0;
     if (t > 1) t = 1;
     double eased = t * t * (3.0 - 2.0 * t);
-    SettingsMetrics m = GetSettingsMetrics(hWnd);
-    int slide = (int)((1.0 - eased) * 22 * m.dpi + 0.5);
-    int fade = (int)(eased * 255.0 + 0.5);
-    int back = 255 - fade;
+    int top = g_tabContentTop;
+    if (top < 0) top = 0;
+    if (top > rc.bottom) top = rc.bottom;
+    int contentH = rc.bottom - top;
+    int dOld = (int)(eased * contentH + 0.5);   // 旧页上移距离
+    int dNew = contentH - dOld;                 // 新页与旧页无缝衔接（dOld+dNew=contentH）
 
     WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
     if (g_alphaPaintBits && g_tabFrom.bits && g_tabTo.bits &&
@@ -4084,52 +4088,22 @@ static void SettingsTabAnimPaint(HDC dc, HWND hWnd, const RECT& rc) {
         g_tabFrom.h >= rc.bottom && g_tabTo.h >= rc.bottom) {
         int w = rc.right, h = rc.bottom;
         int row = g_alphaPaintRowPixels;
-        int top = g_tabContentTop;
-        if (top < 0) top = 0;
-        if (top > h) top = h;
-        BOOL material = IsMaterialApplied(hWnd) != FALSE;
-        DWORD bgC = C_BG;
-        int bgR = GetRValue(bgC), bgG = GetGValue(bgC), bgB = GetBValue(bgC);
-
-        // 内容区：底层旧页（透明度随进度衰减），上层新页（下移 slide 像素，随进度上滑归位）
+        size_t rowBytes = (size_t)w * sizeof(RGBQUAD);
+        // 标题/Tab 栏静止：直接取新页缓存
+        for (int y = 0; y < top; y++)
+            memcpy(g_alphaPaintBits + (size_t)y * row,
+                   g_tabTo.bits + (size_t)y * g_tabTo.row, rowBytes);
+        // 内容区：[top, h-dOld) 来自旧页（整体上移 dOld），[h-dOld, h) 来自新页（上移归位中）
         for (int y = top; y < h; y++) {
             RGBQUAD* dst = g_alphaPaintBits + (size_t)y * row;
-            const RGBQUAD* srcF = g_tabFrom.bits + (size_t)y * g_tabFrom.row;
-            const RGBQUAD* srcT = (y - slide >= top)
-                ? g_tabTo.bits + (size_t)(y - slide) * g_tabTo.row : NULL;
-            for (int x = 0; x < w; x++) {
-                int a1 = (material ? srcF[x].rgbReserved : 255) * back / 255;
-                int r, g, b, a;
-                if (material) {
-                    r = srcF[x].rgbRed * a1;
-                    g = srcF[x].rgbGreen * a1;
-                    b = srcF[x].rgbBlue * a1;
-                    a = a1;
-                } else {
-                    r = (srcF[x].rgbRed * a1 + bgR * (255 - a1)) / 255;
-                    g = (srcF[x].rgbGreen * a1 + bgG * (255 - a1)) / 255;
-                    b = (srcF[x].rgbBlue * a1 + bgB * (255 - a1)) / 255;
-                    a = 255;
-                }
-                if (srcT) {
-                    int a2 = (material ? srcT[x].rgbReserved : 255) * fade / 255;
-                    if (a2 > 0) {
-                        r = (srcT[x].rgbRed * a2 + r * (255 - a2)) / 255;
-                        g = (srcT[x].rgbGreen * a2 + g * (255 - a2)) / 255;
-                        b = (srcT[x].rgbBlue * a2 + b * (255 - a2)) / 255;
-                        a = a2 + a * (255 - a2) / 255;
-                    }
-                }
-                dst[x].rgbRed = (BYTE)r;
-                dst[x].rgbGreen = (BYTE)g;
-                dst[x].rgbBlue = (BYTE)b;
-                dst[x].rgbReserved = (BYTE)a;
+            if (y < h - dOld) {
+                memcpy(dst, g_tabFrom.bits + (size_t)(y + dOld) * g_tabFrom.row, rowBytes);
+            } else {
+                int sy = y - dNew;
+                if (sy < top) sy = top;
+                memcpy(dst, g_tabTo.bits + (size_t)sy * g_tabTo.row, rowBytes);
             }
         }
-        // 内容区之上（标题/Tab 栏静止）：直接复制新页缓存
-        for (int y = 0; y < top; y++)
-            memcpy(g_alphaPaintBits + (size_t)y * row, g_tabTo.bits + (size_t)y * g_tabTo.row,
-                   (size_t)w * sizeof(RGBQUAD));
         if (!surface.buffered)
             BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
     } else {

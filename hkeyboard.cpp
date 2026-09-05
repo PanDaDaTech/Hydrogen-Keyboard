@@ -2439,12 +2439,8 @@ static void ShowKB(BOOL show, BOOL isManual) {
         int fromY = work.bottom;
         if (g_mainMotion.active && GetWindowRect(g_hWnd, &current)) fromY = current.top;
         g_vis = TRUE;
-        // 直接在目标位置显示（无上升动画）；显示前完成材质与首帧，避免黑帧
-        if (!IsMaterialApplied(g_hWnd)) ApplyWindowMaterial(g_hWnd);
-        RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-        SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+        // 主键盘呼出保留自绘底部上滑动画
+        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, targetY, 220, MOTION_NONE);
     } else {
         if (!g_vis) return;
         g_manualShow = FALSE;
@@ -2475,13 +2471,20 @@ static void UserHideKeyboard() {
 }
 
 static void ExitApplicationAnimated() {
-    // 退出关闭走 DWM 原生窗口动画：直接销毁窗口（配合 WinMain 退出前短暂
-    // 延时，给 DWM 时间播放关闭过渡；工具窗口本身可能被系统排除，见说明）
+    // 主键盘退出保留自绘下滑动画（工具窗口无法触发 DWM 原生过渡）
     if (!g_hWnd || !IsWindow(g_hWnd)) return;
     if (g_exiting) return;
     g_exiting = TRUE;
+    if (!IsWindowVisible(g_hWnd)) {
+        DestroyWindow(g_hWnd);
+        return;
+    }
+    RECT work = {0}, current = {0};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    GetWindowRect(g_hWnd, &current);
     g_vis = FALSE;
-    DestroyWindow(g_hWnd);
+    StartWindowMotion(&g_mainMotion, g_hWnd, current.left, current.top,
+                      work.bottom, 160, MOTION_DESTROY);
 }
 
 // × 关闭：已记住选择则直接按所记方式执行，否则弹出关闭方式提示窗口
@@ -3976,9 +3979,10 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
 }
 
 static void CloseSettingsAnimated(HWND hWnd) {
-    // 关闭走 DWM 原生窗口动画：直接销毁窗口，由 DWM 合成标准关闭过渡
+    // 系统级淡出后销毁（AnimateWindow 为官方动画 API，材质窗口表现稳定）
     if (!hWnd || !IsWindow(hWnd) || g_settingsClosing) return;
     g_settingsClosing = TRUE;
+    AnimateWindow(hWnd, 200, AW_BLEND | AW_HIDE);
     DestroyWindow(hWnd);
 }
 
@@ -4205,7 +4209,9 @@ static void OpenSettingsTab(int tab) {
     g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
         if (!IsWindowVisible(g_settingsHwnd)) {
-            ShowWindow(g_settingsHwnd, SW_SHOW);   // 直接显示（无上升动画）
+            // 系统级淡入
+            if (!AnimateWindow(g_settingsHwnd, 200, AW_BLEND))
+                ShowWindow(g_settingsHwnd, SW_SHOW);
         } else {
             if (!IsMaterialApplied(g_settingsHwnd)) ApplyWindowMaterial(g_settingsHwnd);
         }
@@ -4222,8 +4228,11 @@ static void OpenSettingsTab(int tab) {
     g_settingsHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardSettings", T(L"设置", L"Settings"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_settingsHwnd) {
-        // 直接显示（无上升动画）
-        ShowWindow(g_settingsHwnd, SW_SHOW);
+        // 隐藏状态先完成首帧绘制，避免淡入时空白
+        RedrawWindow(g_settingsHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        // 系统级淡入（AnimateWindow，置顶/无边框窗口均可用的官方动画 API）
+        if (!AnimateWindow(g_settingsHwnd, 200, AW_BLEND))
+            ShowWindow(g_settingsHwnd, SW_SHOW);
         SetForegroundWindow(g_settingsHwnd);
     }
 }
@@ -4246,9 +4255,10 @@ static BOOL g_pTracking = FALSE;
 static BOOL g_promptClosing = FALSE;
 
 static void ClosePromptAnimated(HWND hWnd) {
-    // 关闭走 DWM 原生窗口动画：直接销毁窗口，由 DWM 合成标准关闭过渡
+    // 系统级淡出后销毁（AnimateWindow 为官方动画 API，材质窗口表现稳定）
     if (!hWnd || !IsWindow(hWnd) || g_promptClosing) return;
     g_promptClosing = TRUE;
+    AnimateWindow(hWnd, 200, AW_BLEND | AW_HIDE);
     DestroyWindow(hWnd);
 }
 
@@ -4431,8 +4441,11 @@ static void OpenClosePrompt() {
     g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"关闭轻键", L"Close HKeyboard"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
-        // 直接显示（无上升动画）
-        ShowWindow(g_closePromptHwnd, SW_SHOW);
+        // 隐藏状态先完成首帧绘制，避免淡入时空白
+        RedrawWindow(g_closePromptHwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        // 系统级淡入（AnimateWindow，置顶/无边框窗口均可用的官方动画 API）
+        if (!AnimateWindow(g_closePromptHwnd, 200, AW_BLEND))
+            ShowWindow(g_closePromptHwnd, SW_SHOW);
         SetForegroundWindow(g_closePromptHwnd);
     }
 }
@@ -5261,9 +5274,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    // 主窗口销毁后稍作停留再退出：DWM 播放原生关闭过渡需要主进程短暂存活，
-    // 立即退出会掐断关闭动画（设置/提示窗口常驻不受影响）
-    Sleep(280);
     if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
     if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
     if (g_fontRegMdl2) RemoveFontMemResourceEx(g_fontRegMdl2);

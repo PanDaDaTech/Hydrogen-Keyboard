@@ -3985,9 +3985,10 @@ static void CloseSettingsAnimated(HWND hWnd) {
     StartWindowMotion(&g_settingsMotion, hWnd, rc.left, rc.top, rc.top + (int)(32 * GetSystemDpiScale()), 170, MOTION_DESTROY);
 }
 
-// ========== Tab 切换动画（类 WinUI3 push：旧页上移推出，新页自下方推入） ==========
-// 内容页整页缓存为 32bpp DIB，动画期间逐帧仅做“按行 memcpy”的推挤合成，
-// 无任何 GDI+ 矢量重绘、无两页交叠，避免掉帧与文字重影。
+// ========== Tab 切换动画（类 WinUI3：新页自下方 24px 上滑入场） ==========
+// 每一帧都用当前主题实时重绘新页（设置页远轻于键盘页，单帧数毫秒），
+// 帧间仅做按行位移拷贝 —— 颜色永远与当前主题一致，不存在缓存配色过期，
+// 也不做两页混合，避免任何交叠重影。
 struct SettingsPageCache {
     HBITMAP  bmp;
     HDC      dc;
@@ -3995,12 +3996,11 @@ struct SettingsPageCache {
     int      row;
     int      w, h;
 };
-static SettingsPageCache g_tabFrom = {};
 static SettingsPageCache g_tabTo = {};
 static BOOL     g_tabAnim = FALSE;
 static LONGLONG g_tabAnimStart = 0;
 static int      g_tabContentTop = 0;
-#define TAB_ANIM_DURATION_MS 240
+#define TAB_ANIM_DURATION_MS 200
 
 static void ReleasePageCache(SettingsPageCache& c) {
     if (c.bmp) { DeleteObject(c.bmp); c.bmp = 0; }
@@ -4010,12 +4010,11 @@ static void ReleasePageCache(SettingsPageCache& c) {
 }
 
 static void ReleaseTabAnimCaches() {
-    ReleasePageCache(g_tabFrom);
     ReleasePageCache(g_tabTo);
     g_tabAnim = FALSE;
 }
 
-// 将当前设置页完整渲染进缓存 DIB（材质模式的透明底/色调层一并烘焙）
+// 将当前设置页（g_sTab）以当前主题实时重绘进缓存 DIB（材质透明底/色调层一并烘焙）
 static void RenderPageCache(SettingsPageCache& c, HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
     if (m.W <= 0 || m.H <= 0) return;
@@ -4067,62 +4066,79 @@ static void RenderPageCache(SettingsPageCache& c, HWND hWnd) {
     g_alphaPaintRect = prevRect;
 }
 
-// 动画帧：旧页整页上移推出、新页自下方推入（类 WinUI3 push 转场）。
-// 每行像素完整来自其中一页（按行 memcpy，无交叠/无混合），杜绝两页文字
-// 同位置交叠的重影，同时逐帧成本极低不掉帧。
+// 设置页内容区上滑空隙行的背景色调 alpha（与 DrawWindowMaterialTint 非主窗口分支一致）
+static BYTE SettingsTintAlpha() {
+    BOOL dark = g_theme->bg == g_darkTheme.bg;
+    if (g_materialMode == 1) return dark ? 104 : 132;
+    return dark ? 76 : 104;
+}
+
+// 动画帧：新页实时重绘后整体自下方 dy 处上移归位；标题/Tab 栏保持静止，
+// 内容区顶部滑入过程中的空隙行以背景色（材质模式为半透明色调）填充。
 static void SettingsTabAnimPaint(HDC dc, HWND hWnd, const RECT& rc) {
     double t = (double)(QpcNowMs() - g_tabAnimStart) / TAB_ANIM_DURATION_MS;
     if (t < 0) t = 0;
     if (t > 1) t = 1;
     double eased = t * t * (3.0 - 2.0 * t);
-    int top = g_tabContentTop;
-    if (top < 0) top = 0;
-    if (top > rc.bottom) top = rc.bottom;
-    int contentH = rc.bottom - top;
-    int dOld = (int)(eased * contentH + 0.5);   // 旧页上移距离
-    int dNew = contentH - dOld;                 // 新页与旧页无缝衔接（dOld+dNew=contentH）
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    int dy = (int)((1.0 - eased) * 24 * m.dpi + 0.5);
 
     WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
-    if (g_alphaPaintBits && g_tabFrom.bits && g_tabTo.bits &&
-        g_tabFrom.w >= rc.right && g_tabTo.w >= rc.right &&
-        g_tabFrom.h >= rc.bottom && g_tabTo.h >= rc.bottom) {
-        int w = rc.right, h = rc.bottom;
-        int row = g_alphaPaintRowPixels;
-        size_t rowBytes = (size_t)w * sizeof(RGBQUAD);
-        // 标题/Tab 栏静止：直接取新页缓存
-        for (int y = 0; y < top; y++)
-            memcpy(g_alphaPaintBits + (size_t)y * row,
-                   g_tabTo.bits + (size_t)y * g_tabTo.row, rowBytes);
-        // 内容区：[top, h-dOld) 来自旧页（整体上移 dOld），[h-dOld, h) 来自新页（上移归位中）
-        for (int y = top; y < h; y++) {
-            RGBQUAD* dst = g_alphaPaintBits + (size_t)y * row;
-            if (y < h - dOld) {
-                memcpy(dst, g_tabFrom.bits + (size_t)(y + dOld) * g_tabFrom.row, rowBytes);
-            } else {
-                int sy = y - dNew;
-                if (sy < top) sy = top;
-                memcpy(dst, g_tabTo.bits + (size_t)sy * g_tabTo.row, rowBytes);
-            }
-        }
-        if (!surface.buffered)
-            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
-    } else {
-        // 缓存缺失：回退普通整页绘制
+    if (!g_alphaPaintBits) {
+        // 画布无直接位访问：回退普通整页绘制
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
         DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         SettingsDraw(surface.dc, hWnd);
         if (!surface.buffered)
             BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface, TRUE);
+        return;
     }
+
+    // 每帧以当前主题实时重绘新页（颜色与正常绘制完全一致）
+    RenderPageCache(g_tabTo, hWnd);
+    if (!g_tabTo.bits) {
+        ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
+        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
+        SettingsDraw(surface.dc, hWnd);
+        if (!surface.buffered)
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface, TRUE);
+        return;
+    }
+
+    int w = rc.right, h = rc.bottom;
+    int row = g_alphaPaintRowPixels;
+    int top = g_tabContentTop;
+    if (top < 0) top = 0;
+    if (top > h) top = h;
+    if (dy > h - top) dy = h - top;
+
+    // 标题/Tab 栏静止：直接拷贝新页缓存
+    for (int y = 0; y < top; y++)
+        memcpy(g_alphaPaintBits + (size_t)y * row,
+               g_tabTo.bits + (size_t)y * g_tabTo.row, (size_t)w * sizeof(RGBQUAD));
+    // 内容区整体下移 dy（动画中），随进度上移归位
+    for (int y = h - 1; y >= top + dy; y--)
+        memcpy(g_alphaPaintBits + (size_t)y * row,
+               g_tabTo.bits + (size_t)(y - dy) * g_tabTo.row, (size_t)w * sizeof(RGBQUAD));
+    // 顶部空隙行：背景色（材质模式为半透明色调层，与正常绘制的底色一致）
+    if (dy > 0) {
+        if (IsMaterialApplied(hWnd))
+            DrawAlphaSurface(surface.dc, 0, top, w, dy, C_BG, SettingsTintAlpha());
+        else
+            Fill(surface.dc, 0, top, w, dy, C_BG);
+    }
+    if (!surface.buffered)
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
     EndWindowPaintSurface(&surface, TRUE);
 }
 
-// Tab 切换时启动动画：先缓存旧页，调用方切换 g_sTab 后缓存新页
+// Tab 切换时启动动画（每帧实时重绘，无需预缓存页面内容）
 static void StartTabSwitchAnimation(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd) || g_settingsMoving) return;
     SettingsMetrics m = GetSettingsMetrics(hWnd);
     g_tabContentTop = m.contentY;
-    RenderPageCache(g_tabFrom, hWnd);   // 旧页（g_sTab 尚未切换）
     g_tabAnimStart = QpcNowMs();
     g_tabAnim = TRUE;
     SetTimer(hWnd, TIMER_TAB_ANIM, 15, NULL);
@@ -4141,7 +4157,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     if (hit == S_HIT_TABL || (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2)) {
         int newTab = (hit == S_HIT_TABL) ? 3 : (hit - S_HIT_TAB0);
         BOOL tabChanged = (newTab != g_sTab);
-        if (tabChanged) StartTabSwitchAnimation(hWnd);   // 缓存旧页（切换前）
+        if (tabChanged) StartTabSwitchAnimation(hWnd);
         g_sTab = newTab;
         g_dropTheme = FALSE;
         g_dropMaterial = FALSE;
@@ -4150,7 +4166,6 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
-        if (tabChanged && g_tabAnim) RenderPageCache(g_tabTo, hWnd);   // 缓存新页
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }

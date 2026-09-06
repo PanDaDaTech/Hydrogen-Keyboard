@@ -546,7 +546,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     // Row 4: Shift, 网址后缀×6, ? , ., ↑, Shift (12 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(52 * dpiScale * scaleX);
+        int wUp = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度
         int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 9;
@@ -568,8 +568,8 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);
-        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wArw = (int)(90 * dpiScale * scaleX);   // 与 ↑/↓/→ 统一宽度
+        int wUp   = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度   // ↓ 与上方 ↑ 同宽对齐
         int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
         int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
         int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
@@ -714,7 +714,7 @@ static void BuildKeys() {
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(52 * dpiScale * scaleX);
+        int wUp = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度
         int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
@@ -740,8 +740,8 @@ static void BuildKeys() {
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);
-        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wArw = (int)(90 * dpiScale * scaleX);   // 与 ↑/↓/→ 统一宽度
+        int wUp   = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度   // ↓ 与上方 ↑ 同宽对齐
         int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
         if (g_showFKeys) {
             // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (10 keys)

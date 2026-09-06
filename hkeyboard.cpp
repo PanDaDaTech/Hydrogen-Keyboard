@@ -1693,7 +1693,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x10: case 0xA0: case 0xA1: return L"Shift";
         case 0x11: return L"Ctrl";
         case 0x12: return L"Alt";
-        case 0x5B: return L"Win";
+        case 0x5B: return L"";   // Win 键：矢量绘制 Windows 徽标，无文字
         case 0x5D: return L"\xE700";   // Segoe MDL2/Fluent GlobalNavButton 汉堡菜单图标
         case 0x20: return L"";         // 空格键不显示文字
         case 0x25: return L"\x2190";
@@ -2213,7 +2213,21 @@ static void DrawKeys(HDC dc) {
         // 未按 Shift：双符号显示（数字 + 顶部特殊符号，副符号置灰）；
         // 按 Shift：开启“仅显示特殊符号”时只显示顶部符号（不显示数字），关闭时仍显示数字。
         BOOL shiftOn = (g_sh || g_physShift);
-        if (baseCh && shiftCh && shiftCh != baseCh) {
+        if (k->vk == 0x5B) {
+            // Win 键：字体无 Windows 徽标字形，直接矢量绘制 Win11 风格四格徽标
+            double u = (double)k->h * 0.42;
+            int sq = (int)(u * 0.44);
+            int gp = (int)(u * 0.12);
+            if (sq < 2) sq = 2;
+            int total = sq * 2 + gp;
+            int ox = k->x + (k->w - total) / 2;
+            int oy = k->y + (k->h - total) / 2;
+            int rr = (int)(sq * 0.18);
+            DrawRoundRect(dc, ox, oy, sq, sq, textC, textC, rr);
+            DrawRoundRect(dc, ox + sq + gp, oy, sq, sq, textC, textC, rr);
+            DrawRoundRect(dc, ox, oy + sq + gp, sq, sq, textC, textC, rr);
+            DrawRoundRect(dc, ox + sq + gp, oy + sq + gp, sq, sq, textC, textC, rr);
+        } else if (baseCh && shiftCh && shiftCh != baseCh) {
             if (shiftOn) {
                 wchar_t single[2] = { g_shiftSymbols ? shiftCh : baseCh, 0 };
                 DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);

@@ -353,7 +353,9 @@ static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收�
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
-int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘
+int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘 2=完整
+int         g_prevLayout = 0;          // 123 按钮切到小键盘前的布局（会话内记忆）
+BOOL        g_showNumBtn = TRUE;       // 标题栏是否显示 123 小键盘切换按钮
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
@@ -425,7 +427,10 @@ static void InitWindowSizeForDpi() {
     if (g_layoutMode == 1) {        // 小键盘：紧凑尺寸
         g_ww = (int)(430 * dpiScale);
         g_wh = (int)(320 * dpiScale);
-    } else {                        // 全尺寸/常用
+    } else if (g_layoutMode == 2) { // 完整键盘：主区+导航区+数字区
+        g_ww = (int)(1380 * dpiScale);
+        g_wh = (int)(320 * dpiScale);
+    } else {                        // 全尺寸
         g_ww = (int)(980 * dpiScale);
         g_wh = (int)(320 * dpiScale);
     }
@@ -483,6 +488,120 @@ static void BuildNumpad(int y) {
         AddKey(cx, y, colW * 2 + g_keyGap, g_keyHeight, 0x60, K_NORMAL);
         cx += colW * 2 + g_keyGap + g_keyGap;
         AddKey(cx, y, colW, g_keyHeight, 0x6E, K_NORMAL);
+    }
+}
+
+// 完整键盘布局（104 键）：主区 + 导航区 + 数字区
+// 导航区 3 列（PrtSc/Ins/Del 三行 + ↑ 居中列 + ←↓→ 底行，↑↓ 天然十字对齐），
+// 数字区 4 列（Num / * -，7 8 9 +(跨2行)，4 5 6，1 2 3 Enter(跨2行)，0(跨2列) .）
+static void BuildComplete(int y, double dpiScale, double scaleX) {
+    int gap = g_keyGap;
+    int navW = (int)(52 * dpiScale * scaleX);         // 导航/数字区键宽（与字母键同宽）
+    int navBlockW = navW * 3 + 2 * gap;               // 导航区 3 列总宽
+    int numBlockW = navW * 4 + 3 * gap;               // 数字区 4 列总宽
+    int MAIN_W = KEY_AREA_W - 2 * gap - navBlockW - numBlockW;   // 主区宽度（剩余全给主区）
+    if (MAIN_W < 400) MAIN_W = 400;                   // 窗口过窄时保底（允许溢出）
+    int h2 = g_keyHeight * 2 + gap;
+    int mx = KEY_AREA_X;                              // 主区当前 x
+    int nx = KEY_AREA_X + MAIN_W + gap;               // 导航区 x
+    int px = nx + navBlockW + gap;                    // 数字区 x
+
+    // Row 0: Esc, F1~F12, Del | PrtSc ScrLk Pause | Num / * -
+    {
+        int wEsc = (int)(56 * dpiScale * scaleX);
+        int wDel = (int)(56 * dpiScale * scaleX);
+        int aw = (MAIN_W - wEsc - wDel - 13 * gap) / 12;
+        int rem = MAIN_W - wEsc - wDel - 13 * gap - aw * 12;
+        AddKey(mx, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); mx += wEsc + gap;
+        for (int i = 0; i < 12; i++) {
+            int w = aw + (i < rem ? 1 : 0);
+            AddKey(mx, y, w, g_keyHeight, (short)(0x70 + i), K_NORMAL);
+            mx += w + gap;
+        }
+        AddKey(mx, y, wDel, g_keyHeight, 0x2E, K_SPECIAL);
+        { int cx = nx; short v[3] = {0x2C, 0x46, 0x13};
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v[i], K_SPECIAL); cx += navW + gap; } }
+        { int cx = px; short v[4] = {0x90, 0x6F, 0x6A, 0x6D};
+          KeyType t[4] = {K_SPECIAL, K_NORMAL, K_NORMAL, K_NORMAL};
+          for (int i = 0; i < 4; i++) { AddKey(cx, y, navW, g_keyHeight, v[i], t[i]); cx += navW + gap; } }
+        y += g_keyHeight + gap;
+    }
+    // Row 1: Tab, q~p, [\, Backspace | Ins Home PgUp | 7 8 9 +(跨2行)
+    {
+        int wTab = (int)(68 * dpiScale * scaleX);
+        int wBk  = (int)(68 * dpiScale * scaleX);
+        int aw = (MAIN_W - wTab - wBk - 14 * gap) / 13;
+        int rem = MAIN_W - wTab - wBk - 14 * gap - aw * 13;
+        short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x08};
+        KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+        AddKey(mx, y, wTab, g_keyHeight, v[0], t[0]); mx += wTab + gap;
+        for (int i = 1; i <= 13; i++) { int w = aw + (i <= rem ? 1 : 0); AddKey(mx, y, w, g_keyHeight, v[i], t[i]); mx += w + gap; }
+        AddKey(mx, y, wBk, g_keyHeight, v[14], t[14]);
+        { int cx = nx; short v2[3] = {0x2D, 0x24, 0x21};
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v2[i], K_SPECIAL); cx += navW + gap; } }
+        { int cx = px;
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, (short)(0x67 + i), K_NORMAL); cx += navW + gap; }
+          AddKey(cx, y, navW, h2, 0x6B, K_NORMAL); }
+        y += g_keyHeight + gap;
+    }
+    // Row 2: Caps, a~l, ;', Enter | Del End PgDn | 4 5 6
+    {
+        int wCaps = (int)(80 * dpiScale * scaleX);
+        int wEnt  = (int)(90 * dpiScale * scaleX);
+        int aw = (MAIN_W - wCaps - wEnt - 12 * gap) / 11;
+        int rem = MAIN_W - wCaps - wEnt - 12 * gap - aw * 11;
+        short v[13] = {0x14,0x41,0x53,0x44,0x46,0x47,0x48,0x4A,0x4B,0x4C,0xBA,0xDE,0x0D};
+        AddKey(mx, y, wCaps, g_keyHeight, v[0], K_CAPS); mx += wCaps + gap;
+        for (int i = 1; i <= 11; i++) {
+            int w = aw + (i <= rem ? 1 : 0);
+            AddKey(mx, y, w, g_keyHeight, v[i], i <= 9 ? K_LETTER : K_NORMAL);
+            mx += w + gap;
+        }
+        AddKey(mx, y, wEnt, g_keyHeight, v[12], K_SPECIAL);
+        { int cx = nx; short v2[3] = {0x2E, 0x23, 0x22};
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v2[i], K_SPECIAL); cx += navW + gap; } }
+        { int cx = px;
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, (short)(0x64 + i), K_NORMAL); cx += navW + gap; } }
+        y += g_keyHeight + gap;
+    }
+    // Row 3: Shift, z~/, Shift | ↑（居中列） | 1 2 3 Enter(跨2行)
+    {
+        int wLSh = (int)(95 * dpiScale * scaleX);
+        int wRSh = (int)(52 * dpiScale * scaleX);
+        int aw = (MAIN_W - wLSh - wRSh - 11 * gap) / 10;
+        int rem = MAIN_W - wLSh - wRSh - 11 * gap - aw * 10;
+        short v[12] = {0xA0,0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF,0xA1};
+        AddKey(mx, y, wLSh, g_keyHeight, v[0], K_MOD); mx += wLSh + gap;
+        for (int i = 1; i <= 10; i++) {
+            int w = aw + (i <= rem ? 1 : 0);
+            AddKey(mx, y, w, g_keyHeight, v[i], i <= 7 ? K_LETTER : K_NORMAL);
+            mx += w + gap;
+        }
+        AddKey(mx, y, wRSh, g_keyHeight, v[11], K_MOD);
+        AddKey(nx + navW + gap, y, navW, g_keyHeight, 0x26, K_ARROW);   // ↑ 正对下方 ↓
+        { int cx = px;
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, (short)(0x61 + i), K_NORMAL); cx += navW + gap; }
+          AddKey(cx, y, navW, h2, 0x0D, K_SPECIAL); }
+        y += g_keyHeight + gap;
+    }
+    // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl | ← ↓ → | 0(跨2列) .
+    {
+        int wFn   = (int)(46 * dpiScale * scaleX);
+        int wCtl  = (int)(56 * dpiScale * scaleX);
+        int wWin  = (int)(46 * dpiScale * scaleX);
+        int wAlt  = (int)(58 * dpiScale * scaleX);
+        int wMenu = (int)(56 * dpiScale * scaleX);
+        int left = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+        int spaceW = MAIN_W - left - 7 * gap; if (spaceW < 60) spaceW = 60;
+        int w[8] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl};
+        short v[8] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11};
+        KeyType t[8] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 8; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + gap; }
+        { int cx = nx; short v2[3] = {0x25, 0x28, 0x27};   // ↓ 正对上方 ↑
+          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v2[i], K_ARROW); cx += navW + gap; } }
+        AddKey(px, y, navW * 2 + gap, g_keyHeight, 0x60, K_NORMAL);
+        AddKey(px + navW * 2 + 2 * gap, y, navW, g_keyHeight, 0x6E, K_NORMAL);
     }
 }
 
@@ -598,9 +717,9 @@ static void BuildKeys() {
     g_keyAreaX = (int)(10 * dpiScale); if (g_keyAreaX < 6) g_keyAreaX = 6;
     int bottomPad = (int)(16 * dpiScale); if (bottomPad < 8) bottomPad = 8;
 
-    // 行数：全尺寸 5 行 + 可选 F1~F12 顶行；小键盘 5 行；Fn 网页布局固定 5 行
-    BOOL webSurf = g_fnLayer && g_fnWebLayout && g_layoutMode != 1;
-    int rows = 5 + (g_layoutMode != 1 && g_showFKeys && !webSurf ? 1 : 0);
+    // 行数：全尺寸 5 行 + 可选 F1~F12 顶行；小键盘/完整 5 行；Fn 网页布局固定 5 行
+    BOOL webSurf = g_fnLayer && g_fnWebLayout && g_layoutMode == 0;
+    int rows = 5 + (g_layoutMode == 0 && g_showFKeys && !webSurf ? 1 : 0);
     g_keyHeight = (g_wh - g_headerH - bottomPad - (rows - 1) * g_keyGap) / rows;
     if (g_keyHeight < 20) g_keyHeight = 20;
 
@@ -608,6 +727,11 @@ static void BuildKeys() {
 
     if (g_layoutMode == 1) {   // 小键盘
         BuildNumpad(y);
+        return;
+    }
+
+    if (g_layoutMode == 2) {   // 完整键盘（主区+导航区+数字区）
+        BuildComplete(y, dpiScale, scaleX);
         return;
     }
 
@@ -1548,6 +1672,14 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x26: return L"\x2191";
         case 0x27: return L"\x2192";
         case 0x28: return L"\x2193";
+        case 0x2C: return L"PrtSc";
+        case 0x46: return L"ScrLk";
+        case 0x13: return L"Pause";
+        case 0x2D: return L"Ins";
+        case 0x24: return L"Home";
+        case 0x21: return L"PgUp";
+        case 0x23: return L"End";
+        case 0x22: return L"PgDn";
         case 0xC0: return L"\x60";
     }
 
@@ -1903,6 +2035,7 @@ static void DoKeyAction(const KeyDef* k) {
 #define HDR_DOCK  1000
 #define HDR_MIN   1003
 #define HDR_CLOSE 1004
+#define HDR_NUM   1005   // 123 按钮：切换小键盘
 
 static int HitHeader(int x, int y) {
     if (y < 0 || y >= g_headerH) return -1;
@@ -1912,6 +2045,7 @@ static int HitHeader(int x, int y) {
     int gap     = (int)(6 * dpiScale);
     int wClose = (int)(28 * dpiScale);
     int wMin   = (int)(28 * dpiScale);
+    int wNum   = (int)(40 * dpiScale);
     int wMenu  = (int)(48 * dpiScale);
     int btnH   = (int)(28 * dpiScale);
     if (btnH > g_headerH - 4) btnH = g_headerH - 4;
@@ -1921,10 +2055,12 @@ static int HitHeader(int x, int y) {
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
+    int xNum   = g_showNumBtn ? (xMin - gap - wNum) : xMin;
     int xMenu  = (int)(6 * dpiScale);
 
     if (x >= xClose && x < xClose + wClose) return HDR_CLOSE;
     if (x >= xMin && x < xMin + wMin) return HDR_MIN;
+    if (g_showNumBtn && x >= xNum && x < xNum + wNum) return HDR_NUM;
     if (x >= xMenu && x < xMenu + wMenu) return HDR_DOCK;
     return -1;
 }
@@ -1962,10 +2098,12 @@ static void DrawHeader(HDC dc) {
 
     int wClose = (int)(28 * dpiScale);
     int wMin   = (int)(28 * dpiScale);
+    int wNum   = (int)(40 * dpiScale);
     int wMenu  = (int)(48 * dpiScale);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
+    int xNum   = g_showNumBtn ? (xMin - gap - wNum) : xMin;
     int xMenu  = (int)(6 * dpiScale);
 
     if (IsMainMaterialPaintActive())
@@ -1976,9 +2114,20 @@ static void DrawHeader(HDC dc) {
     DrawTextC(dc, xMenu, btnY, wMenu, btnH, T(L"\x8BBE\x7F6E", L"Settings"), g_f12, C_WHITE);   // 菜单按钮 → 打开设置页
 
     int xTitle = xMenu + wMenu + gap;
-    int wTitle = xMin - xTitle - gap;
+    int wTitle = (g_showNumBtn ? xNum : xMin) - xTitle - gap;
     if (wTitle > 40) {
         DrawTextC(dc, xTitle, 0, wTitle, g_headerH, L"", g_f12, C_DIM);
+    }
+
+    // 123 按钮：主布局与小键盘布局间切换（悬停同款圆角底）
+    if (g_showNumBtn) {
+        if (g_hdrHov == HDR_NUM) {
+            if (IsMainMaterialPaintActive())
+                DrawRoundRectAlpha(dc, xNum, btnY, wNum, btnH, C_HOVER, C_KEY_BORDER, 6, 196, 150);
+            else
+                DrawRoundRect(dc, xNum, btnY, wNum, btnH, C_HOVER, C_KEY_BORDER, 6);
+        }
+        DrawTextC(dc, xNum, btnY, wNum, btnH, L"123", g_f12, C_WHITE);
     }
 
     // 最小化按钮：悬停时与设置页关闭按钮同款圆角底（C_HOVER + C_KEY_BORDER），图标为 AA 横线
@@ -2443,6 +2592,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_LAYOUT_OPT2    17
 #define S_HIT_FKEYS          18
 #define S_HIT_FNWEB          94
+#define S_HIT_NPBTN          24   // 布局 Tab：显示标题栏 123 切换按钮
 #define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
 #define S_HIT_THEME_OPT0     21
@@ -2506,8 +2656,8 @@ static const wchar_t* g_materialNamesEn[3] = { L"Off", L"Mica", L"Acrylic" };
 static const int g_opacityValues[6] = { 100, 90, 80, 70, 60, 50 };
 static const wchar_t* g_opacityNames[6] = { L"100%（不透明）", L"90%", L"80%", L"70%", L"60%", L"50%" };
 static const wchar_t* g_opacityNamesEn[6] = { L"100% (Opaque)", L"90%", L"80%", L"70%", L"60%", L"50%" };
-static const wchar_t* g_layoutNames[2] = { L"全尺寸", L"小键盘" };
-static const wchar_t* g_layoutNamesEn[2] = { L"Full", L"Numpad" };
+static const wchar_t* g_layoutNames[3] = { L"全尺寸", L"小键盘", L"完整" };
+static const wchar_t* g_layoutNamesEn[3] = { L"Full", L"Numpad", L"Complete" };
 
 static int g_switchAnimHit = S_HIT_NONE;
 static LONGLONG g_switchAnimStart = 0;
@@ -2729,11 +2879,12 @@ static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     // 常规 Tab 行序（自动收起行仅在自动呼出开启时存在）：
     //   g_af 开：0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
     //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=界面语言
-    // 布局 Tab 行序：0=键盘布局 1=Fn 网页布局
+    // 布局 Tab 行序：0=键盘布局 1=Fn 网页布局 2=123 切换按钮
     int rowIndex;
     if (hit == S_HIT_AUTO) rowIndex = 0;
     else if (hit == S_HIT_AUTOHIDE) rowIndex = 1;
     else if (hit == S_HIT_FNWEB) rowIndex = 1;   // 布局 Tab 第 1 行
+    else if (hit == S_HIT_NPBTN) rowIndex = 2;   // 布局 Tab 第 2 行
     else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
     else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
     else rowIndex = g_af ? 5 : 4;
@@ -3092,6 +3243,11 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingRow(dc, r, 6, T(L"Fn 网页布局", L"Fn Web Layout"),
                        T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"), g_sHov == S_HIT_FNWEB);
         DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
+
+        r = SettingsRowRect(m, 2);
+        DrawSettingRow(dc, r, 4, T(L"小键盘切换按钮", L"Numpad Toggle Button"),
+                       T(L"在标题栏显示 123 按钮，点击在当前布局与小键盘间切换", L"Show a 123 button in the title bar to toggle the numpad"), g_sHov == S_HIT_NPBTN);
+        DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
     } else if (g_sTab == 1) {
         RECT r = SettingsRowRect(m, 0);
         DrawSettingRow(dc, r, 7, T(L"主题模式", L"Theme Mode"),
@@ -3237,11 +3393,11 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         RECT r;
         if (g_dropLayout) {
             r = SettingsRowRect(m, 0);
-            const wchar_t* names[2];
-            for (int i = 0; i < 2; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
+            const wchar_t* names[3];
+            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
             int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
-                          m.comboW, m.comboH, names, 2, g_layoutMode, g_dropLayoutHov);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
+                          m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
         }
     } else if (g_sTab == 1) {
         RECT r;
@@ -3345,7 +3501,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             r = SettingsRowRect(m, 0);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 3; i++) {
                 if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
                 ly += m.comboH;
             }
@@ -3356,6 +3512,9 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
         r = SettingsRowRect(m, 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+
+        r = SettingsRowRect(m, 2);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_NPBTN;
     } else if (g_sTab == 1) {
         RECT r;
         struct DropHit { BOOL open; int row; int count; int firstHit; } drops[3] = {
@@ -3549,7 +3708,8 @@ static void LoadConfig() {
     if (g_mainOpacity < 50 || g_mainOpacity > 100) g_mainOpacity = 100;
     g_wallpaperAccent = (IniGetInt(L"Theme", L"Wallpaper", 0) != 0);
     g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
-    if (g_layoutMode < 0 || g_layoutMode > 1) g_layoutMode = 0;
+    if (g_layoutMode < 0 || g_layoutMode > 2) g_layoutMode = 0;
+    g_showNumBtn = IniGetInt(L"Keyboard", L"ShowNumBtn", 1) != 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
@@ -3693,6 +3853,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_LAYOUT_OPT0:
     case S_HIT_LAYOUT_OPT1:
+    case S_HIT_LAYOUT_OPT2:
         g_layoutMode = hit - S_HIT_LAYOUT_OPT0;
         g_dropLayout = FALSE;
         layoutChanged = TRUE;
@@ -3714,6 +3875,12 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
             BuildKeys();   // 网页布局层切换需重建键位表
             InvalidateRect(g_hWnd, NULL, TRUE);
         }
+        break;
+    case S_HIT_NPBTN:
+        BeginSwitchAnimation(hWnd, hit, g_showNumBtn, !g_showNumBtn);
+        g_showNumBtn = !g_showNumBtn;
+        IniSetInt(L"Keyboard", L"ShowNumBtn", g_showNumBtn ? 1 : 0);
+        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);   // 主窗口标题栏按钮显隐
         break;
     case S_HIT_SHIFTSYM:
         BeginSwitchAnimation(hWnd, hit, g_shiftSymbols, !g_shiftSymbols);
@@ -4011,7 +4178,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         if (hov != g_sHov) { g_sHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
         int thov = (hov >= S_HIT_THEME_OPT0 && hov <= S_HIT_THEME_OPT2) ? hov - S_HIT_THEME_OPT0 : -1;
         int mhov = (hov >= S_HIT_MATERIAL_OPT0 && hov <= S_HIT_MATERIAL_OPT2) ? hov - S_HIT_MATERIAL_OPT0 : -1;
-        int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT1) ? hov - S_HIT_LAYOUT_OPT0 : -1;
+        int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT2) ? hov - S_HIT_LAYOUT_OPT0 : -1;
         int langov = (hov >= S_HIT_LANG_OPT0 && hov <= S_HIT_LANG_OPT1) ? hov - S_HIT_LANG_OPT0 : -1;
         int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT0 + 2) ? hov - S_HIT_HL_OPT0 : -1;
         int clov = (hov >= S_HIT_CLOSE_OPT0 && hov <= S_HIT_CLOSE_OPT1) ? hov - S_HIT_CLOSE_OPT0 : -1;
@@ -4757,6 +4924,15 @@ static void OnLDown(HWND hWnd, int x, int y) {
         case HDR_DOCK: OpenSettings(); break;
         case HDR_MIN: UserHideKeyboard(); break;   // 手动收起（自动收起开启时同输入框内不回弹）
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
+        case HDR_NUM:   // 123：当前布局 ↔ 小键盘
+            if (g_layoutMode != 1) {
+                g_prevLayout = g_layoutMode;
+                g_layoutMode = 1;
+            } else {
+                g_layoutMode = g_prevLayout;
+            }
+            ApplyKeyboardLayout(TRUE);   // 按布局重置窗口大小并重建键位
+            break;
         }
         return;
     }

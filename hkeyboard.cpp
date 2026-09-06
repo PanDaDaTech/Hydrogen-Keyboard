@@ -547,7 +547,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);   // 与 ↓ 同宽对齐
-        int wRSh = (int)(90 * dpiScale * scaleX);   // Win11 风格：自然宽度
+        int wRSh = (int)(52 * dpiScale * scaleX);   // 右 Shift 与 → 同宽，保证 ↓ 正对 ↑（十字对齐）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 9;
         int rem = KEY_AREA_W - fixed - 11 * g_keyGap - aw * 9;
@@ -570,7 +570,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);   // ← 与 ↑/↓ 同宽
         int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽
-        int wRSh  = (int)(52 * dpiScale * scaleX);   // → 小方向键（Win11 ‹˅› 风格，不与上方对齐）
+        int wRSh  = (int)(52 * dpiScale * scaleX);   // → 与右 Shift 同宽（十字对齐约束）
         int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
         int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
@@ -715,7 +715,7 @@ static void BuildKeys() {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);   // 与 ↓ 同宽对齐
-        int wRSh = (int)(90 * dpiScale * scaleX);   // Win11 风格：自然宽度
+        int wRSh = (int)(52 * dpiScale * scaleX);   // 右 Shift 与 → 同宽，保证 ↓ 正对 ↑（十字对齐）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
@@ -742,7 +742,7 @@ static void BuildKeys() {
         int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);   // ← 与 ↑/↓ 同宽
         int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽
-        int wRSh  = (int)(52 * dpiScale * scaleX);   // → 小方向键（Win11 ‹˅› 风格，不与上方对齐）
+        int wRSh  = (int)(52 * dpiScale * scaleX);   // → 与右 Shift 同宽（十字对齐约束）
         if (g_showFKeys) {
             // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (10 keys)
             int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;

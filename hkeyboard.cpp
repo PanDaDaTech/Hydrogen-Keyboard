@@ -367,6 +367,7 @@ HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
+HFONT       g_fKeyIcon = 0;   // 键面图标字体（Segoe MDL2/Fluent，Menu 键汉堡图标用）
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0, g_sfIcon = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
@@ -570,7 +571,7 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = wUp;
+        int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
@@ -687,7 +688,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = wUp;
+        int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 9;
         int rem = KEY_AREA_W - fixed - 11 * g_keyGap - aw * 9;
@@ -870,7 +871,7 @@ static void BuildKeys() {
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
         int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = wUp;
+        int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
@@ -1029,6 +1030,7 @@ static void RecreateFontsAndLayout() {
     if (g_f14b) DeleteObject(g_f14b);
     if (g_f16b) DeleteObject(g_f16b);
     if (g_f18b) DeleteObject(g_f18b);
+    if (g_fKeyIcon) DeleteObject(g_fKeyIcon);
 
     double dpiScale = GetSystemDpiScale();
     double baseH = 320.0 * dpiScale;
@@ -1044,6 +1046,7 @@ static void RecreateFontsAndLayout() {
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
     g_f18b = MakeFont((int)(18 * finalFontScale), 1);
+    g_fKeyIcon = MakeIconFont((int)(20 * finalFontScale));   // Menu 键汉堡图标
 
     BuildKeys();
 }
@@ -1691,8 +1694,8 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x11: return L"Ctrl";
         case 0x12: return L"Alt";
         case 0x5B: return L"Win";
-        case 0x5D: return L"Menu";
-        case 0x20: return T(L"\x7A7A\x683C", L"Space");
+        case 0x5D: return L"\xE700";   // Segoe MDL2/Fluent GlobalNavButton 汉堡菜单图标
+        case 0x20: return L"";         // 空格键不显示文字
         case 0x25: return L"\x2190";
         case 0x26: return L"\x2191";
         case 0x27: return L"\x2192";
@@ -1701,7 +1704,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
     }
 
     if (k->type == K_HIDE) return T(L"\x6536\x8D77", L"Hide");
-    if (k->type == K_SPACE) return T(L"\x7A7A\x683C", L"Space");
+    if (k->type == K_SPACE) return L"";
     if (k->type == K_SPECIAL && k->vk == 0) return L"Fn";
     return L"";
 }
@@ -2195,6 +2198,7 @@ static void DrawKeys(HDC dc) {
             }
         }
         HFONT f = darkKey ? g_f14b : g_f14;
+        if (k->vk == 0x5D) f = g_fKeyIcon;   // Menu 键：汉堡菜单图标（MDL2/Fluent E700）
         if (k->vk == 0x08) f = g_f18b;   // 退格：深色键，大号粗体箭头
         if (k->vk == 0x0D) f = g_f13b;   // Enter：深色键
         DWORD textC = (active || pressed) && IsLightColor(bg) ? 0x1A1A1A : C_WHITE;
@@ -5214,6 +5218,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f13b); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
         DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b); DeleteObject(g_sfIcon);
+        DeleteObject(g_fKeyIcon);
         PostQuitMessage(0);
         return 0;
     }

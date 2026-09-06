@@ -529,7 +529,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     // Row 3: Caps, a-l, ;, ', Enter (13 keys)，与全尺寸布局一致
     {
         int wCaps = (int)(80 * dpiScale * scaleX);
-        int wEnter = (int)(90 * dpiScale * scaleX);
+        int wEnter = (int)(68 * dpiScale * scaleX);   // 右列统一 68（与 Backspace/Del 同宽）
         int fixed = wCaps + wEnter;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 11;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 11;
@@ -546,8 +546,8 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     // Row 4: Shift, 网址后缀×6, ? , ., ↑, Shift (12 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度
-        int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
+        int wUp = (int)(52 * dpiScale * scaleX);   // 与 ↓ 同宽对齐
+        int wRSh = (int)(68 * dpiScale * scaleX);   // 与上方 Enter 同宽，右列统一 68
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 11 * g_keyGap) / 9;
         int rem = KEY_AREA_W - fixed - 11 * g_keyGap - aw * 9;
@@ -568,9 +568,9 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(90 * dpiScale * scaleX);   // 与 ↑/↓/→ 统一宽度
-        int wUp   = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度   // ↓ 与上方 ↑ 同宽对齐
-        int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
+        int wArw = (int)(52 * dpiScale * scaleX);   // ← 与 ↑/↓ 同宽
+        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wRSh  = (int)(68 * dpiScale * scaleX);   // → 与右 Shift 同宽，右列统一 68
         int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
         int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
         if (spaceW < 60) spaceW = 60;
@@ -696,7 +696,7 @@ static void BuildKeys() {
     // Row 2: Caps, a-l, ;, ', Enter  (13 keys)
     {
         int wCaps = (int)(80 * dpiScale * scaleX);
-        int wEnter = (int)(90 * dpiScale * scaleX);
+        int wEnter = (int)(68 * dpiScale * scaleX);   // 右列统一 68（与 Backspace/Del 同宽）
         int fixed = wCaps + wEnter;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 11;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 11;
@@ -714,8 +714,8 @@ static void BuildKeys() {
     // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
     {
         int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度
-        int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
+        int wUp = (int)(52 * dpiScale * scaleX);   // 与 ↓ 同宽对齐
+        int wRSh = (int)(68 * dpiScale * scaleX);   // 与上方 Enter 同宽，右列统一 68
         int fixed = wLSh + wRSh + wUp;
         int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
         int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
@@ -740,9 +740,9 @@ static void BuildKeys() {
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(90 * dpiScale * scaleX);   // 与 ↑/↓/→ 统一宽度
-        int wUp   = (int)(90 * dpiScale * scaleX);   // 与方向键统一宽度   // ↓ 与上方 ↑ 同宽对齐
-        int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
+        int wArw = (int)(52 * dpiScale * scaleX);   // ← 与 ↑/↓ 同宽
+        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wRSh  = (int)(68 * dpiScale * scaleX);   // → 与右 Shift 同宽，右列统一 68
         if (g_showFKeys) {
             // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (10 keys)
             int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;

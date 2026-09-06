@@ -353,7 +353,7 @@ static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收�
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
-int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘 2=常用
+int         g_layoutMode = 0;          // 键盘布局：0=全尺寸 1=小键盘
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
@@ -486,142 +486,12 @@ static void BuildNumpad(int y) {
     }
 }
 
-// 常用布局（标准 87 键 TKL：无数字小键盘，可选 F1~F12 顶行）
-// 始终保留 Esc 与 Fn：F 行开启时 Esc 位于顶行、Fn 隐藏；关闭时 Esc 在主键区行首、Fn 在底排
-static void BuildCommon(int y, double dpiScale, double scaleX) {
-    // F 行（可选）：Esc, F1~F12
-    if (g_showFKeys) {
-        int aw = (KEY_AREA_W - 12 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - 12 * g_keyGap - aw * 13;
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            AddKey(x, y, w, g_keyHeight, (short)(i == 0 ? 0x1B : 0x70 + i - 1), (i == 0) ? K_SPECIAL : K_NORMAL);
-            x += w + g_keyGap;
-        }
-        y += g_keyHeight + g_keyGap;
-    }
-
-    // Row 1: (Esc), `, 1-0, -, =, Backspace
-    {
-        int wEsc = (int)(50 * dpiScale * scaleX);
-        int wBksp = (int)(80 * dpiScale * scaleX);
-        if (!g_showFKeys) {
-            // F 行关闭：Esc 保留在行首（15 键）
-            int fixed = wEsc + wBksp;
-            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-            int w[15]; w[0] = wEsc;
-            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-            w[14] = wBksp;
-            short v[15] = {0x1B,0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
-            KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            // F 行开启：Esc 已在顶行（14 键）
-            int aw = (KEY_AREA_W - wBksp - 13 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - wBksp - 13 * g_keyGap - aw * 13;
-            short v[14] = {0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
-            KeyType t[14] = {K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 14; i++) {
-                int w = (i == 13) ? wBksp : (aw + (i < rem ? 1 : 0));
-                AddKey(x, y, w, g_keyHeight, v[i], t[i]);
-                x += w + g_keyGap;
-            }
-        }
-    }
-    y += g_keyHeight + g_keyGap;
-
-    // Row 2: Tab, Q-P, [, ], \ (14 keys)
-    {
-        int wTab = (int)(72 * dpiScale * scaleX);
-        int aw = (KEY_AREA_W - wTab - 13 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - wTab - 13 * g_keyGap - aw * 13;
-        short v[14] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC};
-        KeyType t[14] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 14; i++) {
-            int w = (i == 0) ? wTab : (aw + (i <= rem ? 1 : 0));
-            AddKey(x, y, w, g_keyHeight, v[i], t[i]);
-            x += w + g_keyGap;
-        }
-    }
-    y += g_keyHeight + g_keyGap;
-
-    // Row 3: Caps, A-L, ;, ', Enter (13 keys)
-    {
-        int wCaps = (int)(86 * dpiScale * scaleX);
-        int wEnter = (int)(96 * dpiScale * scaleX);
-        int fixed = wCaps + wEnter;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 11;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 11;
-        int w[13]; w[0] = wCaps;
-        for (int i = 1; i <= 11; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[12] = wEnter;
-        short v[13] = {0x14,0x41,0x53,0x44,0x46,0x47,0x48,0x4A,0x4B,0x4C,0xBA,0xDE,0x0D};
-        KeyType t[13] = {K_CAPS,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-    }
-    y += g_keyHeight + g_keyGap;
-
-    // Row 4: LShift, Z-M, ,, ., /, ↑, RShift (14 keys)
-    {
-        int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(52 * dpiScale * scaleX);
-        int wRSh = (int)(90 * dpiScale * scaleX);   // 右 Shift 与上方 Enter 同宽（右缘齐边）
-        int fixed = wLSh + wRSh + wUp;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
-        int w[13]; w[0] = wLSh;
-        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[11] = wUp; w[12] = wRSh;
-        short v[13] = {0xA0,0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF,0x26,0xA1};
-        KeyType t[13] = {K_MOD,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_ARROW,K_MOD};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-    }
-    y += g_keyHeight + g_keyGap;
-
-    // Row 5: (Fn), Ctrl, Win, Alt, Space, Alt, Menu, Ctrl, ←, ↓, →
-    // F 行开启时隐藏 Fn（Esc 已在顶行保留）
-    {
-        int wFn  = (int)(46 * dpiScale * scaleX);
-        int wCtl = (int)(56 * dpiScale * scaleX);
-        int wWin = (int)(46 * dpiScale * scaleX);
-        int wAlt = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);
-        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
-        int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
-        if (g_showFKeys) {
-            int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
-            short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
-            short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        }
-    }
 }
 
 // Fn 网页布局层：整体结构跟随当前布局样式（全尺寸/常用），
 // 仅行1 数字键换为 F1~F12、行4 字母键换为网址后缀键
 static void BuildFnSurf(int y, double dpiScale, double scaleX) {
-    BOOL commonStyle = (g_layoutMode == 2);   // 常用布局：行2 无 Del、行5 带 Menu
+    // Fn 网页层结构跟随全尺寸布局（含 Menu 键）：行2 带 Del、行5 带 Menu
     // Row 1: Esc, `, F1~F12, Backspace (15 keys)
     {
         int wEsc = (int)(50 * dpiScale * scaleX);
@@ -641,31 +511,20 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 2: Tab, q-p, [, ], \, Del (15 keys)；常用布局无 Del (14 keys)
+    // Row 2: Tab, q-p, [, ], \, Del (15 keys)
     {
         int wTab = (int)(68 * dpiScale * scaleX);
         int wDel = (int)(68 * dpiScale * scaleX);
-        if (commonStyle) {
-            int aw = (KEY_AREA_W - wTab - 13 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - wTab - 13 * g_keyGap - aw * 13;
-            int w[14]; w[0] = wTab;
-            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-            short v[14] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC};
-            KeyType t[14] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 14; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            int fixed = wTab + wDel;
-            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-            int w[15]; w[0] = wTab;
-            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-            w[14] = wDel;
-            short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
-            KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        }
+        int fixed = wTab + wDel;
+        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
+        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
+        int w[15]; w[0] = wTab;
+        for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
+        w[14] = wDel;
+        short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
+        KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         y += g_keyHeight + g_keyGap;
     }
 
@@ -704,8 +563,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 5: Fn, Ctrl, Win, Alt, 空格, Alt, (Menu), Ctrl, ←, ↓, →
-    // 常用布局带 Menu 键（11 keys）；全尺寸与原布局一致（10 keys）
+    // Row 5: Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (11 keys)
     {
         int wFn  = (int)(46 * dpiScale * scaleX);
         int wCtl = (int)(56 * dpiScale * scaleX);
@@ -715,25 +573,14 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int wArw = (int)(52 * dpiScale * scaleX);
         int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
         int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
-        if (commonStyle) {
-            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
-            short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wUp, wRSh};
-            short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        }
+        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+        int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
+        if (spaceW < 60) spaceW = 60;
+        int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
+        short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+        KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+        int x = KEY_AREA_X;
+        for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
     }
 }
 
@@ -766,14 +613,9 @@ static void BuildKeys() {
         return;
     }
 
-    // Fn 网页布局层（按 Fn 键切换，全尺寸/常用布局下生效）
+    // Fn 网页布局层（按 Fn 键切换，全尺寸布局下生效）
     if (g_fnLayer && g_fnWebLayout) {
         BuildFnSurf(y, dpiScale, scaleX);
-        return;
-    }
-
-    if (g_layoutMode == 2) {   // 常用（标准 TKL）
-        BuildCommon(y, dpiScale, scaleX);
         return;
     }
 
@@ -893,34 +735,36 @@ static void BuildKeys() {
     }
     y += g_keyHeight + g_keyGap;
 
-    // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, →  (10 keys)；F 行开启时隐藏 Fn
+    // Row 4: (Fn), Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, →；F 行开启时隐藏 Fn
     {
         int wFn  = (int)(46 * dpiScale * scaleX);
         int wCtl = (int)(56 * dpiScale * scaleX);
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
+        int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
         int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
         int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
         if (g_showFKeys) {
-            // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, → (9 keys)
-            int leftOfArrows = wCtl + wWin + wAlt + wAlt + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 8 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[9] = {wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wUp, wRSh};
-            short v[9] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[9] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 9; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
+            // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (10 keys)
+            int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
             int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wUp, wRSh};
-            short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
+            short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
+        } else {
+            // 有 Fn：Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (11 keys)
+            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
+            if (spaceW < 60) spaceW = 60;
+            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
+            short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
+            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
+            int x = KEY_AREA_X;
+            for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         }
     }
 }
@@ -1052,7 +896,7 @@ static void RecreateFontsAndLayout() {
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
     g_f18b = MakeFont((int)(18 * finalFontScale), 1);
-    g_fKeyIcon = MakeIconFont((int)(20 * finalFontScale));   // Menu 键汉堡图标
+    g_fKeyIcon = MakeIconFont((int)(15 * finalFontScale));   // Menu 键汉堡图标
 
     BuildKeys();
 }
@@ -2664,8 +2508,8 @@ static const wchar_t* g_materialNamesEn[3] = { L"Off", L"Mica", L"Acrylic" };
 static const int g_opacityValues[6] = { 100, 90, 80, 70, 60, 50 };
 static const wchar_t* g_opacityNames[6] = { L"100%（不透明）", L"90%", L"80%", L"70%", L"60%", L"50%" };
 static const wchar_t* g_opacityNamesEn[6] = { L"100% (Opaque)", L"90%", L"80%", L"70%", L"60%", L"50%" };
-static const wchar_t* g_layoutNames[3] = { L"全尺寸", L"小键盘", L"常用" };
-static const wchar_t* g_layoutNamesEn[3] = { L"Full", L"Numpad", L"Common" };
+static const wchar_t* g_layoutNames[2] = { L"全尺寸", L"小键盘" };
+static const wchar_t* g_layoutNamesEn[2] = { L"Full", L"Numpad" };
 
 static int g_switchAnimHit = S_HIT_NONE;
 static LONGLONG g_switchAnimStart = 0;
@@ -3395,11 +3239,11 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         RECT r;
         if (g_dropLayout) {
             r = SettingsRowRect(m, 0);
-            const wchar_t* names[3];
-            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
+            const wchar_t* names[2];
+            for (int i = 0; i < 2; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
             int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
-                          m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
+                          m.comboW, m.comboH, names, 2, g_layoutMode, g_dropLayoutHov);
         }
     } else if (g_sTab == 1) {
         RECT r;
@@ -3502,8 +3346,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (g_dropLayout) {
             r = SettingsRowRect(m, 0);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
-            for (int i = 0; i < 3; i++) {
+            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
+            for (int i = 0; i < 2; i++) {
                 if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
                 ly += m.comboH;
             }
@@ -3707,7 +3551,7 @@ static void LoadConfig() {
     if (g_mainOpacity < 50 || g_mainOpacity > 100) g_mainOpacity = 100;
     g_wallpaperAccent = (IniGetInt(L"Theme", L"Wallpaper", 0) != 0);
     g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
-    if (g_layoutMode < 0 || g_layoutMode > 2) g_layoutMode = 0;
+    if (g_layoutMode < 0 || g_layoutMode > 1) g_layoutMode = 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
@@ -3851,7 +3695,6 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_LAYOUT_OPT0:
     case S_HIT_LAYOUT_OPT1:
-    case S_HIT_LAYOUT_OPT2:
         g_layoutMode = hit - S_HIT_LAYOUT_OPT0;
         g_dropLayout = FALSE;
         layoutChanged = TRUE;
@@ -4170,7 +4013,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         if (hov != g_sHov) { g_sHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
         int thov = (hov >= S_HIT_THEME_OPT0 && hov <= S_HIT_THEME_OPT2) ? hov - S_HIT_THEME_OPT0 : -1;
         int mhov = (hov >= S_HIT_MATERIAL_OPT0 && hov <= S_HIT_MATERIAL_OPT2) ? hov - S_HIT_MATERIAL_OPT0 : -1;
-        int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT2) ? hov - S_HIT_LAYOUT_OPT0 : -1;
+        int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT1) ? hov - S_HIT_LAYOUT_OPT0 : -1;
         int langov = (hov >= S_HIT_LANG_OPT0 && hov <= S_HIT_LANG_OPT1) ? hov - S_HIT_LANG_OPT0 : -1;
         int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT0 + 2) ? hov - S_HIT_HL_OPT0 : -1;
         int clov = (hov >= S_HIT_CLOSE_OPT0 && hov <= S_HIT_CLOSE_OPT1) ? hov - S_HIT_CLOSE_OPT0 : -1;

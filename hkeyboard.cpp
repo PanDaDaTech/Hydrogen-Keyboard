@@ -486,8 +486,6 @@ static void BuildNumpad(int y) {
     }
 }
 
-}
-
 // Fn 网页布局层：整体结构跟随当前布局样式（全尺寸/常用），
 // 仅行1 数字键换为 F1~F12、行4 字母键换为网址后缀键
 static void BuildFnSurf(int y, double dpiScale, double scaleX) {

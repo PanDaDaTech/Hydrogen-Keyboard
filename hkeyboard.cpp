@@ -2048,7 +2048,7 @@ static int HitHeader(int x, int y) {
     int gap     = (int)(6 * dpiScale);
     int wClose = (int)(28 * dpiScale);
     int wMin   = (int)(28 * dpiScale);
-    int wNum   = (int)(40 * dpiScale);
+    int wNum   = (int)(48 * dpiScale);
     int wMenu  = (int)(48 * dpiScale);
     int btnH   = (int)(28 * dpiScale);
     if (btnH > g_headerH - 4) btnH = g_headerH - 4;
@@ -2058,12 +2058,12 @@ static int HitHeader(int x, int y) {
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
-    int xNum   = g_showNumBtn ? (xMin - gap - wNum) : xMin;
+    int xNum   = (g_showNumBtn && g_layoutMode != 2) ? (xMin - gap - wNum) : xMin;
     int xMenu  = (int)(6 * dpiScale);
 
     if (x >= xClose && x < xClose + wClose) return HDR_CLOSE;
     if (x >= xMin && x < xMin + wMin) return HDR_MIN;
-    if (g_showNumBtn && x >= xNum && x < xNum + wNum) return HDR_NUM;
+    if (g_showNumBtn && g_layoutMode != 2 && x >= xNum && x < xNum + wNum) return HDR_NUM;
     if (x >= xMenu && x < xMenu + wMenu) return HDR_DOCK;
     return -1;
 }
@@ -2101,12 +2101,13 @@ static void DrawHeader(HDC dc) {
 
     int wClose = (int)(28 * dpiScale);
     int wMin   = (int)(28 * dpiScale);
-    int wNum   = (int)(40 * dpiScale);
+    int wNum   = (int)(48 * dpiScale);
     int wMenu  = (int)(48 * dpiScale);
 
     int xClose = g_ww - rMargin - wClose;
     int xMin   = xClose - gap - wMin;
-    int xNum   = g_showNumBtn ? (xMin - gap - wNum) : xMin;
+    BOOL numBtnVisible = (g_showNumBtn && g_layoutMode != 2);   // 完整布局自带数字区：默认隐藏 123
+    int xNum   = numBtnVisible ? (xMin - gap - wNum) : xMin;
     int xMenu  = (int)(6 * dpiScale);
 
     if (IsMainMaterialPaintActive())
@@ -2117,19 +2118,18 @@ static void DrawHeader(HDC dc) {
     DrawTextC(dc, xMenu, btnY, wMenu, btnH, T(L"\x8BBE\x7F6E", L"Settings"), g_f12, C_WHITE);   // 菜单按钮 → 打开设置页
 
     int xTitle = xMenu + wMenu + gap;
-    int wTitle = (g_showNumBtn ? xNum : xMin) - xTitle - gap;
+    int wTitle = (numBtnVisible ? xNum : xMin) - xTitle - gap;
     if (wTitle > 40) {
         DrawTextC(dc, xTitle, 0, wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
-    // 123 按钮：主布局与小键盘布局间切换（悬停同款圆角底）
-    if (g_showNumBtn) {
-        if (g_hdrHov == HDR_NUM) {
-            if (IsMainMaterialPaintActive())
-                DrawRoundRectAlpha(dc, xNum, btnY, wNum, btnH, C_HOVER, C_KEY_BORDER, 6, 196, 150);
-            else
-                DrawRoundRect(dc, xNum, btnY, wNum, btnH, C_HOVER, C_KEY_BORDER, 6);
-        }
+    // 123 按钮：与设置按钮同款胶囊样式（常态底 + 同字体），点击在当前布局与小键盘间切换
+    if (numBtnVisible) {
+        if (IsMainMaterialPaintActive())
+            DrawRoundRectAlpha(dc, xNum, btnY, wNum, btnH, C_KEY, C_KEY_BORDER,
+                               btnH / 2, 188, 150);
+        else
+            DrawRoundRect(dc, xNum, btnY, wNum, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
         DrawTextC(dc, xNum, btnY, wNum, btnH, L"123", g_f12, C_WHITE);
     }
 

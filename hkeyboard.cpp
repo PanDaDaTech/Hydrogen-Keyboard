@@ -894,7 +894,7 @@ static void RecreateFontsAndLayout() {
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
     g_f18b = MakeFont((int)(18 * finalFontScale), 1);
-    g_fKeyIcon = MakeIconFont((int)(15 * finalFontScale));   // Menu 键汉堡图标
+    g_fKeyIcon = MakeIconFont((int)(12 * finalFontScale));   // Menu 键汉堡图标（缩小）
 
     BuildKeys();
 }
@@ -2063,7 +2063,7 @@ static void DrawKeys(HDC dc) {
         BOOL shiftOn = (g_sh || g_physShift);
         if (k->vk == 0x5B) {
             // Win 键：字体无 Windows 徽标字形，直接矢量绘制 Win11 风格四格徽标
-            double u = (double)k->h * 0.42;
+            double u = (double)k->h * 0.32;   // 缩小：徽标占键高 32%
             int sq = (int)(u * 0.44);
             int gp = (int)(u * 0.12);
             if (sq < 2) sq = 2;

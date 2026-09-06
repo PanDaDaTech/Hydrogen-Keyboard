@@ -534,6 +534,7 @@ static void BuildComplete(int y, double dpiScale, double scaleX) {
         int rem = MAIN_W - wTab - wBk - 14 * gap - aw * 13;
         short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x08};
         KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
+        mx = KEY_AREA_X;   // 主区每行 x 归位
         AddKey(mx, y, wTab, g_keyHeight, v[0], t[0]); mx += wTab + gap;
         for (int i = 1; i <= 13; i++) { int w = aw + (i <= rem ? 1 : 0); AddKey(mx, y, w, g_keyHeight, v[i], t[i]); mx += w + gap; }
         AddKey(mx, y, wBk, g_keyHeight, v[14], t[14]);
@@ -551,6 +552,7 @@ static void BuildComplete(int y, double dpiScale, double scaleX) {
         int aw = (MAIN_W - wCaps - wEnt - 12 * gap) / 11;
         int rem = MAIN_W - wCaps - wEnt - 12 * gap - aw * 11;
         short v[13] = {0x14,0x41,0x53,0x44,0x46,0x47,0x48,0x4A,0x4B,0x4C,0xBA,0xDE,0x0D};
+        mx = KEY_AREA_X;   // 主区每行 x 归位
         AddKey(mx, y, wCaps, g_keyHeight, v[0], K_CAPS); mx += wCaps + gap;
         for (int i = 1; i <= 11; i++) {
             int w = aw + (i <= rem ? 1 : 0);
@@ -571,6 +573,7 @@ static void BuildComplete(int y, double dpiScale, double scaleX) {
         int aw = (MAIN_W - wLSh - wRSh - 11 * gap) / 10;
         int rem = MAIN_W - wLSh - wRSh - 11 * gap - aw * 10;
         short v[12] = {0xA0,0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF,0xA1};
+        mx = KEY_AREA_X;   // 主区每行 x 归位
         AddKey(mx, y, wLSh, g_keyHeight, v[0], K_MOD); mx += wLSh + gap;
         for (int i = 1; i <= 10; i++) {
             int w = aw + (i <= rem ? 1 : 0);

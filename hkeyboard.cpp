@@ -594,20 +594,22 @@ static void BuildCommon(int y, double dpiScale, double scaleX) {
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
+        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
         if (g_showFKeys) {
             int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+            int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
             short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
             KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         } else {
             int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 10 * g_keyGap;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
             short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
             KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
@@ -711,20 +713,22 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wMenu = (int)(56 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
+        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
         if (commonStyle) {
             int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 10 * g_keyGap;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wArw, wArw};
+            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
             short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
             KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         } else {
             int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wUp, wRSh};
             short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
             KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
@@ -896,21 +900,23 @@ static void BuildKeys() {
         int wWin = (int)(46 * dpiScale * scaleX);
         int wAlt = (int)(58 * dpiScale * scaleX);
         int wArw = (int)(52 * dpiScale * scaleX);
+        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽对齐
+        int wRSh  = (int)(90 * dpiScale * scaleX);   // → 与上方 Shift 同宽对齐
         if (g_showFKeys) {
             // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Ctrl, ←, ↓, → (9 keys)
             int leftOfArrows = wCtl + wWin + wAlt + wAlt + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 8 * g_keyGap;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 8 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[9] = {wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+            int w[9] = {wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wUp, wRSh};
             short v[9] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
             KeyType t[9] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;
             for (int i = 0; i < 9; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         } else {
             int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw * 3 - 9 * g_keyGap;
+            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
             if (spaceW < 60) spaceW = 60;
-            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wArw, wArw};
+            int w[10] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wCtl, wArw, wUp, wRSh};
             short v[10] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x11, 0x25, 0x28, 0x27};
             KeyType t[10] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
             int x = KEY_AREA_X;

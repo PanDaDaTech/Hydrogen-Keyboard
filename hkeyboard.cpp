@@ -293,6 +293,10 @@ static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
+// 配置读写（实现位于文件后半段，此处提前声明供键位处理逻辑调用）
+static void GetConfigPath(wchar_t* buf, int cch);
+static void IniSetInt(const wchar_t* section, const wchar_t* key, int val);
+static int  IniGetInt(const wchar_t* section, const wchar_t* key, int def);
 
 // Global state
 HINSTANCE   g_hInst = 0;

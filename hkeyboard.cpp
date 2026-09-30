@@ -15,6 +15,7 @@
 #include "resource.h"
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
+#include "hk_icons_generated.h"   // 自绘图标几何（由 svg_to_gdi.py 生成，替代图标字体）
 
 // 当前编译架构（关于页显示用）
 #ifdef _M_ARM64
@@ -165,6 +166,10 @@ static DWORD BlendColor(DWORD from, DWORD to, double value) {
 // 把黑/白按 alpha 覆盖到实色底上（等价 rgba 覆盖），返回预混实色
 static DWORD OverlayBgr(DWORD base, BOOL white, double alpha) {
     return BlendColor(base, white ? 0xFFFFFF : 0x000000, alpha);
+}
+
+static Gdiplus::Color GpColorFromBgr(DWORD color) {
+    return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
 }
 
 // 色相预览色：与主色同一配方（oklch 0.70 / 0.14），用于色板与色相滑轨
@@ -420,6 +425,7 @@ BOOL        g_npHidden = FALSE;        // 完整布局：数字区当前是否�
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
+int         g_keyIconStyle = 0;        // 按键图标样式：0=文字（默认）1=图标 2=图标+文字（ini Keyboard/KeyIconStyle）
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
 static int  g_hdrHov = -1;            // 标题栏按钮悬停（HDR_*，-1=无）
@@ -430,13 +436,10 @@ HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
-HFONT       g_fKeyIcon = 0;   // 键面图标字体（Segoe MDL2/Fluent，Menu 键汉堡图标用）
-static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0, g_sfIcon = 0;   // 设置/关闭窗口固定字号字体
+static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
-static HANDLE g_fontRegMdl2 = 0;       // 内嵌 Segoe MDL2（Win10 以下系统图标字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
-static BOOL   g_mdl2Ready = FALSE;     // 内嵌 MDL2 注册成功（系统无 MDL2 时可用）
 NOTIFYICONDATAW g_nid;
 
 // ===== GDI+ 平滑绘图（抗锯齿圆形，避免 GDI Ellipse 锯齿） =====
@@ -454,16 +457,6 @@ static void DrawCircleAA(HDC dc, int x, int y, int r, DWORD fill) {
     Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
     g.FillEllipse(&br, (Gdiplus::REAL)(x - r), (Gdiplus::REAL)(y - r),
                   (Gdiplus::REAL)(r * 2), (Gdiplus::REAL)(r * 2));
-}
-
-// 抗锯齿实心三角形（下拉框箭头等小图形）
-static void DrawTriangleAA(HDC dc, int ax, int ay, int bx, int by, int cx, int cy, DWORD fill) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    Gdiplus::Point pts[3] = { Gdiplus::Point(ax, ay), Gdiplus::Point(bx, by), Gdiplus::Point(cx, cy) };
-    Gdiplus::SolidBrush br(Gdiplus::Color(255, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
-    g.FillPolygon(&br, pts, 3);
 }
 
 // Fn 功能键层：TRUE 时数字行显示为 F1~F12（或按设置切换到上网布局）
@@ -982,14 +975,11 @@ static void BuildKeys() {
 
 // 注册内嵌字体（MiSans 精简版）到当前进程；失败则回退系统字体
 static void LoadEmbeddedFonts() {
-    struct { int id; HANDLE* slot; } fonts[3] = {
+    struct { int id; HANDLE* slot; } fonts[2] = {
         { IDR_FONT_REGULAR, &g_fontRegRegular },
         { IDR_FONT_BOLD,    &g_fontRegBold },
-        { IDR_FONT_MDL2,    &g_fontRegMdl2 },
     };
-    for (int i = 0; i < 3; i++) {
-        // Win10 及以上系统自带 Segoe MDL2/Fluent，跳过内嵌图标字体（省内存）
-        if (fonts[i].id == IDR_FONT_MDL2 && g_winBuild >= 10240) continue;
+    for (int i = 0; i < 2; i++) {
         HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), MAKEINTRESOURCEW(10));  // RT_RCDATA
         if (!hr) continue;
         HGLOBAL hg = LoadResource(g_hInst, hr);
@@ -1001,8 +991,7 @@ static void LoadEmbeddedFonts() {
         HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
         if (h && n > 0) {
             *fonts[i].slot = h;
-            if (fonts[i].id == IDR_FONT_MDL2) g_mdl2Ready = TRUE;
-            else g_fontReady = TRUE;
+            g_fontReady = TRUE;
         }
     }
 }
@@ -1036,42 +1025,6 @@ static HFONT MakeFont(double size, BOOL bold) {
     return f;
 }
 
-static HFONT MakeIconFont(double size) {
-    HDC dc = GetDC(NULL);
-    int dpi = GetDeviceCaps(dc, LOGPIXELSY);
-    int height = -MulDiv((int)(size + 0.5), dpi, 72);
-    ReleaseDC(NULL, dc);
-
-    // 图标字体按系统环境选择：
-    //   Win10 及以上：Fluent Icons（Win11）/ MDL2（Win10）
-    //   Win10 以下（Win7/8.x）：MDL2 优先——系统未自带时由内嵌副本注册提供，
-    //   Segoe UI Symbol 作为未注册成功的兜底
-    const wchar_t* faces[4];
-    int n = 0;
-    if (g_winBuild >= 10240) {
-        faces[n++] = L"Segoe Fluent Icons";
-        faces[n++] = L"Segoe MDL2 Assets";
-    } else {
-        faces[n++] = L"Segoe MDL2 Assets";
-        faces[n++] = L"Segoe UI Symbol";
-    }
-    if (g_winBuild < 10240 && g_mdl2Ready) n = 1;   // 内嵌 MDL2 已注册，仅保留首选
-    for (int i = 0; i < n; i++) {
-        HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, faces[i]);
-        if (!font) continue;
-        dc = GetDC(NULL);
-        HFONT old = (HFONT)SelectObject(dc, font);
-        wchar_t actual[LF_FACESIZE] = {0};
-        GetTextFaceW(dc, LF_FACESIZE, actual);
-        SelectObject(dc, old);
-        ReleaseDC(NULL, dc);
-        if (_wcsicmp(actual, faces[i]) == 0) return font;
-        DeleteObject(font);
-    }
-    return MakeFont(size, FALSE);
-}
 // 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
@@ -1080,7 +1033,6 @@ static void InitFixedFonts() {
     g_sf13b = MakeFont(10.5 * dpi, 1);   // Tab / 按钮
     g_sf14b = MakeFont(11.5 * dpi, 1);   // 面板标题
     g_sf20b = MakeFont(20 * dpi, 1);     // 设置页大标题
-    g_sfIcon = MakeIconFont(16);         // 紧凑 Windows 11 Fluent 图标
 }
 
 static void RecreateFontsAndLayout() {
@@ -1091,7 +1043,6 @@ static void RecreateFontsAndLayout() {
     if (g_f14b) DeleteObject(g_f14b);
     if (g_f16b) DeleteObject(g_f16b);
     if (g_f18b) DeleteObject(g_f18b);
-    if (g_fKeyIcon) DeleteObject(g_fKeyIcon);
 
     double dpiScale = GetSystemDpiScale();
     double baseH = 320.0 * dpiScale;
@@ -1107,7 +1058,6 @@ static void RecreateFontsAndLayout() {
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
     g_f18b = MakeFont((int)(18 * finalFontScale), 1);
-    g_fKeyIcon = MakeIconFont((int)(12 * finalFontScale));   // Menu 键汉堡图标（缩小）
 
     BuildKeys();
 }
@@ -1425,6 +1375,142 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     }
 }
 
+// ===== 自绘图标运行层（替代图标字体）=====
+// 几何来自 hk_icons_generated.h，与 PanDaPE-Maker 的 icons.rs 同源（24 网格 / 1.9 描边 / round）。
+// 收益：任意尺寸、任意色相都可用，加一个图标＝加一段顶点数据，不用重跑字体子集化。
+static const HkIconDef& HkIcon(int id) { return k_hkIcons[id]; }
+
+static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
+    if (!s || !s[0] || !f) return 0;
+    HFONT old = (HFONT)SelectObject(dc, f);
+    SIZE sz = {0, 0};
+    GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
+    SelectObject(dc, old);
+    return sz.cx;
+}
+
+// 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
+// 否则 16px 图标的线会连带缩细，与制作工具的观感对不上。
+static void DrawHkIcon(HDC dc, float x, float y, float size,
+                       const HkIconDef& def, DWORD fg, DWORD hole) {
+    if (!def.nodes || def.grid <= 0.0f || size <= 0.0f) return;
+
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+    const float k = size / def.grid;
+    Gdiplus::Matrix mat(k, 0.0f, 0.0f, k, x, y);
+
+    const HkIconNode* n = def.nodes;
+    while (n->op != HKIC_END) {
+        if (n->op != HKIC_BEGIN) { ++n; continue; }
+        HkIconPaint paint = (HkIconPaint)(int)n->a;
+        float strokeW = n->b > 0.0f ? n->b : 1.9f;
+        DWORD color = ((int)n->c) ? hole : fg;
+        ++n;
+
+        Gdiplus::GraphicsPath path;
+        float px = 0.0f, py = 0.0f;
+        BOOL have = FALSE;   // 当前子路径是否已有可用起点
+        while (n->op != HKIC_BEGIN && n->op != HKIC_END) {
+            switch (n->op) {
+            case HKIC_MOVE:
+                px = n->a; py = n->b; have = TRUE;
+                break;
+            case HKIC_LINE:
+                if (have) path.AddLine(px, py, n->a, n->b);
+                px = n->a; py = n->b; have = TRUE;
+                break;
+            case HKIC_CUBIC:
+                if (have) path.AddBezier(px, py, n->a, n->b, n->c, n->d, n->e, n->f);
+                px = n->e; py = n->f; have = TRUE;
+                break;
+            case HKIC_CLOSE:
+                if (path.GetPointCount() > 0) path.CloseFigure();
+                break;
+            default:
+                break;
+            }
+            ++n;
+        }
+        if (path.GetPointCount() <= 0) continue;
+        path.Transform(&mat);
+
+        if (paint == HKIC_FILL) {
+            Gdiplus::SolidBrush brush(GpColorFromBgr(color));
+            g.FillPath(&brush, &path);
+        } else {
+            Gdiplus::Pen pen(GpColorFromBgr(color), (Gdiplus::REAL)(k * strokeW));
+            pen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+            pen.SetLineJoin(Gdiplus::LineJoinRound);
+            g.DrawPath(&pen, &path);
+        }
+    }
+}
+
+// 图标 tile：圆角 10、底 C_REGULAR，内容为 iconSize 的矢量图标
+// （iconId < 0 时画 text —— 功能键行那类没有对应图标、但需要方块的行用它）
+static void DrawIconTile(HDC dc, int x, int y, int size, int iconSize, int iconId, const wchar_t* text) {
+    DrawRoundRect(dc, x, y, size, size, C_REGULAR, C_REGULAR, (int)(10 * GetSystemDpiScale()));
+    if (iconId >= 0) {
+        int pad = (size - iconSize) / 2;
+        DrawHkIcon(dc, (float)(x + pad), (float)(y + pad), (float)iconSize,
+                   HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
+    } else if (text) {
+        DrawTextC(dc, x, y, size, size, text, g_sf13b, C_BTN_CONTENT);
+    }
+}
+
+// 键 → 图标；返回 NULL 表示该键不参与图标化（永远走文字）
+// 硬规则：双符号键、字母数字、F1~F12、Esc/Ctrl/Alt/Fn 及各缩写键都没有公认图形，保持文字。
+static const HkIconDef* KeyIconFor(const KeyDef* k) {
+    if (!k) return NULL;
+    if (k->type == K_HIDE) return &HkIcon(HKICON_CHEVRONDOWN);
+    switch (k->vk) {
+    case 0x5D: return &HkIcon(HKICON_HAMBURGER);                        // Menu
+    case 0x10: case 0xA0: case 0xA1: return &HkIcon(HKICON_SHIFT);      // Shift
+    case 0x14: return &HkIcon(HKICON_CAPSLOCK);                         // Caps
+    case 0x09: return &HkIcon(HKICON_TAB);                              // Tab
+    case 0x0D: return &HkIcon(HKICON_ENTER);                            // Enter
+    case 0x08: return &HkIcon(HKICON_BACKSPACE);                        // 退格
+    case 0x25: return &HkIcon(HKICON_ARROWLEFT);
+    case 0x26: return &HkIcon(HKICON_ARROWUP);
+    case 0x27: return &HkIcon(HKICON_ARROWRIGHT);
+    case 0x28: return &HkIcon(HKICON_ARROWDOWN);
+    }
+    return NULL;
+}
+
+// 键面标签的图标形态；返回 FALSE 表示该键不参与图标化（调用方继续走文字路径）。
+// 颜色只有 textC 一个来源，所以「普通/修饰/按下/强调」四态与深色主题都自动跟随，零分支。
+static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, DWORD color) {
+    if (g_keyIconStyle == 0) return FALSE;
+    const HkIconDef* ic = KeyIconFor(k);
+    if (!ic) return FALSE;
+
+    double dpi = GetSystemDpiScale();
+    int pure  = (int)(20 * dpi);   // 纯图标
+    int small = (int)(18 * dpi);   // 图标+文字里的图标
+    int gap   = (int)(6 * dpi);
+
+    // 「图标+文字」是尽力而为：放不下就降级为纯图标，绝不允许压边
+    if (g_keyIconStyle == 2 && text && text[0] && k->w >= (int)(40 * dpi)) {
+        int tw = MeasureTextW(dc, text, f);
+        if (small + gap + tw <= k->w - (int)(16 * dpi)) {
+            int total = small + gap + tw;
+            int x = k->x + (k->w - total) / 2;
+            DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - small) / 2), (float)small,
+                       *ic, color, color);
+            DrawTextC(dc, x + small + gap, k->y, tw + 4, k->h, text, f, color);
+            return TRUE;
+        }
+    }
+    DrawHkIcon(dc, (float)(k->x + (k->w - pure) / 2), (float)(k->y + (k->h - pure) / 2),
+               (float)pure, *ic, color, color);
+    return TRUE;
+}
+
 static wchar_t GetSymForKey(short vk, BOOL shifted) {
     struct { short vk; wchar_t n, s; } map[] = {
         {0x31,L'1',L'!'},{0x32,L'2',L'@'},{0x33,L'3',L'#'},{0x34,L'4',L'$'},{0x35,L'5',L'%'},
@@ -1494,7 +1580,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x11: return L"Ctrl";
         case 0x12: return L"Alt";
         case 0x5B: return L"";   // Win 键：矢量绘制 Windows 徽标，无文字
-        case 0x5D: return L"\xE700";   // Segoe MDL2/Fluent GlobalNavButton 汉堡菜单图标
+        case 0x5D: return L"";   // Menu 键：矢量绘制汉堡图标，无文字
         case 0x20: return L"";         // 空格键不显示文字
         case 0x25: return L"\x2190";
         case 0x26: return L"\x2191";
@@ -1873,86 +1959,111 @@ static void DoKeyAction(const KeyDef* k) {
 #define HDR_CLOSE 1004
 #define HDR_NUM   1005   // 123 按钮：切换小键盘
 
+// 标题栏几何：绘制与命中必须取自同一份数据。
+// 这里历史上抄过两份（DrawHeader / HitHeader 各写一遍），改宽度就会出「按钮画在左、
+// 热区在右」的 bug；今后任何改动只改这里。
+struct HeaderMetrics {
+    int btnY, btnH;
+    int wMenu, wMin, wNum, wClose;
+    int xMenu, xMin, xNum, xClose;
+    int xTitle, wTitle;
+    BOOL numBtnVisible;
+};
+
+static HeaderMetrics GetHeaderMetrics() {
+    double dpiScale = GetSystemDpiScale();
+    double dpi = dpiScale;
+    HeaderMetrics hm = {};
+    hm.btnH = (int)(28 * dpi);
+    if (hm.btnH > g_headerH - 4) hm.btnH = g_headerH - 4;
+    hm.btnY = (g_headerH - hm.btnH) / 2;
+
+    int gap     = (int)(6 * dpi);
+    int rMargin = (int)(6 * dpi);
+
+    // 设置按钮宽度随「按键图标样式」变化：文字 48 / 仅图标 40 / 图标+文字 68
+    int menuW = (g_keyIconStyle == 1) ? 40 : ((g_keyIconStyle == 2) ? 68 : 48);
+    hm.wMenu  = (int)(menuW * dpi);
+    hm.wClose = (int)(28 * dpi);
+    hm.wMin   = (int)(28 * dpi);
+    hm.wNum   = (int)(48 * dpi);
+
+    hm.xClose = g_ww - rMargin - hm.wClose;
+    hm.xMin   = hm.xClose - gap - hm.wMin;
+    hm.numBtnVisible = (g_showNumBtn && g_layoutMode != 2);   // 完整布局自带数字区：默认隐藏 123
+    hm.xNum   = hm.numBtnVisible ? (hm.xMin - gap - hm.wNum) : hm.xMin;
+    hm.xMenu  = (int)(6 * dpi);
+
+    hm.xTitle = hm.xMenu + hm.wMenu + gap;
+    hm.wTitle = (hm.numBtnVisible ? hm.xNum : hm.xMin) - hm.xTitle - gap;
+    return hm;
+}
+
 static int HitHeader(int x, int y) {
     if (y < 0 || y >= g_headerH) return -1;
+    HeaderMetrics hm = GetHeaderMetrics();
+    if (y < hm.btnY || y >= hm.btnY + hm.btnH) return -1;
 
-    double dpiScale = GetSystemDpiScale();
-    int rMargin = (int)(6 * dpiScale);
-    int gap     = (int)(6 * dpiScale);
-    int wClose = (int)(28 * dpiScale);
-    int wMin   = (int)(28 * dpiScale);
-    int wNum   = (int)(48 * dpiScale);
-    int wMenu  = (int)(48 * dpiScale);
-    int btnH   = (int)(28 * dpiScale);
-    if (btnH > g_headerH - 4) btnH = g_headerH - 4;
-    int btnY = (g_headerH - btnH) / 2;
-
-    if (y < btnY || y >= btnY + btnH) return -1;
-
-    int xClose = g_ww - rMargin - wClose;
-    int xMin   = xClose - gap - wMin;
-    int xNum   = (g_showNumBtn && g_layoutMode != 2) ? (xMin - gap - wNum) : xMin;
-    int xMenu  = (int)(6 * dpiScale);
-
-    if (x >= xClose && x < xClose + wClose) return HDR_CLOSE;
-    if (x >= xMin && x < xMin + wMin) return HDR_MIN;
-    if (g_showNumBtn && g_layoutMode != 2 && x >= xNum && x < xNum + wNum) return HDR_NUM;
-    if (x >= xMenu && x < xMenu + wMenu) return HDR_DOCK;
+    if (x >= hm.xClose && x < hm.xClose + hm.wClose) return HDR_CLOSE;
+    if (x >= hm.xMin && x < hm.xMin + hm.wMin) return HDR_MIN;
+    if (hm.numBtnVisible && x >= hm.xNum && x < hm.xNum + hm.wNum) return HDR_NUM;
+    if (x >= hm.xMenu && x < hm.xMenu + hm.wMenu) return HDR_DOCK;
     return -1;
+}
+
+// 「设置」按钮内容随图标样式变化（图标+文字模式下齿轮与文字一起居中）
+static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
+    double dpi = GetSystemDpiScale();
+    DrawRoundRect(dc, hm.xMenu, hm.btnY, hm.wMenu, hm.btnH, C_KEY, C_KEY_BORDER, hm.btnH / 2);
+    const wchar_t* label = T(L"\x8BBE\x7F6E", L"Settings");
+    if (g_keyIconStyle == 0) {
+        DrawTextC(dc, hm.xMenu, hm.btnY, hm.wMenu, hm.btnH, label, g_f12, C_WHITE);
+        return;
+    }
+    int iconSz = (int)(17 * dpi);
+    int gap    = (int)(6 * dpi);
+    int tw     = (g_keyIconStyle == 2) ? MeasureTextW(dc, label, g_f12) : 0;
+    int total  = iconSz + (tw > 0 ? gap + tw : 0);
+    int x      = hm.xMenu + (hm.wMenu - total) / 2;
+    DrawHkIcon(dc, (float)x, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
+               HkIcon(HKICON_GEAR), C_WHITE, C_WHITE);
+    if (tw > 0) DrawTextC(dc, x + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, C_WHITE);
 }
 
 static void DrawHeader(HDC dc) {
     // 标题栏与主界面一体化：不单独铺底色，统一由 ClearWindowBackBuffer 的面板底色呈现。
     double dpiScale = GetSystemDpiScale();
-    int rMargin = (int)(6 * dpiScale);
-    int gap     = (int)(6 * dpiScale);
-    int btnH    = (int)(28 * dpiScale);
-    if (btnH > g_headerH - 4) btnH = g_headerH - 4;
-    int btnY = (g_headerH - btnH) / 2;
+    HeaderMetrics hm = GetHeaderMetrics();
 
-    int wClose = (int)(28 * dpiScale);
-    int wMin   = (int)(28 * dpiScale);
-    int wNum   = (int)(48 * dpiScale);
-    int wMenu  = (int)(48 * dpiScale);
+    DrawHeaderMenuButton(dc, hm);
 
-    int xClose = g_ww - rMargin - wClose;
-    int xMin   = xClose - gap - wMin;
-    BOOL numBtnVisible = (g_showNumBtn && g_layoutMode != 2);   // 完整布局自带数字区：默认隐藏 123
-    int xNum   = numBtnVisible ? (xMin - gap - wNum) : xMin;
-    int xMenu  = (int)(6 * dpiScale);
-
-    DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
-    DrawTextC(dc, xMenu, btnY, wMenu, btnH, T(L"\x8BBE\x7F6E", L"Settings"), g_f12, C_WHITE);   // 菜单按钮 → 打开设置页
-
-    int xTitle = xMenu + wMenu + gap;
-    int wTitle = (numBtnVisible ? xNum : xMin) - xTitle - gap;
-    if (wTitle > 40) {
-        DrawTextC(dc, xTitle, 0, wTitle, g_headerH, L"", g_f12, C_DIM);
+    if (hm.wTitle > 40) {
+        DrawTextC(dc, hm.xTitle, 0, hm.wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
     // 123 按钮：与设置按钮同款胶囊样式（常态底 + 同字体），点击在当前布局与小键盘间切换
-    if (numBtnVisible) {
-        DrawRoundRect(dc, xNum, btnY, wNum, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
-        DrawTextC(dc, xNum, btnY, wNum, btnH, L"123", g_f12, C_WHITE);
+    if (hm.numBtnVisible) {
+        DrawRoundRect(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH, C_KEY, C_KEY_BORDER, hm.btnH / 2);
+        DrawTextC(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH, L"123", g_f12, C_WHITE);
     }
 
     // 最小化按钮：悬停时与设置页关闭按钮同款圆角底，图标为 AA 横线
     if (g_hdrHov == HDR_MIN) {
-        DrawRoundRect(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, hm.xMin, hm.btnY, hm.wMin, hm.btnH, C_HOVER, C_KEY_BORDER, 6);
     }
     {
-        int cx = xMin + wMin / 2;
-        int cy = btnY + btnH / 2;
+        int cx = hm.xMin + hm.wMin / 2;
+        int cy = hm.btnY + hm.btnH / 2;
         int half = (int)(5 * dpiScale);
         DrawLineAA(dc, cx - half, cy, cx + half, cy, C_DIM, 2.0f);
     }
     // 关闭按钮：与设置页关闭按钮同款样式（悬停圆角底 + AA 的 X 图标）
     if (g_hdrHov == HDR_CLOSE) {
-        DrawRoundRect(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, hm.xClose, hm.btnY, hm.wClose, hm.btnH, C_HOVER, C_KEY_BORDER, 6);
     }
     {
-        int cx = xClose + wClose / 2;
-        int cy = btnY + btnH / 2;
+        int cx = hm.xClose + hm.wClose / 2;
+        int cy = hm.btnY + hm.btnH / 2;
         int r  = (int)(5 * dpiScale); if (r < 4) r = 4;
         DrawLineAA(dc, cx - r, cy - r, cx + r, cy + r, C_DIM, 2.0f);
         DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
@@ -2002,7 +2113,6 @@ static void DrawKeys(HDC dc) {
         // 字体粗细跟随键面底色：普通键（字母/数字/标点/空格/网址后缀）用常规字重，
         // 修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体
         HFONT f = (isMod || k->type == K_HIDE) ? g_f14b : g_f14;
-        if (k->vk == 0x5D) f = g_fKeyIcon;   // Menu 键：汉堡菜单图标（MDL2/Fluent E700）
         if (k->vk == 0x08) f = g_f18b;   // 退格：大号粗体箭头
         if (k->vk == 0x0D) f = g_f13b;   // Enter：强调键
 
@@ -2016,7 +2126,16 @@ static void DrawKeys(HDC dc) {
         // 未按 Shift：双符号显示（数字 + 顶部特殊符号，副符号置灰）；
         // 按 Shift：开启“仅显示特殊符号”时只显示顶部符号（不显示数字），关闭时仍显示数字。
         BOOL shiftOn = (g_sh || g_physShift);
-        if (k->vk == 0x5B) {
+        BOOL dual = (baseCh && shiftCh && shiftCh != baseCh);
+
+        if (k->vk == 0x5D) {
+            // Menu 键：原本靠图标字体的 \xE700 画汉堡，取消图标字体后一律改矢量，
+            // 三种图标样式下外观一致（它本身没有可用文字，不参与「图标+文字」）。
+            double dpi = GetSystemDpiScale();
+            int s = (int)(20 * dpi);
+            DrawHkIcon(dc, (float)(k->x + (k->w - s) / 2), (float)(k->y + (k->h - s) / 2),
+                       (float)s, HkIcon(HKICON_HAMBURGER), textC, textC);
+        } else if (k->vk == 0x5B) {
             // Win 键：字体无 Windows 徽标字形，直接矢量绘制 Win11 风格四格徽标
             double u = (double)k->h * 0.32;   // 缩小：徽标占键高 32%
             int sq = (int)(u * 0.44);
@@ -2030,14 +2149,15 @@ static void DrawKeys(HDC dc) {
             DrawRoundRect(dc, ox + sq + gp, oy, sq, sq, textC, textC, rr);
             DrawRoundRect(dc, ox, oy + sq + gp, sq, sq, textC, textC, rr);
             DrawRoundRect(dc, ox + sq + gp, oy + sq + gp, sq, sq, textC, textC, rr);
-        } else if (baseCh && shiftCh && shiftCh != baseCh) {
+        } else if (dual) {
+            // 双符号键在三态下都是文字：主字符 + 副符号本身就是两个信息，图标化会毁数据
             if (shiftOn) {
                 wchar_t single[2] = { g_shiftSymbols ? shiftCh : baseCh, 0 };
                 DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);
             } else {
                 DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
             }
-        } else {
+        } else if (!DrawKeyLabel(dc, k, f, txt, textC)) {
             DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
         }
     }
@@ -2064,7 +2184,7 @@ static int       g_kbCacheRow = 0;
 static int       g_kbCacheW = 0, g_kbCacheH = 0;
 
 struct KbFrameSig {
-    int w, h, hk, pk, hdrHov, layoutMode, nk, hue;
+    int w, h, hk, pk, hdrHov, layoutMode, nk, hue, keyIconStyle;
     DWORD themeBg;
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, fnLayer, showFKeys,
@@ -2129,6 +2249,7 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.layoutMode = g_layoutMode; sig.nk = g_nk;
     sig.themeBg = g_themeBuf.pageBg;
     sig.hue = g_hue;
+    sig.keyIconStyle = g_keyIconStyle;   // 漏掉这一项 → 切换图标样式后主键盘不刷新（看似"没生效"）
     sig.dpi = (float)GetSystemDpiScale();
     sig.sh = g_sh; sig.ct = g_ct; sig.al = g_al; sig.cp = g_cp;
     sig.winKey = g_winKey; sig.physShift = g_physShift; sig.physWin = g_physWin;
@@ -2387,6 +2508,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_FNWEB          94
 #define S_HIT_NPBTN          24   // 布局 Tab：显示标题栏 123 切换按钮
 #define S_HIT_NPTAB          25   // 布局 Tab：Tab 键切换小键盘（仅完整布局显示）
+#define S_HIT_KEYICON        26   // 布局 Tab：按键图标样式（分段控件，整条一个命中码）
 #define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
 #define S_HIT_THEME_OPT0     21
@@ -2483,33 +2605,20 @@ static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
     }
 }
 
-static void SettingsTab(HDC dc, int x, int y, int w, int h, const wchar_t* label, BOOL active, BOOL hover) {
-    DWORD text = active || hover ? C_WHITE : C_DIM;
-    DrawTextC(dc, x, y, w, h - 5, label, g_sf13b, text);
-    if (active) {
-        int uw = (int)(34 * GetSystemDpiScale());
-        DrawRoundRect(dc, x + (w - uw) / 2, y + h - 4, uw, 4, C_HOT, C_HOT, 2);
-    }
-}
-
-// 圆角方框面板（设置项容器）
-static void DrawPanel(HDC dc, int x, int y, int w, int h) {
-    DrawRoundRect(dc, x, y, w, h, C_KEY, C_KEY_BORDER, 6);
-}
-// 可指定圆角半径的面板（键盘布局 / 主题页用大圆角）
-static void DrawPanelR(HDC dc, int x, int y, int w, int h, int r) {
-    DrawRoundRect(dc, x, y, w, h, C_KEY, C_KEY_BORDER, r);
-}
-
+// ========== 设置页度量与布局 ==========
+// 语法对齐制作工具：一个 tab 就是一张卡，卡内逐行，行间画 1px 分隔线。
+// 行高不再是常数（下拉/分段行 40 高，比开关行高），所以行位置由累计高度算出；
+// 绘制与命中都走下面同一组函数，避免两边各算一遍。
 struct SettingsMetrics {
     double dpi;
     int W, H;
     int margin;
-    int titleY, titleH;
+    int titleY, titleH, headIcon;      // 页面标题 + 页面头 38×38 图标 tile
     int closeX, closeY, closeW, closeH;
-    int tabsY, tabH, tabW, tabGap;
+    int tabsY, tabH, tabGap;           // tab 高 42、间隙 28
     int contentX, contentY, contentW;
-    int rowH, rowGap;
+    int rowPadY;                       // 行上下内边距 12
+    int tileSize, tileGap;             // 行图标 30×30 + 与文字的间距 18
     int comboW, comboH;
     int switchW, switchH;
 };
@@ -2520,39 +2629,117 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
     m.dpi = GetSystemDpiScale();
     m.W = rc.right; m.H = rc.bottom;
     m.margin = (int)(30 * m.dpi);
-    m.titleY = (int)(16 * m.dpi);
-    m.titleH = (int)(30 * m.dpi);
+    m.titleY = (int)(10 * m.dpi);
+    m.titleH = (int)(34 * m.dpi);
+    m.headIcon = (int)(38 * m.dpi);
     m.closeW = m.closeH = (int)(28 * m.dpi);
     m.closeX = m.W - m.margin - m.closeW;
-    m.closeY = (int)(15 * m.dpi);
-    m.tabsY = (int)(57 * m.dpi);
-    m.tabH = (int)(33 * m.dpi);
-    m.tabW = (int)(80 * m.dpi);
-    m.tabGap = (int)(8 * m.dpi);
+    m.closeY = (int)(14 * m.dpi);
+    m.tabsY = (int)(56 * m.dpi);
+    m.tabH = (int)(42 * m.dpi);
+    m.tabGap = (int)(28 * m.dpi);
     m.contentX = m.margin;
-    m.contentY = (int)(110 * m.dpi);
+    m.contentY = (int)(112 * m.dpi);
     m.contentW = m.W - m.margin * 2;
-    m.rowH = (int)(52 * m.dpi);
-    m.rowGap = (int)(6 * m.dpi);
-    m.comboW = (int)(172 * m.dpi);
-    m.comboH = (int)(30 * m.dpi);
-    m.switchW = (int)(42 * m.dpi);
-    m.switchH = (int)(21 * m.dpi);
+    m.rowPadY = (int)(12 * m.dpi);
+    m.tileSize = (int)(30 * m.dpi);
+    m.tileGap = (int)(18 * m.dpi);
+    m.comboW = (int)(176 * m.dpi);
+    m.comboH = (int)(40 * m.dpi);
+    m.switchW = (int)(46 * m.dpi);
+    m.switchH = (int)(26 * m.dpi);
     return m;
 }
 
+// 每行的「控件高」：开关 26 / 下拉与分段 40；无控件行给 0（由两行文字块决定）
+static int SettingsRowCtrlHeight(int tab, int index) {
+    if (tab == 0) {                                 // 常规
+        int closeRow = g_af ? 2 : 1;
+        if (index == closeRow) return 40;           // 关闭按钮下拉
+        if (index == closeRow + 4) return 40;       // 界面语言下拉
+        return 26;
+    }
+    if (tab == 3) {                                 // 布局
+        if (index == 0 || index == 1) return 40;    // 键盘布局下拉 / 按键图标样式分段
+        return 26;
+    }
+    if (tab == 1) return 40;                        // 主题：模式 / 透明度 / 色相 都是下拉行
+    return 0;
+}
+
+// 行高 = 12*2 + max(tile 30, 控件高, 两行文字块 34)
+// 主题 tab 的色相行是可展开行：展开态固定 210（内含分隔线 + 色板 + 滑轨 + HEX），收起态按普通行算
+static int SettingsRowHeight(const SettingsMetrics& m, int index) {
+    if (g_sTab == 1 && index == 2 && !g_wallpaperAccent) return (int)(210 * m.dpi);
+    int content = SettingsRowCtrlHeight(g_sTab, index);
+    if (content < 30) content = 30;
+    if (content < 34) content = 34;
+    return m.rowPadY * 2 + content;
+}
+
+static int SettingsRowCount(int tab) {
+    if (tab == 0) return g_af ? 7 : 6;
+    if (tab == 3) return (g_layoutMode == 2) ? 5 : 4;
+    if (tab == 1) return 3;
+    return 0;
+}
+
+static int SettingsRowTop(const SettingsMetrics& m, int index) {
+    int y = m.contentY;
+    for (int i = 0; i < index; i++) y += SettingsRowHeight(m, i);
+    return y;
+}
+
 static RECT SettingsRowRect(const SettingsMetrics& m, int index) {
-    int y = m.contentY + index * (m.rowH + m.rowGap);
-    RECT r = {m.contentX, y, m.contentX + m.contentW, y + m.rowH};
+    int y = SettingsRowTop(m, index);
+    RECT r = {m.contentX, y, m.contentX + m.contentW, y + SettingsRowHeight(m, index)};
     return r;
 }
 
+// 整张卡：行的 12px 上下内边距就是卡片的内边距，卡片自身不再留白
+static RECT SettingsCardRect(const SettingsMetrics& m) {
+    RECT r = {m.contentX, m.contentY, m.contentX + m.contentW, m.contentY};
+    int n = SettingsRowCount(g_sTab);
+    for (int i = 0; i < n; i++) r.bottom += SettingsRowHeight(m, i);
+    return r;
+}
+
+// 卡片：圆角 16、底 C_KEY、无描边无阴影；行间 1px 分隔线（左右各缩进 20），最后一行下方不画
+static void DrawSettingsCard(HDC dc, const SettingsMetrics& m) {
+    RECT card = SettingsCardRect(m);
+    DrawRoundRect(dc, card.left, card.top, card.right - card.left, card.bottom - card.top,
+                  C_KEY, C_KEY, (int)(16 * m.dpi));
+    int n = SettingsRowCount(g_sTab);
+    for (int i = 0; i + 1 < n; i++) {
+        int y = SettingsRowRect(m, i + 1).top;
+        Fill(dc, card.left + (int)(20 * m.dpi), y,
+             (card.right - card.left) - (int)(40 * m.dpi), 1, C_LINE_DIV);
+    }
+}
+
+// 行内元素定位：tile 在左，文字块起点 = 卡左 + 20 + 30 + 18
+static int SettingsRowTileX(const SettingsMetrics& m) { return m.contentX + (int)(20 * m.dpi); }
+static int SettingsRowTextX(const SettingsMetrics& m) { return SettingsRowTileX(m) + m.tileSize + m.tileGap; }
+static int SettingsRowPadY(const SettingsMetrics& m) { return m.rowPadY; }
+
+// 控件统一右对齐，右边界 = 卡片右内边距（20）
 static int SettingsComboX(const SettingsMetrics& m, const RECT& row) {
     return row.right - (int)(20 * m.dpi) - m.comboW;
 }
 
 static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {
     return row.top + (row.bottom - row.top - m.comboH) / 2;
+}
+
+// 展开行（主题色相编辑器）里的下拉不居中，而是与标题对齐
+static int SettingsComboYTop(const SettingsMetrics& m, const RECT& row) {
+    return row.top + m.rowPadY;
+}
+
+// 开关行的文字块右界：给「开/关」文字（34）+ 开关（46）让位，
+// 否则长描述会压到开关上（标签宽度按控件自适应，不写死）
+static int SettingsSwitchTextRight(const SettingsMetrics& m, const RECT& row) {
+    return row.right - (int)(20 * m.dpi) - m.switchW - (int)(42 * m.dpi);
 }
 
 static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, int count) {
@@ -2564,9 +2751,135 @@ static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, i
     return above >= minY ? above : minY;
 }
 
-static RECT SettingsHighlightRect(const SettingsMetrics& m, BOOL expanded) {
-    RECT r = SettingsRowRect(m, 2);
-    if (expanded) r.bottom = r.top + (int)(210 * m.dpi);
+// 行内容：图标 tile + 两行文字块。ctrlLeft > 0 时文字块右侧让位给右对齐的控件
+static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& row,
+                                  int iconId, const wchar_t* glyph,
+                                  const wchar_t* title, const wchar_t* desc,
+                                  BOOL hover, int ctrlLeft) {
+    if (hover) {
+        RECT h = row;
+        h.left  += (int)(6 * m.dpi);
+        h.right -= (int)(6 * m.dpi);
+        h.top   += (int)(2 * m.dpi);
+        h.bottom -= (int)(2 * m.dpi);
+        // C_HOVER 在白卡上几乎看不见，行悬停用 btn_regular_bg_hover 那档
+        DrawRoundRect(dc, h.left, h.top, h.right - h.left, h.bottom - h.top,
+                      C_REGULAR_HOV, C_REGULAR_HOV, (int)(10 * m.dpi));
+    }
+    int ty = row.top + SettingsRowPadY(m);
+    DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
+
+    int tx = SettingsRowTextX(m);
+    int rightLimit = (ctrlLeft > 0) ? ctrlLeft - (int)(12 * m.dpi) : row.right - (int)(20 * m.dpi);
+    int tw = rightLimit - tx;
+    if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
+    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sf14b, C_WHITE);
+    if (desc && desc[0])
+        DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
+}
+
+// ===== tab strip：文字宽 + 固定间隙，左起排布（不是固定宽度格子） =====
+static void SettingsTabLabels(const wchar_t* out[4]) {
+    out[0] = T(L"常规", L"General");
+    out[1] = T(L"布局", L"Layout");
+    out[2] = T(L"主题", L"Theme");
+    out[3] = T(L"关于", L"About");
+}
+
+static const int k_settingsTabHits[4] = {S_HIT_TAB0, S_HIT_TABL, S_HIT_TAB1, S_HIT_TAB2};
+
+static int MeasureTabWidth(HDC dc, const wchar_t* label, double dpi) {
+    return MeasureTextW(dc, label, g_sf13b) + (int)(4 * dpi);
+}
+
+// 返回每个 tab 的矩形（顺序：常规 / 布局 / 主题 / 关于）
+static void SettingsTabRects(const SettingsMetrics& m, const wchar_t* labels[4], RECT out[4]) {
+    HDC dc = GetDC(0);
+    int x = m.contentX + (int)(4 * m.dpi);
+    for (int i = 0; i < 4; i++) {
+        int w = MeasureTabWidth(dc, labels[i], m.dpi);
+        out[i].left = x; out[i].top = m.tabsY;
+        out[i].right = x + w; out[i].bottom = m.tabsY + m.tabH;
+        x += w + m.tabGap;
+    }
+    ReleaseDC(0, dc);
+}
+
+static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
+    const wchar_t* labels[4];
+    SettingsTabLabels(labels);
+    RECT tr[4];
+    SettingsTabRects(m, labels, tr);
+    int active = (g_sTab == 0) ? 0 : (g_sTab == 3 ? 1 : (g_sTab == 1 ? 2 : 3));
+    for (int i = 0; i < 4; i++) {
+        BOOL on = (i == active);
+        DrawTextC(dc, tr[i].left, tr[i].top, tr[i].right - tr[i].left, m.tabH - 6,
+                  labels[i], g_sf13b, (on || g_sHov == k_settingsTabHits[i]) ? C_WHITE : C_DIM);
+    }
+    // strip 下缘 1px 分隔线，选中项底部 3px 主色横线压在上面
+    Fill(dc, m.contentX, m.tabsY + m.tabH, m.contentW, 1, C_LINE_DIV);
+    if (active >= 0) {
+        DrawRoundRect(dc, tr[active].left, m.tabsY + m.tabH - 3, tr[active].right - tr[active].left,
+                      3, C_HOT, C_HOT, 2);
+    }
+}
+
+// ===== 分段控件（三选一）：轨道 C_REGULAR + 选中段 C_KEY/C_BTN_CONTENT =====
+// 选中段文字用 btn_content 而不是 primary：#53A3F2 在白卡上只有 2.66:1。
+static int SegmentedWidth(const SettingsMetrics& m, const wchar_t** items, int count) {
+    HDC dc = GetDC(0);
+    int w = (int)(6 * m.dpi);   // 轨道左右 padding 3
+    for (int i = 0; i < count; i++) w += MeasureTextW(dc, items[i], g_sf13b) + (int)(36 * m.dpi);
+    ReleaseDC(0, dc);
+    return w;
+}
+
+static void DrawSegmented(HDC dc, const SettingsMetrics& m, const RECT& r,
+                          const wchar_t** items, int count, int sel) {
+    int pad = (int)(3 * m.dpi);
+    DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                  C_REGULAR, C_REGULAR, (int)(10 * m.dpi));
+    int x = r.left + pad;
+    int h = (r.bottom - r.top) - pad * 2;
+    for (int i = 0; i < count; i++) {
+        int w = MeasureTextW(dc, items[i], g_sf13b) + (int)(36 * m.dpi);
+        if (i == sel) {
+            DrawRoundRect(dc, x, r.top + pad, w, h, C_KEY, C_KEY, (int)(8 * m.dpi));
+        }
+        DrawTextC(dc, x, r.top + pad, w, h, items[i], g_sf13b, (i == sel) ? C_BTN_CONTENT : C_DIM);
+        x += w;
+    }
+}
+
+// 命中分段：返回段下标，未命中返回 -1（绘制与命中共用同一套段宽算法）
+static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
+                             const wchar_t** items, int count, int x) {
+    HDC dc = GetDC(0);
+    int pad = (int)(3 * m.dpi);
+    int cx = r.left + pad;
+    int hit = -1;
+    for (int i = 0; i < count; i++) {
+        int w = MeasureTextW(dc, items[i], g_sf13b) + (int)(36 * m.dpi);
+        if (x >= cx && x < cx + w) { hit = i; break; }
+        cx += w;
+    }
+    ReleaseDC(0, dc);
+    return hit;
+}
+
+// 「按键图标样式」的三段文案与控件矩形：绘制 / 命中 / 点击必须共用（画与热区同源）
+static void KeyIconSegItems(const wchar_t* out[3]) {
+    out[0] = T(L"文字", L"Text");
+    out[1] = T(L"图标", L"Icon");
+    out[2] = T(L"图标+文字", L"Icon+Text");
+}
+
+static RECT KeyIconSegRect(const SettingsMetrics& m, const wchar_t* items[3]) {
+    RECT row = SettingsRowRect(m, 1);
+    int w = SegmentedWidth(m, items, 3);
+    int x = row.right - (int)(20 * m.dpi) - w;
+    int y = SettingsComboY(m, row);
+    RECT r = {x, y, x + w, y + m.comboH};
     return r;
 }
 
@@ -2580,100 +2893,34 @@ static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
 static void SettingsPaletteMetrics(const SettingsMetrics& m, const RECT& row,
                                    int* x, int* y, int* size, int* gap) {
     *x = row.left + (int)(30 * m.dpi);
-    *y = row.top + (int)(70 * m.dpi);
+    *y = row.top + (int)(76 * m.dpi);
     *size = (int)(26 * m.dpi);
-    *gap = (int)(14 * m.dpi);
+    *gap = (int)(8 * m.dpi);
 }
 
-static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row, int index) {
+static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row) {
     int x = row.left + (int)(30 * m.dpi);
-    int y = row.top + (int)((112 + index * 36) * m.dpi);
+    int y = row.top + (int)(124 * m.dpi);
     RECT r = {x, y, row.right - (int)(30 * m.dpi), y + (int)(14 * m.dpi)};
     return r;
-}
-
-static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
-    double dpi = GetSystemDpiScale();
-    int size = (int)(24 * dpi);
-    if (kind == 3) {
-        int pad = (int)(3 * dpi);
-        DrawRoundRect(dc, x + pad, y + pad, size - pad * 2, size - pad * 2,
-                      C_KEY, C_WHITE, (int)(3 * dpi));
-        DrawTextC(dc, x, y, size, size, L"F", g_sf13b, C_WHITE);
-        return;
-    }
-    if (kind == 9) {
-        int inset = (int)(3 * dpi);
-        int pane = size - (int)(8 * dpi);
-        DrawRoundRect(dc, x + inset, y + (int)(6 * dpi), pane, pane,
-                      C_HOVER, C_DIM, (int)(3 * dpi));
-        DrawRoundRect(dc, x + (int)(7 * dpi), y + inset, pane, pane,
-                      C_KEY, C_WHITE, (int)(3 * dpi));
-        return;
-    }
-
-    static const wchar_t* glyphs[9] = {
-        L"\xE7C9", // TouchPointer
-        L"\xE8BB", // ChromeClose
-        L"\xE765", // KeyboardClassic
-        L"",
-        L"\xE752", // UpArrowShiftKey
-        L"\xE823", // Clock
-        L"\xE774", // Globe
-        L"\xE771", // Personalize
-        L"\xE790"  // Color
-    };
-    RECT r = {x, y, x + size, y + size};
-    if (DrawAlphaText(dc, x, y, size, size, glyphs[kind], g_sfIcon,
-                         C_WHITE, Gdiplus::StringAlignmentCenter)) return;
-    SelectObject(dc, g_sfIcon);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, C_WHITE);
-    DrawTextW(dc, glyphs[kind], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-}
-
-// 行内容（不含面板背景）：供独立行与分组面板内的子行复用
-// icon < 0 表示无图标行（文本/描述位置与有图标的行保持一致）
-static void DrawSettingRowContent(HDC dc, const RECT& row, int icon, const wchar_t* title,
-                                  const wchar_t* desc, BOOL hover) {
-    double dpi = GetSystemDpiScale();
-    if (hover) {
-        DrawRoundRectAlpha(dc, row.left + 1, row.top + 1,
-                           row.right - row.left - 2, row.bottom - row.top - 2,
-                           C_HOVER, C_HOVER, 8, 255, 255);
-    }
-    int iconSize = (int)(24 * dpi);
-    if (icon >= 0)
-        DrawSettingsIcon(dc, row.left + (int)(14 * dpi), row.top + (row.bottom - row.top - iconSize) / 2, icon);
-    int tx = row.left + (int)(52 * dpi);
-    int tw = row.right - tx - (int)(220 * dpi);
-    DrawTextL(dc, tx, row.top + (int)(5 * dpi), tw, (int)(20 * dpi), title, g_sf14b, C_WHITE);
-    DrawTextL(dc, tx, row.top + (int)(27 * dpi), tw, (int)(18 * dpi), desc, g_sf12, C_DIM);
-}
-
-static void DrawSettingRow(HDC dc, const RECT& row, int icon, const wchar_t* title,
-                           const wchar_t* desc, BOOL hover) {
-    DrawRoundRect(dc, row.left, row.top, row.right - row.left, row.bottom - row.top,
-                  hover ? C_HOVER : C_KEY, hover ? C_HOT : C_KEY_BORDER, 8);
-    DrawSettingRowContent(dc, row, icon, title, desc, FALSE);
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     // 常规 Tab 行序（自动收起行仅在自动呼出开启时存在）：
     //   g_af 开：0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
     //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=界面语言
-    // 布局 Tab 行序：0=键盘布局 1=Fn 网页布局 2=123 切换按钮
+    // 布局 Tab 行序：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 切换按钮 4=Tab 切换小键盘
     int rowIndex;
     if (hit == S_HIT_AUTO) rowIndex = 0;
     else if (hit == S_HIT_AUTOHIDE) rowIndex = 1;
-    else if (hit == S_HIT_FNWEB) rowIndex = 1;   // 布局 Tab 第 1 行
-    else if (hit == S_HIT_NPBTN) rowIndex = 2;   // 布局 Tab 第 2 行
-    else if (hit == S_HIT_NPTAB) rowIndex = 3;   // 布局 Tab 第 3 行（仅完整布局）
+    else if (hit == S_HIT_FNWEB) rowIndex = 2;
+    else if (hit == S_HIT_NPBTN) rowIndex = 3;
+    else if (hit == S_HIT_NPTAB) rowIndex = 4;
     else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
     else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
     else rowIndex = g_af ? 5 : 4;
     RECT row = SettingsRowRect(m, rowIndex);
-    row.left = row.right - (int)(105 * m.dpi);
+    row.left = row.right - (int)(120 * m.dpi);
     return row;
 }
 
@@ -2711,10 +2958,6 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
 
 // 预设色相（对齐 panda-core 的 PRESET_HUES），色板按 oklch(0.70 0.14 H) 渲染
 static const int g_presetHues[5] = { 250, 210, 180, 300, 30 };
-
-static Gdiplus::Color GpColorFromBgr(DWORD color) {
-    return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
-}
 
 // 色相滑轨：彩虹渐变直接用主色的 oklch 配方铺满，与色板、滑钮颜色完全一致
 static void DrawHueSlider(HDC dc, const RECT& r, int hue) {
@@ -2762,18 +3005,20 @@ static void DrawHueSlider(HDC dc, const RECT& r, int hue) {
     DrawCircleAA(dc, cx, cy, radius - 2, HueAccentBgr(hue));
 }
 
-// 下拉框
+// 下拉框：高 40、圆角 12、左右 padding 14、主色描边
 static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, BOOL open, BOOL hover) {
-    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_DARK, C_DIM, 6);
-    DrawTextL(dc, x + 10, y, w - 30, h, text, g_sf13, C_WHITE);
-    int ax = x + w - 14, ay = y + h / 2;
-    DrawTriangleAA(dc, ax - 5, ay - 3, ax + 5, ay - 3, ax, ay + 3, C_DIM);
+    double dpi = GetSystemDpiScale();
+    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_DARK, C_BORDER_HOVER, (int)(12 * dpi));
+    DrawTextL(dc, x + (int)(14 * dpi), y, w - (int)(46 * dpi), h, text, g_sf13, C_WHITE);
+    int sz = (int)(16 * dpi);
+    DrawHkIcon(dc, (float)(x + w - (int)(14 * dpi) - sz), (float)(y + (h - sz) / 2), (float)sz,
+               HkIcon(HKICON_CHEVRONDOWN), C_DIM, C_DIM);
 }
 
 // 下拉列表（参考下拉菜单样式：悬停圆角高亮 + 选中项左侧强调条）
 static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
     double dpi = GetSystemDpiScale();
-    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_FLOAT, C_KEY_BORDER, 6);
+    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_FLOAT, C_BORDER_HOVER, (int)(12 * dpi));
     for (int i = 0; i < count; i++) {
         int iy = y + 2 + i * itemH;
         if (i == hov || i == sel) {
@@ -2832,31 +3077,56 @@ static const wchar_t* CloseActionName() {
     return T(g_closeToTray ? L"隐藏到系统托盘" : L"直接退出程序",
              g_closeToTray ? L"Hide to tray" : L"Exit program");
 }
-// 关于页底部两个链接的居中布局：
-// “项目地址 | 问题反馈”同一行居中，分隔符 | 不参与超链接
-static void AboutLinkLayout(int x0, int cw, int* px1, int* pw1, int* psep, int* psepW, int* px2, int* pw2) {
-    HDC dc = GetDC(0);
-    HFONT of = (HFONT)SelectObject(dc, g_sf12);
-    SIZE s1, s2, ss;
-    const wchar_t* t1 = T(L"项目地址", L"Project URL");
-    const wchar_t* t2 = T(L"问题反馈", L"Feedback");
-    GetTextExtentPoint32W(dc, t1, (int)wcslen(t1), &s1);
-    GetTextExtentPoint32W(dc, t2, (int)wcslen(t2), &s2);
-    GetTextExtentPoint32W(dc, L"|", 1, &ss);
-    SelectObject(dc, of);
-    ReleaseDC(0, dc);
-    int gap = (int)(14 * GetSystemDpiScale());
-    int total = s1.cx + gap + ss.cx + gap + s2.cx;
-    int x = x0 + (cw - total) / 2;
-    *px1 = x; *pw1 = s1.cx;
-    *psep = x + s1.cx + gap; *psepW = ss.cx;
-    *px2 = x + s1.cx + gap + ss.cx + gap; *pw2 = s2.cx;
+// 关于页链接行：行高 = 12*2 + max(tile 30, 圆形按钮 34, 两行文字 34)
+static int AboutLinkRowHeight(const SettingsMetrics& m) {
+    return m.rowPadY * 2 + (int)(34 * m.dpi);
+}
+
+static RECT AboutLinkRowRect(const SettingsMetrics& m, const RECT& card, int index) {
+    int h = AboutLinkRowHeight(m);
+    RECT r = {card.left, card.top + h * index, card.right, card.top + h * (index + 1)};
+    return r;
+}
+
+// 链接行：整行可点（触摸场景下命中区必须够大），右侧 34×34 圆形 External 按钮
+static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
+                             int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
+    if (hover) {
+        RECT h = row;
+        h.left  += (int)(6 * m.dpi);
+        h.right -= (int)(6 * m.dpi);
+        h.top   += (int)(2 * m.dpi);
+        h.bottom -= (int)(2 * m.dpi);
+        DrawRoundRect(dc, h.left, h.top, h.right - h.left, h.bottom - h.top,
+                      C_REGULAR_HOV, C_REGULAR_HOV, (int)(10 * m.dpi));
+    }
+    int ty = row.top + m.rowPadY;
+    DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, NULL);
+
+    int btn = (int)(34 * m.dpi);
+    int bx = row.right - (int)(20 * m.dpi) - btn;
+    int by = row.top + (row.bottom - row.top - btn) / 2;
+    DrawRoundRect(dc, bx, by, btn, btn, hover ? C_REGULAR_HOV : C_REGULAR,
+                  hover ? C_REGULAR_HOV : C_REGULAR, btn / 2);
+    int isz = (int)(17 * m.dpi);
+    DrawHkIcon(dc, (float)(bx + (btn - isz) / 2), (float)(by + (btn - isz) / 2), (float)isz,
+               HkIcon(HKICON_EXTERNAL), C_BTN_CONTENT, C_BTN_CONTENT);
+
+    int tx = SettingsRowTextX(m);
+    int tw = bx - (int)(12 * m.dpi) - tx;
+    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sf14b, C_WHITE);
+    if (desc && desc[0])
+        DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
 
-    DrawTextL(dc, m.margin, m.titleY, m.W - m.margin * 2 - m.closeW - 12,
+    // 页面头：38×38 图标 tile + 26px 标题（关于 tab 用 Info，其余用设置齿轮）
+    DrawIconTile(dc, m.margin, m.titleY, m.headIcon, (int)(20 * m.dpi),
+                 (g_sTab == 2) ? HKICON_INFO : HKICON_GEAR, NULL);
+    int titleX = m.margin + m.headIcon + (int)(16 * m.dpi);
+    DrawTextL(dc, titleX, m.titleY, m.closeX - (int)(12 * m.dpi) - titleX,
               m.titleH, T(L"设置", L"Settings"), g_sf20b, C_WHITE);
     if (g_sHov == S_HIT_CLOSE) {
         DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH, C_HOVER, C_KEY_BORDER, 6);
@@ -2868,143 +3138,175 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
     }
 
-    int tabX = m.margin;
-    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"常规", L"General"), g_sTab == 0, g_sHov == S_HIT_TAB0);
-    tabX += m.tabW + m.tabGap;
-    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"布局", L"Layout"), g_sTab == 3, g_sHov == S_HIT_TABL);
-    tabX += m.tabW + m.tabGap;
-    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"主题", L"Theme"), g_sTab == 1, g_sHov == S_HIT_TAB1);
-    tabX += m.tabW + m.tabGap;
-    SettingsTab(dc, tabX, m.tabsY, m.tabW, m.tabH, T(L"关于", L"About"), g_sTab == 2, g_sHov == S_HIT_TAB2);
-    Fill(dc, m.margin, m.tabsY + m.tabH + 8, m.contentW, 1, C_KEY_BORDER);
+    DrawTabStrip(dc, m);
+
+    // 一个 tab 就是一张卡；关于 tab 自己画两张卡，不进这条路径
+    if (g_sTab != 2) DrawSettingsCard(dc, m);
 
     if (g_sTab == 0) {
         // 行序（自动收起行仅在自动呼出开启时存在，隐藏时后续行上移一行）：
         //   0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
         int closeRow = g_af ? 2 : 1;
 
-        // 分组面板：自动呼出 + 自动收起（参考“关闭按钮”分组样式）
         RECT r0 = SettingsRowRect(m, 0);
-        RECT rAutoHide = SettingsRowRect(m, 1);
-        DrawRoundRect(dc, r0.left, r0.top, r0.right - r0.left, rAutoHide.bottom - r0.top,
-                      C_KEY, C_KEY_BORDER, 8);
-        Fill(dc, r0.left + 1, rAutoHide.top - m.rowGap / 2 - 1, r0.right - r0.left - 2, 1, C_KEY_BORDER);
-        DrawSettingRowContent(dc, r0, 0, T(L"自动呼出", L"Auto Pop-up"),
+        DrawSettingRowContent(dc, m, r0, HKICON_CARET, NULL,
+                              T(L"自动呼出", L"Auto Pop-up"),
                               T(L"点击输入框时自动弹出键盘", L"Show the keyboard when an input gets focus"),
-                              g_sHov == S_HIT_AUTO);
+                              g_sHov == S_HIT_AUTO, SettingsSwitchTextRight(m, r0));
         DrawSettingSwitch(dc, m, r0, g_af, S_HIT_AUTO);
+
         if (g_af) {
-            DrawSettingRowContent(dc, rAutoHide, -1, T(L"自动收起", L"Auto Hide"),
+            RECT ra = SettingsRowRect(m, 1);
+            DrawSettingRowContent(dc, m, ra, HKICON_CLOCK, NULL,
+                                  T(L"自动收起", L"Auto Hide"),
                                   T(L"收起键盘后在同一输入框内不自动弹出", L"Stay hidden after minimizing in the same input"),
-                                  g_sHov == S_HIT_AUTOHIDE);
-            DrawSettingSwitch(dc, m, rAutoHide, g_afAutoHide, S_HIT_AUTOHIDE);
+                                  g_sHov == S_HIT_AUTOHIDE, SettingsSwitchTextRight(m, ra));
+            DrawSettingSwitch(dc, m, ra, g_afAutoHide, S_HIT_AUTOHIDE);
         }
 
-        // 分组面板：关闭按钮 + 记住我的选择（子项无图标，参考分组设置样式）
         RECT r1 = SettingsRowRect(m, closeRow);
-        RECT r2 = SettingsRowRect(m, closeRow + 1);
-        DrawRoundRect(dc, r1.left, r1.top, r1.right - r1.left, r2.bottom - r1.top,
-                      C_KEY, C_KEY_BORDER, 8);
-        // 分隔线（横跨面板）
-        Fill(dc, r1.left + 1, r2.top - m.rowGap / 2 - 1, r1.right - r1.left - 2, 1, C_KEY_BORDER);
-        DrawSettingRowContent(dc, r1, 1, T(L"关闭按钮", L"Close Button"),
+        int ctrlL = SettingsComboX(m, r1);
+        DrawSettingRowContent(dc, m, r1, HKICON_CLOSE, NULL,
+                              T(L"关闭按钮", L"Close Button"),
                               T(L"选择关闭窗口时执行的操作", L"Choose what happens when the window is closed"),
-                              g_sHov == S_HIT_CLOSE_DROP);
-        DrawSettingRowContent(dc, r2, -1, T(L"记住我的选择", L"Remember My Choice"),
-                              T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"),
-                              g_sHov == S_HIT_REMEMBER);
-        DrawCombo(dc, SettingsComboX(m, r1), SettingsComboY(m, r1), m.comboW, m.comboH,
+                              g_sHov == S_HIT_CLOSE_DROP, ctrlL);
+        DrawCombo(dc, ctrlL, SettingsComboY(m, r1), m.comboW, m.comboH,
                   CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
+
+        RECT r2 = SettingsRowRect(m, closeRow + 1);
+        DrawSettingRowContent(dc, m, r2, HKICON_CHECK, NULL,
+                              T(L"记住我的选择", L"Remember My Choice"),
+                              T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"),
+                              g_sHov == S_HIT_REMEMBER, SettingsSwitchTextRight(m, r2));
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
         RECT r = SettingsRowRect(m, closeRow + 2);
-        DrawSettingRow(dc, r, 3, T(L"功能键行", L"Function Key Row"),
-                       T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"), g_sHov == S_HIT_FKEYS);
+        DrawSettingRowContent(dc, m, r, -1, L"F",   // 功能键行保留手绘 F
+                              T(L"功能键行", L"Function Key Row"),
+                              T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"),
+                              g_sHov == S_HIT_FKEYS, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_showFKeys, S_HIT_FKEYS);
 
         r = SettingsRowRect(m, closeRow + 3);
-        DrawSettingRow(dc, r, 4, T(L"Shift 符号", L"Shift Symbols"),
-                       T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"), g_sHov == S_HIT_SHIFTSYM);
+        DrawSettingRowContent(dc, m, r, HKICON_SHIFT, NULL,
+                              T(L"Shift 符号", L"Shift Symbols"),
+                              T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"),
+                              g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
 
         r = SettingsRowRect(m, closeRow + 4);
-        DrawSettingRow(dc, r, 6, T(L"界面语言", L"Language"),
-                       T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+        ctrlL = SettingsComboX(m, r);
+        DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
+                              T(L"界面语言", L"Language"),
+                              T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"),
+                              g_sHov == S_HIT_LANG_DROP, ctrlL);
+        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
                   g_lang ? g_langNamesEn[g_lang] : g_langNames[g_lang],
                   g_dropLang, g_sHov == S_HIT_LANG_DROP);
     } else if (g_sTab == 3) {
-        // 布局 Tab：键盘布局 + Fn 网页布局
+        // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 按钮 4=Tab 切换小键盘
         RECT r = SettingsRowRect(m, 0);
-        DrawSettingRow(dc, r, 2, T(L"键盘布局", L"Keyboard Layout"),
-                       T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"), g_sHov == S_HIT_LAYOUT_DROP);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+        int ctrlL = SettingsComboX(m, r);
+        DrawSettingRowContent(dc, m, r, HKICON_KEYBOARD, NULL,
+                              T(L"键盘布局", L"Keyboard Layout"),
+                              T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"),
+                              g_sHov == S_HIT_LAYOUT_DROP, ctrlL);
+        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
                   g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
                   g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
 
+        // 按键图标样式：分段控件三选一，改完立即重绘主键盘
         r = SettingsRowRect(m, 1);
-        DrawSettingRow(dc, r, 6, T(L"Fn 网页布局", L"Fn Web Layout"),
-                       T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"), g_sHov == S_HIT_FNWEB);
-        DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
+        const wchar_t* seg[3];
+        KeyIconSegItems(seg);
+        RECT segR = KeyIconSegRect(m, seg);
+        DrawSettingRowContent(dc, m, r, HKICON_KEYBOARDMARK, NULL,
+                              T(L"按键图标样式", L"Key Icon Style"),
+                              T(L"键面显示为文字、图标或两者并存", L"Draw key faces as text, icons, or both"),
+                              FALSE, segR.left);
+        DrawSegmented(dc, m, segR, seg, 3, g_keyIconStyle);
 
         r = SettingsRowRect(m, 2);
-        DrawSettingRow(dc, r, 4, T(L"小键盘切换按钮", L"Numpad Toggle Button"),
-                       T(L"在标题栏显示 123 按钮，点击在当前布局与小键盘间切换", L"Show a 123 button in the title bar to toggle the numpad"), g_sHov == S_HIT_NPBTN);
+        DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
+                              T(L"Fn 网页布局", L"Fn Web Layout"),
+                              T(L"按 Fn 切换到上网常用布局", L"Press Fn to switch to the web-friendly layout"),
+                              g_sHov == S_HIT_FNWEB, SettingsSwitchTextRight(m, r));
+        DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
+
+        r = SettingsRowRect(m, 3);
+        DrawSettingRowContent(dc, m, r, HKICON_PANEL, NULL,
+                              T(L"小键盘切换按钮", L"Numpad Toggle Button"),
+                              T(L"在标题栏显示 123 按钮，点击在当前布局与小键盘间切换", L"Show a 123 button in the title bar to toggle the numpad"),
+                              g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
 
         if (g_layoutMode == 2) {
-            r = SettingsRowRect(m, 3);
-            DrawSettingRow(dc, r, 3, T(L"Tab 切换小键盘", L"Tab Toggles Numpad"),
-                           T(L"完整布局下按 Tab 键显示/隐藏右侧数字区", L"Press Tab in the full layout to show or hide the numpad section"), g_sHov == S_HIT_NPTAB);
+            r = SettingsRowRect(m, 4);
+            DrawSettingRowContent(dc, m, r, -1, L"F",   // Tab 切换小键盘同样保留手绘 F
+                                  T(L"Tab 切换小键盘", L"Tab Toggles Numpad"),
+                                  T(L"完整布局下按 Tab 键显示/隐藏右侧数字区", L"Press Tab in the full layout to show or hide the numpad section"),
+                                  g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r));
             DrawSettingSwitch(dc, m, r, g_npTabToggle, S_HIT_NPTAB);
         }
     } else if (g_sTab == 1) {
         RECT r = SettingsRowRect(m, 0);
-        DrawSettingRow(dc, r, 7, T(L"主题模式", L"Theme Mode"),
-                       T(L"跟随系统，或固定使用深色、浅色主题", L"Follow Windows or use a fixed dark or light theme"), FALSE);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+        int ctrlL = SettingsComboX(m, r);
+        DrawSettingRowContent(dc, m, r, HKICON_CONTRAST, NULL,
+                              T(L"主题模式", L"Theme Mode"),
+                              T(L"跟随系统，或固定使用深色、浅色主题", L"Follow Windows or use a fixed dark or light theme"),
+                              FALSE, ctrlL);
+        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
                   g_lang ? g_themeNamesEn[g_themeMode] : g_themeNames[g_themeMode],
                   g_dropTheme, g_sHov == S_HIT_THEME_DROP);
 
         r = SettingsRowRect(m, 1);
-        DrawSettingRow(dc, r, 9, T(L"主界面透明度", L"Keyboard Opacity"),
-                       T(L"调整主界面的不透明度", L"Adjust the keyboard window opacity"), FALSE);
+        ctrlL = SettingsComboX(m, r);
         int oi = OpacityIndex();
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+        DrawSettingRowContent(dc, m, r, HKICON_PANEL, NULL,
+                              T(L"主界面透明度", L"Keyboard Opacity"),
+                              T(L"调整主界面的不透明度", L"Adjust the keyboard window opacity"),
+                              FALSE, ctrlL);
+        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
                   g_lang ? g_opacityNamesEn[oi] : g_opacityNames[oi],
                   g_dropOpacity, g_sHov == S_HIT_OPACITY_DROP);
 
+        // 主题色相：可展开行（展开时行高 210，行内是分隔线 + 色板 + 滑轨 + HEX）
         BOOL customHue = !g_wallpaperAccent;
-        r = SettingsHighlightRect(m, customHue);
-        DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, C_KEY, C_KEY_BORDER, 8);
-        DrawSettingsIcon(dc, r.left + (int)(14 * m.dpi), r.top + (int)(14 * m.dpi), 8);
-        int tx = r.left + (int)(52 * m.dpi);
-        int tw = r.right - tx - (int)(220 * m.dpi);
-        DrawTextL(dc, tx, r.top + (int)(5 * m.dpi), tw, (int)(20 * m.dpi),
-                  T(L"主题色相", L"Theme Hue"), g_sf14b, C_WHITE);
-        DrawTextL(dc, tx, r.top + (int)(27 * m.dpi), tw, (int)(18 * m.dpi),
-                  T(L"一个色相统一调整面板、按键与强调色", L"One hue recolors the panel, keys and accent"), g_sf12, C_DIM);
-        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, SettingsRowRect(m, 2)),
-                  m.comboW, m.comboH, g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
+        r = SettingsRowRect(m, 2);
+        ctrlL = SettingsComboX(m, r);
+        DrawSettingRowContent(dc, m, r, HKICON_PALETTE, NULL,
+                              T(L"主题色相", L"Theme Hue"),
+                              T(L"一个色相统一调整面板、按键与强调色", L"One hue recolors the panel, keys and accent"),
+                              FALSE, ctrlL);
+        DrawCombo(dc, ctrlL, SettingsComboYTop(m, r), m.comboW, m.comboH,
+                  g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
                   g_dropHl, g_sHov == S_HIT_HL_DROP);
 
         if (customHue) {
-            Fill(dc, r.left + (int)(18 * m.dpi), r.top + (int)(56 * m.dpi),
-                 r.right - r.left - (int)(36 * m.dpi), 1, C_META);
+            Fill(dc, r.left + (int)(20 * m.dpi), r.top + (int)(56 * m.dpi),
+                 r.right - r.left - (int)(40 * m.dpi), 1, C_META);
 
             int palX, palY, palS, palGap;
             SettingsPaletteMetrics(m, r, &palX, &palY, &palS, &palGap);
             for (int i = 0; i < 5; i++) {
                 DWORD color = HueAccentBgr(g_presetHues[i]);
-                int cx = palX + i * (palS + palGap) + palS / 2;
-                int cy = palY + palS / 2;
+                int px = palX + i * (palS + palGap);
                 BOOL selected = abs(g_hue - g_presetHues[i]) <= 6;   // 老配置的色相未必正好落在预设值上
-                if (selected || g_sHov == S_HIT_HL_PAL0 + i)
-                    DrawCircleAA(dc, cx, cy, palS / 2 + (int)(3 * m.dpi), selected ? C_WHITE : C_HOT);
-                DrawCircleAA(dc, cx, cy, palS / 2, color);
+                // 选中 = 外层主色环 + 2px 卡色间隔环（色板是圆角方块，不再是圆）
+                if (selected || g_sHov == S_HIT_HL_PAL0 + i) {
+                    int ring = selected ? (int)(4 * m.dpi) : (int)(3 * m.dpi);
+                    DWORD ringC = selected ? C_HOT : C_REGULAR_HOV;
+                    DrawRoundRect(dc, px - ring, palY - ring, palS + ring * 2, palS + ring * 2,
+                                  ringC, ringC, (int)(12 * m.dpi));
+                    DrawRoundRect(dc, px - ring + (int)(2 * m.dpi), palY - ring + (int)(2 * m.dpi),
+                                  palS + ring * 2 - (int)(4 * m.dpi), palS + ring * 2 - (int)(4 * m.dpi),
+                                  C_KEY, C_KEY, (int)(10 * m.dpi));
+                }
+                DrawRoundRect(dc, px, palY, palS, palS, color, color, (int)(8 * m.dpi));
                 if (selected) {
                     HPEN pen = CreatePen(PS_SOLID, 2, C_ON_PRIMARY);
                     HPEN old = (HPEN)SelectObject(dc, pen);
+                    int cx = px + palS / 2, cy = palY + palS / 2;
                     MoveToEx(dc, cx - (int)(5 * m.dpi), cy, NULL);
                     LineTo(dc, cx - (int)(1 * m.dpi), cy + (int)(4 * m.dpi));
                     LineTo(dc, cx + (int)(6 * m.dpi), cy - (int)(5 * m.dpi));
@@ -3012,7 +3314,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                 }
             }
 
-            RECT slider = SettingsColorSliderRect(m, r, 0);
+            RECT slider = SettingsColorSliderRect(m, r);
             DrawHueSlider(dc, slider, g_hue);
 
             RECT input = SettingsHexRect(m, r);
@@ -3025,7 +3327,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DrawTextC(dc, r.left + (int)(55 * m.dpi), input.top, (int)(18 * m.dpi), inputH,
                       L"#", g_sf13b, C_DIM);
             DrawRoundRect(dc, input.left, input.top, inputW, inputH,
-                          g_hlEditFocus ? C_HOVER : C_DARK, g_hlEditFocus ? C_HOT : C_KEY_BORDER, 6);
+                          g_hlEditFocus ? C_HOVER : C_DARK,
+                          g_hlEditFocus ? C_HOT : C_BORDER_HOVER, (int)(12 * m.dpi));
             wchar_t hexbuf[8];
             if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(preview, hexbuf);
             const wchar_t* shown = hexbuf[0] == L'#' ? hexbuf + 1 : hexbuf;
@@ -3034,36 +3337,46 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                       showHint ? L"RRGGBB" : shown, g_sf13, showHint ? C_DIM : C_WHITE);
         }
     } else {
-        int x0 = m.contentX, y = m.contentY + (int)(26 * m.dpi), cw = m.contentW;
-        int logo = (int)(82 * m.dpi);
-        HICON hIcon = LoadMainIcon(logo);
-        if (hIcon) {
-            DrawIconEx(dc, x0 + (cw - logo) / 2, y, hIcon, logo, logo, 0, NULL, DI_NORMAL);
-            DestroyIcon(hIcon);
-        }
-        y += logo + (int)(24 * m.dpi);
-        DrawTextC(dc, x0, y, cw, (int)(30 * m.dpi), T(L"HKeyboard 轻键", L"HKeyboard"), g_sf20b, C_WHITE);
-        y += (int)(38 * m.dpi);
-        wchar_t ver[64];
-        swprintf(ver, 64, T(L"版本：v%hs (%ls)", L"Version: v%hs (%ls)"), VER_FILEVERSION_STR, ArchName());
-        DrawTextC(dc, x0, y, cw, (int)(20 * m.dpi), ver, g_sf12, C_DIM);
+        // 关于 tab：两张卡（身份 / 链接），版权行在卡片下方居中
+        int mark = (int)(44 * m.dpi);
+        RECT card1 = { m.contentX, m.contentY, m.contentX + m.contentW, 0 };
+        card1.bottom = card1.top + (int)(16 * m.dpi) * 2 + mark;
+        DrawRoundRect(dc, card1.left, card1.top, card1.right - card1.left, card1.bottom - card1.top,
+                      C_KEY, C_KEY, (int)(16 * m.dpi));
 
-        int uy = m.H - m.margin - (int)(20 * m.dpi);
-        DrawTextC(dc, x0, uy - (int)(28 * m.dpi), cw, (int)(18 * m.dpi),
+        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图、不加 tile
+        int my = card1.top + (int)(16 * m.dpi);
+        DrawHkIcon(dc, (float)(card1.left + (int)(20 * m.dpi)), (float)my, (float)mark,
+                   HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
+
+        int tx = card1.left + (int)(20 * m.dpi) + mark + (int)(18 * m.dpi);
+        int ty = card1.top + (int)(22 * m.dpi);
+        DrawTextL(dc, tx, ty, card1.right - tx - (int)(20 * m.dpi), (int)(26 * m.dpi),
+                  T(L"HKeyboard 轻键", L"HKeyboard"), g_sf20b, C_WHITE);
+        wchar_t meta[96];
+        swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs (%ls)", L"Lightweight screen keyboard · v%hs (%ls)"),
+                 VER_FILEVERSION_STR, ArchName());
+        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), card1.right - tx - (int)(20 * m.dpi), (int)(18 * m.dpi),
+                  meta, g_sf12, C_DIM);
+
+        RECT card2 = { m.contentX, card1.bottom + (int)(12 * m.dpi), m.contentX + m.contentW, 0 };
+        card2.bottom = card2.top + AboutLinkRowHeight(m) * 2;
+        DrawRoundRect(dc, card2.left, card2.top, card2.right - card2.left, card2.bottom - card2.top,
+                      C_KEY, C_KEY, (int)(16 * m.dpi));
+        Fill(dc, card2.left + (int)(20 * m.dpi), card2.top + AboutLinkRowHeight(m),
+             (card2.right - card2.left) - (int)(40 * m.dpi), 1, C_LINE_DIV);
+        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, card2, 0), HKICON_GITHUB,
+                         T(L"项目地址", L"Project URL"),
+                         L"github.com/PanDaDaTech/Hydrogen-Keyboard",
+                         g_sHov == S_HIT_URL);
+        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, card2, 1), HKICON_INFO,
+                         T(L"问题反馈", L"Feedback"),
+                         T(L"遇到 bug 或有建议，到 Issues 提一个", L"Report bugs or ideas on GitHub Issues"),
+                         g_sHov == S_HIT_FEEDBACK);
+
+        // 版权行：文字逐字保留（含 2026 与结尾句点），12px C_DIM 居中，放在卡片下方
+        DrawTextC(dc, m.contentX, card2.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sf12, C_DIM);
-        int x1, w1, x2, w2, sx, sw2;
-        AboutLinkLayout(x0, cw, &x1, &w1, &sx, &sw2, &x2, &w2);
-        DrawTextL(dc, x1, uy, w1, (int)(18 * m.dpi), T(L"项目地址", L"Project URL"), g_sf12, C_HOT);
-        DrawTextL(dc, sx, uy, sw2, (int)(18 * m.dpi), L"|", g_sf12, C_DIM);
-        DrawTextL(dc, x2, uy, w2, (int)(18 * m.dpi), T(L"问题反馈", L"Feedback"), g_sf12, C_HOT);
-        if (g_sHov == S_HIT_URL || g_sHov == S_HIT_FEEDBACK) {
-            int lx = g_sHov == S_HIT_URL ? x1 : x2;
-            int lw = g_sHov == S_HIT_URL ? w1 : w2;
-            HPEN pen = CreatePen(PS_SOLID, 1, C_HOT);
-            HPEN old = (HPEN)SelectObject(dc, pen);
-            MoveToEx(dc, lx, uy + (int)(16 * m.dpi), NULL); LineTo(dc, lx + lw, uy + (int)(16 * m.dpi));
-            SelectObject(dc, old); DeleteObject(pen);
-        }
     }
 
     // 下拉列表最后绘制，确保覆盖后续卡片。
@@ -3129,11 +3442,16 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
     if (x >= m.closeX && x < m.closeX + m.closeW && y >= m.closeY && y < m.closeY + m.closeH) return S_HIT_CLOSE;
 
-    int tabX = m.margin;
-    const int tabHits[4] = {S_HIT_TAB0, S_HIT_TABL, S_HIT_TAB1, S_HIT_TAB2};   // 视觉顺序：常规/布局/主题/关于
-    for (int i = 0; i < 4; i++) {
-        if (x >= tabX && x < tabX + m.tabW && y >= m.tabsY && y < m.tabsY + m.tabH) return tabHits[i];
-        tabX += m.tabW + m.tabGap;
+    // tab 条：与绘制共用同一套矩形（文字宽 + 固定间隙）
+    {
+        const wchar_t* labels[4];
+        SettingsTabLabels(labels);
+        RECT tr[4];
+        SettingsTabRects(m, labels, tr);
+        for (int i = 0; i < 4; i++) {
+            if (x >= tr[i].left && x < tr[i].right && y >= tr[i].top && y < tr[i].bottom)
+                return k_settingsTabHits[i];
+        }
     }
 
     if (g_sTab == 0) {
@@ -3166,9 +3484,8 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTOHIDE;
         }
 
+        // 整行命中：悬停高亮整行，点击任意处展开下拉
         r = SettingsRowRect(m, closeRow);
-        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-        // 整行命中：悬停高亮分组主行，点击任意处展开下拉
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_CLOSE_DROP;
 
         r = SettingsRowRect(m, closeRow + 1);
@@ -3180,15 +3497,16 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
 
         r = SettingsRowRect(m, closeRow + 4);
-        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
     } else if (g_sTab == 3) {
+        // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 按钮 4=Tab 切换小键盘
         RECT r;
         // 下拉列表优先命中
         if (g_dropLayout) {
             r = SettingsRowRect(m, 0);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
+            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
             for (int i = 0; i < 3; i++) {
                 if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
                 ly += m.comboH;
@@ -3198,14 +3516,22 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LAYOUT_DROP;
 
-        r = SettingsRowRect(m, 1);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+        // 按键图标样式：整条分段控件一个命中码，段下标在点击时按 x 算
+        {
+            const wchar_t* seg[3];
+            KeyIconSegItems(seg);
+            RECT sr = KeyIconSegRect(m, seg);
+            if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_KEYICON;
+        }
 
         r = SettingsRowRect(m, 2);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+
+        r = SettingsRowRect(m, 3);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_NPBTN;
 
         if (g_layoutMode == 2) {
-            r = SettingsRowRect(m, 3);
+            r = SettingsRowRect(m, 4);
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_NPTAB;
         }
     } else if (g_sTab == 1) {
@@ -3244,11 +3570,10 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_OPACITY_DROP;
 
         r = SettingsRowRect(m, 2);
-        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
+        comboX = SettingsComboX(m, r); comboY = SettingsComboYTop(m, r);
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HL_DROP;
 
         if (!g_wallpaperAccent) {
-            r = SettingsHighlightRect(m, TRUE);
             RECT input = SettingsHexRect(m, r);
             if (x >= input.left && x < input.right && y >= input.top && y < input.bottom) return S_HIT_HL_BOX;
             int palX, palY, palS, palGap;
@@ -3257,17 +3582,22 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 int px = palX + i * (palS + palGap);
                 if (x >= px && x < px + palS && y >= palY && y < palY + palS) return S_HIT_HL_PAL0 + i;
             }
-            RECT slider = SettingsColorSliderRect(m, r, 0);
+            RECT slider = SettingsColorSliderRect(m, r);
             int pad = (int)(8 * m.dpi);
             if (x >= slider.left && x < slider.right && y >= slider.top - pad && y < slider.bottom + pad)
                 return S_HIT_HL_HUE;
         }
     } else {
-        int uy = m.H - m.margin - (int)(20 * m.dpi);
-        int x1, w1, x2, w2, sx, sw2;
-        AboutLinkLayout(m.contentX, m.contentW, &x1, &w1, &sx, &sw2, &x2, &w2);
-        if (x >= x1 && x < x1 + w1 && y >= uy && y < uy + (int)(20 * m.dpi)) return S_HIT_URL;
-        if (x >= x2 && x < x2 + w2 && y >= uy && y < uy + (int)(20 * m.dpi)) return S_HIT_FEEDBACK;
+        // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）
+        int mark = (int)(44 * m.dpi);
+        RECT card1 = { m.contentX, m.contentY, m.contentX + m.contentW, 0 };
+        card1.bottom = card1.top + (int)(16 * m.dpi) * 2 + mark;
+        RECT card2 = { m.contentX, card1.bottom + (int)(12 * m.dpi), m.contentX + m.contentW, 0 };
+        card2.bottom = card2.top + AboutLinkRowHeight(m) * 2;
+        RECT r0 = AboutLinkRowRect(m, card2, 0);
+        if (x >= r0.left && x < r0.right && y >= r0.top && y < r0.bottom) return S_HIT_URL;
+        RECT r1 = AboutLinkRowRect(m, card2, 1);
+        if (x >= r1.left && x < r1.right && y >= r1.top && y < r1.bottom) return S_HIT_FEEDBACK;
     }
     return S_HIT_NONE;
 }
@@ -3375,6 +3705,7 @@ static void EnsureConfigFile() {
     IniSetInt(L"Keyboard", L"Layout", 0);
     IniSetInt(L"Keyboard", L"FKeys", 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", 0);
+    IniSetInt(L"Keyboard", L"KeyIconStyle", 0);
     IniSetInt(L"General", L"ShiftSymbols", 1);
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"AutoPopup", 1);
@@ -3407,6 +3738,8 @@ static void LoadConfig() {
     g_npHidden = IniGetInt(L"Keyboard", L"NpHidden", 0) != 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
+    g_keyIconStyle = IniGetInt(L"Keyboard", L"KeyIconStyle", 0);
+    if (g_keyIconStyle < 0 || g_keyIconStyle > 2) g_keyIconStyle = 0;   // 0=文字（= 升级前的现状）
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
     g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
     g_lang = IniGetInt(L"General", L"Language", 0);
@@ -3433,6 +3766,7 @@ static void SaveLayoutConfig() {
     IniSetInt(L"Keyboard", L"Layout", g_layoutMode);
     IniSetInt(L"Keyboard", L"FKeys", g_showFKeys ? 1 : 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", g_fnWebLayout ? 1 : 0);
+    IniSetInt(L"Keyboard", L"KeyIconStyle", g_keyIconStyle);
 }
 
 // 应用键盘布局：保存设置、重建按键；resetSize=TRUE 时按布局与 DPI 重置窗口大小
@@ -3480,8 +3814,8 @@ static void CommitHexEdit(HWND hWnd) {
 // 拖动色相滑轨：0..359 闭区间（上限不能是 360，否则末端会被取模打回 0）
 static void UpdateHueSlider(HWND hWnd, int mouseX) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
-    RECT row = SettingsHighlightRect(m, TRUE);
-    RECT slider = SettingsColorSliderRect(m, row, 0);
+    RECT row = SettingsRowRect(m, 2);
+    RECT slider = SettingsColorSliderRect(m, row);
     double p = (double)(mouseX - slider.left) / (double)(slider.right - slider.left - 1);
     if (p < 0.0) p = 0.0; if (p > 1.0) p = 1.0;
 
@@ -3739,6 +4073,21 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_hlSliderDrag = hit;
         SetCapture(hWnd);
         UpdateHueSlider(hWnd, x);
+        return;
+    }
+    if (hit == S_HIT_KEYICON) {
+        // 分段控件：按 x 定位具体段；改完存盘并立即重绘主键盘（三窗口联动的关键一步）
+        SettingsMetrics km = GetSettingsMetrics(hWnd);
+        const wchar_t* seg[3];
+        KeyIconSegItems(seg);
+        RECT sr = KeyIconSegRect(km, seg);
+        int idx = SegmentedHitIndex(km, sr, seg, 3, x);
+        if (idx >= 0) {
+            g_keyIconStyle = idx;
+            IniSetInt(L"Keyboard", L"KeyIconStyle", g_keyIconStyle);
+            if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
+        }
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }
     if (hit == S_HIT_CLOSE) { SendMessageW(hWnd, WM_CLOSE, 0, 0); return; }
@@ -4859,8 +5208,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f13b); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
-        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b); DeleteObject(g_sfIcon);
-        DeleteObject(g_fKeyIcon);
+        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
         PostQuitMessage(0);
         return 0;
     }
@@ -5018,7 +5366,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
     if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
     if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
-    if (g_fontRegMdl2) RemoveFontMemResourceEx(g_fontRegMdl2);
     if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "resource.h"
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
@@ -24,10 +25,14 @@
 #define HK_ARCH L"32位"
 #endif
 
-// 界面语言与高亮颜色（需在 ArchName / ApplyTheme 之前声明，供其读取）
-int         g_lang = 0;                // 语言：0=中文 1=English
-int         g_hlMode = 0;              // 高亮颜色：0=默认 1=自定义
-int         g_hlColor = 0xD47800;      // 自定义高亮颜色（BGR）
+// 主题色相取值范围：上限是 359 而非 360，否则滑轨末端会被取模打回 0
+#define HKB_DEFAULT_HUE  300
+#define HKB_HUE_MIN      0
+#define HKB_HUE_MAX      359
+
+// 界面语言与主题色相（需在 ArchName / ApplyTheme 之前声明，供其读取）
+int         g_lang = 0;                    // 语言：0=中文 1=English
+int         g_hue = HKB_DEFAULT_HUE;       // 主题色相 0..359（oklch 色相角，单旋钮换肤）
 
 // 关于页架构显示（随语言切换 64/32位或 64/32-bit）
 static const wchar_t* ArchName() {
@@ -63,7 +68,6 @@ int g_keyHeight = 46;
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
-#define WM_REAPPLY_MATERIAL (WM_APP + 103)
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -84,60 +88,127 @@ int g_keyHeight = 46;
 #define S_HIT_TABL 5
 #define S_HIT_AUTOHIDE 110   // 注意：97~102 已被透明度下拉占用
 
-// ========== Theme System ==========
-struct ThemeColors {
-    DWORD bg;
-    DWORD hdr;
-    DWORD key;
-    DWORD keyBorder;
-    DWORD dark;
-    DWORD hover;
-    DWORD hot;
-    DWORD text;
-    DWORD dim;
+// ========== Ethereal 主题令牌（单一色相驱动） ==========
+// 取自 Halo Ethereal：所有中性色都挂在同一个色相角上，换主题＝换一个 --hue；
+// 层级感只靠「面板底略深 + 键帽/卡片纯白」的明度差建立，不用描边也不用阴影。
+
+struct HkbTokens {
+    DWORD pageBg;            // 窗口 / 键盘面板底（page-bg）
+    DWORD cardBg;            // 普通键帽 / 卡片（card-bg）
+    DWORD keyOutline;        // 键帽轮廓
+    DWORD keyOutlineHover;   // 键帽悬停轮廓
+    DWORD btnRegularBg;      // 修饰键底
+    DWORD btnRegularBgHover;
+    DWORD btnRegularBgActive;
+    DWORD btnCardBgHover;    // 普通键悬停底
+    DWORD btnPlainBgHover;   // 次要键（收起 / 网址后缀）底
+    DWORD btnContent;        // 修饰键文字
+    DWORD controlBg;         // 输入框 / 下拉 / 开关轨道底
+    DWORD floatPanelBg;      // 弹出层底
+    DWORD primary;           // 强调色
+    DWORD primaryFg;         // 强调底上的文字
+    DWORD lineDivider;       // 弱分隔线
+    DWORD metaDivider;       // 次强分隔线
+    DWORD text;              // 主文字
+    DWORD textMuted;         // 弱化文字
 };
 
-// Win11 Dark Theme (BGR format for GDI)
-static const ThemeColors g_darkTheme = {
-    0x1F1F1F,  // bg
-    0x181818,  // hdr
-    0x2C2C2C,  // key
-    0x3A3A3A,  // keyBorder
-    0x242424,  // dark
-    0x383838,  // hover
-    0xD47800,  // hot (Win11 accent blue #0078D4 in BGR)
-    0xF5F5F5,  // text
-    0xA0A0A0   // dim
-};
+// oklch(L, C, h) → sRGB，与 panda-core 的 Tokens::with_hue 结果一致
+static double OklchEncode(double x) {
+    return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+static BYTE OklchChannel(double x) {
+    if (x < 0.0) x = 0.0; else if (x > 1.0) x = 1.0;
+    double v = OklchEncode(x);
+    if (v < 0.0) v = 0.0; else if (v > 1.0) v = 1.0;
+    return (BYTE)(v * 255.0 + 0.5);
+}
+static DWORD OklchToBgr(double L, double chroma, double hueDeg) {
+    const double PI = 3.14159265358979323846;
+    double rad = hueDeg * PI / 180.0;
+    double a = chroma * cos(rad);
+    double b = chroma * sin(rad);
+    double lp = L + 0.3963377774 * a + 0.2158037573 * b;
+    double mp = L - 0.1055613458 * a - 0.0638541728 * b;
+    double sp = L - 0.0894841775 * a - 1.2914855480 * b;
+    double l = lp * lp * lp, m = mp * mp * mp, s = sp * sp * sp;
+    double r  =  4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+    double g  = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    double bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+    return RGB(OklchChannel(r), OklchChannel(g), OklchChannel(bl));
+}
 
-// Win11 Light Theme (BGR format for GDI)
-static const ThemeColors g_lightTheme = {
-    0xF3F3F3,  // bg
-    0xEAEAEA,  // hdr
-    0xFFFFFF,  // key
-    0xD6D6D6,  // keyBorder
-    0xE8E8E8,  // dark
-    0xF0F0F0,  // hover
-    0xD47800,  // hot (Win11 accent blue #0078D4 in BGR)
-    0x1A1A1A,  // text
-    0x666666   // dim
-};
+// sRGB → oklch 色相角（迁移旧高亮色 / 取壁纸强调色色相 / HEX 输入用）
+static double OklchHueOfBgr(DWORD bgr) {
+    const double PI = 3.14159265358979323846;
+    double rgb[3] = { GetRValue(bgr) / 255.0, GetGValue(bgr) / 255.0, GetBValue(bgr) / 255.0 };
+    for (int i = 0; i < 3; i++)
+        rgb[i] = rgb[i] <= 0.04045 ? rgb[i] / 12.92 : pow((rgb[i] + 0.055) / 1.055, 2.4);
+    double l = 0.4122214708 * rgb[0] + 0.5363325363 * rgb[1] + 0.0514459929 * rgb[2];
+    double m = 0.2119034982 * rgb[0] + 0.6806995451 * rgb[1] + 0.1073969566 * rgb[2];
+    double s = 0.0883024619 * rgb[0] + 0.2817188376 * rgb[1] + 0.6299787005 * rgb[2];
+    l = pow(l, 1.0 / 3.0); m = pow(m, 1.0 / 3.0); s = pow(s, 1.0 / 3.0);
+    double a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+    double b = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+    double h = atan2(b, a) * 180.0 / PI;
+    if (h < 0.0) h += 360.0;
+    return h;
+}
+
+static DWORD BlendColor(DWORD from, DWORD to, double value) {
+    int r = (int)(GetRValue(from) + (GetRValue(to) - GetRValue(from)) * value + 0.5);
+    int g = (int)(GetGValue(from) + (GetGValue(to) - GetGValue(from)) * value + 0.5);
+    int b = (int)(GetBValue(from) + (GetBValue(to) - GetBValue(from)) * value + 0.5);
+    return RGB(r, g, b);
+}
+
+// 把黑/白按 alpha 覆盖到实色底上（等价 rgba 覆盖），返回预混实色
+static DWORD OverlayBgr(DWORD base, BOOL white, double alpha) {
+    return BlendColor(base, white ? 0xFFFFFF : 0x000000, alpha);
+}
+
+// 色相预览色：与主色同一配方（oklch 0.70 / 0.14），用于色板与色相滑轨
+static DWORD HueAccentBgr(int hue) {
+    if (hue < HKB_HUE_MIN) hue = HKB_HUE_MIN;
+    if (hue > HKB_HUE_MAX) hue = HKB_HUE_MAX;
+    return OklchToBgr(0.70, 0.14, (double)hue);
+}
+
+// 由色相派生全部令牌。轮廓与分隔线一律预混成实色：
+// GDI+ 往 32bpp BI_RGB DIB 里画半透明形状时 alpha 语义不可靠，实色还能让 XP 与 Win11 字节级一致。
+static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
+    double h = (double)hue;
+    out->primary   = dark ? OklchToBgr(0.75, 0.140, h) : OklchToBgr(0.70, 0.140, h);
+    out->pageBg    = dark ? OklchToBgr(0.16, 0.014, h) : OklchToBgr(0.95, 0.010, h);
+    out->cardBg    = dark ? OklchToBgr(0.23, 0.015, h) : RGB(255, 255, 255);
+    out->btnRegularBg       = dark ? OklchToBgr(0.33, 0.035, h) : OklchToBgr(0.95, 0.025, h);
+    out->btnRegularBgHover  = dark ? OklchToBgr(0.38, 0.040, h) : OklchToBgr(0.90, 0.050, h);
+    out->btnRegularBgActive = dark ? OklchToBgr(0.43, 0.045, h) : OklchToBgr(0.85, 0.080, h);
+    out->btnCardBgHover     = dark ? OklchToBgr(0.30, 0.030, h) : OklchToBgr(0.98, 0.005, h);
+    out->btnPlainBgHover    = dark ? OklchToBgr(0.30, 0.035, h) : OklchToBgr(0.95, 0.025, h);
+    out->btnContent         = dark ? OklchToBgr(0.75, 0.100, h) : OklchToBgr(0.55, 0.120, h);
+    out->text               = dark ? OklchToBgr(0.85, 0.020, h) : OklchToBgr(0.25, 0.020, h);
+    out->floatPanelBg       = dark ? OklchToBgr(0.17, 0.012, h) : RGB(255, 255, 255);
+
+    out->keyOutline      = BlendColor(out->cardBg, out->text, 0.20);
+    out->keyOutlineHover = BlendColor(out->cardBg, out->primary, 0.45);
+    out->controlBg       = BlendColor(out->cardBg, out->text, 0.18);
+    out->lineDivider     = OverlayBgr(out->pageBg, dark, 0.08);
+    out->metaDivider     = OverlayBgr(out->pageBg, dark, 0.20);
+    out->textMuted       = OverlayBgr(out->pageBg, dark, 0.60);   // t60：black/white @ 60%
+    // Enter / 确认键：浅色底压深字（5.7:1），深色底用黑 70% 混主色（5.4:1）
+    out->primaryFg       = dark ? BlendColor(out->primary, RGB(0, 0, 0), 0.70) : out->text;
+}
 
 // Theme mode: 0 = follow system, 1 = force dark, 2 = force light
 static int g_themeMode = 0;
-// Background material: 0 = off, 1 = Mica, 2 = Acrylic
-static int g_materialMode = 0;
-// 主界面透明度（%，100=不透明）：仅不支持系统 backdrop 的旧系统（PE/Win10 1803-）可用
+// 主界面透明度（%，100=不透明）：分层窗口实现，所有系统均可用
 static int g_mainOpacity = 100;
-static BOOL g_isWinPE = FALSE;
 static DWORD g_winBuild = 0;      // 系统Build号（RtlGetVersion，0=未知）
-static BOOL g_isWin11 = FALSE;    // Win11（Build>=22000）：支持 Mica
-static BOOL g_supportsMaterial = FALSE;  // Win10 1809+（Build>=17763）且非 PE：支持系统 backdrop
-static void ApplyAllWindowMaterials();
-// 是否启用“高亮按钮跟随系统壁纸强调色”（仅通过 -wallpaper 命令行参数开启，默认关闭）
+// 是否启用“主题色相跟随系统壁纸强调色”（仅通过 -wallpaper 命令行参数开启，默认关闭）
 static BOOL g_wallpaperAccent = FALSE;
-static ThemeColors g_themeBuf;
-static const ThemeColors* g_theme = &g_themeBuf;
+static HkbTokens g_themeBuf;
+static const HkbTokens* g_theme = &g_themeBuf;
 
 static BOOL IsSystemDarkMode() {
     HKEY hKey;
@@ -151,22 +222,10 @@ static BOOL IsSystemDarkMode() {
     return (val == 0);
 }
 
-static BOOL IsSystemBackdropDarkMode() {
-    HKEY hKey;
-    DWORD val = 1, sz = sizeof(val);
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegQueryValueExW(hKey, L"SystemUsesLightTheme", NULL, NULL, (LPBYTE)&val, &sz);
-        RegCloseKey(hKey);
-    }
-    return val == 0;
-}
-
 static BOOL IsDarkThemeActive() {
     if (g_themeMode == 1) return TRUE;
     if (g_themeMode == 2) return FALSE;
-    return g_materialMode != 0 ? IsSystemBackdropDarkMode() : IsSystemDarkMode();
+    return IsSystemDarkMode();
 }
 
 // 读取系统 DWM 强调色并转为 GDI COLORREF (BGR)。
@@ -218,58 +277,56 @@ static DWORD GetWallpaperAccentBgr() {
 }
 
 static void ApplyTheme() {
-    const ThemeColors* base;
-    if (g_themeMode == 1) {
-        base = &g_darkTheme;
-    } else if (g_themeMode == 2) {
-        base = &g_lightTheme;
-    } else {
-        base = IsDarkThemeActive() ? &g_darkTheme : &g_lightTheme;
-    }
-
-    g_themeBuf = *base;
-
-    // 高亮色：自定义颜色优先；其次 -wallpaper 跟随壁纸强调色
-    if (g_hlMode == 1) {
-        g_themeBuf.hot = (DWORD)g_hlColor;
-    } else if (g_wallpaperAccent) {
+    int hue = g_hue;
+    if (hue < HKB_HUE_MIN) hue = HKB_HUE_MIN;
+    if (hue > HKB_HUE_MAX) hue = HKB_HUE_MAX;
+    if (g_wallpaperAccent) {
         DWORD accent = GetWallpaperAccentBgr();
-        if (accent != 0) g_themeBuf.hot = accent;
+        if (accent != 0) {
+            hue = (int)(OklchHueOfBgr(accent) + 0.5);
+            if (hue > HKB_HUE_MAX) hue = HKB_HUE_MAX;
+        }
     }
-
+    HkbTokensBuild(hue, IsDarkThemeActive(), &g_themeBuf);
     g_theme = &g_themeBuf;
 }
 
-// 重新应用主题；颜色确实发生变化时刷新窗口
+// 设置 / 关闭提示窗口句柄：主题刷新时需要一并重绘（统一定义在 RefreshThemeAndRepaint 之前）
+static HWND g_settingsHwnd = 0;
+static HWND g_closePromptHwnd = 0;
+
+// 重新应用主题；颜色确实发生变化时刷新窗口（三个窗口一起，避免只换主键盘留下残留配色）
 static void RefreshThemeAndRepaint(HWND hWnd) {
-    ThemeColors before = g_themeBuf;
+    HkbTokens before = g_themeBuf;
     ApplyTheme();
-    if (memcmp(&before, &g_themeBuf, sizeof(ThemeColors)) != 0) {
-        ApplyAllWindowMaterials();
+    if (memcmp(&before, &g_themeBuf, sizeof(HkbTokens)) != 0) {
         InvalidateRect(hWnd, 0, TRUE);
+        if (g_settingsHwnd && IsWindow(g_settingsHwnd))
+            RedrawWindow(g_settingsHwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
+        if (g_closePromptHwnd && IsWindow(g_closePromptHwnd))
+            RedrawWindow(g_closePromptHwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
     }
 }
 
-// Convenience macros to access current theme colors
-#define C_BG           (g_theme->bg)
-#define C_HDR          (g_theme->hdr)
-#define C_KEY          (g_theme->key)
-#define C_KEY_BORDER   (g_theme->keyBorder)
-#define C_DARK         (g_theme->dark)
-#define C_HOVER        (g_theme->hover)
-#define C_HOT          (g_theme->hot)
+// Convenience macros to access current theme tokens
+#define C_BG           (g_theme->pageBg)
+#define C_KEY          (g_theme->cardBg)
+#define C_KEY_BORDER   (g_theme->keyOutline)
+#define C_BORDER_HOVER (g_theme->keyOutlineHover)
+#define C_DARK         (g_theme->controlBg)
+#define C_HOVER        (g_theme->btnCardBgHover)
+#define C_HOT          (g_theme->primary)
 #define C_WHITE        (g_theme->text)
-#define C_DIM          (g_theme->dim)
-
-// Keep light material text readable without making every text tier the same
-// near-black color. Explicitly selected Dark Theme keeps its original palette.
-static DWORD ResolveFontColor(DWORD color) {
-    if (g_materialMode != 0 && g_themeMode != 1) {
-        if (color == C_DIM) return RGB(112, 112, 112);
-        if (color == C_WHITE) return RGB(48, 48, 48);
-    }
-    return color;
-}
+#define C_DIM          (g_theme->textMuted)
+#define C_ON_PRIMARY   (g_theme->primaryFg)
+#define C_BTN_CONTENT  (g_theme->btnContent)
+#define C_REGULAR      (g_theme->btnRegularBg)
+#define C_REGULAR_HOV  (g_theme->btnRegularBgHover)
+#define C_REGULAR_ACT  (g_theme->btnRegularBgActive)
+#define C_PLAIN        (g_theme->btnPlainBgHover)
+#define C_FLOAT        (g_theme->floatPanelBg)
+#define C_LINE_DIV     (g_theme->lineDivider)
+#define C_META         (g_theme->metaDivider)
 
 enum KeyType {
     K_NORMAL, K_LETTER, K_MOD, K_CAPS,
@@ -301,8 +358,6 @@ static int  IniGetInt(const wchar_t* section, const wchar_t* key, int def);
 // Global state
 HINSTANCE   g_hInst = 0;
 HWND        g_hWnd = 0;
-static HWND g_settingsHwnd = 0;
-static HWND g_closePromptHwnd = 0;
 enum WindowMotionFinish { MOTION_NONE, MOTION_HIDE, MOTION_DESTROY };
 struct WindowMotion {
     HWND hWnd;
@@ -1104,37 +1159,7 @@ static void DrawRoundRect(HDC dc, int x, int y, int w, int h, DWORD fillC, DWORD
     DrawRoundRectAlpha(dc, x, y, w, h, fillC, borderC, radius, 255, 255);
 }
 
-static void DrawAlphaSurface(HDC dc, int x, int y, int w, int h, DWORD color, BYTE alpha) {
-    if (w <= 0 || h <= 0 || alpha == 0) return;
-    Gdiplus::Graphics g(dc);
-    Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, GetRValue(color),
-                                             GetGValue(color), GetBValue(color)));
-    g.FillRectangle(&brush, x, y, w, h);
-}
-
 typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND, DWORD, LPCVOID, DWORD);
-struct DwmMarginsLocal { int left, right, top, bottom; };
-typedef HRESULT (WINAPI *DwmExtendFrameIntoClientAreaProc)(HWND, const DwmMarginsLocal*);
-typedef HRESULT (WINAPI *DwmFlushProc)();
-typedef HANDLE PaintBufferHandleLocal;
-typedef HRESULT (WINAPI *BufferedPaintInitProc)();
-typedef PaintBufferHandleLocal (WINAPI *BeginBufferedPaintProc)(HDC, const RECT*, int, const void*, HDC*);
-typedef HRESULT (WINAPI *EndBufferedPaintProc)(PaintBufferHandleLocal, BOOL);
-typedef HRESULT (WINAPI *BufferedPaintClearProc)(PaintBufferHandleLocal, const RECT*);
-typedef HRESULT (WINAPI *GetBufferedPaintBitsProc)(PaintBufferHandleLocal, RGBQUAD**, int*);
-
-struct AccentPolicyLocal {
-    int state;
-    int flags;
-    DWORD gradientColor;
-    int animationId;
-};
-struct WindowCompositionAttribDataLocal {
-    int attrib;
-    PVOID data;
-    SIZE_T size;
-};
-typedef BOOL (WINAPI *SetWindowCompositionAttributeProc)(HWND, WindowCompositionAttribDataLocal*);
 
 static DwmSetWindowAttributeProc GetDwmSetWindowAttribute() {
     static HMODULE dwm = NULL;
@@ -1144,70 +1169,6 @@ static DwmSetWindowAttributeProc GetDwmSetWindowAttribute() {
         initialized = TRUE;
         dwm = LoadLibraryW(L"dwmapi.dll");
         if (dwm) proc = (DwmSetWindowAttributeProc)GetProcAddress(dwm, "DwmSetWindowAttribute");
-    }
-    return proc;
-}
-
-static DwmExtendFrameIntoClientAreaProc GetDwmExtendFrameIntoClientArea() {
-    static HMODULE dwm = NULL;
-    static DwmExtendFrameIntoClientAreaProc proc = NULL;
-    static BOOL initialized = FALSE;
-    if (!initialized) {
-        initialized = TRUE;
-        dwm = LoadLibraryW(L"dwmapi.dll");
-        if (dwm) proc = (DwmExtendFrameIntoClientAreaProc)GetProcAddress(dwm, "DwmExtendFrameIntoClientArea");
-    }
-    return proc;
-}
-
-static DwmFlushProc GetDwmFlush() {
-    static HMODULE dwm = NULL;
-    static DwmFlushProc proc = NULL;
-    static BOOL initialized = FALSE;
-    if (!initialized) {
-        initialized = TRUE;
-        dwm = LoadLibraryW(L"dwmapi.dll");
-        if (dwm) proc = (DwmFlushProc)GetProcAddress(dwm, "DwmFlush");
-    }
-    return proc;
-}
-
-struct BufferedPaintApiLocal {
-    BufferedPaintInitProc init;
-    BeginBufferedPaintProc begin;
-    EndBufferedPaintProc end;
-    BufferedPaintClearProc clear;
-    GetBufferedPaintBitsProc bits;
-};
-
-static const BufferedPaintApiLocal* GetBufferedPaintApi() {
-    static HMODULE module = NULL;
-    static BufferedPaintApiLocal api = {};
-    static BOOL initialized = FALSE;
-    if (!initialized) {
-        initialized = TRUE;
-        module = LoadLibraryW(L"uxtheme.dll");
-        if (module) {
-            api.init = (BufferedPaintInitProc)GetProcAddress(module, "BufferedPaintInit");
-            api.begin = (BeginBufferedPaintProc)GetProcAddress(module, "BeginBufferedPaint");
-            api.end = (EndBufferedPaintProc)GetProcAddress(module, "EndBufferedPaint");
-            api.clear = (BufferedPaintClearProc)GetProcAddress(module, "BufferedPaintClear");
-            api.bits = (GetBufferedPaintBitsProc)GetProcAddress(module, "GetBufferedPaintBits");
-            if (!api.init || !api.begin || !api.end || FAILED(api.init())) {
-                ZeroMemory(&api, sizeof(api));
-            }
-        }
-    }
-    return api.begin ? &api : NULL;
-}
-
-static SetWindowCompositionAttributeProc GetSetWindowCompositionAttribute() {
-    static SetWindowCompositionAttributeProc proc = NULL;
-    static BOOL initialized = FALSE;
-    if (!initialized) {
-        initialized = TRUE;
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        if (user32) proc = (SetWindowCompositionAttributeProc)GetProcAddress(user32, "SetWindowCompositionAttribute");
     }
     return proc;
 }
@@ -1226,159 +1187,97 @@ static BOOL TryApplyWin11RoundedWindow(HWND hWnd) {
 
 static void ApplyRoundedWindow(HWND hWnd, int logicalRadius) {
     (void)logicalRadius;
-    // Win11+：保留系统原生 DWM 圆角；Win10 及以下（含对应版本 PE）强制直角窗口
+    // Win11+ 保留系统原生 DWM 圆角；Win10 及以下沿用系统样式（直角）。
+    // 圆角观感主要由面板 16px / 键帽 8px 的内圆角提供，窗口外框跟随系统即可。
     if (g_winBuild >= 22000) {
         if (TryApplyWin11RoundedWindow(hWnd)) return;
     }
     SetWindowRgn(hWnd, NULL, TRUE);
 }
 
-static BOOL IsMaterialApplied(HWND hWnd) {
-    return hWnd && GetPropW(hWnd, L"HKeyboardMaterial") != NULL;
-}
-
 static BOOL g_alphaPaintActive = FALSE;
-static BOOL g_bufferedPaintActive = FALSE;   // 当前画布是否为 DWM 缓冲透明画布（材质模式）
 static RGBQUAD* g_alphaPaintBits = NULL;
 static int g_alphaPaintRowPixels = 0;
 static RECT g_alphaPaintRect = {0, 0, 0, 0};
 
 struct WindowPaintSurfaceLocal {
     HDC dc;
-    PaintBufferHandleLocal buffered;
     HDC memory;
     HBITMAP bitmap;
     HBITMAP oldBitmap;
-    BOOL alpha;
     BOOL previousAlpha;
-    BOOL previousBuffered;
     RGBQUAD* previousBits;
     int previousRowPixels;
     RECT previousRect;
 };
 
+// 所有窗口统一使用 32bpp 顶向下 DIB 画布：文字走统一的 alpha 混合路径，
+// 浅色 / 深色 / XP / Win11 的渲染观感完全一致——这是全平台一致性的基石，不要改成 GDI 直绘文字。
 static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, const RECT& rc) {
     WindowPaintSurfaceLocal surface = {};
     surface.previousAlpha = g_alphaPaintActive;
-    surface.previousBuffered = g_bufferedPaintActive;
     surface.previousBits = g_alphaPaintBits;
     surface.previousRowPixels = g_alphaPaintRowPixels;
     surface.previousRect = g_alphaPaintRect;
+    (void)hWnd;
 
-    if (IsMaterialApplied(hWnd)) {
-        const BufferedPaintApiLocal* api = GetBufferedPaintApi();
-        if (api) {
-            HDC bufferedDc = NULL;
-            surface.buffered = api->begin(target, &rc, 2, NULL, &bufferedDc); // BPBF_TOPDOWNDIB
-            if (surface.buffered && bufferedDc) {
-                surface.dc = bufferedDc;
-                surface.alpha = TRUE;
-                g_alphaPaintActive = TRUE;
-                g_bufferedPaintActive = TRUE;
-                api->clear(surface.buffered, NULL);
-                g_alphaPaintBits = NULL;
-                g_alphaPaintRowPixels = 0;
-                g_alphaPaintRect = rc;
-                if (api->bits) {
-                    RGBQUAD* bits = NULL;
-                    int rowPixels = 0;
-                    if (SUCCEEDED(api->bits(surface.buffered, &bits, &rowPixels)) &&
-                        bits && rowPixels > 0) {
-                        g_alphaPaintBits = bits;
-                        g_alphaPaintRowPixels = rowPixels;
-                    }
-                }
-                return surface;
-            }
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w > 0 && h > 0) {
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        surface.memory = CreateCompatibleDC(target);
+        surface.bitmap = CreateDIBSection(target, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (surface.memory && surface.bitmap && bits) {
+            surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
+            surface.dc = surface.memory;
+            g_alphaPaintActive = TRUE;
+            g_alphaPaintBits = (RGBQUAD*)bits;
+            g_alphaPaintRowPixels = w;
+            g_alphaPaintRect = rc;
+            return surface;
         }
-    }
-
-    // 无材质模式：同样使用 32bpp 顶向下 DIB，使文字统一走 alpha 混合路径，
-    // 保证浅色/深色/材质各模式下的文字渲染观感完全一致。
-    {
-        int w = rc.right - rc.left, h = rc.bottom - rc.top;
-        if (w > 0 && h > 0) {
-            BITMAPINFO bmi = {};
-            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bmi.bmiHeader.biWidth = w;
-            bmi.bmiHeader.biHeight = -h;
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-            void* bits = NULL;
-            surface.memory = CreateCompatibleDC(target);
-            surface.bitmap = CreateDIBSection(target, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-            if (surface.memory && surface.bitmap && bits) {
-                surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
-                surface.dc = surface.memory;
-                surface.alpha = FALSE;
-                g_alphaPaintActive = TRUE;
-                g_bufferedPaintActive = FALSE;
-                g_alphaPaintBits = (RGBQUAD*)bits;
-                g_alphaPaintRowPixels = w;
-                g_alphaPaintRect = rc;
-                return surface;
-            }
-            // DIB 创建失败：回退普通兼容位图（GDI 直绘文字）
-            if (surface.memory) { DeleteDC(surface.memory); surface.memory = NULL; }
-            if (surface.bitmap) { DeleteObject(surface.bitmap); surface.bitmap = NULL; }
-        }
+        // DIB 创建失败：回退普通兼容位图（GDI 直绘文字）
+        if (surface.memory) { DeleteDC(surface.memory); surface.memory = NULL; }
+        if (surface.bitmap) { DeleteObject(surface.bitmap); surface.bitmap = NULL; }
     }
 
     surface.memory = CreateCompatibleDC(target);
-    surface.bitmap = CreateCompatibleBitmap(target, rc.right - rc.left, rc.bottom - rc.top);
+    surface.bitmap = CreateCompatibleBitmap(target, w, h);
     surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
     surface.dc = surface.memory;
-    surface.alpha = FALSE;
     g_alphaPaintActive = FALSE;
-    g_bufferedPaintActive = FALSE;
     g_alphaPaintBits = NULL;
     g_alphaPaintRowPixels = 0;
     return surface;
 }
 
-static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface, BOOL commit) {
+static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface) {
     if (!surface) return;
-    if (surface->buffered) {
-        const BufferedPaintApiLocal* api = GetBufferedPaintApi();
-        if (api) api->end(surface->buffered, commit);
-        g_alphaPaintActive = surface->previousAlpha;
-        g_bufferedPaintActive = surface->previousBuffered;
-        g_alphaPaintBits = surface->previousBits;
-        g_alphaPaintRowPixels = surface->previousRowPixels;
-        g_alphaPaintRect = surface->previousRect;
-        return;
-    }
     if (surface->memory) {
         SelectObject(surface->memory, surface->oldBitmap);
         if (surface->bitmap) DeleteObject(surface->bitmap);
         DeleteDC(surface->memory);
     }
     g_alphaPaintActive = surface->previousAlpha;
-    g_bufferedPaintActive = surface->previousBuffered;
     g_alphaPaintBits = surface->previousBits;
     g_alphaPaintRowPixels = surface->previousRowPixels;
     g_alphaPaintRect = surface->previousRect;
 }
 
+// 统一铺不透明面板底色（page-bg），全部内容都画在它上面
 static void ClearWindowBackBuffer(HDC dc, HWND hWnd, int w, int h) {
-    // DWM backdrop requires a clean glass surface. Copying the previous window DC
-    // reintroduces stale pixels and causes Tab/page ghosting after every repaint.
-    // 仅缓冲透明画布（材质模式）跳过填充；无材质 DIB 画布必须填不透明底色。
-    if (IsMaterialApplied(hWnd) && g_bufferedPaintActive) return;
-    Fill(dc, 0, 0, w, h, IsMaterialApplied(hWnd) ? 0x000000 : C_BG);
-}
-
-static BOOL IsWindowsPE() {
-    HKEY key = NULL;
-    LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-        L"SYSTEM\\CurrentControlSet\\Control\\MiniNT", 0, KEY_READ, &key);
-    if (result == ERROR_SUCCESS) RegCloseKey(key);
-    return result == ERROR_SUCCESS;
+    (void)hWnd;
+    Fill(dc, 0, 0, w, h, C_BG);
 }
 
 // 检测系统版本（RtlGetVersion 不受兼容性清单影响）
-// Win11 = Build 22000+（支持 Mica）；Win10 1809+ = Build 17763+（支持亚克力 backdrop）
+// Win11 = Build 22000+（窗口保留系统原生圆角）；其余版本沿用系统样式（直角）
 typedef LONG (WINAPI *RtlGetVersionFn)(OSVERSIONINFOW *);
 static void DetectWinVersion() {
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
@@ -1394,12 +1293,9 @@ static void DetectWinVersion() {
         fallback.dwOSVersionInfoSize = sizeof(fallback);
         if (GetVersionExW(&fallback)) g_winBuild = fallback.dwBuildNumber;
     }
-    g_isWin11 = g_winBuild >= 22000;
-    g_supportsMaterial = !g_isWinPE && g_winBuild >= 17763;
 }
 
-// 主界面透明度（分层窗口统一透明）：Win2000+ 均支持，
-// 用于无系统 backdrop 的环境（Win7/8.x、精简版 Win10/11 PE 等）
+// 主界面透明度（分层窗口统一透明）：Win2000+ 均支持，所有系统都可用
 static void ApplyWindowOpacity(HWND hWnd, BOOL enable) {
     if (!hWnd || !IsWindow(hWnd)) return;
     LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
@@ -1413,103 +1309,9 @@ static void ApplyWindowOpacity(HWND hWnd, BOOL enable) {
     }
 }
 
-static void ApplyWindowMaterial(HWND hWnd) {
-    if (!hWnd || !IsWindow(hWnd)) return;
-
-    DwmSetWindowAttributeProc setAttr = GetDwmSetWindowAttribute();
-    DwmExtendFrameIntoClientAreaProc extendFrame = GetDwmExtendFrameIntoClientArea();
-    DwmFlushProc flush = GetDwmFlush();
-    SetWindowCompositionAttributeProc setComposition = GetSetWindowCompositionAttribute();
-    BOOL applied = FALSE;
-    BOOL extendBackdrop = FALSE;
-
-    // Fully reset the previous material first. Mica and Acrylic use different
-    // composition paths and otherwise leak state into each other when switched.
-    if (setComposition) {
-        AccentPolicyLocal disabled = {0, 0, 0, 0};
-        WindowCompositionAttribDataLocal data = {19, &disabled, sizeof(disabled)};
-        setComposition(hWnd, &data);
-    }
-    if (setAttr) {
-        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int none = 1;
-        setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE, &none, sizeof(none));
-    }
-    if (extendFrame) {
-        DwmMarginsLocal margins = {0, 0, 0, 0};
-        extendFrame(hWnd, &margins);
-    }
-    RemovePropW(hWnd, L"HKeyboardMaterial");
-    if (flush) flush();
-
-    if (setAttr) {
-        const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE = 20;
-        BOOL dark = g_theme->bg == g_darkTheme.bg;
-        if (FAILED(setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_VALUE, &dark, sizeof(dark)))) {
-            const DWORD DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE = 19;
-            setAttr(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD_VALUE, &dark, sizeof(dark));
-        }
-    }
-
-    if (g_materialMode == 0) {
-        // 无系统 backdrop 的环境（Win7/8.x、PE、Win10 1803-）：
-        // 主界面透明度用分层窗口实现，兼容性最好
-        ApplyWindowOpacity(hWnd, !g_supportsMaterial && hWnd == g_hWnd && g_mainOpacity < 100);
-        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
-        return;
-    }
-
-    // Windows 11 native backdrops. Mica and Acrylic stay on the same DWM path.
-    if (setAttr) {
-        const DWORD DWMWA_SYSTEMBACKDROP_TYPE_VALUE = 38;
-        int backdrop = g_materialMode == 1 ? 2 : 3;
-        if (SUCCEEDED(setAttr(hWnd, DWMWA_SYSTEMBACKDROP_TYPE_VALUE,
-                              &backdrop, sizeof(backdrop)))) {
-            applied = TRUE;
-            extendBackdrop = TRUE;
-        }
-    }
-
-    // Compatibility fallback for Windows 10 or older Win11 builds.
-    if (!applied && setComposition) {
-        AccentPolicyLocal policy = {0, 0, 0, 0};
-        BOOL dark = g_theme->bg == g_darkTheme.bg;
-        policy.state = g_materialMode == 1 ? 5 : 4;
-        policy.flags = 2;
-        DWORD tintAlpha = g_materialMode == 1 ? (dark ? 0xE0 : 0xE4)
-                                               : (dark ? 0xC0 : 0xC8);
-        policy.gradientColor = (tintAlpha << 24) | (C_BG & 0x00FFFFFF);
-        WindowCompositionAttribDataLocal data = {19, &policy, sizeof(policy)};
-        if (setComposition(hWnd, &data)) {
-            applied = TRUE;
-            extendBackdrop = TRUE;
-        }
-    }
-
-    if (extendFrame) {
-        DwmMarginsLocal margins = {0, 0, 0, 0};
-        if (extendBackdrop) margins.left = margins.right = margins.top = margins.bottom = -1;
-        extendFrame(hWnd, &margins);
-    }
-
-    if (applied) {
-        SetPropW(hWnd, L"HKeyboardMaterial", (HANDLE)(INT_PTR)1);
-        ApplyWindowOpacity(hWnd, FALSE);   // 材质与分层透明互斥，切材质时清除
-    } else {
-        RemovePropW(hWnd, L"HKeyboardMaterial");
-    }
-    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
-}
-
-static void ApplyAllWindowMaterials() {
-    ApplyWindowMaterial(g_hWnd);
-    ApplyWindowMaterial(g_settingsHwnd);
-    ApplyWindowMaterial(g_closePromptHwnd);
-}
-
-static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
-                             const wchar_t* text, HFONT font, DWORD color,
-                             Gdiplus::StringAlignment alignment) {
+static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
+                          const wchar_t* text, HFONT font, DWORD color,
+                          Gdiplus::StringAlignment alignment) {
     if (!text || !font || w <= 0 || h <= 0) return FALSE;
     if (!g_alphaPaintActive || !g_alphaPaintBits || g_alphaPaintRowPixels <= 0)
         return FALSE;
@@ -1546,7 +1348,7 @@ static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
 
     if (drawn > 0) {
         RGBQUAD* mask = (RGBQUAD*)rawMask;
-        DWORD resolved = ResolveFontColor(color);
+        DWORD resolved = color;
         int red = GetRValue(resolved);
         int green = GetGValue(resolved);
         int blue = GetBValue(resolved);
@@ -1587,11 +1389,11 @@ static BOOL DrawMaterialText(HDC dc, int x, int y, int w, int h,
 }
 
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
-    if (DrawMaterialText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentCenter)) return;
+    if (DrawAlphaText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentCenter)) return;
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, ResolveFontColor(c));
+    SetTextColor(dc, c);
     DrawTextW(dc, s, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -1604,31 +1406,23 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     // 副符号（键上半部）
     buf[0] = shiftCh;
     RECT rt = {x, y, x + w, y + h / 2};
-    if (!DrawMaterialText(dc, rt.left, rt.top, rt.right - rt.left, rt.bottom - rt.top,
+    if (!DrawAlphaText(dc, rt.left, rt.top, rt.right - rt.left, rt.bottom - rt.top,
                           buf, fShift, shiftC, Gdiplus::StringAlignmentCenter)) {
         SelectObject(dc, fShift);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, ResolveFontColor(shiftC));
+        SetTextColor(dc, shiftC);
         DrawTextW(dc, buf, -1, &rt, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
     // 主字符（键下半部）
     buf[0] = baseCh;
     RECT rb = {x, y + h / 2, x + w, y + h};
-    if (!DrawMaterialText(dc, rb.left, rb.top, rb.right - rb.left, rb.bottom - rb.top,
+    if (!DrawAlphaText(dc, rb.left, rb.top, rb.right - rb.left, rb.bottom - rb.top,
                           buf, fBase, baseC, Gdiplus::StringAlignmentCenter)) {
         SelectObject(dc, fBase);
-        SetTextColor(dc, ResolveFontColor(baseC));
+        SetTextColor(dc, baseC);
         DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
-}
-
-// 判断 BGR 颜色是否为浅色，用于在高亮按钮上自动选择深/浅色文字以保证可读性
-static BOOL IsLightColor(DWORD bgr) {
-    int r = bgr & 0xFF;
-    int g = (bgr >> 8) & 0xFF;
-    int b = (bgr >> 16) & 0xFF;
-    return (r * 299 + g * 587 + b * 114) / 1000 >= 150;
 }
 
 static wchar_t GetSymForKey(short vk, BOOL shifted) {
@@ -2107,30 +1901,8 @@ static int HitHeader(int x, int y) {
     return -1;
 }
 
-static BOOL IsMainMaterialPaintActive() {
-    return IsMaterialApplied(g_hWnd) && g_alphaPaintActive;
-}
-
-// 材质模式的半透明色调层：让窗口内容与 DWM Mica/亚克力背景融合为一体。
-// 所有窗口（主键盘/设置/关闭提示）统一使用同一色调，观感一致；
-// 主界面的 Mica 色调更轻，让壁纸色调透出更明显（亚克力本身效果强，无需减弱）。
-static void DrawWindowMaterialTint(HDC dc, HWND hWnd, int w, int h) {
-    if (!IsMaterialApplied(hWnd) || !g_alphaPaintActive) return;
-    BOOL dark = g_theme->bg == g_darkTheme.bg;
-    BOOL isMain = (hWnd == g_hWnd);
-    BYTE alpha;
-    if (g_materialMode == 1) {
-        // Mica：主界面仅保留极轻色调，让壁纸强调色透出，与桌面连成一体
-        alpha = isMain ? (dark ? 56 : 72) : (dark ? 104 : 132);
-    } else {
-        alpha = dark ? 76 : 104;
-    }
-    DrawAlphaSurface(dc, 0, 0, w, h, C_BG, alpha);
-}
-
 static void DrawHeader(HDC dc) {
-    // 标题栏与主界面一体化：不再单独铺 C_HDR 底色，
-    // 背景统一由 ClearWindowBackBuffer（纯色）或 DWM 材质（Mica/亚克力）呈现。
+    // 标题栏与主界面一体化：不单独铺底色，统一由 ClearWindowBackBuffer 的面板底色呈现。
     double dpiScale = GetSystemDpiScale();
     int rMargin = (int)(6 * dpiScale);
     int gap     = (int)(6 * dpiScale);
@@ -2149,11 +1921,7 @@ static void DrawHeader(HDC dc) {
     int xNum   = numBtnVisible ? (xMin - gap - wNum) : xMin;
     int xMenu  = (int)(6 * dpiScale);
 
-    if (IsMainMaterialPaintActive())
-        DrawRoundRectAlpha(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER,
-                           btnH / 2, 188, 150);
-    else
-        DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
+    DrawRoundRect(dc, xMenu, btnY, wMenu, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
     DrawTextC(dc, xMenu, btnY, wMenu, btnH, T(L"\x8BBE\x7F6E", L"Settings"), g_f12, C_WHITE);   // 菜单按钮 → 打开设置页
 
     int xTitle = xMenu + wMenu + gap;
@@ -2164,20 +1932,13 @@ static void DrawHeader(HDC dc) {
 
     // 123 按钮：与设置按钮同款胶囊样式（常态底 + 同字体），点击在当前布局与小键盘间切换
     if (numBtnVisible) {
-        if (IsMainMaterialPaintActive())
-            DrawRoundRectAlpha(dc, xNum, btnY, wNum, btnH, C_KEY, C_KEY_BORDER,
-                               btnH / 2, 188, 150);
-        else
-            DrawRoundRect(dc, xNum, btnY, wNum, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
+        DrawRoundRect(dc, xNum, btnY, wNum, btnH, C_KEY, C_KEY_BORDER, btnH / 2);
         DrawTextC(dc, xNum, btnY, wNum, btnH, L"123", g_f12, C_WHITE);
     }
 
-    // 最小化按钮：悬停时与设置页关闭按钮同款圆角底（C_HOVER + C_KEY_BORDER），图标为 AA 横线
+    // 最小化按钮：悬停时与设置页关闭按钮同款圆角底，图标为 AA 横线
     if (g_hdrHov == HDR_MIN) {
-        if (IsMainMaterialPaintActive())
-            DrawRoundRectAlpha(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6, 196, 150);
-        else
-            DrawRoundRect(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, xMin, btnY, wMin, btnH, C_HOVER, C_KEY_BORDER, 6);
     }
     {
         int cx = xMin + wMin / 2;
@@ -2187,10 +1948,7 @@ static void DrawHeader(HDC dc) {
     }
     // 关闭按钮：与设置页关闭按钮同款样式（悬停圆角底 + AA 的 X 图标）
     if (g_hdrHov == HDR_CLOSE) {
-        if (IsMainMaterialPaintActive())
-            DrawRoundRectAlpha(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6, 196, 150);
-        else
-            DrawRoundRect(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, xClose, btnY, wClose, btnH, C_HOVER, C_KEY_BORDER, 6);
     }
     {
         int cx = xClose + wClose / 2;
@@ -2208,39 +1966,45 @@ static void DrawKeys(HDC dc) {
         BOOL pressed = (i == g_pk);
         BOOL hover = (i == g_hk);
 
-        DWORD bg = C_KEY;
-        if (active || pressed) bg = C_HOT;
-        else if (hover) bg = C_HOVER;
-        else if (!(k->vk >= 0x200 && k->vk <= 0x205)) {   // 网址后缀键显示为普通键
-            int dt[] = {K_SPECIAL, K_CAPS, K_MOD, K_ARROW, K_HIDE};
-            for (size_t j = 0; j < sizeof(dt)/sizeof(dt[0]); j++) {
-                if (k->type == dt[j]) { bg = C_DARK; break; }
+        BOOL isDomain = (k->vk >= 0x200 && k->vk <= 0x205);   // 网址后缀键
+        BOOL isAccent = (k->vk == 0x0D);                      // Enter / 确认键（强调键）
+        // 修饰与功能键：Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等
+        BOOL isMod = FALSE;
+        if (!isDomain) {
+            KeyType mt[] = {K_SPECIAL, K_CAPS, K_MOD, K_ARROW};
+            for (size_t j = 0; j < sizeof(mt)/sizeof(mt[0]); j++) {
+                if (k->type == mt[j]) { isMod = TRUE; break; }
             }
         }
+        BOOL isPlain = (k->type == K_HIDE) || isDomain;       // 收起 / 次要键
 
-        if (IsMainMaterialPaintActive()) {
-            BYTE fillAlpha = (active || pressed) ? 232 : (hover ? 204 : 180);
-            DrawRoundRectAlpha(dc, k->x, k->y, k->w, k->h, bg, C_KEY_BORDER,
-                               8, fillAlpha, 145);
+        // 键帽状态机：底色 / 轮廓 / 文字三路同时变（Ethereal 的按钮配方）。
+        // 触摸没有 hover 的预览语义，按下即直接给出「按下」态，无需逐帧插值。
+        DWORD bg, outline, textC;
+        if (isAccent) {
+            bg = C_HOT; outline = C_HOT; textC = C_ON_PRIMARY;
+        } else if (active || pressed) {
+            bg = C_REGULAR_ACT; outline = C_BORDER_HOVER; textC = C_WHITE;
+        } else if (isPlain) {
+            bg = hover ? C_REGULAR_HOV : C_PLAIN;
+            outline = C_LINE_DIV; textC = C_DIM;
+        } else if (isMod) {
+            if (hover) { bg = C_REGULAR_HOV; outline = C_BORDER_HOVER; textC = C_WHITE; }
+            else       { bg = C_REGULAR;     outline = C_KEY_BORDER;   textC = C_BTN_CONTENT; }
         } else {
-            DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, C_KEY_BORDER, 8);
+            if (hover) { bg = C_HOVER; outline = C_BORDER_HOVER; textC = C_WHITE; }
+            else       { bg = C_KEY;   outline = C_KEY_BORDER;   textC = C_WHITE; }
         }
+
+        DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, outline, 8);
 
         const wchar_t* txt = KeyText(k);
-        // 字体粗细跟随键面底色：白色普通键（字母/数字/标点/空格/网址后缀）用常规字重，
-        // 深色修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体
-        BOOL darkKey = FALSE;
-        if (!(k->vk >= 0x200 && k->vk <= 0x205)) {   // 网址后缀键按普通键处理
-            int dt[] = {K_SPECIAL, K_CAPS, K_MOD, K_ARROW, K_HIDE};
-            for (size_t j = 0; j < sizeof(dt)/sizeof(dt[0]); j++) {
-                if (k->type == dt[j]) { darkKey = TRUE; break; }
-            }
-        }
-        HFONT f = darkKey ? g_f14b : g_f14;
+        // 字体粗细跟随键面底色：普通键（字母/数字/标点/空格/网址后缀）用常规字重，
+        // 修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体
+        HFONT f = (isMod || k->type == K_HIDE) ? g_f14b : g_f14;
         if (k->vk == 0x5D) f = g_fKeyIcon;   // Menu 键：汉堡菜单图标（MDL2/Fluent E700）
-        if (k->vk == 0x08) f = g_f18b;   // 退格：深色键，大号粗体箭头
-        if (k->vk == 0x0D) f = g_f13b;   // Enter：深色键
-        DWORD textC = (active || pressed) && IsLightColor(bg) ? 0x1A1A1A : C_WHITE;
+        if (k->vk == 0x08) f = g_f18b;   // 退格：大号粗体箭头
+        if (k->vk == 0x0D) f = g_f13b;   // Enter：强调键
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -2300,18 +2064,16 @@ static int       g_kbCacheRow = 0;
 static int       g_kbCacheW = 0, g_kbCacheH = 0;
 
 struct KbFrameSig {
-    int w, h, hk, pk, hdrHov, layoutMode, nk;
+    int w, h, hk, pk, hdrHov, layoutMode, nk, hue;
     DWORD themeBg;
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, fnLayer, showFKeys,
-         fnWebLayout, shiftSymbols, lang, material;
+         fnWebLayout, shiftSymbols, lang;
     BOOL operator!=(const KbFrameSig& o) const { return memcmp(this, &o, sizeof(*this)) != 0; }
 };
 static KbFrameSig g_kbSig = {};
 
 static void RenderKbFrameInto(HDC refDc, int w, int h) {
-    BOOL material = IsMaterialApplied(g_hWnd) != FALSE;
-
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = w;
@@ -2326,26 +2088,22 @@ static void RenderKbFrameInto(HDC refDc, int w, int h) {
     if (!mem) { DeleteObject(bmp); return; }
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
-    // 将 DrawMaterialText 的 alpha 合成目标指向缓存 DIB（与画布路径一致）
+    // 将 DrawAlphaText 的 alpha 合成目标指向缓存 DIB（与画布路径一致）
     BOOL prevAlpha = g_alphaPaintActive;
-    BOOL prevBuffered = g_bufferedPaintActive;
     RGBQUAD* prevBits = g_alphaPaintBits;
     int prevRow = g_alphaPaintRowPixels;
     RECT prevRect = g_alphaPaintRect;
     g_alphaPaintActive = TRUE;
-    g_bufferedPaintActive = material;   // 材质模式跳过不透明底填充，保留 alpha 供 DWM 合成
     g_alphaPaintBits = (RGBQUAD*)bits;
     g_alphaPaintRowPixels = w;
     RECT rc = {0, 0, w, h};
     g_alphaPaintRect = rc;
 
-    if (!material) Fill(mem, 0, 0, w, h, C_BG);
-    DrawWindowMaterialTint(mem, g_hWnd, w, h);
+    Fill(mem, 0, 0, w, h, C_BG);
     DrawHeader(mem);
     DrawKeys(mem);
 
     g_alphaPaintActive = prevAlpha;
-    g_bufferedPaintActive = prevBuffered;
     g_alphaPaintBits = prevBits;
     g_alphaPaintRowPixels = prevRow;
     g_alphaPaintRect = prevRect;
@@ -2369,13 +2127,13 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.w = g_ww; sig.h = g_wh;
     sig.hk = g_hk; sig.pk = g_pk; sig.hdrHov = g_hdrHov;
     sig.layoutMode = g_layoutMode; sig.nk = g_nk;
-    sig.themeBg = g_themeBuf.bg;
+    sig.themeBg = g_themeBuf.pageBg;
+    sig.hue = g_hue;
     sig.dpi = (float)GetSystemDpiScale();
     sig.sh = g_sh; sig.ct = g_ct; sig.al = g_al; sig.cp = g_cp;
     sig.winKey = g_winKey; sig.physShift = g_physShift; sig.physWin = g_physWin;
     sig.fnLayer = g_fnLayer; sig.showFKeys = g_showFKeys; sig.fnWebLayout = g_fnWebLayout;
     sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
-    sig.material = IsMaterialApplied(hWnd);
     if (g_kbCacheBmp && g_kbCacheW == g_ww && g_kbCacheH == g_wh && !(sig != g_kbSig)) return;
 
     HDC dc = GetDC(hWnd);
@@ -2414,10 +2172,8 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     motion->finish = finish;
     motion->active = TRUE;
 
-    // 未显示过才应用材质；WM_CREATE 已应用时跳过，避免启动动画首帧重复切换背景卡顿
-    if (!IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
     // 显示前先在隐藏状态下同步完成首帧绘制：DWM 首次合成时窗口内容已就绪，
-    // 消除材质模式“黑一帧”与首帧全量绘制造成的可见顿挫
+    // 消除首帧全量绘制造成的可见顿挫
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -2430,7 +2186,6 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
         motion->active = FALSE;
         if (finish == MOTION_HIDE) ShowWindow(hWnd, SW_HIDE);
         else if (finish == MOTION_DESTROY) DestroyWindow(hWnd);
-        else PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
     }
 }
 
@@ -2457,8 +2212,6 @@ static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
         ShowWindow(hWnd, SW_HIDE);
     } else if (finish == MOTION_DESTROY) {
         DestroyWindow(hWnd);
-    } else {
-        PostMessageW(hWnd, WM_REAPPLY_MATERIAL, 0, 0);
     }
     return TRUE;
 }
@@ -2488,8 +2241,6 @@ static void ShowKB(BOOL show, BOOL isManual) {
             StopWindowMotion(&g_mainMotion);
             SetWindowPos(g_hWnd, HWND_TOPMOST, sx, targetY, g_ww, g_wh,
                          SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            // 材质已应用时不再重置重套，避免可见的“材质切换”闪烁
-            if (!IsMaterialApplied(g_hWnd)) ApplyWindowMaterial(g_hWnd);
             RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
             return;
         }
@@ -2603,7 +2354,7 @@ static void ShowHelpDialog(HWND hWnd) {
         L"  -dark      : \x5F3A\x5236\x6DF1\x8272\x4E3B\x9898\n"
         L"  -light     : \x5F3A\x5236\x6D45\x8272\x4E3B\x9898\n"
         L"  -theme:system : \x8DDF\x968F\x7CFB\x7EDF\x4E3B\x9898\xFF08\x9ED8\x8BA4\xFF09\n"
-        L"  -wallpaper   : \x9AD8\x4EAE\x6309\x94AE\x989C\x8272\x8DDF\x968F\x7CFB\x7EDF\x58C1\x7EB8\x81EA\x52A8\x63D0\x53D6\x7684\x5F3A\x8C03\x8272\xFF08\x9ED8\x8BA4\x5173\x95ED\xFF09",
+        L"  -wallpaper   : \x4E3B\x9898\x8272\x76F8\x8DDF\x968F\x7CFB\x7EDF\x58C1\x7EB8\x81EA\x52A8\x63D0\x53D6\x7684\x5F3A\x8C03\x8272\xFF08\x9ED8\x8BA4\x5173\x95ED\xFF09",
         L"[Command-line Parameters]\n"
         L"  -h / -help / -? : Show this help\n"
         L"  -show      : Show the keyboard on startup\n"
@@ -2615,7 +2366,7 @@ static void ShowHelpDialog(HWND hWnd) {
         L"  -dark      : Force dark theme\n"
         L"  -light     : Force light theme\n"
         L"  -theme:system : Follow the system theme (default)\n"
-        L"  -wallpaper   : Highlight color follows the wallpaper accent (default off)"),
+        L"  -wallpaper   : Theme hue follows the wallpaper accent (default off)"),
         T(L"\x547D\x4EE4\x884C\x53C2\x6570\x5E2E\x52A9", L"Command-line Parameters"),
         MB_OK | MB_ICONINFORMATION);
 }
@@ -2652,16 +2403,9 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_HL_DROP         60
 #define S_HIT_HL_OPT0         61
 #define S_HIT_HL_OPT1         62
-#define S_HIT_HL_OPT2         63
 #define S_HIT_HL_BOX          64
 #define S_HIT_HL_HUE          65
-#define S_HIT_HL_SAT          66
-#define S_HIT_HL_VAL          67
 #define S_HIT_HL_PAL0         80
-#define S_HIT_MATERIAL_DROP   90
-#define S_HIT_MATERIAL_OPT0   91
-#define S_HIT_MATERIAL_OPT1   92
-#define S_HIT_MATERIAL_OPT2   93
 #define S_HIT_REMEMBER        95
 #define S_HIT_OPACITY_DROP    96
 #define S_HIT_OPACITY_OPT0    97   // ~ OPT5（6 档透明度）
@@ -2681,21 +2425,17 @@ static BOOL g_dropHl = FALSE;          // 高亮颜色下拉
 static int  g_dropHlHov = -1;
 static BOOL g_dropClose = FALSE;        // 关闭按钮操作下拉
 static int  g_dropCloseHov = -1;
-static BOOL g_dropMaterial = FALSE;     // 背景材质下拉
-static int  g_dropMaterialHov = -1;
-static BOOL g_dropOpacity = FALSE;      // 主界面透明度下拉（旧系统）
+static BOOL g_dropOpacity = FALSE;      // 主界面透明度下拉
 static int  g_dropOpacityHov = -1;
 static BOOL g_hlEditFocus = FALSE;     // HEX 输入框是否处于编辑态
 static wchar_t g_hlEditBuf[8] = {0};   // 编辑中的 HEX 文本（#RRGGBB）
 static int g_hlSliderDrag = S_HIT_NONE;
 static const wchar_t* g_langNames[2] = { L"简体中文", L"English" };
 static const wchar_t* g_langNamesEn[2] = { L"Simplified Chinese", L"English" };
-static const wchar_t* g_hlModeNames[3] = { L"默认", L"跟随壁纸", L"自定义" };
-static const wchar_t* g_hlModeNamesEn[3] = { L"Default", L"Follow Wallpaper", L"Custom" };
+static const wchar_t* g_hlModeNames[2] = { L"自定义色相", L"跟随壁纸" };
+static const wchar_t* g_hlModeNamesEn[2] = { L"Custom Hue", L"Follow Wallpaper" };
 static const wchar_t* g_themeNames[3] = { L"跟随系统", L"深色主题", L"浅色主题" };
 static const wchar_t* g_themeNamesEn[3] = { L"Follow System", L"Dark Theme", L"Light Theme" };
-static const wchar_t* g_materialNames[3] = { L"关闭", L"Mica", L"亚克力" };
-static const wchar_t* g_materialNamesEn[3] = { L"Off", L"Mica", L"Acrylic" };
 static const int g_opacityValues[6] = { 100, 90, 80, 70, 60, 50 };
 static const wchar_t* g_opacityNames[6] = { L"100%（不透明）", L"90%", L"80%", L"70%", L"60%", L"50%" };
 static const wchar_t* g_opacityNamesEn[6] = { L"100% (Opaque)", L"90%", L"80%", L"70%", L"60%", L"50%" };
@@ -2708,11 +2448,11 @@ static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
 static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
-    if (DrawMaterialText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear)) return;
+    if (DrawAlphaText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear)) return;
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, ResolveFontColor(c));
+    SetTextColor(dc, c);
     DrawTextW(dc, s, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -2728,13 +2468,13 @@ static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
     DrawRoundRect(dc, x, y, w, h, on ? C_HOT : C_DARK, C_KEY_BORDER, h / 2);
     int knob = h - 6;
     int kx = on ? x + w - knob - 3 : x + 3;
-    DrawRoundRect(dc, kx, y + 3, knob, knob, on ? 0xFFFFFF : C_DIM, on ? 0xFFFFFF : C_DIM, knob / 2);
+    DrawRoundRect(dc, kx, y + 3, knob, knob, on ? C_KEY : C_DIM, on ? C_KEY : C_DIM, knob / 2);
 }
 
 static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
     DrawRoundRect(dc, x, y, s, s, on ? C_HOT : C_KEY, C_KEY_BORDER, s / 3);
     if (on) {
-        HPEN p = CreatePen(PS_SOLID, 2, 0xFFFFFF);   // 勾固定白色，深浅色一致
+        HPEN p = CreatePen(PS_SOLID, 2, C_ON_PRIMARY);
         HPEN op = (HPEN)SelectObject(dc, p);
         MoveToEx(dc, x + 3, y + s / 2, NULL);
         LineTo(dc, x + s / 2, y + s - 3);
@@ -2826,14 +2566,14 @@ static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, i
 
 static RECT SettingsHighlightRect(const SettingsMetrics& m, BOOL expanded) {
     RECT r = SettingsRowRect(m, 2);
-    if (expanded) r.bottom = r.top + (int)(260 * m.dpi);
+    if (expanded) r.bottom = r.top + (int)(210 * m.dpi);
     return r;
 }
 
 static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
     int w = (int)(150 * m.dpi), h = (int)(32 * m.dpi);
-    RECT r = {row.left + (int)(74 * m.dpi), row.top + (int)(216 * m.dpi),
-              row.left + (int)(74 * m.dpi) + w, row.top + (int)(216 * m.dpi) + h};
+    RECT r = {row.left + (int)(74 * m.dpi), row.top + (int)(160 * m.dpi),
+              row.left + (int)(74 * m.dpi) + w, row.top + (int)(160 * m.dpi) + h};
     return r;
 }
 
@@ -2884,11 +2624,11 @@ static void DrawSettingsIcon(HDC dc, int x, int y, int kind) {
         L"\xE790"  // Color
     };
     RECT r = {x, y, x + size, y + size};
-    if (DrawMaterialText(dc, x, y, size, size, glyphs[kind], g_sfIcon,
+    if (DrawAlphaText(dc, x, y, size, size, glyphs[kind], g_sfIcon,
                          C_WHITE, Gdiplus::StringAlignmentCenter)) return;
     SelectObject(dc, g_sfIcon);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, ResolveFontColor(C_WHITE));
+    SetTextColor(dc, C_WHITE);
     DrawTextW(dc, glyphs[kind], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -2946,13 +2686,6 @@ static void BeginSwitchAnimation(HWND hWnd, int hit, BOOL from, BOOL to) {
     SetTimer(hWnd, TIMER_SETTINGS_ANIM, 16, NULL);
 }
 
-static DWORD BlendColor(DWORD from, DWORD to, double value) {
-    int r = (int)(GetRValue(from) + (GetRValue(to) - GetRValue(from)) * value + 0.5);
-    int g = (int)(GetGValue(from) + (GetGValue(to) - GetGValue(from)) * value + 0.5);
-    int b = (int)(GetBValue(from) + (GetBValue(to) - GetBValue(from)) * value + 0.5);
-    return RGB(r, g, b);
-}
-
 static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL on, int hit) {
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
     int y = row.top + (row.bottom - row.top - m.switchH) / 2;
@@ -2972,66 +2705,19 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
     int knob = m.switchH - 6;
     int travel = m.switchW - knob - 6;
     int kx = x + 3 + (int)(travel * value + 0.5);
-    DWORD knobColor = BlendColor(C_DIM, 0xFFFFFF, value);
+    DWORD knobColor = BlendColor(C_DIM, C_KEY, value);
     DrawRoundRect(dc, kx, y + 3, knob, knob, knobColor, knobColor, knob / 2);
 }
 
-// 高亮色板（RGB）：与自定义编辑器顶部的常用主题色对应
-static const int g_paletteRgb[5] = {
-    0x3B82F6, 0x22C55E, 0x8B5CF6, 0xF43F5E, 0xB4A5F4
-};
-static DWORD RgbToBgr(int rgb) {
-    return (DWORD)(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF));
-}
-
-static DWORD HsvToBgr(double hue, double sat, double val) {
-    while (hue < 0.0) hue += 360.0;
-    while (hue >= 360.0) hue -= 360.0;
-    if (sat < 0.0) sat = 0.0; if (sat > 1.0) sat = 1.0;
-    if (val < 0.0) val = 0.0; if (val > 1.0) val = 1.0;
-
-    double hh = hue / 60.0;
-    int sector = (int)hh;
-    double f = hh - sector;
-    double p = val * (1.0 - sat);
-    double q = val * (1.0 - sat * f);
-    double t = val * (1.0 - sat * (1.0 - f));
-    double r = val, g = t, b = p;
-    switch (sector % 6) {
-    case 0: r = val; g = t; b = p; break;
-    case 1: r = q; g = val; b = p; break;
-    case 2: r = p; g = val; b = t; break;
-    case 3: r = p; g = q; b = val; break;
-    case 4: r = t; g = p; b = val; break;
-    case 5: r = val; g = p; b = q; break;
-    }
-    return RGB((int)(r * 255.0 + 0.5), (int)(g * 255.0 + 0.5), (int)(b * 255.0 + 0.5));
-}
-
-static void BgrToHsv(DWORD bgr, double* hue, double* sat, double* val) {
-    double r = GetRValue(bgr) / 255.0;
-    double g = GetGValue(bgr) / 255.0;
-    double b = GetBValue(bgr) / 255.0;
-    double maxv = r > g ? (r > b ? r : b) : (g > b ? g : b);
-    double minv = r < g ? (r < b ? r : b) : (g < b ? g : b);
-    double delta = maxv - minv;
-    double h = 0.0;
-    if (delta > 0.0001) {
-        if (maxv == r) h = 60.0 * ((g - b) / delta);
-        else if (maxv == g) h = 60.0 * (2.0 + (b - r) / delta);
-        else h = 60.0 * (4.0 + (r - g) / delta);
-        if (h < 0.0) h += 360.0;
-    }
-    *hue = h;
-    *sat = maxv <= 0.0001 ? 0.0 : delta / maxv;
-    *val = maxv;
-}
+// 预设色相（对齐 panda-core 的 PRESET_HUES），色板按 oklch(0.70 0.14 H) 渲染
+static const int g_presetHues[5] = { 250, 210, 180, 300, 30 };
 
 static Gdiplus::Color GpColorFromBgr(DWORD color) {
     return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
 }
 
-static void DrawColorSlider(HDC dc, const RECT& r, int kind, double hue, double sat, double val) {
+// 色相滑轨：彩虹渐变直接用主色的 oklch 配方铺满，与色板、滑钮颜色完全一致
+static void DrawHueSlider(HDC dc, const RECT& r, int hue) {
     int w = r.right - r.left;
     int h = r.bottom - r.top;
     if (w <= 1 || h <= 1) return;
@@ -3053,37 +2739,27 @@ static void DrawColorSlider(HDC dc, const RECT& r, int kind, double hue, double 
         path.CloseFigure();
         g.SetClip(&path);
 
-        if (kind == 0) {
-            for (int i = 0; i < 6; i++) {
-                Gdiplus::REAL left = x + width * (Gdiplus::REAL)i / 6.0f;
-                Gdiplus::REAL right = x + width * (Gdiplus::REAL)(i + 1) / 6.0f + 1.0f;
-                Gdiplus::LinearGradientBrush brush(
-                    Gdiplus::PointF(left, y), Gdiplus::PointF(right, y),
-                    GpColorFromBgr(HsvToBgr(i * 60.0, 1.0, 1.0)),
-                    GpColorFromBgr(HsvToBgr((i + 1) * 60.0, 1.0, 1.0)));
-                g.FillRectangle(&brush, left, y, right - left, height);
-            }
-        } else {
-            DWORD from = kind == 1 ? HsvToBgr(hue, 0.0, val) : HsvToBgr(hue, sat, 0.0);
-            DWORD to = kind == 1 ? HsvToBgr(hue, 1.0, val) : HsvToBgr(hue, sat, 1.0);
+        for (int i = 0; i < 6; i++) {
+            Gdiplus::REAL left = x + width * (Gdiplus::REAL)i / 6.0f;
+            Gdiplus::REAL right = x + width * (Gdiplus::REAL)(i + 1) / 6.0f + 1.0f;
             Gdiplus::LinearGradientBrush brush(
-                Gdiplus::PointF(x, y), Gdiplus::PointF(x + width, y),
-                GpColorFromBgr(from), GpColorFromBgr(to));
-            g.FillRectangle(&brush, x, y, width, height);
+                Gdiplus::PointF(left, y), Gdiplus::PointF(right, y),
+                GpColorFromBgr(OklchToBgr(0.70, 0.14, i * 60.0)),
+                GpColorFromBgr(OklchToBgr(0.70, 0.14, (i + 1) * 60.0)));
+            g.FillRectangle(&brush, left, y, right - left, height);
         }
         g.ResetClip();
         Gdiplus::Pen border(GpColorFromBgr(C_KEY_BORDER), 1.0f);
         g.DrawPath(&border, &path);
     }
 
-    double selected = kind == 0 ? hue / 359.0 : (kind == 1 ? sat : val);
+    double selected = (double)hue / (double)HKB_HUE_MAX;
     if (selected < 0.0) selected = 0.0; if (selected > 1.0) selected = 1.0;
     int cx = r.left + (int)((w - 1) * selected + 0.5);
     int cy = (r.top + r.bottom) / 2;
     int radius = h / 2 + 3;
     DrawCircleAA(dc, cx, cy, radius, C_WHITE);
-    DrawCircleAA(dc, cx, cy, radius - 2, kind == 0 ? HsvToBgr(hue, 1.0, 1.0) :
-                 (kind == 1 ? HsvToBgr(hue, sat, 1.0) : HsvToBgr(hue, sat, val)));
+    DrawCircleAA(dc, cx, cy, radius - 2, HueAccentBgr(hue));
 }
 
 // 下拉框
@@ -3097,7 +2773,7 @@ static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, B
 // 下拉列表（参考下拉菜单样式：悬停圆角高亮 + 选中项左侧强调条）
 static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
     double dpi = GetSystemDpiScale();
-    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_DARK, C_DIM, 6);
+    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_FLOAT, C_KEY_BORDER, 6);
     for (int i = 0; i < count; i++) {
         int iy = y + 2 + i * itemH;
         if (i == hov || i == sel) {
@@ -3143,30 +2819,13 @@ static void HexFromBgr(DWORD bgr, wchar_t* out) {
     int r = bgr & 0xFF, g = (bgr >> 8) & 0xFF, b = (bgr >> 16) & 0xFF;
     swprintf(out, 8, L"#%02X%02X%02X", r, g, b);
 }
-// 材质选项随系统版本变化：Win11 = 关闭/Mica/亚克力，Win10 1809+ = 关闭/亚克力
-static int MaterialOptionCount() {
-    return g_isWin11 ? 3 : 2;
-}
-static int MaterialModeOf(int idx) {
-    if (idx == 1 && !g_isWin11) return 2;   // 非 Win11 无 Mica，第二项为亚克力
-    return idx;
-}
-static int MaterialIndexOf(int mode) {
-    if (!g_isWin11 && mode == 2) return 1;
-    return mode;
-}
-static const wchar_t* MaterialNameOf(int idx) {
-    if (!g_isWin11 && idx == 1) return g_lang ? g_materialNamesEn[2] : g_materialNames[2];
-    return g_lang ? g_materialNamesEn[idx] : g_materialNames[idx];
-}
 static int OpacityIndex() {
     for (int i = 0; i < 6; i++) if (g_opacityValues[i] == g_mainOpacity) return i;
     return 0;
 }
-// 高亮颜色下拉当前选项：0=默认 1=跟随壁纸 2=自定义
+// 主题色相下拉当前选项：0=自定义色相 1=跟随壁纸
 static int HlSel() {
-    if (g_wallpaperAccent) return 1;
-    return g_hlMode == 1 ? 2 : 0;
+    return g_wallpaperAccent ? 1 : 0;
 }
 // 关闭按钮操作下拉当前文案
 static const wchar_t* CloseActionName() {
@@ -3308,53 +2967,43 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   g_dropTheme, g_sHov == S_HIT_THEME_DROP);
 
         r = SettingsRowRect(m, 1);
-        if (g_supportsMaterial) {
-            DrawSettingRow(dc, r, 9, T(L"背景材质", L"Background Material"),
-                           T(L"选择 Mica、亚克力或纯色背景", L"Choose Mica, Acrylic, or a solid background"), FALSE);
-            DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
-                      MaterialNameOf(MaterialIndexOf(g_materialMode)),
-                      g_dropMaterial, g_sHov == S_HIT_MATERIAL_DROP);
-        } else {
-            // PE / XP~Win10 1803：无系统 backdrop，改为主界面透明度调整
-            DrawSettingRow(dc, r, 9, T(L"主界面透明度", L"Keyboard Opacity"),
-                           T(L"调整主界面的不透明度", L"Adjust the keyboard window opacity"), FALSE);
-            int oi = OpacityIndex();
-            DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
-                      g_lang ? g_opacityNamesEn[oi] : g_opacityNames[oi],
-                      g_dropOpacity, g_sHov == S_HIT_OPACITY_DROP);
-        }
+        DrawSettingRow(dc, r, 9, T(L"主界面透明度", L"Keyboard Opacity"),
+                       T(L"调整主界面的不透明度", L"Adjust the keyboard window opacity"), FALSE);
+        int oi = OpacityIndex();
+        DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, r), m.comboW, m.comboH,
+                  g_lang ? g_opacityNamesEn[oi] : g_opacityNames[oi],
+                  g_dropOpacity, g_sHov == S_HIT_OPACITY_DROP);
 
-        BOOL customColor = HlSel() == 2;
-        r = SettingsHighlightRect(m, customColor);
+        BOOL customHue = !g_wallpaperAccent;
+        r = SettingsHighlightRect(m, customHue);
         DrawRoundRect(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, C_KEY, C_KEY_BORDER, 8);
         DrawSettingsIcon(dc, r.left + (int)(14 * m.dpi), r.top + (int)(14 * m.dpi), 8);
         int tx = r.left + (int)(52 * m.dpi);
         int tw = r.right - tx - (int)(220 * m.dpi);
         DrawTextL(dc, tx, r.top + (int)(5 * m.dpi), tw, (int)(20 * m.dpi),
-                  T(L"高亮颜色", L"Highlight Color"), g_sf14b, C_WHITE);
+                  T(L"主题色相", L"Theme Hue"), g_sf14b, C_WHITE);
         DrawTextL(dc, tx, r.top + (int)(27 * m.dpi), tw, (int)(18 * m.dpi),
-                  T(L"使用默认颜色、壁纸强调色或自定义颜色", L"Use the default, wallpaper accent, or a custom color"), g_sf12, C_DIM);
+                  T(L"一个色相统一调整面板、按键与强调色", L"One hue recolors the panel, keys and accent"), g_sf12, C_DIM);
         DrawCombo(dc, SettingsComboX(m, r), SettingsComboY(m, SettingsRowRect(m, 2)),
                   m.comboW, m.comboH, g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
                   g_dropHl, g_sHov == S_HIT_HL_DROP);
 
-        if (customColor) {
+        if (customHue) {
             Fill(dc, r.left + (int)(18 * m.dpi), r.top + (int)(56 * m.dpi),
-                 r.right - r.left - (int)(36 * m.dpi), 1, C_KEY_BORDER);
+                 r.right - r.left - (int)(36 * m.dpi), 1, C_META);
 
             int palX, palY, palS, palGap;
             SettingsPaletteMetrics(m, r, &palX, &palY, &palS, &palGap);
             for (int i = 0; i < 5; i++) {
-                DWORD color = RgbToBgr(g_paletteRgb[i]);
+                DWORD color = HueAccentBgr(g_presetHues[i]);
                 int cx = palX + i * (palS + palGap) + palS / 2;
                 int cy = palY + palS / 2;
-                BOOL selected = color == (DWORD)g_hlColor;
+                BOOL selected = abs(g_hue - g_presetHues[i]) <= 6;   // 老配置的色相未必正好落在预设值上
                 if (selected || g_sHov == S_HIT_HL_PAL0 + i)
                     DrawCircleAA(dc, cx, cy, palS / 2 + (int)(3 * m.dpi), selected ? C_WHITE : C_HOT);
                 DrawCircleAA(dc, cx, cy, palS / 2, color);
                 if (selected) {
-                    DWORD check = IsLightColor(color) ? 0x202020 : 0xFFFFFF;
-                    HPEN pen = CreatePen(PS_SOLID, 2, check);
+                    HPEN pen = CreatePen(PS_SOLID, 2, C_ON_PRIMARY);
                     HPEN old = (HPEN)SelectObject(dc, pen);
                     MoveToEx(dc, cx - (int)(5 * m.dpi), cy, NULL);
                     LineTo(dc, cx - (int)(1 * m.dpi), cy + (int)(4 * m.dpi));
@@ -3363,25 +3012,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                 }
             }
 
-            double hue, sat, val;
-            BgrToHsv((DWORD)g_hlColor, &hue, &sat, &val);
-            for (int i = 0; i < 3; i++) {
-                RECT slider = SettingsColorSliderRect(m, r, i);
-                DrawColorSlider(dc, slider, i, hue, sat, val);
-            }
+            RECT slider = SettingsColorSliderRect(m, r, 0);
+            DrawHueSlider(dc, slider, g_hue);
 
             RECT input = SettingsHexRect(m, r);
             int inputW = input.right - input.left, inputH = input.bottom - input.top;
+            DWORD preview = HueAccentBgr(g_hue);
             int colorCx = r.left + (int)(42 * m.dpi);
             int colorCy = input.top + inputH / 2;
             DrawCircleAA(dc, colorCx, colorCy, (int)(11 * m.dpi), C_KEY_BORDER);
-            DrawCircleAA(dc, colorCx, colorCy, (int)(9 * m.dpi), (DWORD)g_hlColor);
+            DrawCircleAA(dc, colorCx, colorCy, (int)(9 * m.dpi), preview);
             DrawTextC(dc, r.left + (int)(55 * m.dpi), input.top, (int)(18 * m.dpi), inputH,
                       L"#", g_sf13b, C_DIM);
             DrawRoundRect(dc, input.left, input.top, inputW, inputH,
                           g_hlEditFocus ? C_HOVER : C_DARK, g_hlEditFocus ? C_HOT : C_KEY_BORDER, 6);
             wchar_t hexbuf[8];
-            if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(g_hlColor, hexbuf);
+            if (g_hlEditFocus) wcscpy(hexbuf, g_hlEditBuf); else HexFromBgr(preview, hexbuf);
             const wchar_t* shown = hexbuf[0] == L'#' ? hexbuf + 1 : hexbuf;
             BOOL showHint = g_hlEditFocus && shown[0] == 0;
             DrawTextL(dc, input.left + (int)(12 * m.dpi), input.top, inputW - (int)(20 * m.dpi), inputH,
@@ -3460,16 +3106,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
                           m.comboW, m.comboH, names, 3, g_themeMode, g_dropThemeHov);
         }
-        if (g_dropMaterial && g_supportsMaterial) {
-            r = SettingsRowRect(m, 1);
-            int count = MaterialOptionCount();
-            const wchar_t* names[3];
-            for (int i = 0; i < count; i++) names[i] = MaterialNameOf(i);
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, count),
-                          m.comboW, m.comboH, names, count, MaterialIndexOf(g_materialMode), g_dropMaterialHov);
-        }
-        if (g_dropOpacity && !g_supportsMaterial) {
+        if (g_dropOpacity) {
             r = SettingsRowRect(m, 1);
             const wchar_t* names[6];
             for (int i = 0; i < 6; i++) names[i] = g_lang ? g_opacityNamesEn[i] : g_opacityNames[i];
@@ -3479,11 +3116,11 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         }
         if (g_dropHl) {
             r = SettingsRowRect(m, 2);
-            const wchar_t* names[3];
-            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_hlModeNamesEn[i] : g_hlModeNames[i];
+            const wchar_t* names[2];
+            for (int i = 0; i < 2; i++) names[i] = g_lang ? g_hlModeNamesEn[i] : g_hlModeNames[i];
             int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
-                          m.comboW, m.comboH, names, 3, HlSel(), g_dropHlHov);
+            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
+                          m.comboW, m.comboH, names, 2, HlSel(), g_dropHlHov);
         }
     }
 }
@@ -3573,12 +3210,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
     } else if (g_sTab == 1) {
         RECT r;
-        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[3] = {
+        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[2] = {
             {g_dropTheme, 0, 3, S_HIT_THEME_OPT0},
-            {g_dropMaterial, 1, g_supportsMaterial ? MaterialOptionCount() : 0, S_HIT_MATERIAL_OPT0},
-            {g_dropHl, 2, 3, S_HIT_HL_OPT0}
+            {g_dropHl, 2, 2, S_HIT_HL_OPT0}
         };
-        for (int d = 0; d < 3; d++) {
+        for (int d = 0; d < 2; d++) {
             if (!drops[d].open) continue;
             r = SettingsRowRect(m, drops[d].row);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
@@ -3589,7 +3225,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 ly += m.comboH;
             }
         }
-        if (g_dropOpacity && !g_supportsMaterial) {
+        if (g_dropOpacity) {
             r = SettingsRowRect(m, 1);
             int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
             int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
@@ -3605,17 +3241,13 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
         r = SettingsRowRect(m, 1);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
-        if (g_supportsMaterial) {
-            if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_MATERIAL_DROP;
-        } else {
-            if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_OPACITY_DROP;
-        }
+        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_OPACITY_DROP;
 
         r = SettingsRowRect(m, 2);
         comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
         if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HL_DROP;
 
-        if (HlSel() == 2) {
+        if (!g_wallpaperAccent) {
             r = SettingsHighlightRect(m, TRUE);
             RECT input = SettingsHexRect(m, r);
             if (x >= input.left && x < input.right && y >= input.top && y < input.bottom) return S_HIT_HL_BOX;
@@ -3625,12 +3257,10 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 int px = palX + i * (palS + palGap);
                 if (x >= px && x < px + palS && y >= palY && y < palY + palS) return S_HIT_HL_PAL0 + i;
             }
-            for (int i = 0; i < 3; i++) {
-                RECT slider = SettingsColorSliderRect(m, r, i);
-                int pad = (int)(8 * m.dpi);
-                if (x >= slider.left && x < slider.right && y >= slider.top - pad && y < slider.bottom + pad)
-                    return S_HIT_HL_HUE + i;
-            }
+            RECT slider = SettingsColorSliderRect(m, r, 0);
+            int pad = (int)(8 * m.dpi);
+            if (x >= slider.left && x < slider.right && y >= slider.top - pad && y < slider.bottom + pad)
+                return S_HIT_HL_HUE;
         }
     } else {
         int uy = m.H - m.margin - (int)(20 * m.dpi);
@@ -3728,24 +3358,28 @@ static void EnsureConfigFile() {
             IniSetInt(L"General", L"AutoHide", g_afAutoHide ? 1 : 0);
             IniSetInt(L"General", L"ConfigVersion", 4);
         }
+        if (ver < 5) {
+            // 材质子系统已移除：清掉废弃键，避免“设置页没有该项却仍在套材质”的幽灵状态。
+            // 旧 General/HighlightColor 保留不删——它只作为 Theme/Hue 缺失时的色相迁移来源。
+            WritePrivateProfileStringW(L"Theme", L"Material", NULL, path);
+            IniSetInt(L"General", L"ConfigVersion", 5);
+        }
         return;
     }
     IniSetInt(L"General", L"RememberClose", 0);
     IniSetInt(L"General", L"CloseToTray", 0);
     IniSetInt(L"Theme", L"Mode", 0);
     IniSetInt(L"Theme", L"Wallpaper", 0);
-    IniSetInt(L"Theme", L"Material", 0);
+    IniSetInt(L"Theme", L"Hue", HKB_DEFAULT_HUE);
     IniSetInt(L"Theme", L"Opacity", 100);
     IniSetInt(L"Keyboard", L"Layout", 0);
     IniSetInt(L"Keyboard", L"FKeys", 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", 0);
     IniSetInt(L"General", L"ShiftSymbols", 1);
     IniSetInt(L"General", L"Language", 0);
-    IniSetInt(L"General", L"HighlightMode", 0);
-    IniSetInt(L"General", L"HighlightColor", 0xD47800);
     IniSetInt(L"General", L"AutoPopup", 1);
     IniSetInt(L"General", L"AutoHide", 1);
-    IniSetInt(L"General", L"ConfigVersion", 4);
+    IniSetInt(L"General", L"ConfigVersion", 5);
 }
 
 // 读取上次的窗口大小 / 主题 / 关闭行为
@@ -3756,13 +3390,16 @@ static void LoadConfig() {
     // 窗口大小与位置按布局记忆恢复（见 WinMain / ApplyKeyboardLayout）
     int tm = IniGetInt(L"Theme", L"Mode", -1);
     if (tm >= 0 && tm <= 2) g_themeMode = tm;
-    int material = IniGetInt(L"Theme", L"Material", 0);
-    if (material < 0 || material > 2) material = 0;
-    if (!g_isWin11 && material == 1) material = 2;   // 非 Win11 无 Mica，回退亚克力
-    g_materialMode = (g_isWinPE || !g_supportsMaterial) ? 0 : material;
     g_mainOpacity = IniGetInt(L"Theme", L"Opacity", 100);
     if (g_mainOpacity < 50 || g_mainOpacity > 100) g_mainOpacity = 100;
     g_wallpaperAccent = (IniGetInt(L"Theme", L"Wallpaper", 0) != 0);
+    // 主题色相：老配置没有 Theme/Hue 时，由旧“高亮颜色”的色相换算得到
+    int hue = IniGetInt(L"Theme", L"Hue", -1);
+    if (hue < HKB_HUE_MIN || hue > HKB_HUE_MAX) {
+        hue = (int)(OklchHueOfBgr((DWORD)IniGetInt(L"General", L"HighlightColor", 0xD47800)) + 0.5);
+        if (hue > HKB_HUE_MAX) hue = HKB_HUE_MAX;
+    }
+    g_hue = hue;
     g_layoutMode = IniGetInt(L"Keyboard", L"Layout", 0);
     if (g_layoutMode < 0 || g_layoutMode > 2) g_layoutMode = 0;
     g_showNumBtn = IniGetInt(L"Keyboard", L"ShowNumBtn", 1) != 0;
@@ -3774,9 +3411,6 @@ static void LoadConfig() {
     g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
-    g_hlMode = IniGetInt(L"General", L"HighlightMode", 0);
-    if (g_hlMode < 0 || g_hlMode > 1) g_hlMode = 0;
-    g_hlColor = IniGetInt(L"General", L"HighlightColor", 0xD47800);
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
     g_afAutoHide = (IniGetInt(L"General", L"AutoHide", 1) != 0);
 }
@@ -3791,7 +3425,7 @@ static void SaveCloseSettings() {
 static void SaveThemeConfig() {
     IniSetInt(L"Theme", L"Mode", g_themeMode);
     IniSetInt(L"Theme", L"Wallpaper", g_wallpaperAccent ? 1 : 0);
-    IniSetInt(L"Theme", L"Material", g_materialMode);
+    IniSetInt(L"Theme", L"Hue", g_hue);
 }
 
 // 持久化键盘布局设置
@@ -3824,15 +3458,16 @@ static void ApplyKeyboardLayout(BOOL resetSize) {
     }
 }
 
-// HEX 颜色编辑：每次输入产生完整合法 #RRGGBB 时实时应用
+// HEX 编辑：输入完整合法 #RRGGBB 时取其色相实时换肤
 static void TryApplyHexEdit(HWND hWnd) {
     DWORD bgr;
     if (!ParseHexToBgr(g_hlEditBuf, &bgr)) return;
-    g_hlColor = (int)bgr;
-    g_hlMode = 1;
+    int hue = (int)(OklchHueOfBgr(bgr) + 0.5);
+    if (hue > HKB_HUE_MAX) hue = HKB_HUE_MAX;
+    g_hue = hue;
+    g_wallpaperAccent = FALSE;
     ApplyTheme();
-    IniSetInt(L"General", L"HighlightMode", 1);
-    IniSetInt(L"General", L"HighlightColor", (int)bgr);
+    SaveThemeConfig();
     if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     (void)hWnd;
 }
@@ -3842,42 +3477,26 @@ static void CommitHexEdit(HWND hWnd) {
     InvalidateRect(hWnd, NULL, TRUE);
 }
 
-static void UpdateHighlightSlider(HWND hWnd, int hit, int mouseX) {
+// 拖动色相滑轨：0..359 闭区间（上限不能是 360，否则末端会被取模打回 0）
+static void UpdateHueSlider(HWND hWnd, int mouseX) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
     RECT row = SettingsHighlightRect(m, TRUE);
-    int index = hit - S_HIT_HL_HUE;
-    if (index < 0 || index > 2) return;
-    RECT slider = SettingsColorSliderRect(m, row, index);
+    RECT slider = SettingsColorSliderRect(m, row, 0);
     double p = (double)(mouseX - slider.left) / (double)(slider.right - slider.left - 1);
     if (p < 0.0) p = 0.0; if (p > 1.0) p = 1.0;
 
-    double hue, sat, val;
-    BgrToHsv((DWORD)g_hlColor, &hue, &sat, &val);
-    if (index == 0) {
-        hue = p * 359.0;
-        if (sat < 0.05) sat = 0.70;
-        if (val < 0.20) val = 1.0;
-    } else if (index == 1) {
-        sat = p;
-    } else {
-        val = p;
-    }
-
-    g_hlColor = (int)HsvToBgr(hue, sat, val);
-    g_hlMode = 1;
+    g_hue = (int)(p * (double)HKB_HUE_MAX + 0.5);
+    if (g_hue > HKB_HUE_MAX) g_hue = HKB_HUE_MAX;
     g_wallpaperAccent = FALSE;
     g_hlEditFocus = FALSE;
     ApplyTheme();
-    IniSetInt(L"General", L"HighlightMode", 1);
-    IniSetInt(L"General", L"HighlightColor", g_hlColor);
-    IniSetInt(L"Theme", L"Wallpaper", 0);
+    SaveThemeConfig();
     if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
 }
 
 static void SettingsApplyHit(HWND hWnd, int hit) {
     BOOL themeChanged = FALSE;
-    BOOL materialChanged = FALSE;
     BOOL layoutChanged = FALSE;        // 布局模式切换：按布局重置窗口大小
     BOOL keyRowsChanged = FALSE;       // 仅增减键行（功能键行）：保持窗口大小
     switch (hit) {
@@ -3894,7 +3513,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_CLOSE_DROP:
         g_dropClose = !g_dropClose;
-        if (g_dropClose) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropCloseHov = -1; }
+        if (g_dropClose) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropCloseHov = -1; }
         break;
     case S_HIT_CLOSE_OPT0:
     case S_HIT_CLOSE_OPT1:
@@ -3909,7 +3528,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_LAYOUT_DROP:
         g_dropLayout = !g_dropLayout;
-        if (g_dropLayout) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLayoutHov = -1; }
+        if (g_dropLayout) { g_dropTheme = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLayoutHov = -1; }
         break;
     case S_HIT_LAYOUT_OPT0:
     case S_HIT_LAYOUT_OPT1:
@@ -3956,7 +3575,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_THEME_DROP:
         g_dropTheme = !g_dropTheme;
-        if (g_dropTheme) { g_dropMaterial = FALSE; g_dropOpacity = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropThemeHov = -1; }
+        if (g_dropTheme) { g_dropOpacity = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropThemeHov = -1; }
         break;
     case S_HIT_THEME_OPT0:
     case S_HIT_THEME_OPT1:
@@ -3964,25 +3583,9 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         if (g_themeMode != hit - S_HIT_THEME_OPT0) { g_themeMode = hit - S_HIT_THEME_OPT0; themeChanged = TRUE; }
         g_dropTheme = FALSE;
         break;
-    case S_HIT_MATERIAL_DROP:
-        g_dropMaterial = !g_dropMaterial;
-        if (g_dropMaterial) { g_dropTheme = FALSE; g_dropOpacity = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropMaterialHov = -1; }
-        break;
-    case S_HIT_MATERIAL_OPT0:
-    case S_HIT_MATERIAL_OPT1:
-    case S_HIT_MATERIAL_OPT2:
-    {
-        int mode = MaterialModeOf(hit - S_HIT_MATERIAL_OPT0);
-        if (hit - S_HIT_MATERIAL_OPT0 < MaterialOptionCount() && g_materialMode != mode) {
-            g_materialMode = mode;
-            materialChanged = TRUE;
-        }
-        g_dropMaterial = FALSE;
-        break;
-    }
     case S_HIT_OPACITY_DROP:
         g_dropOpacity = !g_dropOpacity;
-        if (g_dropOpacity) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropOpacityHov = -1; }
+        if (g_dropOpacity) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropOpacityHov = -1; }
         break;
     case S_HIT_OPACITY_OPT0:
     case S_HIT_OPACITY_OPT0 + 1:
@@ -3993,11 +3596,14 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         g_mainOpacity = g_opacityValues[hit - S_HIT_OPACITY_OPT0];
         g_dropOpacity = FALSE;
         IniSetInt(L"Theme", L"Opacity", g_mainOpacity);
-        ApplyAllWindowMaterials();   // 立即应用透明度
+        if (g_hWnd && IsWindow(g_hWnd)) {   // 立即应用透明度
+            ApplyWindowOpacity(g_hWnd, g_mainOpacity < 100);
+            RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+        }
         break;
     case S_HIT_LANG_DROP:
         g_dropLang = !g_dropLang;
-        if (g_dropLang) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLangHov = -1; }
+        if (g_dropLang) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLangHov = -1; }
         break;
     case S_HIT_LANG_OPT0:
     case S_HIT_LANG_OPT1:
@@ -4008,31 +3614,24 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         break;
     case S_HIT_HL_DROP:
         g_dropHl = !g_dropHl;
-        if (g_dropHl) { g_dropTheme = FALSE; g_dropMaterial = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropClose = FALSE; g_dropHlHov = -1; }
+        if (g_dropHl) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropClose = FALSE; g_dropHlHov = -1; }
         break;
     case S_HIT_HL_OPT0:
     case S_HIT_HL_OPT1:
-    case S_HIT_HL_OPT2:
-    {
-        int sel = hit - S_HIT_HL_OPT0;
-        if (sel == 1) { g_hlMode = 0; g_wallpaperAccent = TRUE; }
-        else if (sel == 2) { g_hlMode = 1; g_wallpaperAccent = FALSE; }
-        else { g_hlMode = 0; g_wallpaperAccent = FALSE; }
+        g_wallpaperAccent = (hit == S_HIT_HL_OPT1);
         g_dropHl = FALSE;
-        if (g_hlMode == 0) g_hlEditFocus = FALSE;
+        if (g_wallpaperAccent) g_hlEditFocus = FALSE;
         ApplyTheme();
-        IniSetInt(L"General", L"HighlightMode", g_hlMode);
-        IniSetInt(L"Theme", L"Wallpaper", g_wallpaperAccent ? 1 : 0);
+        SaveThemeConfig();
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
         break;
-    }
     case S_HIT_HL_BOX:
-        if (HlSel() == 2) {
+        if (!g_wallpaperAccent) {
             if (g_hlEditFocus) {
                 CommitHexEdit(hWnd);
             } else {
                 g_hlEditFocus = TRUE;
-                HexFromBgr(g_hlColor, g_hlEditBuf);
+                HexFromBgr(HueAccentBgr(g_hue), g_hlEditBuf);
                 SetFocus(hWnd);
             }
         }
@@ -4042,14 +3641,11 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     case S_HIT_HL_PAL0 + 2:
     case S_HIT_HL_PAL0 + 3:
     case S_HIT_HL_PAL0 + 4:
-        g_hlColor = (int)RgbToBgr(g_paletteRgb[hit - S_HIT_HL_PAL0]);
-        g_hlMode = 1;
+        g_hue = g_presetHues[hit - S_HIT_HL_PAL0];
         g_wallpaperAccent = FALSE;
         g_hlEditFocus = FALSE;
         ApplyTheme();
-        IniSetInt(L"General", L"HighlightMode", 1);
-        IniSetInt(L"General", L"HighlightColor", g_hlColor);
-        IniSetInt(L"Theme", L"Wallpaper", 0);
+        SaveThemeConfig();
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
         break;
     case S_HIT_URL:
@@ -4063,13 +3659,6 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     if (themeChanged) {
         ApplyTheme();                                   // 立即换肤
         SaveThemeConfig();                              // 持久化主题选择
-        ApplyAllWindowMaterials();
-        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
-    }
-    if (materialChanged) {
-        ApplyTheme();
-        SaveThemeConfig();
-        ApplyAllWindowMaterials();
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
     }
     if (layoutChanged) ApplyKeyboardLayout(TRUE);       // 应用布局并按布局重置窗口大小
@@ -4103,7 +3692,7 @@ static void StartWindowFade(HWND hWnd, WinFade& f, BOOL closing) {
     SetTimer(hWnd, TIMER_WIN_FADE, 10, NULL);
 }
 
-// 渐变结束/取消后的恢复：透明度模式恢复设定透明度，其余移除分层属性
+// 渐变结束/取消后的恢复：设置页 / 关闭提示窗口恢复不透明
 static void FinishWindowFade(HWND hWnd, WinFade& f) {
     f.active = FALSE;
     KillTimer(hWnd, TIMER_WIN_FADE);
@@ -4111,13 +3700,9 @@ static void FinishWindowFade(HWND hWnd, WinFade& f) {
         DestroyWindow(hWnd);   // 渐隐至全透明后销毁
         return;
     }
-    if (!g_supportsMaterial && g_mainOpacity < 100) {
-        SetLayeredWindowAttributes(hWnd, 0, (BYTE)(g_mainOpacity * 255 / 100), LWA_ALPHA);
-    } else {
-        LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
-        SetWindowLongW(hWnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
-        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
-    }
+    LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
+    SetWindowLongW(hWnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
 }
 
 static void CancelWindowFade(HWND hWnd, WinFade& f) {
@@ -4150,18 +3735,17 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     if (g_settingsClosing) return;   // 渐隐关闭中不再响应点击
     int hit = SettingsHitTest(hWnd, x, y);
     if (g_hlEditFocus && hit != S_HIT_HL_BOX) CommitHexEdit(hWnd);   // 点击其它位置时提交 HEX 编辑
-    if (hit >= S_HIT_HL_HUE && hit <= S_HIT_HL_VAL) {
+    if (hit == S_HIT_HL_HUE) {
         g_hlSliderDrag = hit;
         SetCapture(hWnd);
-        UpdateHighlightSlider(hWnd, hit, x);
+        UpdateHueSlider(hWnd, x);
         return;
     }
     if (hit == S_HIT_CLOSE) { SendMessageW(hWnd, WM_CLOSE, 0, 0); return; }
     if (hit == S_HIT_TABL || (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2)) {
-        // Tab 即时切换（不做逐帧过渡，避免材质/配色异常）
+        // Tab 即时切换（不做逐帧过渡，避免配色异常）
         g_sTab = (hit == S_HIT_TABL) ? 3 : (hit - S_HIT_TAB0);
         g_dropTheme = FALSE;
-        g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
         g_dropOpacity = FALSE;
         g_dropLang = FALSE;
@@ -4172,10 +3756,9 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     }
     if (hit != S_HIT_NONE) {
         SettingsApplyHit(hWnd, hit);
-    } else if (g_dropTheme || g_dropMaterial || g_dropLayout || g_dropOpacity || g_dropLang || g_dropHl || g_dropClose) {
+    } else if (g_dropTheme || g_dropLayout || g_dropOpacity || g_dropLang || g_dropHl || g_dropClose) {
         // 点击空白处关闭下拉
         g_dropTheme = FALSE;
-        g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
         g_dropOpacity = FALSE;
         g_dropLang = FALSE;
@@ -4189,7 +3772,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     switch (msg) {
     case WM_CREATE:
         ApplyRoundedWindow(hWnd, 14);
-        ApplyWindowMaterial(hWnd);
         {
             // 显式确保 DWM 窗口过渡未被禁用（属性 3 默认开启，防御性设置）
             DwmSetWindowAttributeProc setAttr = GetDwmSetWindowAttribute();
@@ -4199,10 +3781,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
                 setAttr(hWnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
             }
         }
-        return 0;
-    case WM_REAPPLY_MATERIAL:
-        // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
-        if (IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
@@ -4214,11 +3792,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         RECT rc; GetClientRect(hWnd, &rc);
         WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
-        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         SettingsDraw(surface.dc, hWnd);
-        if (!surface.buffered)
-            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
-        EndWindowPaintSurface(&surface, TRUE);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface);
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -4228,7 +3804,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         return 0;
     case WM_LBUTTONUP:
         if (g_hlSliderDrag != S_HIT_NONE) {
-            UpdateHighlightSlider(hWnd, g_hlSliderDrag, GET_X_LPARAM(l));
+            UpdateHueSlider(hWnd, GET_X_LPARAM(l));
             g_hlSliderDrag = S_HIT_NONE;
             if (GetCapture() == hWnd) ReleaseCapture();
             return 0;
@@ -4236,24 +3812,22 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         break;
     case WM_MOUSEMOVE: {
         if (g_hlSliderDrag != S_HIT_NONE) {
-            UpdateHighlightSlider(hWnd, g_hlSliderDrag, GET_X_LPARAM(l));
+            UpdateHueSlider(hWnd, GET_X_LPARAM(l));
             return 0;
         }
         if (!g_sTracking) { TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hWnd, 0}; TrackMouseEvent(&tme); g_sTracking = TRUE; }
         int hov = SettingsHitTest(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (hov != g_sHov) { g_sHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
         int thov = (hov >= S_HIT_THEME_OPT0 && hov <= S_HIT_THEME_OPT2) ? hov - S_HIT_THEME_OPT0 : -1;
-        int mhov = (hov >= S_HIT_MATERIAL_OPT0 && hov <= S_HIT_MATERIAL_OPT2) ? hov - S_HIT_MATERIAL_OPT0 : -1;
         int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT2) ? hov - S_HIT_LAYOUT_OPT0 : -1;
         int langov = (hov >= S_HIT_LANG_OPT0 && hov <= S_HIT_LANG_OPT1) ? hov - S_HIT_LANG_OPT0 : -1;
-        int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT0 + 2) ? hov - S_HIT_HL_OPT0 : -1;
+        int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT1) ? hov - S_HIT_HL_OPT0 : -1;
         int clov = (hov >= S_HIT_CLOSE_OPT0 && hov <= S_HIT_CLOSE_OPT1) ? hov - S_HIT_CLOSE_OPT0 : -1;
         int ohov = (hov >= S_HIT_OPACITY_OPT0 && hov <= S_HIT_OPACITY_OPT0 + 5) ? hov - S_HIT_OPACITY_OPT0 : -1;
-        if (thov != g_dropThemeHov || mhov != g_dropMaterialHov || lhov != g_dropLayoutHov ||
+        if (thov != g_dropThemeHov || lhov != g_dropLayoutHov ||
             langov != g_dropLangHov || hlov != g_dropHlHov || clov != g_dropCloseHov ||
             ohov != g_dropOpacityHov) {
             g_dropThemeHov = thov;
-            g_dropMaterialHov = mhov;
             g_dropLayoutHov = lhov;
             g_dropLangHov = langov;
             g_dropHlHov = hlov;
@@ -4367,7 +3941,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_sHov = -1;
         g_sTracking = FALSE;
         g_dropTheme = FALSE;
-        g_dropMaterial = FALSE;
         g_dropLayout = FALSE;
         g_dropOpacity = FALSE;
         g_dropLang = FALSE;
@@ -4391,8 +3964,6 @@ static void OpenSettingsTab(int tab) {
             // 先置为全透明，再显示并渐显
             StartWindowFade(g_settingsHwnd, g_settingsFade, FALSE);
             ShowWindow(g_settingsHwnd, SW_SHOW);
-        } else {
-            if (!IsMaterialApplied(g_settingsHwnd)) ApplyWindowMaterial(g_settingsHwnd);
         }
         SetForegroundWindow(g_settingsHwnd);
         InvalidateRect(g_settingsHwnd, NULL, TRUE);   // 切到指定 Tab 后刷新
@@ -4471,7 +4042,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sf13, IsLightColor(C_HOT) ? 0x1A1A1A : C_WHITE);
+    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sf13, C_ON_PRIMARY);
     DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
     DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sf13, C_WHITE);
 }
@@ -4534,7 +4105,6 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE:
         ApplyRoundedWindow(hWnd, 14);
-        ApplyWindowMaterial(hWnd);
         {
             // 显式确保 DWM 窗口过渡未被禁用（属性 3 默认开启，防御性设置）
             DwmSetWindowAttributeProc setAttr = GetDwmSetWindowAttribute();
@@ -4544,10 +4114,6 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 setAttr(hWnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
             }
         }
-        return 0;
-    case WM_REAPPLY_MATERIAL:
-        // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
-        if (IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
         return 0;
     case WM_SIZE:
         ApplyRoundedWindow(hWnd, 14);
@@ -4559,11 +4125,9 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         RECT rc; GetClientRect(hWnd, &rc);
         WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
-        DrawWindowMaterialTint(surface.dc, hWnd, rc.right, rc.bottom);
         PromptDraw(surface.dc, hWnd);
-        if (!surface.buffered)
-            BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
-        EndWindowPaintSurface(&surface, TRUE);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        EndWindowPaintSurface(&surface);
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -4681,11 +4245,11 @@ static void ShowMenu(HWND hWnd) {
         if (g_af) UpdateAutoVisibility();
         InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_THEME + 1) {
-        g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); ApplyAllWindowMaterials(); InvalidateRect(hWnd, 0, TRUE);
+        g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_THEME + 2) {
-        g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); ApplyAllWindowMaterials(); InvalidateRect(hWnd, 0, TRUE);
+        g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_THEME + 3) {
-        g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); ApplyAllWindowMaterials(); InvalidateRect(hWnd, 0, TRUE);
+        g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_SETTINGS) {
         OpenSettings();
     } else if (id == ID_MENU_ABOUT) {
@@ -5071,7 +4635,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         RecreateFontsAndLayout();
         SetWindowLong(hWnd, GWL_EXSTYLE, GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST);
         ApplyRoundedWindow(hWnd, 10);
-        ApplyWindowMaterial(hWnd);
+        ApplyWindowOpacity(hWnd, g_mainOpacity < 100);   // 分层窗口整体透明（所有系统可用）
         EnsureKbFrameCache(hWnd);   // 窗口可见前预热渲染首帧，消除启动黑帧与首帧卡顿
         g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
         g_winHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_FOCUS, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
@@ -5124,38 +4688,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc = {0, 0, g_ww, g_wh};
         EnsureKbFrameCache(hWnd);
-        BOOL useKbCache = g_kbCacheBmp && g_kbCacheBits &&
-                          g_kbCacheW == g_ww && g_kbCacheH == g_wh &&
-                          (IsMaterialApplied(hWnd) ? TRUE : g_kbCacheDc != 0);
+        BOOL useKbCache = g_kbCacheBmp && g_kbCacheDc && g_kbCacheBits &&
+                          g_kbCacheW == g_ww && g_kbCacheH == g_wh;
         if (useKbCache) {
-            if (IsMaterialApplied(hWnd)) {
-                // 材质模式：缓冲透明画布 + 逐位复制缓存（保留 alpha 供 DWM 合成）
-                const BufferedPaintApiLocal* api = GetBufferedPaintApi();
-                HDC bufferedDc = NULL;
-                HANDLE bp = api ? api->begin(dc, &rc, 2, NULL, &bufferedDc) : NULL;
-                if (bp && bufferedDc && api->bits) {
-                    RGBQUAD* bits = NULL; int row = 0;
-                    if (SUCCEEDED(api->bits(bp, &bits, &row)) && bits && row > 0) {
-                        int copyW = g_kbCacheRow < row ? g_kbCacheRow : row;
-                        for (int y = 0; y < g_kbCacheH; y++)
-                            memcpy(bits + y * row, g_kbCacheBits + y * g_kbCacheRow,
-                                   (size_t)copyW * sizeof(RGBQUAD));
-                    }
-                }
-                if (bp) api->end(bp, TRUE);
-            } else {
-                BitBlt(dc, 0, 0, g_ww, g_wh, g_kbCacheDc, 0, 0, SRCCOPY);
-            }
+            BitBlt(dc, 0, 0, g_ww, g_wh, g_kbCacheDc, 0, 0, SRCCOPY);
         } else {
             // 缓存创建失败时回退到逐帧全量绘制
             WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
             ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
-            DrawWindowMaterialTint(surface.dc, hWnd, g_ww, g_wh);
             DrawHeader(surface.dc);
             DrawKeys(surface.dc);
-            if (!surface.buffered)
-                BitBlt(dc, 0, 0, g_ww, g_wh, surface.dc, 0, 0, SRCCOPY);
-            EndWindowPaintSurface(&surface, TRUE);
+            BitBlt(dc, 0, 0, g_ww, g_wh, surface.dc, 0, 0, SRCCOPY);
+            EndWindowPaintSurface(&surface);
         }
         EndPaint(hWnd, &ps);
         return 0;
@@ -5203,14 +4747,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_FOCUS_EVENT:
         UpdateAutoVisibility();
         return 0;
-    case WM_REAPPLY_MATERIAL:
-        // 仅在材质缺失时补套；已应用时重置+重套会造成可见的材质闪烁
-        if (IsWindowVisible(hWnd) && !IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
-        return 0;
     case WM_SHOW_KEYBOARD:
         if (w) {
             ApplyTheme();
-            if (!IsMaterialApplied(hWnd)) ApplyWindowMaterial(hWnd);
             ShowKB(TRUE, TRUE);
         } else {
             ShowKB(FALSE, TRUE);
@@ -5290,9 +4829,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             if (g_af) UpdateAutoVisibility();
             InvalidateRect(hWnd, 0, TRUE);
             break;
-        case ID_MENU_THEME + 1: g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); ApplyAllWindowMaterials(); InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); ApplyAllWindowMaterials(); InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); ApplyAllWindowMaterials(); InvalidateRect(hWnd, 0, TRUE); break;
+        case ID_MENU_THEME + 1: g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
+        case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
+        case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_SETTINGS: OpenSettings(); break;
         case ID_MENU_ABOUT: OpenSettingsTab(2); break;
         case ID_MENU_EXIT: ExitApplicationAnimated(); break;
@@ -5375,8 +4914,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     InitTimePeriodApi();
     if (g_timePeriod.begin) g_timePeriod.begin(1);   // 提升动画定时器精度
 
-    // 系统环境检测需在字体初始化前完成（图标字体按系统版本选择）
-    g_isWinPE = IsWindowsPE();
+    // 系统版本检测（图标字体按系统版本选择）
     DetectWinVersion();
 
     InitGdiPlus();       // 初始化 GDI+ （抗锯齿圆形绘图）

@@ -1662,24 +1662,37 @@ static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
 // 参考图里左列的 Esc / Tab / Caps / Shift 名字贴着左边缘、右列的 Backspace / Del /
 // Enter / Shift 贴着右边缘 —— 宽键居中会让名字独自飘在一条缝上，反而看不出是哪个键。
 //
-// ⚠ 绘制矩形的宽必须用「容纳宽度」（MeasureTextW / GDI+），**不能**用 advance：
-//   GDI+ 的 DrawString 在 NoWrap 下一次判定放不下就**整字丢掉尾部**，而它判据用的
-//   正是 MeasureString 的量宽（比 advance 两侧各多约 0.2em）。这里曾经图省事写成
-//   `rw = adv + 4`，实机立刻现形：Esc→Es、Del→De、Ctrl→Ctr、Alt→Al、Fn→F。
-//   位置按 advance 摆（居中/贴边才准），矩形宽按容纳宽给 —— 两个宽度各司其职。
+// ⚠ 两个「文字宽度」不能混用，两个坑都踩过：
+//   tw  = MeasureTextW     → GDI+ MeasureString，含约 0.2em 溢出留白，是**容纳宽度**。
+//                            DrawString 在 NoWrap 下的判据就是它，绘制矩形的宽必须 ≥ tw。
+//   adv = MeasureTextAdvW  → GDI 推进宽（advance），是**布局宽度**：它不带 GDI+ 那圈留白。
+//   ① 矩形宽若按 adv 给（`rw = adv + 4`），NoWrap 一次判定放不下就**整字丢掉尾部**：
+//      实机现形 Esc→Es、Del→De、Ctrl→Ctr、Alt→Al、Fn→F。故 rw 必须 = tw + 4。
+//   ② 但「居中」这一步不能自己算矩形：tw 比 adv 宽约 10px（175% DPI 实测），
+//      若按 x = k->x + (k->w - adv)/2 定位、再让 DrawTextC 在宽度 tw+4 的矩形里居中，
+//      墨迹中心会落到 k->x + k->w/2 + (tw - adv)/2 + 2 ≈ **键心右侧 7px**。
+//      实机现象正是「白色按钮（字母键）文本不居中」，且 Ctrl/Alt/Fn 与带图标的
+//      Win/Menu 在同一行里位置对不齐。→ 居中键直接把整键矩形交给 DrawTextC，
+//      与 DrawKeys 里「双符号键」那条路径（DrawTextC(k->x, k->y, k->w, k->h, …)）同源，
+//      两条路径的居中量因而完全一致（残余的 -1px 是 GDI+ 量宽左右不对称的固有量）。
+//   KA_LEFT / KA_RIGHT 才需要自己算矩形起点：这里按 adv 定位（贴边看的是墨迹边缘）。
 static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
     if (!s || !s[0]) return;
+
+    if (k->align == KA_CENTER) {              // 居中：整键矩形，与双符号键同源
+        DrawTextC(dc, k->x, k->y, k->w, k->h, s, f, c);
+        return;
+    }
+
     int tw = MeasureTextW(dc, s, f);          // 容纳宽度：绘制矩形的宽必须 ≥ 它
     if (tw <= 0) return;
-    int rw = tw + 4;                          // 与 DrawTextC 的居中路径同一套取值
-    int adv = MeasureTextAdvW(dc, s, f);      // 布局宽度：整块墨迹实际占多宽
+    int rw = tw + 4;
+    int adv = MeasureTextAdvW(dc, s, f);      // 布局宽度：贴边定位用它才准
     if (adv <= 0) adv = tw;
 
     int inset = (int)(10 * GetSystemDpiScale());
-    int x;
-    if (k->align == KA_LEFT)       x = k->x + inset;
-    else if (k->align == KA_RIGHT) x = k->x + k->w - inset - adv;
-    else                           x = k->x + (k->w - adv) / 2;
+    int x = (k->align == KA_LEFT) ? k->x + inset
+                                  : k->x + k->w - inset - adv;
     if (x < k->x) x = k->x;
     DrawTextC(dc, x, k->y, rw, k->h, s, f, c);
 }
@@ -1972,7 +1985,17 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
             else                           gx = k->x + (k->w - groupW) / 2;
             if (gx < k->x) gx = k->x;
 
-            DrawKeyGlyph(dc, gx, k->y + (k->h - iconInline) / 2, iconInline, k, color);
+            // 图标与文字的**纵向**对齐：图标按自身包围盒居中（DrawHkIcon 的路径上下对称），
+            // 文字按「墨迹框」居中。串里带下降部（Caps / Bksp / Backspace…）时墨迹下缘被
+            // 降部拖低，墨迹中心比字身（cap 高）中心低约「降部深的一半」，图标照键框居中
+            // 就会显得比字母低一截（实测 175% DPI 下 Caps 的图标低 4.5px）。
+            // 带降部时把图标上移这半个降部深（MiSans 墨迹降部 ≈ 0.21em，故取 0.105em）；
+            // 无降部的串（Tab / Enter / Menu / Win / Shift）墨迹中心＝字身中心，不补偿。
+            int iconY = k->y + (k->h - iconInline) / 2;
+            if (TextHasDescender(text))
+                iconY -= (int)(0.105f * FontEmPx(ff) + 0.5f);
+
+            DrawKeyGlyph(dc, gx, iconY, iconInline, k, color);
             // 与标题栏 pill 同一套：文字矩形左移半个余量，墨迹才正好接在间距之后
             DrawTextC(dc, gx + iconInline + gap + drawn / 2 - (tw + 4) / 2, k->y, tw + 4, k->h,
                       text, ff, color);

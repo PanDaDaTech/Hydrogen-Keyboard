@@ -793,7 +793,10 @@ static void BuildKeys() {
     double scaleX = (double)g_ww / baseW;
     double scaleY = (double)g_wh / baseH;
 
-    g_headerH = (int)(36.0 * dpiScale * scaleY); if (g_headerH < 28) g_headerH = 28;
+    // 页头高度 = 按钮 28 + 上下各 10（与键区左右留白 g_keyAreaX 对齐）。
+    // 原来是 36，按钮只离上沿 4 DIP，看着贴顶；现在 10 DIP，与左右留白一致，
+    // 按钮底到第一排键还有 16 DIP，轻重分开。
+    g_headerH = (int)(48.0 * dpiScale * scaleY); if (g_headerH < 38) g_headerH = 38;
     g_keyGap = (int)(4.0 * dpiScale * scaleX); if (g_keyGap < 2) g_keyGap = 2;
     // 圆角窗口四角会裁掉内容：键区左右与底部留出安全边距
     g_keyAreaX = (int)(10 * dpiScale); if (g_keyAreaX < 6) g_keyAreaX = 6;
@@ -1067,13 +1070,6 @@ static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
     Gdiplus::Graphics graphics(dc);
     Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)));
     graphics.FillRectangle(&brush, x, y, w, h);
-}
-
-static void DrawLineAA(HDC dc, int x1, int y1, int x2, int y2, DWORD color, float width) {
-    Gdiplus::Graphics graphics(dc);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)), width);
-    graphics.DrawLine(&pen, x1, y1, x2, y2);
 }
 
 static void DrawRoundRectAlpha(HDC dc, int x, int y, int w, int h, DWORD fillC,
@@ -1982,9 +1978,9 @@ static HeaderMetrics GetHeaderMetrics() {
     int gap     = (int)(6 * dpi);
     int rMargin = (int)(6 * dpi);
 
-    // 设置按钮宽度随「按键图标样式」变化：文字 48 / 仅图标 40 / 图标+文字 68
-    int menuW = (g_keyIconStyle == 1) ? 40 : ((g_keyIconStyle == 2) ? 68 : 48);
-    hm.wMenu  = (int)(menuW * dpi);
+    // 「设置」按钮恒定显示「齿轮 + 设置」，宽度按内容给足；
+    // 「123」保持文字（它是通用符号，不再图标化）
+    hm.wMenu  = (int)(68 * dpi);
     hm.wClose = (int)(28 * dpi);
     hm.wMin   = (int)(28 * dpi);
     hm.wNum   = (int)(48 * dpi);
@@ -2012,23 +2008,23 @@ static int HitHeader(int x, int y) {
     return -1;
 }
 
-// 「设置」按钮内容随图标样式变化（图标+文字模式下齿轮与文字一起居中）
+// 「设置」按钮：与设置页页头、键盘修饰键同一套配方（btn_regular 底 + btn_content 内容），
+// 且恒定显示「齿轮 + 设置」——设置页页头也是齿轮，两处观感才对得上。
 static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
     double dpi = GetSystemDpiScale();
-    DrawRoundRect(dc, hm.xMenu, hm.btnY, hm.wMenu, hm.btnH, C_KEY, C_KEY_BORDER, hm.btnH / 2);
+    BOOL hov = (g_hdrHov == HDR_DOCK);
+    DrawRoundRect(dc, hm.xMenu, hm.btnY, hm.wMenu, hm.btnH,
+                  hov ? C_REGULAR_HOV : C_REGULAR, hov ? C_REGULAR_HOV : C_REGULAR, hm.btnH / 2);
+
     const wchar_t* label = T(L"\x8BBE\x7F6E", L"Settings");
-    if (g_keyIconStyle == 0) {
-        DrawTextC(dc, hm.xMenu, hm.btnY, hm.wMenu, hm.btnH, label, g_f12, C_WHITE);
-        return;
-    }
     int iconSz = (int)(17 * dpi);
     int gap    = (int)(6 * dpi);
-    int tw     = (g_keyIconStyle == 2) ? MeasureTextW(dc, label, g_f12) : 0;
-    int total  = iconSz + (tw > 0 ? gap + tw : 0);
+    int tw     = MeasureTextW(dc, label, g_f12);
+    int total  = iconSz + gap + tw;
     int x      = hm.xMenu + (hm.wMenu - total) / 2;
     DrawHkIcon(dc, (float)x, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
-               HkIcon(HKICON_GEAR), C_WHITE, C_WHITE);
-    if (tw > 0) DrawTextC(dc, x + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, C_WHITE);
+               HkIcon(HKICON_GEAR), C_BTN_CONTENT, C_BTN_CONTENT);
+    DrawTextC(dc, x + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, C_BTN_CONTENT);
 }
 
 static void DrawHeader(HDC dc) {
@@ -2042,33 +2038,33 @@ static void DrawHeader(HDC dc) {
         DrawTextC(dc, hm.xTitle, 0, hm.wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
-    // 123 按钮：与设置按钮同款胶囊样式（常态底 + 同字体），点击在当前布局与小键盘间切换
+    // 123 按钮：与设置按钮同款（btn_regular 配方），点击在当前布局与小键盘间切换。
+    // 「123」保持文字：它是数字区的国际通用写法，图标化是负收益。
     if (hm.numBtnVisible) {
-        DrawRoundRect(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH, C_KEY, C_KEY_BORDER, hm.btnH / 2);
-        DrawTextC(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH, L"123", g_f12, C_WHITE);
+        BOOL hovNum = (g_hdrHov == HDR_NUM);
+        DrawRoundRect(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH,
+                      hovNum ? C_REGULAR_HOV : C_REGULAR, hovNum ? C_REGULAR_HOV : C_REGULAR,
+                      hm.btnH / 2);
+        DrawTextC(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH, L"123", g_f12, C_BTN_CONTENT);
     }
 
-    // 最小化按钮：悬停时与设置页关闭按钮同款圆角底，图标为 AA 横线
+    // 最小化 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
+    int iconSz = (int)(18 * dpiScale);
+    int hoverR = (int)(6 * dpiScale);
     if (g_hdrHov == HDR_MIN) {
-        DrawRoundRect(dc, hm.xMin, hm.btnY, hm.wMin, hm.btnH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, hm.xMin, hm.btnY, hm.wMin, hm.btnH,
+                      C_REGULAR_HOV, C_REGULAR_HOV, hoverR);
     }
-    {
-        int cx = hm.xMin + hm.wMin / 2;
-        int cy = hm.btnY + hm.btnH / 2;
-        int half = (int)(5 * dpiScale);
-        DrawLineAA(dc, cx - half, cy, cx + half, cy, C_DIM, 2.0f);
-    }
-    // 关闭按钮：与设置页关闭按钮同款样式（悬停圆角底 + AA 的 X 图标）
+    DrawHkIcon(dc, (float)(hm.xMin + (hm.wMin - iconSz) / 2),
+               (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
+               HkIcon(HKICON_MINIMIZE), C_DIM, C_DIM);
     if (g_hdrHov == HDR_CLOSE) {
-        DrawRoundRect(dc, hm.xClose, hm.btnY, hm.wClose, hm.btnH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, hm.xClose, hm.btnY, hm.wClose, hm.btnH,
+                      C_REGULAR_HOV, C_REGULAR_HOV, hoverR);
     }
-    {
-        int cx = hm.xClose + hm.wClose / 2;
-        int cy = hm.btnY + hm.btnH / 2;
-        int r  = (int)(5 * dpiScale); if (r < 4) r = 4;
-        DrawLineAA(dc, cx - r, cy - r, cx + r, cy + r, C_DIM, 2.0f);
-        DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
-    }
+    DrawHkIcon(dc, (float)(hm.xClose + (hm.wClose - iconSz) / 2),
+               (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
+               HkIcon(HKICON_CLOSE), C_DIM, C_DIM);
 }
 
 static void DrawKeys(HDC dc) {
@@ -3188,13 +3184,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     DrawTextL(dc, titleX, m.titleY, m.closeX - (int)(12 * m.dpi) - titleX, m.titleH,
               aboutTab ? T(L"关于", L"About") : T(L"设置", L"Settings"), g_sf20b, C_WHITE);
     if (g_sHov == S_HIT_CLOSE) {
-        DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH, C_HOVER, C_KEY_BORDER, 6);
+        DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH,
+                      C_REGULAR_HOV, C_REGULAR_HOV, (int)(6 * m.dpi));
     }
     {
-        int cx = m.closeX + m.closeW / 2, cy = m.closeY + m.closeH / 2;
-        int r = (int)(5 * m.dpi);
-        DrawLineAA(dc, cx - r, cy - r, cx + r, cy + r, C_DIM, 2.0f);
-        DrawLineAA(dc, cx + r, cy - r, cx - r, cy + r, C_DIM, 2.0f);
+        int sz = (int)(18 * m.dpi);
+        DrawHkIcon(dc, (float)(m.closeX + (m.closeW - sz) / 2),
+                   (float)(m.closeY + (m.closeH - sz) / 2), (float)sz,
+                   HkIcon(HKICON_CLOSE), C_DIM, C_DIM);
     }
 
     DrawTabStrip(dc, m);
@@ -4433,10 +4430,15 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sf13, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
-    DrawRoundRect(dc, bx, by, bw, bh, (g_pHov == P_HIT_CLOSE) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
-    int mx = bx + bw / 2, my = by + bh / 2, r = (int)(5 * dpi);
-    DrawLineAA(dc, mx - r, my - r, mx + r, my + r, C_DIM, 2.0f);
-    DrawLineAA(dc, mx + r, my - r, mx - r, my + r, C_DIM, 2.0f);
+    // 与设置页 / 主键盘标题栏一致：平时不铺底，悬停才给一层 btn_regular_bg_hover
+    if (g_pHov == P_HIT_CLOSE) {
+        DrawRoundRect(dc, bx, by, bw, bh, C_REGULAR_HOV, C_REGULAR_HOV, (int)(6 * dpi));
+    }
+    {
+        int sz = (int)(18 * dpi);
+        DrawHkIcon(dc, (float)(bx + (bw - sz) / 2), (float)(by + (bh - sz) / 2), (float)sz,
+                   HkIcon(HKICON_CLOSE), C_DIM, C_DIM);
+    }
 
     int x0 = 20, y = hdr + 12, cw = W - 40;
     int rowH = (int)(24 * dpi);

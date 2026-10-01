@@ -438,7 +438,8 @@ HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
-static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
+static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌 Regular 子集）
+static HANDLE g_fontRegMedium = 0;     // 内嵌 Medium 子集（强调档用）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
 
@@ -598,18 +599,17 @@ static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, in
 }
 
 // ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）--------------------
-static const KbKeySpec kFullMain0[] = {      // F 行：Esc + F1~F12 + Del(2u)
-    // Esc 紧接 F1，中间不留空档：网格里那 1u 空档是一整个键宽，看着就是一个「缺了键」
-    // 的洞（报告里按真 104 建议留，实机反馈「看着难受」）。F1 落在 1.00 这一列，
-    // 与数字行的 `1` 对齐；Del 补成 2u 收满 15u，正好压在退格上方。
-    { 0.00f, 1.00f, 0x1B, K_SPECIAL, 1 },
-    { 1.00f, 1.00f, 0x70, K_NORMAL , 1 }, { 2.00f, 1.00f, 0x71, K_NORMAL , 1 },
-    { 3.00f, 1.00f, 0x72, K_NORMAL , 1 }, { 4.00f, 1.00f, 0x73, K_NORMAL , 1 },
-    { 5.00f, 1.00f, 0x74, K_NORMAL , 1 }, { 6.00f, 1.00f, 0x75, K_NORMAL , 1 },
-    { 7.00f, 1.00f, 0x76, K_NORMAL , 1 }, { 8.00f, 1.00f, 0x77, K_NORMAL , 1 },
-    { 9.00f, 1.00f, 0x78, K_NORMAL , 1 }, { 10.00f, 1.00f, 0x79, K_NORMAL, 1 },
-    { 11.00f, 1.00f, 0x7A, K_NORMAL , 1 }, { 12.00f, 1.00f, 0x7B, K_NORMAL, 1 },
-    { 13.00f, 2.00f, 0x2E, K_SPECIAL, 1 },
+static const KbKeySpec kFullMain0[] = {      // F 行：Esc + F1~F12（三组），无 Del
+    // Del 只在导航区出现（真 104 的 F 行没有 Del）—— 之前两处都有，整把键盘出现两个 Del。
+    // 腾出来的 2u 平分给三处组间缝（Esc|F1、F4|F5、F8|F9 各 2/3 u）：
+    // 既不留空档，F 键又还都是 1u（14.0000 + 1.00 = 15.00，正好收在主区右边缘）。
+    { 0.0000f, 1.00f, 0x1B, K_SPECIAL, 1 },
+    { 1.6667f, 1.00f, 0x70, K_NORMAL , 1 }, { 2.6667f, 1.00f, 0x71, K_NORMAL , 1 },
+    { 3.6667f, 1.00f, 0x72, K_NORMAL , 1 }, { 4.6667f, 1.00f, 0x73, K_NORMAL , 1 },
+    { 6.3333f, 1.00f, 0x74, K_NORMAL , 1 }, { 7.3333f, 1.00f, 0x75, K_NORMAL , 1 },
+    { 8.3333f, 1.00f, 0x76, K_NORMAL , 1 }, { 9.3333f, 1.00f, 0x77, K_NORMAL , 1 },
+    { 11.0000f, 1.00f, 0x78, K_NORMAL, 1 }, { 12.0000f, 1.00f, 0x79, K_NORMAL, 1 },
+    { 13.0000f, 1.00f, 0x7A, K_NORMAL, 1 }, { 14.0000f, 1.00f, 0x7B, K_NORMAL, 1 },
 };
 static const KbKeySpec kFullMain1[] = {      // 数字行
     { 0.00f, 1.00f, 0xC0, K_NORMAL , 1 },
@@ -1094,33 +1094,39 @@ static void SetFullNumpadHidden(HWND hWnd, BOOL hidden) {
     if (hWnd && IsWindow(hWnd)) InvalidateRect(hWnd, NULL, TRUE);
 }
 
-// 注册内嵌字体（MiSans Medium 精简子集，单一字面）到当前进程；失败则回退系统字体
+// 注册内嵌字体（同一族 MiSans 的两个字面：Regular 正文 + Medium 强调）到当前进程；
+// 失败则回退系统字体。两个字面的码位集完全一致，切换字面不会让布局跳动。
 static void LoadEmbeddedFonts() {
-    HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(IDR_FONT), MAKEINTRESOURCEW(10));  // RT_RCDATA
-    if (!hr) return;
-    HGLOBAL hg = LoadResource(g_hInst, hr);
-    if (!hg) return;
-    void* data = LockResource(hg);
-    DWORD sz = SizeofResource(g_hInst, hr);
-    if (!data || sz == 0) return;
-    DWORD n = 0;
-    HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
-    if (h && n > 0) {
-        g_fontReg = h;
-        g_fontReady = TRUE;
+    struct { int id; HANDLE* slot; } fonts[2] = {
+        { IDR_FONT,        &g_fontRegRegular },
+        { IDR_FONT_MEDIUM, &g_fontRegMedium },
+    };
+    for (int i = 0; i < 2; i++) {
+        HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), MAKEINTRESOURCEW(10));  // RT_RCDATA
+        if (!hr) continue;
+        HGLOBAL hg = LoadResource(g_hInst, hr);
+        if (!hg) continue;
+        void* data = LockResource(hg);
+        DWORD sz = SizeofResource(g_hInst, hr);
+        if (!data || sz == 0) continue;
+        DWORD n = 0;
+        HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
+        if (h && n > 0) {
+            *fonts[i].slot = h;
+            g_fontReady = TRUE;
+        }
     }
 }
-// 创建 UI 字体。内嵌字体只有 MiSans Medium 一个字面（族名 MiSans，字重 500）：
-// 请求 FW_BOLD 时 GDI 会做**仿真加粗**（实测同一字号下 tmWeight 由 500 报成 700、
-// 笔画明显变粗），所以「该粗的地方」仍然是粗的。
-// ⛔ 不要再加「tmWeight < 550 就退回 FW_NORMAL」那种回退 —— 内嵌字体是 Medium，
-// 一退回就是全篇没有粗体（曾经这么写过，正是「粗体该粗的必须粗」要防的坑）。
+// 创建 UI 字体。族里放了两个字面：Regular(330) 与 Medium(500)。
+// 强调档请求 FW_MEDIUM（=500，字面自带），**不要请求 FW_BOLD** ——
+// 族里没有 700 的字面，GDI 会拿 Medium 做仿真加粗：描边被撑开、笔画发糊，
+// 就是实机反馈的「GDI+ 字体显示过粗」。也不要在匹配不到时退回 FW_NORMAL（那就没有强调层级了）。
 static HFONT MakeFont(double size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
     const wchar_t* face = g_fontReady ? L"MiSans" : L"Microsoft YaHei";
-    return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
+    return CreateFontW(h, 0, 0, 0, bold ? FW_MEDIUM : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, face);
@@ -1357,15 +1363,22 @@ static void ApplyWindowOpacity(HWND hWnd, BOOL enable) {
 
 static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
                           const wchar_t* text, HFONT font, DWORD color,
-                          Gdiplus::StringAlignment alignment) {
+                          Gdiplus::StringAlignment alignment, BOOL wrap = FALSE) {
     if (!text || !font || w <= 0 || h <= 0) return FALSE;
     if (!g_alphaPaintActive || !g_alphaPaintBits || g_alphaPaintRowPixels <= 0)
         return FALSE;
 
+    // 垂直方向多留一点余量：GDI 严格按给定矩形裁剪，而调用点传进来的 h 常常只够
+    // 「一行字的高度」，于是 g / y / q 这类带下降部的字母尾巴被切平（实机反馈的
+    // 「y g 显示异常」）。把蒙版上下各撑 pad，再整体上移 pad 合成 —— 视觉中心不变。
+    int pad = (int)(4 * GetSystemDpiScale());
+    if (pad < 2) pad = 2;
+    int mh = h + pad * 2;
+
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biHeight = -mh;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -1376,7 +1389,7 @@ static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
         if (maskBitmap) DeleteObject(maskBitmap);
         return FALSE;
     }
-    ZeroMemory(rawMask, (SIZE_T)w * (SIZE_T)h * sizeof(RGBQUAD));
+    ZeroMemory(rawMask, (SIZE_T)w * (SIZE_T)mh * sizeof(RGBQUAD));
 
     HDC maskDc = CreateCompatibleDC(dc);
     if (!maskDc) {
@@ -1387,9 +1400,14 @@ static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
     HFONT oldFont = (HFONT)SelectObject(maskDc, font);
     SetBkMode(maskDc, TRANSPARENT);
     SetTextColor(maskDc, RGB(255, 255, 255));
-    RECT maskRect = {0, 0, w, h};
-    UINT flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-    flags |= alignment == Gdiplus::StringAlignmentCenter ? DT_CENTER : DT_LEFT;
+    RECT maskRect = {0, 0, w, mh};
+    UINT flags = DT_NOPREFIX;
+    if (wrap) {
+        flags |= DT_WORDBREAK | DT_TOP;          // 多行：从顶部开始（DT_VCENTER 只对单行有效）
+    } else {
+        flags |= DT_VCENTER | DT_SINGLELINE;
+        flags |= alignment == Gdiplus::StringAlignmentCenter ? DT_CENTER : DT_LEFT;
+    }
     int drawn = DrawTextW(maskDc, text, -1, &maskRect, flags);
 
     if (drawn > 0) {
@@ -1399,7 +1417,7 @@ static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
         int green = GetGValue(resolved);
         int blue = GetBValue(resolved);
         int dstX = x - g_alphaPaintRect.left;
-        int dstY = y - g_alphaPaintRect.top;
+        int dstY = y - pad - g_alphaPaintRect.top;
         int paintW = g_alphaPaintRect.right - g_alphaPaintRect.left;
         int paintH = g_alphaPaintRect.bottom - g_alphaPaintRect.top;
         if (paintW > g_alphaPaintRowPixels) paintW = g_alphaPaintRowPixels;
@@ -1407,7 +1425,7 @@ static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
         int startX = dstX < 0 ? -dstX : 0;
         int startY = dstY < 0 ? -dstY : 0;
         int endX = w;
-        int endY = h;
+        int endY = mh;
         if (dstX + endX > paintW) endX = paintW - dstX;
         if (dstY + endY > paintH) endY = paintH - dstY;
 
@@ -1609,24 +1627,19 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     if (!ic) return FALSE;
 
     double dpi = GetSystemDpiScale();
-    int iconOnly   = (int)(20 * dpi);   // 纯图标
     int iconInline = (int)(18 * dpi);   // 图标+文字里的图标
     int gap        = (int)(6 * dpi);
 
-    // 「图标+文字」是尽力而为：放不下就降级为纯图标，绝不允许压边
-    if (g_keyIconStyle == 2 && text && text[0] && k->w >= (int)(40 * dpi)) {
-        int tw = MeasureTextW(dc, text, f);
-        if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
-            int total = iconInline + gap + tw;
-            int x = k->x + (k->w - total) / 2;
-            DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
-                       *ic, color, color);
-            DrawTextC(dc, x + iconInline + gap, k->y, tw + 4, k->h, text, f, color);
-            return TRUE;
-        }
-    }
-    DrawHkIcon(dc, (float)(k->x + (k->w - iconOnly) / 2), (float)(k->y + (k->h - iconOnly) / 2),
-               (float)iconOnly, *ic, color, color);
+    // 只有「图标+文字」一种形态（纯图标已按实机反馈去掉）：图标 + 文字并排居中。
+    // 放不下（长标签 + 窄键）时不画图标、交给文字路径，也绝不压边。
+    if (!(text && text[0] && k->w >= (int)(40 * dpi))) return FALSE;
+    int tw = MeasureTextW(dc, text, f);
+    if (iconInline + gap + tw > k->w - (int)(16 * dpi)) return FALSE;
+    int total = iconInline + gap + tw;
+    int x = k->x + (k->w - total) / 2;
+    DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
+               *ic, color, color);
+    DrawTextC(dc, x + iconInline + gap, k->y, tw + 4, k->h, text, f, color);
     return TRUE;
 }
 
@@ -1691,7 +1704,8 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x90: return L"Num";
         case 0x1B: return L"Esc";
         case 0x2E: return L"Del";
-        case 0x08: return L"\x2190";
+        case 0x08: return L"Backspace";   // 不再用 ← 箭头：图标样式的键面本来就是一个带箭头的退格图形，
+                                          // 再叠一个 ← 就成了同一件事画两遍（实机截图里很明显）
         case 0x09: return L"Tab";
         case 0x0D: return L"Enter";
         case 0x14: return L"Caps";
@@ -2719,13 +2733,15 @@ static LONGLONG g_switchAnimStart = 0;
 static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
-static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
-    if (DrawAlphaText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear)) return;
+static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c,
+                      BOOL wrap = FALSE) {
+    if (DrawAlphaText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear, wrap)) return;
     RECT r = {x, y, x + w, y + h};
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, c);
-    DrawTextW(dc, s, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, s, -1, &r, (wrap ? (DT_LEFT | DT_WORDBREAK | DT_TOP)
+                                   : (DT_LEFT | DT_VCENTER | DT_SINGLELINE)) | DT_NOPREFIX);
 }
 
 static void DrawRadio(HDC dc, int x, int cy, int r, BOOL on, DWORD bg) {
@@ -2819,7 +2835,13 @@ static int SettingsRowCtrlDip(int tab, int index) {
     return 0;
 }
 
-// 行高 = (12 + max(图标 tile 30, 控件高, 两行文字块 34) + 12) 个 DIP，最后统一乘 dpi。
+// 描述需要两行的行（文案本身就长，一行放不下会被硬截断）：
+// 行高、绘制、命中三处都读这一份判断，才不会出现「字画到行外 / 热区对不上」。
+static BOOL SettingsRowDescWraps(int tab, int index) {
+    return (tab == 3 && (index == 3 || index == 4));   // 小键盘按钮 / Tab 切换小键盘
+}
+
+// 行高 = (12 + max(图标 tile 30, 控件高, 文字块高) + 12) 个 DIP，最后统一乘 dpi。
 // ⚠ 全长度必须同单位再乘 dpi：这里曾经写成 `m.rowPadY * 2 + content`，
 //   其中 rowPadY 已乘过 dpi、content 还是 DIP，于是高 DPI 下行高偏小 ——
 //   表现为整张卡比预期矮一截、底部留一大片空白、两行文字挤在一起。
@@ -2829,6 +2851,8 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     int contentDip = SettingsRowCtrlDip(g_sTab, index);
     if (contentDip < 30) contentDip = 30;   // 图标 tile
     if (contentDip < 34) contentDip = 34;   // 两行文字块（标题 18 + 描述 16）
+    if (SettingsRowDescWraps(g_sTab, index) && contentDip < 50)
+        contentDip = 50;                    // 标题 18 + 描述两行 32
     return (int)((12 + contentDip + 12) * m.dpi);
 }
 
@@ -2920,7 +2944,7 @@ static void DrawSettingsRowHover(HDC dc, const SettingsMetrics& m, const RECT& r
 static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& row,
                                   int iconId, const wchar_t* glyph,
                                   const wchar_t* title, const wchar_t* desc,
-                                  BOOL hover, int ctrlLeft) {
+                                  BOOL hover, int ctrlLeft, BOOL descWrap = FALSE) {
     if (hover) DrawSettingsRowHover(dc, m, row);
     int ty = row.top + SettingsRowPadY(m);
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
@@ -2930,8 +2954,12 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     int tw = rightLimit - tx;
     if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
     DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sf14b, C_WHITE);
-    if (desc && desc[0])
-        DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
+    if (desc && desc[0]) {
+        if (descWrap)
+            DrawTextL(dc, tx, ty + (int)(20 * m.dpi), tw, (int)(30 * m.dpi), desc, g_sf12, C_DIM, TRUE);
+        else
+            DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
+    }
 }
 
 // ===== tab strip：文字宽 + 固定间隙，左起排布（不是固定宽度格子） =====
@@ -3025,16 +3053,21 @@ static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
     return hit;
 }
 
-// 「按键图标样式」的三段文案与控件矩形：绘制 / 命中 / 点击必须共用（画与热区同源）
-static void KeyIconSegItems(const wchar_t* out[3]) {
+// 「按键图标样式」的两段文案与控件矩形：绘制 / 命中 / 点击必须共用（画与热区同源）。
+// 只有两段：文字 / 图标+文字 —— 纯图标（键面只剩一个裸图形，没有文字兜底）已按实机反馈去掉。
+// 段下标与 g_keyIconStyle 不再相等，收在下面两个小函数里，别在调用点各写一遍映射。
+#define KEYICON_SEG_COUNT 2
+static int KeyIconStyleOfSeg(int seg) { return (seg == 1) ? 2 : 0; }
+static int KeyIconSegOfStyle(int style) { return (style == 2) ? 1 : 0; }
+
+static void KeyIconSegItems(const wchar_t* out[KEYICON_SEG_COUNT]) {
     out[0] = T(L"文字", L"Text");
-    out[1] = T(L"图标", L"Icon");
-    out[2] = T(L"图标+文字", L"Icon+Text");
+    out[1] = T(L"图标+文字", L"Icon+Text");
 }
 
-static RECT KeyIconSegRect(const SettingsMetrics& m, const wchar_t* items[3]) {
+static RECT KeyIconSegRect(const SettingsMetrics& m, const wchar_t* items[KEYICON_SEG_COUNT]) {
     RECT row = SettingsRowRect(m, 1);
-    int w = SegmentedWidth(m, items, 3);
+    int w = SegmentedWidth(m, items, KEYICON_SEG_COUNT);
     int x = row.right - (int)(20 * m.dpi) - w;
     int y = SettingsComboY(m, row);
     RECT r = {x, y, x + w, y + m.comboH};
@@ -3424,16 +3457,16 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                   g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
                   g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
 
-        // 按键图标样式：分段控件三选一，改完立即重绘主键盘
+        // 按键图标样式：分段控件二选一，改完立即重绘主键盘
         r = SettingsRowRect(m, 1);
-        const wchar_t* seg[3];
+        const wchar_t* seg[KEYICON_SEG_COUNT];
         KeyIconSegItems(seg);
         RECT segR = KeyIconSegRect(m, seg);
-        DrawSettingRowContent(dc, m, r, HKICON_KEYBOARDMARK, NULL,
+        DrawSettingRowContent(dc, m, r, HKICON_CARET, NULL,
                               T(L"按键图标样式", L"Key Icon Style"),
-                              T(L"键面显示为文字、图标或两者并存", L"Draw key faces as text, icons, or both"),
+                              T(L"键面显示为文字，或图标与文字并存", L"Draw key faces as text, or icon plus text"),
                               FALSE, segR.left);
-        DrawSegmented(dc, m, segR, seg, 3, g_keyIconStyle);
+        DrawSegmented(dc, m, segR, seg, KEYICON_SEG_COUNT, KeyIconSegOfStyle(g_keyIconStyle));
 
         r = SettingsRowRect(m, 2);
         DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
@@ -3445,16 +3478,16 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         r = SettingsRowRect(m, 3);
         DrawSettingRowContent(dc, m, r, HKICON_NUMPAD, NULL,
                               T(L"小键盘按钮", L"Numpad Button"),
-                              T(L"在标题栏显示小键盘按钮；默认布局下切换到小键盘，全尺寸下显示或隐藏数字区", L"Show a numpad button in the title bar; switches to the numpad layout, or shows/hides the numpad section in the full layout"),
-                              g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r));
+                              T(L"在标题栏显示；默认布局切到小键盘，全尺寸显示或隐藏数字区", L"Show it in the title bar; toggles the numpad layout / section"),
+                              g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r), TRUE);
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
 
         if (g_layoutMode == 2) {
             r = SettingsRowRect(m, 4);
             DrawSettingRowContent(dc, m, r, -1, L"F",   // Tab 切换小键盘同样保留手绘 F
                                   T(L"Tab 切换小键盘", L"Tab Toggles Numpad"),
-                                  T(L"全尺寸布局下按 Tab 键显示或隐藏右侧数字区（与标题栏按钮效果相同）", L"Press Tab in the full layout to show or hide the numpad section (same as the title-bar button)"),
-                                  g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r));
+                                  T(L"全尺寸布局下按 Tab 键显示或隐藏数字区", L"Press Tab in the full layout to show or hide the numpad"),
+                                  g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r), TRUE);
             DrawSettingSwitch(dc, m, r, g_npTabToggle, S_HIT_NPTAB);
         }
     } else if (g_sTab == 1) {
@@ -3725,7 +3758,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
         // 按键图标样式：整条分段控件一个命中码，段下标在点击时按 x 算
         {
-            const wchar_t* seg[3];
+            const wchar_t* seg[KEYICON_SEG_COUNT];
             KeyIconSegItems(seg);
             RECT sr = KeyIconSegRect(m, seg);
             if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_KEYICON;
@@ -3942,7 +3975,10 @@ static void LoadConfig() {
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
     g_keyIconStyle = IniGetInt(L"Keyboard", L"KeyIconStyle", 0);
-    if (g_keyIconStyle < 0 || g_keyIconStyle > 2) g_keyIconStyle = 0;   // 0=文字（= 升级前的现状）
+    // 0=文字（默认，= 升级前的现状）2=图标+文字。
+    // 旧配置里的 1（纯图标）已取消 —— 迁移到 2，别让它落回「文字」丢掉用户的选择。
+    if (g_keyIconStyle == 1) g_keyIconStyle = 2;
+    if (g_keyIconStyle != 2) g_keyIconStyle = 0;
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
     g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
     g_lang = IniGetInt(L"General", L"Language", 0);
@@ -4282,12 +4318,12 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     if (hit == S_HIT_KEYICON) {
         // 分段控件：按 x 定位具体段；改完存盘并立即重绘主键盘（三窗口联动的关键一步）
         SettingsMetrics km = GetSettingsMetrics(hWnd);
-        const wchar_t* seg[3];
+        const wchar_t* seg[KEYICON_SEG_COUNT];
         KeyIconSegItems(seg);
         RECT sr = KeyIconSegRect(km, seg);
-        int idx = SegmentedHitIndex(km, sr, seg, 3, x);
+        int idx = SegmentedHitIndex(km, sr, seg, KEYICON_SEG_COUNT, x);
         if (idx >= 0) {
-            g_keyIconStyle = idx;
+            g_keyIconStyle = KeyIconStyleOfSeg(idx);
             IniSetInt(L"Keyboard", L"KeyIconStyle", g_keyIconStyle);
             if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
         }
@@ -5595,7 +5631,8 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    if (g_fontReg) RemoveFontMemResourceEx(g_fontReg);
+    if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
+    if (g_fontRegMedium) RemoveFontMemResourceEx(g_fontRegMedium);
     if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;

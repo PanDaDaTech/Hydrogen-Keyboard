@@ -1345,6 +1345,33 @@ static float FontEmPx(HFONT f) {
     return (float)(lf.lfHeight < 0 ? -lf.lfHeight : lf.lfHeight);
 }
 
+// 拉丁小写里带下降部的字符。这类串的墨迹本来就低，垂直补偿要另算（见 TextInkShiftPx）。
+static BOOL TextHasDescender(const wchar_t* s) {
+    if (!s) return FALSE;
+    for (const wchar_t* p = s; *p; ++p) {
+        wchar_t c = *p;
+        if (c == L'g' || c == L'j' || c == L'p' || c == L'q' || c == L'y') return TRUE;
+    }
+    return FALSE;
+}
+
+// 单行垂直居中时，把文字矩形下移这个量，墨迹中心才落到矩形中心上。
+//
+// 起因：GDI+ 的 LineAlign=Center 居中「行盒」，实测基线固定在「矩形中心 + 0.2936em」
+// （MiSans-Medium hhea asc/desc = 1.044/0.282em，行盒 1.326em）。而汉字与无下降部的拉丁字
+// 并不占满下降部，墨迹中心因此比矩形中心高（实测，24pt 归一化）：
+//     汉字（设置/自动呼出/小键盘）  -0.089 ~ -0.107 em
+//     大写·数字·无降部拉丁（A/1/Tab/Del）  -0.071 ~ -0.080 em
+//     带下降部（Caps/Backspace/Settings/Layout）  +0.018 ~ +0.027 em
+// 而**图标是按自身包围盒居中的**（`DrawHkIcon` 的路径上下对称），于是只要文字不补偿，
+// 「图标 + 文字」这一对就整体对不齐 —— 实机反馈的「图标文本对不齐」即此。
+// 两类各取一个折中值：无下降部 +0.085em（下移），有下降部 -0.025em（≈ 不下移）。
+static int TextInkShiftPx(float emPx, const wchar_t* s) {
+    if (emPx <= 0.0f) return 0;
+    float v = emPx * (TextHasDescender(s) ? -0.025f : 0.085f);
+    return (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+}
+
 static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
                        float emPx, DWORD color, BOOL center, BOOL wrap) {
     if (!s || !s[0] || w <= 0 || h <= 0 || emPx <= 0.0f) return FALSE;
@@ -1375,6 +1402,9 @@ static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
     Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color),
                                                   GetGValue(color), GetBValue(color)));
     Gdiplus::RectF rc((Gdiplus::REAL)x, (Gdiplus::REAL)y, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
+    // 单行垂直居中时补偿「行盒中心 vs 墨迹中心」的差（见 TextInkShiftPx）。
+    // 不做这一步，所有居中文字都会整体偏高 1~3px；和图标并排时最刺眼。
+    if (!wrap) rc.Y += (Gdiplus::REAL)TextInkShiftPx(emPx, s);
     g.DrawString(s, -1, &font, rc, &fmt, &brush);
     return TRUE;    // Graphics 析构时自动 Flush
 }
@@ -1421,18 +1451,18 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
 // 收益：任意尺寸、任意色相都可用，加一个图标＝加一段顶点数据，不用重跑字体子集化。
 static const HkIconDef& HkIcon(int id) { return k_hkIcons[id]; }
 
-// 量字串宽度。**必须与绘制同源** —— 文字已经改由 GDI+ 绘制（见 DrawTextGp），
-// 而 DrawString 在 NoWrap 下是「按 GDI+ 自己的布局宽度判断放不放得下，放不下就整字丢弃」。
+// ⚠ 文字宽度有**两个不能混用**的用途：
+//   · 容纳宽度 = GDI+ MeasureString（本函数）—— DrawString 在 NoWrap 下按这个宽度判断放不放得下，
+//     所以「绘制矩形的宽」必须 ≥ 它；量出来的值比 advance 两侧各多约 0.2em。
+//   · 布局宽度 = advance（用 MeasureTextAdvW）—— 排版 / 居中 / 图标与文字的间距必须用它，
+//     否则那 0.2em 的余量会被当成真实文字宽度：图标与文字之间凭空多出空隙、整组还会偏左
+//     （标题栏 pill 实测：图标↔文字间距 19px，而设计值是 10px）。
 //
-// 实测（11pt @175%，MiSans-Medium）：
-//   「常规」 GDI 量 52px（26px/字，与 hmtx 的 1000/1000 = 1.0em 一致，是**对的**）
-//          GDI+ 需要 61.4px（30.7px/字）—— 多出的是 GDI+ 自己的保守余量。
-// 于是旧写法出的事故：Tab 矩形按 GDI 量出 52 + 4dip = 59px，GDI+ 判定放不下两个字，
+// 实测（「常规」，11pt @175%，MiSans-Medium）：
+//   GDI 量 52px（26px/字，与 hmtx 的 1000/1000 = 1.0em 一致，这是 advance，是**对的**）
+//   GDI+ 需要 61.4px（30.7px/字）—— 多出的是 GDI+ 自己的保守余量。
+// 历史事故：Tab 矩形按 GDI 量出 52 + 4dip = 59px 当绘制宽度，GDI+ 判定放不下两个字，
 // 四个 Tab 各只剩第一个字（常规/布局/主题/关于 → 常/布/主/关）。
-// 同样的坑还藏在「键面图标+文字」与标题栏「设置」pill —— 它们都拿这个偏窄的返回值
-// 当绘制矩形宽度（tw + 4），所以长标签一律被丢尾字。
-//
-// 修法只有一条：量宽也交给 GDI+。多出来的余量不是浪费，它同时充当了字与框之间的呼吸空间。
 static int MeasureTextGp(HDC dc, const wchar_t* s, HFONT f) {
     if (!s || !s[0] || !f || !g_gdipFonts) return 0;
     float emPx = FontEmPx(f);
@@ -1458,6 +1488,18 @@ static int MeasureTextGp(HDC dc, const wchar_t* s, HFONT f) {
     return w > 0 ? w + 1 : 0;               // 再留 1px 呼吸空间
 }
 
+// 布局宽度：GDI 的 GetTextExtentPoint32W 返回的理论推进宽（advance），即「文字实际占多宽」。
+// 排版、居中、图标与文字的间距都用它 —— DrawString 的绘制宽度不要用它，会丢字。
+static int MeasureTextAdvW(HDC dc, const wchar_t* s, HFONT f) {
+    if (!s || !s[0] || !f) return 0;
+    HFONT old = (HFONT)SelectObject(dc, f);
+    SIZE sz = {0, 0};
+    GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
+    SelectObject(dc, old);
+    return sz.cx;
+}
+
+// 容纳宽度：绘制矩形的宽必须 ≥ 它（见上方说明）。所有历史调用点用的都是这个语义。
 static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
     if (!s || !s[0] || !f) return 0;
 
@@ -1466,11 +1508,7 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
 
     // 回退：GDI+ 未就绪（启动早期 g_gdipFonts 还没建）时仍用 GDI。
     // 此时文字也画不了 GDI+，会走 DrawTextL/C 的 GDI 回退分支，两边依然同源。
-    HFONT old = (HFONT)SelectObject(dc, f);
-    SIZE sz = {0, 0};
-    GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
-    SelectObject(dc, old);
-    return sz.cx;
+    return MeasureTextAdvW(dc, s, f);
 }
 
 // 键面标签自适应字号：只用来救「PrtSc / ScrLk / Pause / Home / PgUp / PgDn」这类
@@ -1605,13 +1643,17 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     // 退格这类键在 1u 宽的布局里塞不下 [⌫ Backspace]，退回图标至少还能一眼认出是退格；
     // 之前直接放弃图标交给文字路径，反而长标签被裁掉半截 —— 实机反馈的「图标也看不到了」。
     if (text && text[0] && k->w >= (int)(40 * dpi)) {
-        int tw = MeasureTextW(dc, text, f);
+        int tw  = MeasureTextW(dc, text, f);              // 容纳宽度（放得下判定 + 绘制矩形）
+        int adv = MeasureTextAdvW(dc, text, f);           // 布局宽度（整组居中）
+        if (adv <= 0) adv = tw;
         if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
-            int total = iconInline + gap + tw;
-            int x = k->x + (k->w - total) / 2;
+            // 与标题栏 pill 同一套：整组按「图标 + 间距 + 文字实际占宽」居中，
+            // 文字矩形再左移半个余量，墨迹才接在间距之后。
+            int x = k->x + (k->w - (iconInline + gap + adv)) / 2;
             DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
                        *ic, color, color);
-            DrawTextC(dc, x + iconInline + gap, k->y, tw + 4, k->h, text, f, color);
+            DrawTextC(dc, x + iconInline + gap + adv / 2 - (tw + 4) / 2, k->y, tw + 4, k->h,
+                      text, f, color);
             return TRUE;
         }
     }
@@ -2155,11 +2197,19 @@ static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL h
 
     int iconSz = (int)(17 * GetSystemDpiScale());
     int gap    = (int)(6 * GetSystemDpiScale());
-    int tw     = MeasureTextW(dc, label, g_f12);
-    int cx     = x + (w - (iconSz + gap + tw)) / 2;
+    int tw     = MeasureTextW(dc, label, g_f12);       // 容纳宽度 → 绘制矩形用它（见 MeasureTextW）
+    int adv    = MeasureTextAdvW(dc, label, g_f12);    // 布局宽度 → 排版必须用它
+    if (adv <= 0) adv = tw;
+    // 按「图标 + 间距 + 文字实际占宽」整组居中。若用容纳宽度，GDI+ 那两侧各约 0.2em 的余量
+    // 会被当成文字宽度：图标被挤到贴左、图标与文字之间凭空多出近一倍空隙
+    // （实测 19px，设计值 10px）。
+    int cx = x + (w - (iconSz + gap + adv)) / 2;
     DrawHkIcon(dc, (float)cx, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
                icon, fg, fg);
-    DrawTextC(dc, cx + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, fg);
+    // DrawTextC 是把墨迹居中在矩形里的，所以矩形要再左移「(矩形宽 - 文字宽)/2」，
+    // 墨迹才会正好落在间距之后（否则整段文字右移半个余量）。
+    DrawTextC(dc, cx + iconSz + gap + adv / 2 - (tw + 4) / 2, hm.btnY, tw + 4, hm.btnH,
+              label, g_f12, fg);
 }
 
 static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
@@ -2890,12 +2940,23 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     int rightLimit = (ctrlLeft > 0) ? ctrlLeft - (int)(12 * m.dpi) : row.right - (int)(20 * m.dpi);
     int tw = rightLimit - tx;
     if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
-    DrawTextL(dc, tx, ty, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
+
+    // 文字块必须与 tile「中心对中心」。tile 30 DIP、文字块 42 DIP，**共用同一个 top 是不行的**：
+    // 那样 tile 中心会比文字块中心高 6 DIP（上一版就是这样，实机上看着图标偏低）。
+    // 文字块内两行盒的中心分别落在 块顶+10dpi（标题盒 20）与 块顶+26dpi+8dpi（描述盒 16）处，
+    // 于是块中心 = 块顶 + 22dpi。让块中心对齐 tile 中心，反解出块顶。
+    // （文字自身还有「行盒中心 vs 墨迹中心」的补偿，已在 DrawTextGp 里统一做掉，
+    //   所以这里直接按盒中心算即可，不需要再叠一次偏移。）
+    int descBoxH = descWrap ? (int)(32 * m.dpi) : (int)(16 * m.dpi);
+    int textMid = ((int)(20 * m.dpi) / 2 + (int)(26 * m.dpi) + descBoxH / 2) / 2;
+    int tyText = ty + m.tileSize / 2 - textMid;
+
+    DrawTextL(dc, tx, tyText, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0]) {
         if (descWrap)
-            DrawTextL(dc, tx, ty + (int)(26 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
+            DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
         else
-            DrawTextL(dc, tx, ty + (int)(26 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
+            DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
     }
 }
 
@@ -3321,9 +3382,12 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
 
     int tx = SettingsRowTextX(m);
     int tw = bx - (int)(12 * m.dpi) - tx;
-    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sfRow, C_WHITE);
+    // 同 DrawSettingRowContent：文字块与 tile 中心对中心。
+    // 本行盒高 18 / 描述盒顶偏移 18 / 描述盒高 16 → 块中心 = 块顶 + 17.5dpi。
+    int tyText = ty + m.tileSize / 2 - (int)(17.5 * m.dpi);
+    DrawTextL(dc, tx, tyText, tw, (int)(18 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0])
-        DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
+        DrawTextL(dc, tx, tyText + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
@@ -3335,7 +3399,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     DrawIconTile(dc, m.margin, m.titleY, m.headIcon, (int)(20 * m.dpi),
                  aboutTab ? HKICON_INFO : HKICON_GEAR, NULL);
     int titleX = m.margin + m.headIcon + (int)(16 * m.dpi);
-    DrawTextL(dc, titleX, m.titleY, m.closeX - (int)(12 * m.dpi) - titleX, m.titleH,
+    // 标题盒与 38 DIP 的 tile 中心对齐：原来两者共用同一个 top，tile 中心比标题墨迹中心
+    // 低 3.7 DIP（实机量过），大字号的偏差最扎眼。titleH(34) 比 headIcon(38) 矮 4，居中即对称。
+    DrawTextL(dc, titleX, m.titleY + (m.headIcon - m.titleH) / 2, m.closeX - (int)(12 * m.dpi) - titleX, m.titleH,
               aboutTab ? T(L"关于", L"About") : T(L"设置", L"Settings"), g_sfBig, C_WHITE);
     if (g_sHov == S_HIT_CLOSE) {
         DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH,

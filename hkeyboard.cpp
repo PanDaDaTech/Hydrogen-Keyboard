@@ -3089,6 +3089,31 @@ static int ThemeSegItems(const wchar_t** out) {
     for (int i = 0; i < 3; i++) out[i] = g_lang ? g_themeNamesEn[i] : g_themeNames[i];
     return 3;
 }
+// 透明度：下拉里那句「100%（不透明）」做成分段太宽，统一成纯百分比
+static int OpacitySegItems(const wchar_t** out) {
+    static const wchar_t* pct[6] = { L"100%", L"90%", L"80%", L"70%", L"60%", L"50%" };
+    for (int i = 0; i < 6; i++) out[i] = pct[i];
+    return 6;
+}
+// 色相行的模式选择（绘制在行顶部，与展开后的色板/滑轨对齐）
+static int HueModeSegItems(const wchar_t** out) {
+    out[0] = T(L"自定义", L"Custom");
+    out[1] = T(L"跟随壁纸", L"Wallpaper");
+    return 2;
+}
+static RECT RowSegRectTop(const SettingsMetrics& m, const RECT& row,
+                          const wchar_t** items, int count) {
+    RECT r = RowSegRect(m, row, items, count);
+    r.top = SettingsComboYTop(m, row);
+    r.bottom = r.top + m.comboH;
+    return r;
+}
+// 顶部对齐版的分段命中（色相行的控件在行顶部，与展开后的色板/滑轨对齐）
+static int RowSegIndexTop(const SettingsMetrics& m, const RECT& row,
+                          const wchar_t** items, int count, int x) {
+    RECT r = RowSegRectTop(m, row, items, count);
+    return SegmentedHitIndex(m, r, items, count, x);
+}
 
 // 「按键图标样式」的两段文案与控件矩形：绘制 / 命中 / 点击必须共用（画与热区同源）。
 // 只有两段：文字 / 图标+文字 —— 纯图标（键面只剩一个裸图形，没有文字兜底）已按实机反馈去掉。
@@ -3444,13 +3469,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         }
 
         RECT r1 = SettingsRowRect(m, closeRow);
-        int ctrlL = SettingsComboX(m, r1);
+        const wchar_t* cseg[2];
+        int csegn = CloseSegItems(cseg);
+        RECT csegR = RowSegRect(m, r1, cseg, csegn);
         DrawSettingRowContent(dc, m, r1, HKICON_CLOSE, NULL,
                               T(L"关闭按钮", L"Close Button"),
                               T(L"选择关闭窗口时执行的操作", L"Choose what happens when the window is closed"),
-                              g_sHov == S_HIT_CLOSE_DROP, ctrlL);
-        DrawCombo(dc, ctrlL, SettingsComboY(m, r1), m.comboW, m.comboH,
-                  CloseActionName(), g_dropClose, g_sHov == S_HIT_CLOSE_DROP);
+                              g_sHov == S_HIT_CLOSE_DROP, csegR.left);
+        DrawSegmented(dc, m, csegR, cseg, csegn, g_closeToTray ? 1 : 0);
 
         RECT r2 = SettingsRowRect(m, closeRow + 1);
         DrawSettingRowContent(dc, m, r2, HKICON_CHECK, NULL,
@@ -3474,14 +3500,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
 
         r = SettingsRowRect(m, closeRow + 4);
-        ctrlL = SettingsComboX(m, r);
+        const wchar_t* gseg[2];
+        int gsegn = LangSegItems(gseg);
+        RECT gsegR = RowSegRect(m, r, gseg, gsegn);
         DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
                               T(L"界面语言", L"Language"),
                               T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"),
-                              g_sHov == S_HIT_LANG_DROP, ctrlL);
-        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_langNamesEn[g_lang] : g_langNames[g_lang],
-                  g_dropLang, g_sHov == S_HIT_LANG_DROP);
+                              g_sHov == S_HIT_LANG_DROP, gsegR.left);
+        DrawSegmented(dc, m, gsegR, gseg, gsegn, g_lang);
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 按钮 4=Tab 切换小键盘
         RECT r = SettingsRowRect(m, 0);
@@ -3529,37 +3555,36 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         }
     } else if (g_sTab == 1) {
         RECT r = SettingsRowRect(m, 0);
-        int ctrlL = SettingsComboX(m, r);
+        const wchar_t* tseg[3];
+        int tsegn = ThemeSegItems(tseg);
+        RECT tsegR = RowSegRect(m, r, tseg, tsegn);
         DrawSettingRowContent(dc, m, r, HKICON_CONTRAST, NULL,
                               T(L"主题模式", L"Theme Mode"),
                               T(L"跟随系统，或固定使用深色、浅色主题", L"Follow Windows or use a fixed dark or light theme"),
-                              FALSE, ctrlL);
-        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_themeNamesEn[g_themeMode] : g_themeNames[g_themeMode],
-                  g_dropTheme, g_sHov == S_HIT_THEME_DROP);
+                              FALSE, tsegR.left);
+        DrawSegmented(dc, m, tsegR, tseg, tsegn, g_themeMode);
 
         r = SettingsRowRect(m, 1);
-        ctrlL = SettingsComboX(m, r);
-        int oi = OpacityIndex();
+        const wchar_t* oseg[6];
+        int osegn = OpacitySegItems(oseg);
+        RECT osegR = RowSegRect(m, r, oseg, osegn);
         DrawSettingRowContent(dc, m, r, HKICON_PANEL, NULL,
                               T(L"主界面透明度", L"Keyboard Opacity"),
-                              T(L"调整主界面的不透明度", L"Adjust the keyboard window opacity"),
-                              FALSE, ctrlL);
-        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_opacityNamesEn[oi] : g_opacityNames[oi],
-                  g_dropOpacity, g_sHov == S_HIT_OPACITY_DROP);
+                              T(L"调整不透明度", L"Adjust the window opacity"),
+                              FALSE, osegR.left);
+        DrawSegmented(dc, m, osegR, oseg, osegn, OpacityIndex());
 
         // 主题色相：可展开行（展开时行高 210，行内是分隔线 + 色板 + 滑轨 + HEX）
         BOOL customHue = !g_wallpaperAccent;
         r = SettingsRowRect(m, 2);
-        ctrlL = SettingsComboX(m, r);
+        const wchar_t* hseg[2];
+        int hsegn = HueModeSegItems(hseg);
+        RECT hsegR = RowSegRectTop(m, r, hseg, hsegn);
         DrawSettingRowContent(dc, m, r, HKICON_PALETTE, NULL,
                               T(L"主题色相", L"Theme Hue"),
                               T(L"一个色相统一调整面板、按键与强调色", L"One hue recolors the panel, keys and accent"),
-                              FALSE, ctrlL);
-        DrawCombo(dc, ctrlL, SettingsComboYTop(m, r), m.comboW, m.comboH,
-                  g_lang ? g_hlModeNamesEn[HlSel()] : g_hlModeNames[HlSel()],
-                  g_dropHl, g_sHov == S_HIT_HL_DROP);
+                              FALSE, hsegR.left);
+        DrawSegmented(dc, m, hsegR, hseg, hsegn, HlSel());
 
         if (customHue) {
             Fill(dc, r.left + (int)(20 * m.dpi), r.top + (int)(56 * m.dpi),
@@ -3761,9 +3786,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTOHIDE;
         }
 
-        // 整行命中：悬停高亮整行，点击任意处展开下拉
+        // 画框选择：只有控件本身是热区（行内其余位置不再触发切换）
         r = SettingsRowRect(m, closeRow);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_CLOSE_DROP;
+        { const wchar_t* it[2]; int n = CloseSegItems(it);
+          RECT sr = RowSegRect(m, r, it, n);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_CLOSE_DROP; }
 
         r = SettingsRowRect(m, closeRow + 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_REMEMBER;
@@ -3774,8 +3801,9 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
 
         r = SettingsRowRect(m, closeRow + 4);
-        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LANG_DROP;
+        { const wchar_t* it[2]; int n = LangSegItems(it);
+          RECT sr = RowSegRect(m, r, it, n);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LANG_DROP; }
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 按钮 4=Tab 切换小键盘
         RECT r;
@@ -3840,16 +3868,19 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
 
         r = SettingsRowRect(m, 0);
-        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_THEME_DROP;
+        { const wchar_t* it[3]; int n = ThemeSegItems(it);
+          RECT sr = RowSegRect(m, r, it, n);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_THEME_DROP; }
 
         r = SettingsRowRect(m, 1);
-        comboX = SettingsComboX(m, r); comboY = SettingsComboY(m, r);
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_OPACITY_DROP;
+        { const wchar_t* it[6]; int n = OpacitySegItems(it);
+          RECT sr = RowSegRect(m, r, it, n);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_OPACITY_DROP; }
 
         r = SettingsRowRect(m, 2);
-        comboX = SettingsComboX(m, r); comboY = SettingsComboYTop(m, r);
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_HL_DROP;
+        { const wchar_t* it[2]; int n = HueModeSegItems(it);
+          RECT sr = RowSegRectTop(m, r, it, n);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_HL_DROP; }
 
         if (!g_wallpaperAccent) {
             RECT input = SettingsHexRect(m, r);
@@ -4122,10 +4153,17 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         g_afAutoHide = !g_afAutoHide;
         IniSetInt(L"General", L"AutoHide", g_afAutoHide ? 1 : 0);
         break;
-    case S_HIT_CLOSE_DROP:
-        g_dropClose = !g_dropClose;
-        if (g_dropClose) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropCloseHov = -1; }
+    case S_HIT_CLOSE_DROP: {   // 画框选择：按点击的段直接应用
+        SettingsMetrics cm = GetSettingsMetrics(hWnd);
+        RECT cr = SettingsRowRect(cm, g_af ? 2 : 1);
+        const wchar_t* it[2]; int n = CloseSegItems(it);
+        int idx = RowSegIndex(cm, cr, it, n, x);
+        if (idx >= 0) {
+            g_closeToTray = (idx == 1);
+            if (g_rememberClose) SaveCloseSettings();
+        }
         break;
+    }
     case S_HIT_CLOSE_OPT0:
     case S_HIT_CLOSE_OPT1:
         g_closeToTray = (hit == S_HIT_CLOSE_OPT1);
@@ -4189,20 +4227,35 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         IniSetInt(L"General", L"ShiftSymbols", g_shiftSymbols ? 1 : 0);
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
         break;
-    case S_HIT_THEME_DROP:
-        g_dropTheme = !g_dropTheme;
-        if (g_dropTheme) { g_dropOpacity = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropThemeHov = -1; }
+    case S_HIT_THEME_DROP: {
+        SettingsMetrics tm = GetSettingsMetrics(hWnd);
+        RECT tr = SettingsRowRect(tm, 0);
+        const wchar_t* it[3]; int n = ThemeSegItems(it);
+        int idx = RowSegIndex(tm, tr, it, n, x);
+        if (idx >= 0 && idx != g_themeMode) { g_themeMode = idx; themeChanged = TRUE; }
         break;
+    }
     case S_HIT_THEME_OPT0:
     case S_HIT_THEME_OPT1:
     case S_HIT_THEME_OPT2:
         if (g_themeMode != hit - S_HIT_THEME_OPT0) { g_themeMode = hit - S_HIT_THEME_OPT0; themeChanged = TRUE; }
         g_dropTheme = FALSE;
         break;
-    case S_HIT_OPACITY_DROP:
-        g_dropOpacity = !g_dropOpacity;
-        if (g_dropOpacity) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropOpacityHov = -1; }
+    case S_HIT_OPACITY_DROP: {
+        SettingsMetrics om = GetSettingsMetrics(hWnd);
+        RECT orr = SettingsRowRect(om, 1);
+        const wchar_t* it[6]; int n = OpacitySegItems(it);
+        int idx = RowSegIndex(om, orr, it, n, x);
+        if (idx >= 0) {
+            g_mainOpacity = g_opacityValues[idx];
+            IniSetInt(L"Theme", L"Opacity", g_mainOpacity);
+            if (g_hWnd && IsWindow(g_hWnd)) {   // 立即应用透明度
+                ApplyWindowOpacity(g_hWnd, g_mainOpacity < 100);
+                RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+            }
+        }
         break;
+    }
     case S_HIT_OPACITY_OPT0:
     case S_HIT_OPACITY_OPT0 + 1:
     case S_HIT_OPACITY_OPT0 + 2:
@@ -4217,10 +4270,18 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
             RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
         }
         break;
-    case S_HIT_LANG_DROP:
-        g_dropLang = !g_dropLang;
-        if (g_dropLang) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLangHov = -1; }
+    case S_HIT_LANG_DROP: {
+        SettingsMetrics gm = GetSettingsMetrics(hWnd);
+        RECT gr = SettingsRowRect(gm, (g_af ? 2 : 1) + 4);
+        const wchar_t* it[2]; int n = LangSegItems(it);
+        int idx = RowSegIndex(gm, gr, it, n, x);
+        if (idx >= 0 && idx != g_lang) {
+            g_lang = idx;
+            IniSetInt(L"General", L"Language", g_lang);
+            if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);   // 主键盘文本立即切换
+        }
         break;
+    }
     case S_HIT_LANG_OPT0:
     case S_HIT_LANG_OPT1:
         g_lang = hit - S_HIT_LANG_OPT0;
@@ -4228,10 +4289,20 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         IniSetInt(L"General", L"Language", g_lang);
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);   // 主键盘文本立即切换
         break;
-    case S_HIT_HL_DROP:
-        g_dropHl = !g_dropHl;
-        if (g_dropHl) { g_dropTheme = FALSE; g_dropLayout = FALSE; g_dropLang = FALSE; g_dropClose = FALSE; g_dropHlHov = -1; }
+    case S_HIT_HL_DROP: {
+        SettingsMetrics hm = GetSettingsMetrics(hWnd);
+        RECT hr = SettingsRowRect(hm, 2);
+        const wchar_t* it[2]; int n = HueModeSegItems(it);
+        int idx = RowSegIndexTop(hm, hr, it, n, x);   // 色相行的控件在行顶部
+        if (idx >= 0) {
+            g_wallpaperAccent = (idx == 1);
+            if (g_wallpaperAccent) g_hlEditFocus = FALSE;
+            ApplyTheme();
+            SaveThemeConfig();
+            if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
+        }
         break;
+    }
     case S_HIT_HL_OPT0:
     case S_HIT_HL_OPT1:
         g_wallpaperAccent = (hit == S_HIT_HL_OPT1);

@@ -2755,21 +2755,22 @@ static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, i
     return above >= minY ? above : minY;
 }
 
+// 行悬停底色：铺满整行、左右直接贴到卡片边缘（不再内缩，否则会切到图标 tile），
+// 圆角取卡片同款半径 —— 首行/末行因此与卡片圆角正好嵌套，不会凸出到卡片外面。
+static void DrawSettingsRowHover(HDC dc, const SettingsMetrics& m, const RECT& row) {
+    int h = row.bottom - row.top;
+    int r = (int)(16 * m.dpi);
+    if (r > h / 2) r = h / 2;
+    DrawRoundRect(dc, row.left, row.top, row.right - row.left, h,
+                  C_REGULAR_HOV, C_REGULAR_HOV, r);
+}
+
 // 行内容：图标 tile + 两行文字块。ctrlLeft > 0 时文字块右侧让位给右对齐的控件
 static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& row,
                                   int iconId, const wchar_t* glyph,
                                   const wchar_t* title, const wchar_t* desc,
                                   BOOL hover, int ctrlLeft) {
-    if (hover) {
-        RECT h = row;
-        h.left  += (int)(6 * m.dpi);
-        h.right -= (int)(6 * m.dpi);
-        h.top   += (int)(2 * m.dpi);
-        h.bottom -= (int)(2 * m.dpi);
-        // C_HOVER 在白卡上几乎看不见，行悬停用 btn_regular_bg_hover 那档
-        DrawRoundRect(dc, h.left, h.top, h.right - h.left, h.bottom - h.top,
-                      C_REGULAR_HOV, C_REGULAR_HOV, (int)(10 * m.dpi));
-    }
+    if (hover) DrawSettingsRowHover(dc, m, row);
     int ty = row.top + SettingsRowPadY(m);
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
 
@@ -3116,18 +3117,44 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     return a;
 }
 
+// ===== 窗口高度跟随当前 tab 的内容 =====
+// 设置窗宽度固定，但各 tab 的内容高度差很多（常规 7 行 vs 关于两张卡）。
+// 高度按「内容底部 + 一个 margin」算：切 tab / 改行数后收一次边，
+// 短 tab 底部就不会留一大片空白。
+static int SettingsDesiredHeight(HWND hWnd) {
+    SettingsMetrics m = GetSettingsMetrics(hWnd);
+    int bottom;
+    if (g_sTab == 2) {
+        AboutLayout al = GetAboutLayout(m);
+        bottom = al.card2.bottom + (int)(18 * m.dpi) * 2;   // 版权行（18 间距 + 18 行高）
+    } else {
+        bottom = SettingsCardRect(m).bottom;
+    }
+    int want = bottom + m.margin;
+    int minH = (int)(300 * m.dpi);
+    if (want < minH) want = minH;
+    RECT work = {0};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int maxH = work.bottom - work.top;
+    if (maxH > 0 && want > maxH) want = maxH;
+    return want;
+}
+
+// 收到刚好包住内容（保持左上角不动，避免切 tab 时窗口左右乱跳）
+static void SettingsFitHeight(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd)) return;
+    int want = SettingsDesiredHeight(hWnd);
+    RECT rc;
+    if (!GetWindowRect(hWnd, &rc)) return;
+    if (rc.bottom - rc.top == want) return;
+    SetWindowPos(hWnd, NULL, 0, 0, rc.right - rc.left, want,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 // 链接行：整行可点（触摸场景下命中区必须够大），右侧 34×34 圆形 External 按钮
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
-    if (hover) {
-        RECT h = row;
-        h.left  += (int)(6 * m.dpi);
-        h.right -= (int)(6 * m.dpi);
-        h.top   += (int)(2 * m.dpi);
-        h.bottom -= (int)(2 * m.dpi);
-        DrawRoundRect(dc, h.left, h.top, h.right - h.left, h.bottom - h.top,
-                      C_REGULAR_HOV, C_REGULAR_HOV, (int)(10 * m.dpi));
-    }
+    if (hover) DrawSettingsRowHover(dc, m, row);
     int ty = row.top + m.rowPadY;
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, NULL);
 
@@ -4019,6 +4046,7 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
     }
     if (layoutChanged) ApplyKeyboardLayout(TRUE);       // 应用布局并按布局重置窗口大小
     if (keyRowsChanged) ApplyKeyboardLayout(FALSE);     // 仅重建键行，保持当前窗口大小
+    SettingsFitHeight(hWnd);                            // 行数可能变了（自动收起/布局/色相展开）：高度跟着收边
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE); // 设置页立即刷新
 }
 
@@ -4122,6 +4150,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_dropLang = FALSE;
         g_dropHl = FALSE;
         g_dropClose = FALSE;
+        SettingsFitHeight(hWnd);   // 各 tab 内容高度不同：切 tab 时把窗口收到刚好包住内容
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }
@@ -4337,6 +4366,7 @@ static void OpenSettingsTab(int tab) {
             ShowWindow(g_settingsHwnd, SW_SHOW);
         }
         SetForegroundWindow(g_settingsHwnd);
+        SettingsFitHeight(g_settingsHwnd);   // 可能是从菜单直接指定 tab 打开的，高度要跟着走
         InvalidateRect(g_settingsHwnd, NULL, TRUE);   // 切到指定 Tab 后刷新
         return;
     }
@@ -4349,6 +4379,15 @@ static void OpenSettingsTab(int tab) {
     g_settingsHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardSettings", T(L"设置", L"Settings"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_settingsHwnd) {
+        // 高度先按当前 tab 的内容收边，再按新高度重新垂直居中（否则会偏上）
+        SettingsFitHeight(g_settingsHwnd);
+        RECT rc;
+        if (GetWindowRect(g_settingsHwnd, &rc)) {
+            int nh = rc.bottom - rc.top;
+            int ny = work.top + ((work.bottom - work.top) - nh) / 2;
+            SetWindowPos(g_settingsHwnd, HWND_TOPMOST, rc.left, ny,
+                         rc.right - rc.left, nh, SWP_NOACTIVATE);
+        }
         // 先置为全透明，再显示并渐显（避免闪现一帧不透明内容）
         StartWindowFade(g_settingsHwnd, g_settingsFade, FALSE);
         ShowWindow(g_settingsHwnd, SW_SHOW);

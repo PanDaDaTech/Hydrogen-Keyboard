@@ -437,8 +437,9 @@ HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f18 = 0;   // 键面字体（单字重，见字体显示方案 v6）
-static HFONT g_sfBig = 0, g_sfHead = 0, g_sfRow = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
-static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
+static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
+static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
+static HANDLE g_fontReg = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
 
@@ -1107,6 +1108,11 @@ static void LoadEmbeddedFonts() {
     if (h && n > 0) {
         g_fontReg = h;
         g_fontReady = TRUE;
+        // 文字改走 GDI+ 绘制后，GDI+ 也得能看见这个内存字体（两边各自注册一次）
+        if (!g_gdipFonts) {
+            g_gdipFonts = new Gdiplus::PrivateFontCollection();
+            g_gdipFonts->AddMemoryFont(data, (INT)sz);
+        }
     }
 }
 // 创建 UI 字体。界面只有一个字面（MiSans Medium），族里**不存在** 700：
@@ -1125,16 +1131,17 @@ static HFONT MakeFont(double size) {
         DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
-// 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）。
-// 五个字号就是设置页的全部层级：20 大标题 / 13 面板标题 / 12 行主文本 /
-// 10.5 描述·Tab·按钮·分段 / 10 元信息。相邻层级差 1~1.5pt，再配上颜色分工。
+// 设置页五档：22 大标题 / 15 行主文本 / 12 控件标签 / 11 行描述 / 10 元信息。
+// 单字重下层级完全由「字号 + 颜色」承担，相邻档至少差 1pt。
+// 「控件标签」是独立一档：Tab、开关的「开/关」、分段、按钮和行描述原来挤在同一个 10.5pt 上，
+// 于是整页只剩三档、层级是平的。
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
-    g_sfBig  = MakeFont(20   * dpi);   // 页面大标题
-    g_sfHead = MakeFont(13   * dpi);   // 面板标题（原 11.5 粗体 —— 去粗体后 +1.5pt 补回来）
-    g_sfRow  = MakeFont(12   * dpi);   // 行主文本（原 10.5）
-    g_sfBase = MakeFont(10.5 * dpi);   // 行描述 / Tab / 按钮 / 分段 / 开关标签
-    g_sfMeta = MakeFont(10   * dpi);   // 版本号 / Copyright
+    g_sfBig  = MakeFont(22 * dpi);   // 页面大标题
+    g_sfRow  = MakeFont(15 * dpi);   // 行主文本
+    g_sfCtrl = MakeFont(12 * dpi);   // 控件标签：Tab / 开·关 / 分段 / 按钮
+    g_sfBase = MakeFont(11 * dpi);   // 行描述
+    g_sfMeta = MakeFont(10 * dpi);   // 版本号 / Copyright
 }
 
 static void RecreateFontsAndLayout() {
@@ -1158,10 +1165,10 @@ static void RecreateFontsAndLayout() {
 
     // 单字重：不再有 g_f14b / g_f16b / g_f18b（后者本来就是没人引用的死变量）。
     // 修饰键与普通键的区分交给底色 + 文字色（见 DrawKeyFace），与设置页 Tab 同一套逻辑。
-    g_f12 = MakeFont((int)(12 * finalFontScale));
-    g_f13 = MakeFont((int)(13 * finalFontScale));
-    g_f14 = MakeFont((int)(14 * finalFontScale));   // 主档
-    g_f18 = MakeFont((int)(18 * finalFontScale));   // 退格大箭头
+    g_f12 = MakeFont((int)(12 * finalFontScale + 0.5));   // 四舍五入，别让非整数缩放累积偏差
+    g_f13 = MakeFont((int)(13 * finalFontScale + 0.5));
+    g_f14 = MakeFont((int)(14 * finalFontScale + 0.5));   // 主档
+    g_f18 = MakeFont((int)(18 * finalFontScale + 0.5));   // 退格大箭头
 }
 
 static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
@@ -1240,30 +1247,18 @@ static void ApplyRoundedWindow(HWND hWnd, int logicalRadius) {
     SetWindowRgn(hWnd, NULL, TRUE);
 }
 
-static BOOL g_alphaPaintActive = FALSE;
-static RGBQUAD* g_alphaPaintBits = NULL;
-static int g_alphaPaintRowPixels = 0;
-static RECT g_alphaPaintRect = {0, 0, 0, 0};
-
+// 窗口离屏画布（双缓冲）。文字不再单独走蒙版合成：材质早已移除，目标就是不透明的
+// 32bpp DIB，直接用 GDI+ 画上去即可（见 DrawTextGp）。
 struct WindowPaintSurfaceLocal {
     HDC dc;
     HDC memory;
     HBITMAP bitmap;
     HBITMAP oldBitmap;
-    BOOL previousAlpha;
-    RGBQUAD* previousBits;
-    int previousRowPixels;
-    RECT previousRect;
 };
 
-// 所有窗口统一使用 32bpp 顶向下 DIB 画布：文字走统一的 alpha 混合路径，
-// 浅色 / 深色 / XP / Win11 的渲染观感完全一致——这是全平台一致性的基石，不要改成 GDI 直绘文字。
+// 所有窗口统一使用 32bpp 顶向下 DIB 画布（双缓冲）：浅色 / 深色 / XP / Win11 观感一致。
 static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, const RECT& rc) {
     WindowPaintSurfaceLocal surface = {};
-    surface.previousAlpha = g_alphaPaintActive;
-    surface.previousBits = g_alphaPaintBits;
-    surface.previousRowPixels = g_alphaPaintRowPixels;
-    surface.previousRect = g_alphaPaintRect;
     (void)hWnd;
 
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
@@ -1281,10 +1276,6 @@ static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, co
         if (surface.memory && surface.bitmap && bits) {
             surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
             surface.dc = surface.memory;
-            g_alphaPaintActive = TRUE;
-            g_alphaPaintBits = (RGBQUAD*)bits;
-            g_alphaPaintRowPixels = w;
-            g_alphaPaintRect = rc;
             return surface;
         }
         // DIB 创建失败：回退普通兼容位图（GDI 直绘文字）
@@ -1296,9 +1287,6 @@ static WindowPaintSurfaceLocal BeginWindowPaintSurface(HDC target, HWND hWnd, co
     surface.bitmap = CreateCompatibleBitmap(target, w, h);
     surface.oldBitmap = (HBITMAP)SelectObject(surface.memory, surface.bitmap);
     surface.dc = surface.memory;
-    g_alphaPaintActive = FALSE;
-    g_alphaPaintBits = NULL;
-    g_alphaPaintRowPixels = 0;
     return surface;
 }
 
@@ -1309,10 +1297,6 @@ static void EndWindowPaintSurface(WindowPaintSurfaceLocal* surface) {
         if (surface->bitmap) DeleteObject(surface->bitmap);
         DeleteDC(surface->memory);
     }
-    g_alphaPaintActive = surface->previousAlpha;
-    g_alphaPaintBits = surface->previousBits;
-    g_alphaPaintRowPixels = surface->previousRowPixels;
-    g_alphaPaintRect = surface->previousRect;
 }
 
 // 统一铺不透明面板底色（page-bg），全部内容都画在它上面
@@ -1354,100 +1338,54 @@ static void ApplyWindowOpacity(HWND hWnd, BOOL enable) {
     }
 }
 
-static BOOL DrawAlphaText(HDC dc, int x, int y, int w, int h,
-                          const wchar_t* text, HFONT font, DWORD color,
-                          Gdiplus::StringAlignment alignment, BOOL wrap = FALSE) {
-    if (!text || !font || w <= 0 || h <= 0) return FALSE;
-    if (!g_alphaPaintActive || !g_alphaPaintBits || g_alphaPaintRowPixels <= 0)
-        return FALSE;
+// ===== 统一文字绘制：GDI+ 无网格拟合抗锯齿 =====
+// GDI 的 TrueType 光栅器把笔画 snap 到整数像素，于是「字号连续变化、笔画粗细不连续」：
+// 实测竖画/em 在 13→14 DIP 骤降 22%，12 DIP 甚至比 13 更粗 —— 单字重下无法建立层级。
+// GDI+ 的 AntiAlias 不做网格拟合，笔画按 em 线性缩放（实测波动 ±5%）。
+// 从 HFONT 取 em 像素高：GDI 的 lfHeight 负值就是 em 高，与 GDI+ UnitPixel 同义。
+static float FontEmPx(HFONT f) {
+    LOGFONTW lf = {};
+    if (!f || !GetObjectW(f, sizeof(lf), &lf)) return 0.0f;
+    return (float)(lf.lfHeight < 0 ? -lf.lfHeight : lf.lfHeight);
+}
 
-    // 垂直方向多留一点余量：GDI 严格按给定矩形裁剪，而调用点传进来的 h 常常只够
-    // 「一行字的高度」，于是 g / y / q 这类带下降部的字母尾巴被切平（实机反馈的
-    // 「y g 显示异常」）。把蒙版上下各撑 pad，再整体上移 pad 合成 —— 视觉中心不变。
-    int pad = (int)(4 * GetSystemDpiScale());
-    if (pad < 2) pad = 2;
-    int mh = h + pad * 2;
+static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
+                       float emPx, DWORD color, BOOL center, BOOL wrap) {
+    if (!s || !s[0] || w <= 0 || h <= 0 || emPx <= 0.0f) return FALSE;
+    if (!g_gdipFonts) return FALSE;          // GDI+ 私有字体未就绪 → 调用方回退 GDI 直绘
 
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -mh;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    Gdiplus::Graphics g(dc);
+    // 高 DPI 用无 gridfit 的 AntiAlias（笔画线性、层级可预测）；
+    // 低 DPI（<150%）小字号太糊，退回带 gridfit 的 AntiAliasGridFit 保清晰。
+    g.SetTextRenderingHint(GetSystemDpiScale() >= 1.5
+        ? Gdiplus::TextRenderingHintAntiAlias
+        : Gdiplus::TextRenderingHintAntiAliasGridFit);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
-    void* rawMask = NULL;
-    HBITMAP maskBitmap = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &rawMask, NULL, 0);
-    if (!maskBitmap || !rawMask) {
-        if (maskBitmap) DeleteObject(maskBitmap);
-        return FALSE;
-    }
-    ZeroMemory(rawMask, (SIZE_T)w * (SIZE_T)mh * sizeof(RGBQUAD));
+    Gdiplus::FontFamily family(g_fontReady ? L"MiSans" : L"Microsoft YaHei", g_gdipFonts);
+    if (!family.IsAvailable()) return FALSE;
+    Gdiplus::Font font(&family, emPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    if (font.GetLastStatus() != Gdiplus::Ok) return FALSE;
 
-    HDC maskDc = CreateCompatibleDC(dc);
-    if (!maskDc) {
-        DeleteObject(maskBitmap);
-        return FALSE;
-    }
-    HBITMAP oldBitmap = (HBITMAP)SelectObject(maskDc, maskBitmap);
-    HFONT oldFont = (HFONT)SelectObject(maskDc, font);
-    SetBkMode(maskDc, TRANSPARENT);
-    SetTextColor(maskDc, RGB(255, 255, 255));
-    RECT maskRect = {0, 0, w, mh};
-    UINT flags = DT_NOPREFIX;
-    if (wrap) {
-        flags |= DT_WORDBREAK | DT_TOP;          // 多行：从顶部开始（DT_VCENTER 只对单行有效）
-    } else {
-        flags |= DT_VCENTER | DT_SINGLELINE;
-        flags |= alignment == Gdiplus::StringAlignmentCenter ? DT_CENTER : DT_LEFT;
-    }
-    int drawn = DrawTextW(maskDc, text, -1, &maskRect, flags);
+    Gdiplus::StringFormat fmt;
+    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoClip);   // 下降部不被裁
+    if (!wrap)
+        fmt.SetFormatFlags((Gdiplus::StringFormatFlags)(fmt.GetFormatFlags()
+                                                        | Gdiplus::StringFormatFlagsNoWrap));
+    fmt.SetAlignment(center ? Gdiplus::StringAlignmentCenter : Gdiplus::StringAlignmentNear);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
 
-    if (drawn > 0) {
-        RGBQUAD* mask = (RGBQUAD*)rawMask;
-        DWORD resolved = color;
-        int red = GetRValue(resolved);
-        int green = GetGValue(resolved);
-        int blue = GetBValue(resolved);
-        int dstX = x - g_alphaPaintRect.left;
-        int dstY = y - pad - g_alphaPaintRect.top;
-        int paintW = g_alphaPaintRect.right - g_alphaPaintRect.left;
-        int paintH = g_alphaPaintRect.bottom - g_alphaPaintRect.top;
-        if (paintW > g_alphaPaintRowPixels) paintW = g_alphaPaintRowPixels;
-
-        int startX = dstX < 0 ? -dstX : 0;
-        int startY = dstY < 0 ? -dstY : 0;
-        int endX = w;
-        int endY = mh;
-        if (dstX + endX > paintW) endX = paintW - dstX;
-        if (dstY + endY > paintH) endY = paintH - dstY;
-
-        for (int py = startY; py < endY; py++) {
-            RGBQUAD* srcRow = mask + py * w;
-            RGBQUAD* dstRow = g_alphaPaintBits + (dstY + py) * g_alphaPaintRowPixels;
-            for (int px = startX; px < endX; px++) {
-                BYTE alpha = srcRow[px].rgbBlue;
-                if (alpha == 0) continue;
-                RGBQUAD* dst = dstRow + dstX + px;
-                int inverse = 255 - alpha;
-                dst->rgbRed = (BYTE)((red * alpha + dst->rgbRed * inverse + 127) / 255);
-                dst->rgbGreen = (BYTE)((green * alpha + dst->rgbGreen * inverse + 127) / 255);
-                dst->rgbBlue = (BYTE)((blue * alpha + dst->rgbBlue * inverse + 127) / 255);
-                dst->rgbReserved = (BYTE)(alpha + (dst->rgbReserved * inverse + 127) / 255);
-            }
-        }
-    }
-
-    SelectObject(maskDc, oldFont);
-    SelectObject(maskDc, oldBitmap);
-    DeleteDC(maskDc);
-    DeleteObject(maskBitmap);
-    return drawn > 0;
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color),
+                                                  GetGValue(color), GetBValue(color)));
+    Gdiplus::RectF rc((Gdiplus::REAL)x, (Gdiplus::REAL)y, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
+    g.DrawString(s, -1, &font, rc, &fmt, &brush);
+    return TRUE;    // Graphics 析构时自动 Flush
 }
 
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
-    if (DrawAlphaText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentCenter)) return;
-    RECT r = {x, y, x + w, y + h};
+    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, TRUE, FALSE)) return;
+    RECT r = {x, y, x + w, y + h};        // 回退：GDI+ 未就绪 / 字体不可用
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, c);
@@ -1463,8 +1401,8 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     // 副符号（键上半部）
     buf[0] = shiftCh;
     RECT rt = {x, y, x + w, y + h / 2};
-    if (!DrawAlphaText(dc, rt.left, rt.top, rt.right - rt.left, rt.bottom - rt.top,
-                          buf, fShift, shiftC, Gdiplus::StringAlignmentCenter)) {
+    if (!DrawTextGp(dc, rt.left, rt.top, rt.right - rt.left, rt.bottom - rt.top,
+                          buf, FontEmPx(fShift), shiftC, TRUE, FALSE)) {
         SelectObject(dc, fShift);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, shiftC);
@@ -1474,8 +1412,8 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     // 主字符（键下半部）
     buf[0] = baseCh;
     RECT rb = {x, y + h / 2, x + w, y + h};
-    if (!DrawAlphaText(dc, rb.left, rb.top, rb.right - rb.left, rb.bottom - rb.top,
-                          buf, fBase, baseC, Gdiplus::StringAlignmentCenter)) {
+    if (!DrawTextGp(dc, rb.left, rb.top, rb.right - rb.left, rb.bottom - rb.top,
+                          buf, FontEmPx(fBase), baseC, TRUE, FALSE)) {
         SelectObject(dc, fBase);
         SetTextColor(dc, baseC);
         DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1587,7 +1525,7 @@ static void DrawIconTile(HDC dc, int x, int y, int size, int iconSize, int iconI
         DrawHkIcon(dc, (float)(x + pad), (float)(y + pad), (float)iconSize,
                    HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
     } else if (text) {
-        DrawTextC(dc, x, y, size, size, text, g_sfBase, C_BTN_CONTENT);
+        DrawTextC(dc, x, y, size, size, text, g_sfCtrl, C_BTN_CONTENT);
     }
 }
 
@@ -2371,25 +2309,9 @@ static void RenderKbFrameInto(HDC refDc, int w, int h) {
     if (!mem) { DeleteObject(bmp); return; }
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
-    // 将 DrawAlphaText 的 alpha 合成目标指向缓存 DIB（与画布路径一致）
-    BOOL prevAlpha = g_alphaPaintActive;
-    RGBQUAD* prevBits = g_alphaPaintBits;
-    int prevRow = g_alphaPaintRowPixels;
-    RECT prevRect = g_alphaPaintRect;
-    g_alphaPaintActive = TRUE;
-    g_alphaPaintBits = (RGBQUAD*)bits;
-    g_alphaPaintRowPixels = w;
-    RECT rc = {0, 0, w, h};
-    g_alphaPaintRect = rc;
-
     Fill(mem, 0, 0, w, h, C_BG);
     DrawHeader(mem);
     DrawKeys(mem);
-
-    g_alphaPaintActive = prevAlpha;
-    g_alphaPaintBits = prevBits;
-    g_alphaPaintRowPixels = prevRow;
-    g_alphaPaintRect = prevRect;
 
     SelectObject(mem, old);
     DeleteDC(mem);
@@ -2735,8 +2657,8 @@ static BOOL g_switchAnimTo = FALSE;
 
 static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c,
                       BOOL wrap = FALSE) {
-    if (DrawAlphaText(dc, x, y, w, h, s, f, c, Gdiplus::StringAlignmentNear, wrap)) return;
-    RECT r = {x, y, x + w, y + h};
+    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, FALSE, wrap)) return;
+    RECT r = {x, y, x + w, y + h};        // 回退：GDI+ 未就绪 / 字体不可用
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, c);
@@ -2955,12 +2877,12 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     int rightLimit = (ctrlLeft > 0) ? ctrlLeft - (int)(12 * m.dpi) : row.right - (int)(20 * m.dpi);
     int tw = rightLimit - tx;
     if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
-    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sfHead, C_WHITE);
+    DrawTextL(dc, tx, ty, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0]) {
         if (descWrap)
-            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
+            DrawTextL(dc, tx, ty + (int)(26 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
         else
-            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
+            DrawTextL(dc, tx, ty + (int)(26 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
     }
 }
 
@@ -2975,7 +2897,7 @@ static void SettingsTabLabels(const wchar_t* out[4]) {
 static const int k_settingsTabHits[4] = {S_HIT_TAB0, S_HIT_TABL, S_HIT_TAB1, S_HIT_TAB2};
 
 static int MeasureTabWidth(HDC dc, const wchar_t* label, double dpi) {
-    return MeasureTextW(dc, label, g_sfBase) + (int)(4 * dpi);
+    return MeasureTextW(dc, label, g_sfCtrl) + (int)(4 * dpi);
 }
 
 // 返回每个 tab 的矩形（顺序：常规 / 布局 / 主题 / 关于）
@@ -3017,7 +2939,7 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
 static int SegmentedWidth(const SettingsMetrics& m, const wchar_t** items, int count) {
     HDC dc = GetDC(0);
     int w = (int)(6 * m.dpi);   // 轨道左右 padding 3
-    for (int i = 0; i < count; i++) w += MeasureTextW(dc, items[i], g_sfBase) + (int)(36 * m.dpi);
+    for (int i = 0; i < count; i++) w += MeasureTextW(dc, items[i], g_sfCtrl) + (int)(36 * m.dpi);
     ReleaseDC(0, dc);
     return w;
 }
@@ -3030,11 +2952,11 @@ static void DrawSegmented(HDC dc, const SettingsMetrics& m, const RECT& r,
     int x = r.left + pad;
     int h = (r.bottom - r.top) - pad * 2;
     for (int i = 0; i < count; i++) {
-        int w = MeasureTextW(dc, items[i], g_sfBase) + (int)(36 * m.dpi);
+        int w = MeasureTextW(dc, items[i], g_sfCtrl) + (int)(36 * m.dpi);
         if (i == sel) {
             DrawRoundRect(dc, x, r.top + pad, w, h, C_KEY, C_KEY, (int)(8 * m.dpi));
         }
-        DrawTextC(dc, x, r.top + pad, w, h, items[i], g_sfBase, (i == sel) ? C_BTN_CONTENT : C_DIM);
+        DrawTextC(dc, x, r.top + pad, w, h, items[i], g_sfCtrl, (i == sel) ? C_BTN_CONTENT : C_DIM);
         x += w;
     }
 }
@@ -3047,7 +2969,7 @@ static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
     int cx = r.left + pad;
     int hit = -1;
     for (int i = 0; i < count; i++) {
-        int w = MeasureTextW(dc, items[i], g_sfBase) + (int)(36 * m.dpi);
+        int w = MeasureTextW(dc, items[i], g_sfCtrl) + (int)(36 * m.dpi);
         if (x >= cx && x < cx + w) { hit = i; break; }
         cx += w;
     }
@@ -3192,7 +3114,7 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
     int y = row.top + (row.bottom - row.top - m.switchH) / 2;
     DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), row.bottom - row.top,
-              on ? T(L"开", L"On") : T(L"关", L"Off"), g_sfBase, C_WHITE);
+              on ? T(L"开", L"On") : T(L"关", L"Off"), g_sfCtrl, C_WHITE);
     double value = on ? 1.0 : 0.0;
     if (g_switchAnimHit == hit && !g_settingsMoving) {
         double t = (double)(QpcNowMs() - g_switchAnimStart) / 180.0;
@@ -3290,7 +3212,7 @@ static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t*
             DrawRoundRectAlpha(dc, x + (int)(8 * dpi), cy - barH / 2, barW, barH,
                                C_HOT, C_HOT, barW / 2, 255, 255);
         }
-        DrawTextL(dc, x + (int)(17 * dpi), iy, w - (int)(24 * dpi), itemH, items[i], g_sfBase, C_WHITE);
+        DrawTextL(dc, x + (int)(17 * dpi), iy, w - (int)(24 * dpi), itemH, items[i], g_sfCtrl, C_WHITE);
     }
 }
 
@@ -3417,7 +3339,7 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
 
     int tx = SettingsRowTextX(m);
     int tw = bx - (int)(12 * m.dpi) - tx;
-    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sfHead, C_WHITE);
+    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0])
         DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
 }
@@ -4732,7 +4654,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int hdr = (int)(36 * dpi);
     (void)hWnd;
     // 标题区不再铺独立底色，与窗口背景/材质一体化
-    DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sfBase, C_WHITE);
+    DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sfCtrl, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     // 与设置页 / 主键盘标题栏一致：平时不铺底，悬停才给一层 btn_regular_bg_hover
@@ -4749,23 +4671,23 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int rowH = (int)(24 * dpi);
     DrawTextL(dc, x0, y, cw, (int)(20 * dpi), T(L"请选择关闭方式：", L"Choose how to close:"), g_sfBase, C_DIM); y += (int)(22 * dpi);
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0, C_BG);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sfBase, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sfCtrl, C_WHITE);
     y += rowH;
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1, C_BG);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sfBase, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sfCtrl, C_WHITE);
     y += rowH + (int)(4 * dpi);
     int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
     int swX = x0 + cw - swW;
     DrawSwitch(dc, swX, y + (rowH - swH) / 2, swW, swH, g_pRemember);
-    DrawTextL(dc, x0, y, (swX - 12) - x0, rowH, T(L"记住我的选择", L"Remember my choice"), g_sfBase, C_WHITE);
+    DrawTextL(dc, x0, y, (swX - 12) - x0, rowH, T(L"记住我的选择", L"Remember my choice"), g_sfCtrl, C_WHITE);
     y += rowH + (int)(8 * dpi);
     int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sfBase, C_ON_PRIMARY);
+    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sfCtrl, C_ON_PRIMARY);
     DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sfBase, C_WHITE);
+    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sfCtrl, C_WHITE);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {
@@ -5590,7 +5512,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             g_tray = FALSE;
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14); DeleteObject(g_f18);
-        DeleteObject(g_sfBig); DeleteObject(g_sfHead); DeleteObject(g_sfRow);
+        DeleteObject(g_sfBig); DeleteObject(g_sfRow); DeleteObject(g_sfCtrl);
         DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);
         return 0;
@@ -5748,6 +5670,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         DispatchMessage(&msg);
     }
     if (g_fontReg) RemoveFontMemResourceEx(g_fontReg);
+    if (g_gdipFonts) { delete g_gdipFonts; g_gdipFonts = NULL; }
     if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;

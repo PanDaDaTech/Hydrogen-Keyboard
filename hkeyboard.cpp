@@ -437,8 +437,7 @@ HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
-static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
-static HANDLE g_fontRegBold = 0;
+static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
 
@@ -978,56 +977,36 @@ static void BuildKeys() {
     }
 }
 
-// 注册内嵌字体（MiSans 精简版）到当前进程；失败则回退系统字体
+// 注册内嵌字体（MiSans Medium 精简子集，单一字面）到当前进程；失败则回退系统字体
 static void LoadEmbeddedFonts() {
-    struct { int id; HANDLE* slot; } fonts[2] = {
-        { IDR_FONT_REGULAR, &g_fontRegRegular },
-        { IDR_FONT_BOLD,    &g_fontRegBold },
-    };
-    for (int i = 0; i < 2; i++) {
-        HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), MAKEINTRESOURCEW(10));  // RT_RCDATA
-        if (!hr) continue;
-        HGLOBAL hg = LoadResource(g_hInst, hr);
-        if (!hg) continue;
-        void* data = LockResource(hg);
-        DWORD sz = SizeofResource(g_hInst, hr);
-        if (!data || sz == 0) continue;
-        DWORD n = 0;
-        HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
-        if (h && n > 0) {
-            *fonts[i].slot = h;
-            g_fontReady = TRUE;
-        }
+    HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(IDR_FONT), MAKEINTRESOURCEW(10));  // RT_RCDATA
+    if (!hr) return;
+    HGLOBAL hg = LoadResource(g_hInst, hr);
+    if (!hg) return;
+    void* data = LockResource(hg);
+    DWORD sz = SizeofResource(g_hInst, hr);
+    if (!data || sz == 0) return;
+    DWORD n = 0;
+    HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
+    if (h && n > 0) {
+        g_fontReg = h;
+        g_fontReady = TRUE;
     }
 }
-// 创建 UI 字体。粗体请求后用 GetTextMetrics 校验实际匹配到的字重：
-// 内嵌 MiSans Bold（或系统安装版的 Bold 字面）可用时得到真粗体；
-// 只匹配到 Regular 字面时退回 FW_NORMAL，避免 GDI 仿真加粗产生的重影粗体。
+// 创建 UI 字体。内嵌字体只有 MiSans Medium 一个字面（族名 MiSans，字重 500）：
+// 请求 FW_BOLD 时 GDI 会做**仿真加粗**（实测同一字号下 tmWeight 由 500 报成 700、
+// 笔画明显变粗），所以「该粗的地方」仍然是粗的。
+// ⛔ 不要再加「tmWeight < 550 就退回 FW_NORMAL」那种回退 —— 内嵌字体是 Medium，
+// 一退回就是全篇没有粗体（曾经这么写过，正是「粗体该粗的必须粗」要防的坑）。
 static HFONT MakeFont(double size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
     const wchar_t* face = g_fontReady ? L"MiSans" : L"Microsoft YaHei";
-    HFONT f = CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
+    return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, face);
-    if (bold) {
-        HDC dc = GetDC(0);
-        HFONT of = (HFONT)SelectObject(dc, f);
-        TEXTMETRICW tm;
-        BOOL ok = GetTextMetricsW(dc, &tm);
-        SelectObject(dc, of);
-        ReleaseDC(0, dc);
-        if (!ok || tm.tmWeight < 550) {   // 实际匹配到 Regular 字面：放弃仿真加粗
-            DeleteObject(f);
-            f = CreateFontW(h, 0, 0, 0, FW_NORMAL,
-                FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, face);
-        }
-    }
-    return f;
 }
 
 // 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
@@ -5342,7 +5321,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     DetectWinVersion();
 
     InitGdiPlus();       // 初始化 GDI+ （抗锯齿圆形绘图）
-    LoadEmbeddedFonts();   // 注册内嵌字体（MiSans 精简版），失败自动回退系统字体
+    LoadEmbeddedFonts();   // 注册内嵌字体（MiSans Medium 精简子集），失败自动回退系统字体
     InitFixedFonts();      // 设置/关闭窗口固定字号字体
 
     BOOL fShow   = (strstr(cmd, "-show") != NULL);
@@ -5440,8 +5419,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
-    if (g_fontRegBold) RemoveFontMemResourceEx(g_fontRegBold);
+    if (g_fontReg) RemoveFontMemResourceEx(g_fontReg);
     if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;

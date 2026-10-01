@@ -1484,30 +1484,31 @@ static const HkIconDef* KeyIconFor(const KeyDef* k) {
 
 // 键面标签的图标形态；返回 FALSE 表示该键不参与图标化（调用方继续走文字路径）。
 // 颜色只有 textC 一个来源，所以「普通/修饰/按下/强调」四态与深色主题都自动跟随，零分支。
+// 注意：局部变量不要叫 small / pure —— <windows.h> 的 rpcndr.h 里有 `#define small char`。
 static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, DWORD color) {
     if (g_keyIconStyle == 0) return FALSE;
     const HkIconDef* ic = KeyIconFor(k);
     if (!ic) return FALSE;
 
     double dpi = GetSystemDpiScale();
-    int pure  = (int)(20 * dpi);   // 纯图标
-    int small = (int)(18 * dpi);   // 图标+文字里的图标
-    int gap   = (int)(6 * dpi);
+    int iconOnly   = (int)(20 * dpi);   // 纯图标
+    int iconInline = (int)(18 * dpi);   // 图标+文字里的图标
+    int gap        = (int)(6 * dpi);
 
     // 「图标+文字」是尽力而为：放不下就降级为纯图标，绝不允许压边
     if (g_keyIconStyle == 2 && text && text[0] && k->w >= (int)(40 * dpi)) {
         int tw = MeasureTextW(dc, text, f);
-        if (small + gap + tw <= k->w - (int)(16 * dpi)) {
-            int total = small + gap + tw;
+        if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
+            int total = iconInline + gap + tw;
             int x = k->x + (k->w - total) / 2;
-            DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - small) / 2), (float)small,
+            DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
                        *ic, color, color);
-            DrawTextC(dc, x + small + gap, k->y, tw + 4, k->h, text, f, color);
+            DrawTextC(dc, x + iconInline + gap, k->y, tw + 4, k->h, text, f, color);
             return TRUE;
         }
     }
-    DrawHkIcon(dc, (float)(k->x + (k->w - pure) / 2), (float)(k->y + (k->h - pure) / 2),
-               (float)pure, *ic, color, color);
+    DrawHkIcon(dc, (float)(k->x + (k->w - iconOnly) / 2), (float)(k->y + (k->h - iconOnly) / 2),
+               (float)iconOnly, *ic, color, color);
     return TRUE;
 }
 

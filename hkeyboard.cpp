@@ -435,7 +435,7 @@ BOOL        g_tray = FALSE;
 HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
-HFONT       g_f12 = 0, g_f13 = 0, g_f13b = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
+HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌字体）
 static HANDLE g_fontRegBold = 0;
@@ -1043,7 +1043,6 @@ static void InitFixedFonts() {
 static void RecreateFontsAndLayout() {
     if (g_f12) DeleteObject(g_f12);
     if (g_f13) DeleteObject(g_f13);
-    if (g_f13b) DeleteObject(g_f13b);
     if (g_f14) DeleteObject(g_f14);
     if (g_f14b) DeleteObject(g_f14b);
     if (g_f16b) DeleteObject(g_f16b);
@@ -1058,7 +1057,6 @@ static void RecreateFontsAndLayout() {
 
     g_f12  = MakeFont((int)(12 * finalFontScale), 0);
     g_f13  = MakeFont((int)(13 * finalFontScale), 0);
-    g_f13b = MakeFont((int)(13 * finalFontScale), 1);
     g_f14  = MakeFont((int)(14 * finalFontScale), 0);
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
@@ -1486,7 +1484,7 @@ static const HkIconDef* KeyIconFor(const KeyDef* k) {
 }
 
 // 键面标签的图标形态；返回 FALSE 表示该键不参与图标化（调用方继续走文字路径）。
-// 颜色只有 textC 一个来源，所以「普通/修饰/按下/强调」四态与深色主题都自动跟随，零分支。
+// 颜色只有 textC 一个来源，所以「普通/修饰/按下」三态与深色主题都自动跟随，零分支。
 // 注意：局部变量不要叫 small / pure —— <windows.h> 的 rpcndr.h 里有 `#define small char`。
 static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, DWORD color) {
     if (g_keyIconStyle == 0) return FALSE;
@@ -2087,7 +2085,6 @@ static void DrawKeys(HDC dc) {
         BOOL hover = (i == g_hk);
 
         BOOL isDomain = (k->vk >= 0x200 && k->vk <= 0x205);   // 网址后缀键
-        BOOL isAccent = (k->vk == 0x0D);                      // Enter / 确认键（强调键）
         // 修饰与功能键：Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等
         BOOL isMod = FALSE;
         if (!isDomain) {
@@ -2100,10 +2097,10 @@ static void DrawKeys(HDC dc) {
 
         // 键帽状态机：底色 / 轮廓 / 文字三路同时变（Ethereal 的按钮配方）。
         // 触摸没有 hover 的预览语义，按下即直接给出「按下」态，无需逐帧插值。
+        // Enter（K_SPECIAL）与退格、Tab、Shift 同配方：不再给它主色实底——
+        // 实底在触摸键盘上会被当成「已经按下了」，与真正的按下态撞车。
         DWORD bg, outline, textC;
-        if (isAccent) {
-            bg = C_HOT; outline = C_HOT; textC = C_ON_PRIMARY;
-        } else if (active || pressed) {
+        if (active || pressed) {
             bg = C_REGULAR_ACT; outline = C_BORDER_HOVER; textC = C_WHITE;
         } else if (isPlain) {
             bg = hover ? C_REGULAR_HOV : C_PLAIN;
@@ -2123,7 +2120,6 @@ static void DrawKeys(HDC dc) {
         // 修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体
         HFONT f = (isMod || k->type == K_HIDE) ? g_f14b : g_f14;
         if (k->vk == 0x08) f = g_f18b;   // 退格：大号粗体箭头
-        if (k->vk == 0x0D) f = g_f13b;   // Enter：强调键
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -5286,7 +5282,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             g_tray = FALSE;
         }
-        DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f13b); DeleteObject(g_f14);
+        DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
         DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
         PostQuitMessage(0);

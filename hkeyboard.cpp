@@ -1402,9 +1402,11 @@ static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
     Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color),
                                                   GetGValue(color), GetBValue(color)));
     Gdiplus::RectF rc((Gdiplus::REAL)x, (Gdiplus::REAL)y, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
-    // 单行垂直居中时补偿「行盒中心 vs 墨迹中心」的差（见 TextInkShiftPx）。
+    // 垂直居中时补偿「行盒中心 vs 墨迹中心」的差（见 TextInkShiftPx）。
     // 不做这一步，所有居中文字都会整体偏高 1~3px；和图标并排时最刺眼。
-    if (!wrap) rc.Y += (Gdiplus::REAL)TextInkShiftPx(emPx, s);
+    // 折行文本同样要补：首行的上升部与末行的下降部一样没占满行盒，偏移是同一个量
+    // （唯一的折行调用点是设置行的长描述，补上它才与不折行的描述同高）。
+    rc.Y += (Gdiplus::REAL)TextInkShiftPx(emPx, s);
     g.DrawString(s, -1, &font, rc, &fmt, &brush);
     return TRUE;    // Graphics 析构时自动 Flush
 }
@@ -2895,11 +2897,23 @@ static int SettingsComboX(const SettingsMetrics& m, const RECT& row) {
     return row.right - (int)(20 * m.dpi) - m.comboW;
 }
 
-static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {
-    return row.top + (row.bottom - row.top - m.comboH) / 2;
+// 行的「头部」高度 = 12 + 40 + 12 DIP。图标 tile、文字块、行内控件（开关 / 分段 / 下拉）
+// 全都只在这段里居中，**行因为描述折行而变高时不跟着变**。
+// 布局页的「小键盘按钮」「Tab 切换小键盘」两行描述要占两行，整行高 80 DIP；控件若按
+// 整行居中，就会比 tile 与文字块低 (80-64)/2 = 8 DIP（实机实测 8.3 DIP）。
+// 主题页的色相行是可展开行（210 DIP），同理。
+static int SettingsRowHeadH(const SettingsMetrics& m, const RECT& row) {
+    int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
+    int rowH = row.bottom - row.top;
+    return headH > rowH ? rowH : headH;
 }
 
-// 展开行（主题色相编辑器）里的下拉不居中，而是与标题对齐
+static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {
+    return row.top + (SettingsRowHeadH(m, row) - m.comboH) / 2;
+}
+
+// 与 SettingsComboY 等价：头部高 = rowPadY*2 + comboH，在头部里居中后的偏移正好是 rowPadY。
+// 色相行历史上单独走过一个「与标题对齐」的分支，保留这个名字表达意图。
 static int SettingsComboYTop(const SettingsMetrics& m, const RECT& row) {
     return row.top + m.rowPadY;
 }
@@ -2927,12 +2941,9 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
                                   BOOL hover, int ctrlLeft, BOOL descWrap = FALSE) {
     if (hover) DrawSettingsRowHover(dc, m, row);
 
-    // 图标 tile 在行的「头部」里垂直居中：行高 64 DIP 而 tile 只有 30，原来直接顶在上内边距
-    // 12 DIP 处，比文字块的中心高约 5 DIP，看着就是"图标歪了"。展开行（主题色相）只按头部
-    // 那一段居中，不跟着整行跑到中间去。
-    int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
-    int rowH = row.bottom - row.top;
-    if (headH > rowH) headH = rowH;
+    // 图标 tile 与文字块都按行的「头部」居中（见 SettingsRowHeadH）：行因为描述折行
+    // 变高时头部不变，二者仍中心对中心。展开行（主题色相）也走同一条规则，不跟着整行跑。
+    int headH = SettingsRowHeadH(m, row);
     int ty = row.top + (headH - m.tileSize) / 2;
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
 
@@ -2941,20 +2952,35 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     int tw = rightLimit - tx;
     if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
 
+    // 兜底：右侧控件特别宽时文本列会被挤到画不下标题，GDI+ 在 NoWrap 下会把标题右侧
+    // 整段裁掉（主题页「主界面透明度」就曾被裁成「主界面透」）。真的放不下时，允许标题
+    // 一直画到控件左缘为止 —— 只吃掉那 12 DIP 的行内间距，不压住控件本身。
+    // 宁可标题与控件贴在一起，也不要出现半截标题。
+    int needTitle = MeasureTextW(dc, title, g_sfRow);
+    if (ctrlLeft > 0 && tw < needTitle) {
+        int hard = ctrlLeft - tx;
+        if (hard > tw) tw = hard;
+    }
+
     // 文字块必须与 tile「中心对中心」。tile 30 DIP、文字块 42 DIP，**共用同一个 top 是不行的**：
     // 那样 tile 中心会比文字块中心高 6 DIP（上一版就是这样，实机上看着图标偏低）。
     // 文字块内两行盒的中心分别落在 块顶+10dpi（标题盒 20）与 块顶+26dpi+8dpi（描述盒 16）处，
     // 于是块中心 = 块顶 + 22dpi。让块中心对齐 tile 中心，反解出块顶。
+    // 这个 22dpi 与描述折不折行**无关**：折行时用「盒顶上移 8 DIP、盒高 32 DIP」的画法，
+    // 让描述第一行仍落在 块顶+34dpi（见下），块中心因此不变。
     // （文字自身还有「行盒中心 vs 墨迹中心」的补偿，已在 DrawTextGp 里统一做掉，
     //   所以这里直接按盒中心算即可，不需要再叠一次偏移。）
-    int descBoxH = descWrap ? (int)(32 * m.dpi) : (int)(16 * m.dpi);
-    int textMid = ((int)(20 * m.dpi) / 2 + (int)(26 * m.dpi) + descBoxH / 2) / 2;
+    int textMid = ((int)(20 * m.dpi) / 2 + (int)(26 * m.dpi) + (int)(16 * m.dpi) / 2) / 2;
     int tyText = ty + m.tileSize / 2 - textMid;
 
     DrawTextL(dc, tx, tyText, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0]) {
         if (descWrap)
-            DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
+            // 盒顶从 26 上移到 18 DIP、盒高保持 32 DIP：单行时描述墨迹中心仍是 块顶+34dpi，
+            // 与不折行的行完全同高；真折成两行时第二行自然往下走（GDI+ 侧开了 NoClip 不裁）。
+            // 原先直接用「盒顶 26 + 高 32」，单行也会被居中到 块顶+42dpi —— 于是同一页里
+            // 「小键盘按钮」行的标题↔描述间距比上面几行大 8 DIP（实机肉眼可见，实测 +14px）。
+            DrawTextL(dc, tx, tyText + (int)(18 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
         else
             DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
     }
@@ -3010,10 +3036,23 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
 
 // ===== 分段控件（三选一）：轨道 C_REGULAR + 选中段 C_KEY/C_BTN_CONTENT =====
 // 选中段文字用 btn_content 而不是 primary：#53A3F2 在白卡上只有 2.66:1。
+
+// 单个分段的宽度 = 文字「布局宽度」+ 左右各 14 DIP 内边距。
+// 必须用 advance（MeasureTextAdvW）而不是 DrawString 的容纳宽度（MeasureTextW）：
+// 容纳宽度两侧各含约 0.2em 的绘制安全边距，把它当成设计留白加进去，每段会凭空宽出约
+// 10px（em 26px 时）。主题页「主界面透明度」那一行的分段控件有 6 段，多出来的宽度把
+// 左侧文本列挤到只剩 142px，而标题「主界面透明度」需要 174px —— 于是被裁成「主界面透」。
+// 段宽只喂给绘制与命中两条路径（三处共用本函数），且恒大于容纳宽度，不会造成段内文字被裁。
+static int SegmentedItemW(HDC dc, const wchar_t* item, double dpi) {
+    int adv = MeasureTextAdvW(dc, item, g_sfCtrl);
+    if (adv <= 0) adv = MeasureTextW(dc, item, g_sfCtrl);   // GDI+ 未就绪时的回退
+    return adv + (int)(28 * dpi);
+}
+
 static int SegmentedWidth(const SettingsMetrics& m, const wchar_t** items, int count) {
     HDC dc = GetDC(0);
     int w = (int)(6 * m.dpi);   // 轨道左右 padding 3
-    for (int i = 0; i < count; i++) w += MeasureTextW(dc, items[i], g_sfCtrl) + (int)(36 * m.dpi);
+    for (int i = 0; i < count; i++) w += SegmentedItemW(dc, items[i], m.dpi);
     ReleaseDC(0, dc);
     return w;
 }
@@ -3026,7 +3065,7 @@ static void DrawSegmented(HDC dc, const SettingsMetrics& m, const RECT& r,
     int x = r.left + pad;
     int h = (r.bottom - r.top) - pad * 2;
     for (int i = 0; i < count; i++) {
-        int w = MeasureTextW(dc, items[i], g_sfCtrl) + (int)(36 * m.dpi);
+        int w = SegmentedItemW(dc, items[i], m.dpi);
         if (i == sel) {
             DrawRoundRect(dc, x, r.top + pad, w, h, C_KEY, C_KEY, (int)(8 * m.dpi));
         }
@@ -3043,7 +3082,7 @@ static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
     int cx = r.left + pad;
     int hit = -1;
     for (int i = 0; i < count; i++) {
-        int w = MeasureTextW(dc, items[i], g_sfCtrl) + (int)(36 * m.dpi);
+        int w = SegmentedItemW(dc, items[i], m.dpi);
         if (x >= cx && x < cx + w) { hit = i; break; }
         cx += w;
     }
@@ -3186,8 +3225,11 @@ static void BeginSwitchAnimation(HWND hWnd, int hit, BOOL from, BOOL to) {
 
 static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL on, int hit) {
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
-    int y = row.top + (row.bottom - row.top - m.switchH) / 2;
-    DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), row.bottom - row.top,
+    // 开关与「开/关」文字跟 tile / 文字块用同一条基准（行的头部），
+    // 不按整行居中 —— 否则描述折行的那一行里，开关会比标题低 8 DIP。
+    int headH = SettingsRowHeadH(m, row);
+    int y = row.top + (headH - m.switchH) / 2;
+    DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), headH,
               on ? T(L"开", L"On") : T(L"关", L"Off"), g_sfCtrl, C_WHITE);
     double value = on ? 1.0 : 0.0;
     if (g_switchAnimHit == hit && !g_settingsMoving) {
@@ -3366,14 +3408,13 @@ static void SettingsFitHeight(HWND hWnd) {
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
     if (hover) DrawSettingsRowHover(dc, m, row);
-    int headH = m.rowPadY * 2 + (int)(40 * m.dpi), rowH = row.bottom - row.top;
-    if (headH > rowH) headH = rowH;
+    int headH = SettingsRowHeadH(m, row);
     int ty = row.top + (headH - m.tileSize) / 2;   // 与设置页行同一条居中规则
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, NULL);
 
     int btn = (int)(34 * m.dpi);
     int bx = row.right - (int)(20 * m.dpi) - btn;
-    int by = row.top + (row.bottom - row.top - btn) / 2;
+    int by = row.top + (headH - btn) / 2;          // 外链按钮同用头部基准，别跟整行跑
     DrawRoundRect(dc, bx, by, btn, btn, hover ? C_REGULAR_HOV : C_REGULAR,
                   hover ? C_REGULAR_HOV : C_REGULAR, btn / 2);
     int isz = (int)(17 * m.dpi);

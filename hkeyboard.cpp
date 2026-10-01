@@ -2876,7 +2876,14 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
                                   const wchar_t* title, const wchar_t* desc,
                                   BOOL hover, int ctrlLeft, BOOL descWrap = FALSE) {
     if (hover) DrawSettingsRowHover(dc, m, row);
-    int ty = row.top + SettingsRowPadY(m);
+
+    // 图标 tile 在行的「头部」里垂直居中：行高 64 DIP 而 tile 只有 30，原来直接顶在上内边距
+    // 12 DIP 处，比文字块的中心高约 5 DIP，看着就是"图标歪了"。展开行（主题色相）只按头部
+    // 那一段居中，不跟着整行跑到中间去。
+    int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
+    int rowH = row.bottom - row.top;
+    if (headH > rowH) headH = rowH;
+    int ty = row.top + (headH - m.tileSize) / 2;
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
 
     int tx = SettingsRowTextX(m);
@@ -3298,7 +3305,9 @@ static void SettingsFitHeight(HWND hWnd) {
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
     if (hover) DrawSettingsRowHover(dc, m, row);
-    int ty = row.top + m.rowPadY;
+    int headH = m.rowPadY * 2 + (int)(40 * m.dpi), rowH = row.bottom - row.top;
+    if (headH > rowH) headH = rowH;
+    int ty = row.top + (headH - m.tileSize) / 2;   // 与设置页行同一条居中规则
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, NULL);
 
     int btn = (int)(34 * m.dpi);

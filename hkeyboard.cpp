@@ -3848,10 +3848,10 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     // 身份卡高度按「卡内墨迹上下留白相等」定，而不是按行盒对称：
     //   行盒是 标题 26 + 间隙 6 + 描述 18 = 50，上下各留 16 会得到 82；但墨迹并不对称 ——
     //   标题「HKeyboard 轻键」带降部、墨迹比行盒高约 1.4 DIP 且向上溢出，描述墨迹只占行盒
-    //   18 里的 ≈11.4 DIP。用 82 实测留白是「上 14.25 / 下 20.0」，肉眼能看出整体偏上。
-    //   76 = 墨迹高 ≈48 + 上下各 ≈14（实测 14.25 / 13.70，差 0.55 DIP）；
-    //   同时容得下图标盒 44（图标盒顶 +20 → 盒底 64 < 76）。
-    a.card1.bottom = a.card1.top + (int)(76 * m.dpi);
+    //   18 里的 ≈11 DIP。用 82 实测留白是「上 14.25 / 下 20.0」，肉眼能看出整体偏上。
+    //   78 → 卡高 136px，实测墨迹留白「上 26 / 下 25 px」（差 1px）；76 时是 26 / 22 px。
+    //   78 也容得下图标盒 44（图标盒顶 +20 → 盒底 64 < 78）。
+    a.card1.bottom = a.card1.top + (int)(78 * m.dpi);
     a.card2.left = m.contentX;
     a.card2.top = a.card1.bottom + (int)(12 * m.dpi);
     a.card2.right = m.contentX + m.contentW;

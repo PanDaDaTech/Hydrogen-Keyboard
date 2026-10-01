@@ -1967,12 +1967,12 @@ static HeaderMetrics GetHeaderMetrics() {
     int gap     = (int)(6 * dpi);
     int rMargin = (int)(6 * dpi);
 
-    // 「设置」按钮恒定显示「齿轮 + 设置」，宽度按内容给足；
-    // 「123」保持文字（它是通用符号，不再图标化）
+    // 「设置」和「小键盘」两个按钮都是「图标 + 文字」，宽度按内容给足，
+    // 两者共用 DrawHeaderPill 绘制（形状、配色、留白一致）。
     hm.wMenu  = (int)(68 * dpi);
     hm.wClose = (int)(28 * dpi);
     hm.wMin   = (int)(28 * dpi);
-    hm.wNum   = (int)(48 * dpi);
+    hm.wNum   = (int)(84 * dpi);    // 图标 17 + 间距 6 + 文字（小键盘/Numpad）+ 与设置按钮同样的左右留白
 
     hm.xClose = g_ww - rMargin - hm.wClose;
     hm.xMin   = hm.xClose - gap - hm.wMin;
@@ -1997,23 +1997,28 @@ static int HitHeader(int x, int y) {
     return -1;
 }
 
-// 「设置」按钮：与设置页页头、键盘修饰键同一套配方（btn_regular 底 + btn_content 内容），
-// 且恒定显示「齿轮 + 设置」——设置页页头也是齿轮，两处观感才对得上。
-static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
-    double dpi = GetSystemDpiScale();
-    BOOL hov = (g_hdrHov == HDR_DOCK);
-    DrawRoundRect(dc, hm.xMenu, hm.btnY, hm.wMenu, hm.btnH,
+// 标题栏胶囊按钮：底色 + 矢量图标 + 文字，三者同一配方。
+// 「设置」与「小键盘」共用这一份 —— 两个按钮的观感必须一致。
+// 设置按钮恒定显示「齿轮 + 设置」（设置页页头也是齿轮，两处观感才对得上）。
+// 宽度由调用方从 HeaderMetrics 取（绘制与命中同源，见 GetHeaderMetrics 上方的说明）。
+static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL hov,
+                           const HkIconDef& icon, const wchar_t* label) {
+    DrawRoundRect(dc, x, hm.btnY, w, hm.btnH,
                   hov ? C_REGULAR_HOV : C_REGULAR, hov ? C_REGULAR_HOV : C_REGULAR, hm.btnH / 2);
 
-    const wchar_t* label = T(L"\x8BBE\x7F6E", L"Settings");
-    int iconSz = (int)(17 * dpi);
-    int gap    = (int)(6 * dpi);
+    int iconSz = (int)(17 * GetSystemDpiScale());
+    int gap    = (int)(6 * GetSystemDpiScale());
     int tw     = MeasureTextW(dc, label, g_f12);
     int total  = iconSz + gap + tw;
-    int x      = hm.xMenu + (hm.wMenu - total) / 2;
-    DrawHkIcon(dc, (float)x, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
-               HkIcon(HKICON_GEAR), C_BTN_CONTENT, C_BTN_CONTENT);
-    DrawTextC(dc, x + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, C_BTN_CONTENT);
+    int cx     = x + (w - total) / 2;
+    DrawHkIcon(dc, (float)cx, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
+               icon, C_BTN_CONTENT, C_BTN_CONTENT);
+    DrawTextC(dc, cx + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, C_BTN_CONTENT);
+}
+
+static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
+    DrawHeaderPill(dc, hm, hm.xMenu, hm.wMenu, (g_hdrHov == HDR_DOCK),
+                   HkIcon(HKICON_GEAR), T(L"\x8BBE\x7F6E", L"Settings"));
 }
 
 static void DrawHeader(HDC dc) {
@@ -2027,14 +2032,11 @@ static void DrawHeader(HDC dc) {
         DrawTextC(dc, hm.xTitle, 0, hm.wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
-    // 123 按钮：与设置按钮同款（btn_regular 配方），点击在当前布局与小键盘间切换。
-    // 「123」保持文字：它是数字区的国际通用写法，图标化是负收益。
+    // 小键盘按钮：与「设置」同款（图标 + 文字），点击在当前布局与小键盘间切换。
+    // 标签用「小键盘」而不是「123」：它切的是整个布局，图标 + 名称比一个数字清楚。
     if (hm.numBtnVisible) {
-        BOOL hovNum = (g_hdrHov == HDR_NUM);
-        DrawRoundRect(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH,
-                      hovNum ? C_REGULAR_HOV : C_REGULAR, hovNum ? C_REGULAR_HOV : C_REGULAR,
-                      hm.btnH / 2);
-        DrawTextC(dc, hm.xNum, hm.btnY, hm.wNum, hm.btnH, L"123", g_f12, C_BTN_CONTENT);
+        DrawHeaderPill(dc, hm, hm.xNum, hm.wNum, (g_hdrHov == HDR_NUM),
+                       HkIcon(HKICON_NUMPAD), T(L"\x5C0F\x952E\x76D8", L"Numpad"));
     }
 
     // 最小化 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
@@ -3280,7 +3282,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         r = SettingsRowRect(m, 3);
         DrawSettingRowContent(dc, m, r, HKICON_PANEL, NULL,
                               T(L"小键盘切换按钮", L"Numpad Toggle Button"),
-                              T(L"在标题栏显示 123 按钮，点击在当前布局与小键盘间切换", L"Show a 123 button in the title bar to toggle the numpad"),
+                              T(L"在标题栏显示小键盘按钮，点击在当前布局与小键盘间切换", L"Show a numpad button in the title bar to toggle the numpad"),
                               g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
 

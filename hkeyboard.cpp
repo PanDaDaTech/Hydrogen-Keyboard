@@ -437,6 +437,8 @@ HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
+// 小号档：只给 FitKeyFont 用（全尺寸导航区键宽 1u，PrtSc/ScrLk/Pause 这类长标签要能缩下来）
+HFONT       g_f10 = 0, g_f9 = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -677,7 +679,9 @@ static const KbRowSpec kFullMainRows[6] = {
 // ---- 导航区 3u：行位与主区对齐（PrtSc 在 F 行、Ins 在数字行、Del 在 Tab 行、
 //      ↑ 在 Shift 行、←↓→ 在 Ctrl 行）—— 这一点现状就是对的，保持不动 ----
 static const KbKeySpec kFullNav0[] = {
-    { 0.00f, 1.00f, 0x2C, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x46, K_SPECIAL, 1 },
+    // ⚠ ScrLk 必须是 VK_SCROLL(0x91)：一直写成 0x46，而 0x46 是字母 F ——
+    //    这一格等于在按 f，从来没切换过滚动锁。字母 f 是 K_LETTER，两者靠 type 区分。
+    { 0.00f, 1.00f, 0x2C, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x91, K_SPECIAL, 1 },
     { 2.00f, 1.00f, 0x13, K_SPECIAL, 1 },
 };
 static const KbKeySpec kFullNav1[] = {
@@ -1138,6 +1142,8 @@ static void RecreateFontsAndLayout() {
     if (g_f14b) DeleteObject(g_f14b);
     if (g_f16b) DeleteObject(g_f16b);
     if (g_f18b) DeleteObject(g_f18b);
+    if (g_f10) DeleteObject(g_f10);
+    if (g_f9) DeleteObject(g_f9);
 
     double dpiScale = GetSystemDpiScale();
     double baseH = 320.0 * dpiScale;
@@ -1152,6 +1158,8 @@ static void RecreateFontsAndLayout() {
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
     g_f18b = MakeFont((int)(18 * finalFontScale), 1);
+    g_f10  = MakeFont((int)(10 * finalFontScale), 0);
+    g_f9   = MakeFont((int)(9  * finalFontScale), 0);
 
     BuildKeys();
 }
@@ -1480,13 +1488,16 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
 // 起因：全尺寸布局改成 1u 网格后，导航区键宽从 73px 收到与字母键相同的 52px，
 // 「PrtSc / ScrLk / Pause」在 14px 下（约 44px）会撑破键帽 —— 之前是靠
 // 「导航区比字母键宽 59%」把这个矛盾盖住的。
-// 主键盘走 KbFrameSig 帧缓存、只在内容变化时重绘，105 次测量不构成性能问题。
+// 实测（用内嵌字体按程序真实字号量）：默认 1280×404 下 14b/13/12 分别是 18/16/15px，
+// 「PrtSc」实测 66/53/51px，而键内可用宽只有 38px —— 三档全放不下，
+// 所以再补 10/9 两档（13px/11px），最短的那档才能让 PrtSc/Pause 落到实处。
+// 主键盘走 KbFrameSig 帧缓存、只在内容变化时重绘，上百次测量不构成性能问题。
 static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW, BOOL bold) {
     if (!s || !s[0] || maxW <= 0) return bold ? g_f14b : g_f14;
-    HFONT ladder[3] = { bold ? g_f14b : g_f14, g_f13, g_f12 };
-    for (int i = 0; i < 3; i++)
+    HFONT ladder[5] = { bold ? g_f14b : g_f14, g_f13, g_f12, g_f10, g_f9 };
+    for (int i = 0; i < 5; i++)
         if (MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
-    return ladder[2];      // 仍放不下就交给 DrawTextC 的省略逻辑
+    return ladder[4];      // 仍放不下就交给 DrawTextC 的省略逻辑
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -1693,7 +1704,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x27: return L"\x2192";
         case 0x28: return L"\x2193";
         case 0x2C: return L"PrtSc";
-        case 0x46: return L"ScrLk";
+        case 0x91: return L"ScrLk";   // VK_SCROLL（原来是 0x46 = 字母 F，已修）
         case 0x13: return L"Pause";
         case 0x2D: return L"Ins";
         case 0x24: return L"Home";
@@ -5426,6 +5437,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
+        DeleteObject(g_f10); DeleteObject(g_f9);
         DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
         PostQuitMessage(0);
         return 0;

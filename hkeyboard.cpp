@@ -793,12 +793,14 @@ static void BuildKeys() {
     double scaleX = (double)g_ww / baseW;
     double scaleY = (double)g_wh / baseH;
 
-    // 页头高度 = 按钮 28 + 上下各 10（与键区左右留白 g_keyAreaX 对齐）。
-    // 原来是 36，按钮只离上沿 4 DIP，看着贴顶；现在 10 DIP，与左右留白一致，
-    // 按钮底到第一排键还有 16 DIP，轻重分开。
-    g_headerH = (int)(48.0 * dpiScale * scaleY); if (g_headerH < 38) g_headerH = 38;
+    // 页头只随 DPI 缩放，**不随窗口高度缩放** —— 标题栏不该在窗口拉高时变厚。
+    // 44 = 按钮上留白 10 + 按钮 28 + 6，剩下的下留白由第一排键 y 里的
+    // `g_keyGap + 2` 补齐，所以「按钮底 → 第一排键」任何窗口尺寸下都稳定在约 12 DIP。
+    g_headerH = (int)(44.0 * dpiScale); if (g_headerH < 34) g_headerH = 34;
     g_keyGap = (int)(4.0 * dpiScale * scaleX); if (g_keyGap < 2) g_keyGap = 2;
-    // 圆角窗口四角会裁掉内容：键区左右与底部留出安全边距
+    // 键区左右留白 10 DIP。底部不能直接填 10：行高是整数除法，且第一排键的 y 里
+    // 有 `g_keyGap + 2`，所以「实际」底边距 = bottomPad − g_keyGap − 2 + 余数。
+    // 要让实际底边距也等于 10，设定值必须补回 g_keyGap + 2。
     g_keyAreaX = (int)(10 * dpiScale); if (g_keyAreaX < 6) g_keyAreaX = 6;
     int bottomPad = (int)(16 * dpiScale); if (bottomPad < 8) bottomPad = 8;
 
@@ -1972,8 +1974,13 @@ static HeaderMetrics GetHeaderMetrics() {
     double dpi = dpiScale;
     HeaderMetrics hm = {};
     hm.btnH = (int)(28 * dpi);
-    if (hm.btnH > g_headerH - 4) hm.btnH = g_headerH - 4;
-    hm.btnY = (g_headerH - hm.btnH) / 2;
+    // 按钮上留白固定 10 DIP（原来是 (header-btnH)/2 居中，页头 36 时只剩 4 DIP，贴顶）；
+    // 页头被压得很矮时退回居中，免得按钮溢出页头。
+    hm.btnY = (int)(10 * dpi);
+    if (hm.btnY + hm.btnH > g_headerH) {
+        hm.btnY = (g_headerH - hm.btnH) / 2;
+        if (hm.btnY < 0) hm.btnY = 0;
+    }
 
     int gap     = (int)(6 * dpi);
     int rMargin = (int)(6 * dpi);
@@ -2051,12 +2058,15 @@ static void DrawHeader(HDC dc) {
     // 最小化 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
     int iconSz = (int)(18 * dpiScale);
     int hoverR = (int)(6 * dpiScale);
+    // Minimize 这个 glyph 在 12 网格里画在 y=8（网格中心是 6），直接用会比 Close 低 2/12；
+    // 按图标尺寸上移同样的比例，「−」才和「✕」在同一条水平线上。
+    int minLift = iconSz * 2 / 12;
     if (g_hdrHov == HDR_MIN) {
         DrawRoundRect(dc, hm.xMin, hm.btnY, hm.wMin, hm.btnH,
                       C_REGULAR_HOV, C_REGULAR_HOV, hoverR);
     }
     DrawHkIcon(dc, (float)(hm.xMin + (hm.wMin - iconSz) / 2),
-               (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
+               (float)(hm.btnY + (hm.btnH - iconSz) / 2 - minLift), (float)iconSz,
                HkIcon(HKICON_MINIMIZE), C_DIM, C_DIM);
     if (g_hdrHov == HDR_CLOSE) {
         DrawRoundRect(dc, hm.xClose, hm.btnY, hm.wClose, hm.btnH,
@@ -2128,8 +2138,10 @@ static void DrawKeys(HDC dc) {
         if (k->vk == 0x5D) {
             // Menu 键：原本靠图标字体的 \xE700 画汉堡，取消图标字体后一律改矢量，
             // 三种图标样式下外观一致（它本身没有可用文字，不参与「图标+文字」）。
+            // 汉堡的墨迹只占自身网格的 62%×38%，按 20 DIP 画会明显比旁边 14px 标签轻，
+            // 所以这里给到 24 DIP，视觉重量才和 Ctrl / Alt 这些键面对齐。
             double dpi = GetSystemDpiScale();
-            int s = (int)(20 * dpi);
+            int s = (int)(24 * dpi);
             DrawHkIcon(dc, (float)(k->x + (k->w - s) / 2), (float)(k->y + (k->h - s) / 2),
                        (float)s, HkIcon(HKICON_HAMBURGER), textC, textC);
         } else if (k->vk == 0x5B) {

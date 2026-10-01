@@ -438,8 +438,7 @@ HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
-static HANDLE g_fontRegRegular = 0;    // AddFontMemResourceEx 句柄（内嵌 Regular 子集）
-static HANDLE g_fontRegMedium = 0;     // 内嵌 Medium 子集（强调档用）
+static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
 
@@ -1094,39 +1093,30 @@ static void SetFullNumpadHidden(HWND hWnd, BOOL hidden) {
     if (hWnd && IsWindow(hWnd)) InvalidateRect(hWnd, NULL, TRUE);
 }
 
-// 注册内嵌字体（同一族 MiSans 的两个字面：Regular 正文 + Medium 强调）到当前进程；
-// 失败则回退系统字体。两个字面的码位集完全一致，切换字面不会让布局跳动。
+// 注册内嵌字体（MiSans Medium 精简子集，界面唯一字面）到当前进程；失败则回退系统字体
 static void LoadEmbeddedFonts() {
-    struct { int id; HANDLE* slot; } fonts[2] = {
-        { IDR_FONT,        &g_fontRegRegular },
-        { IDR_FONT_MEDIUM, &g_fontRegMedium },
-    };
-    for (int i = 0; i < 2; i++) {
-        HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(fonts[i].id), MAKEINTRESOURCEW(10));  // RT_RCDATA
-        if (!hr) continue;
-        HGLOBAL hg = LoadResource(g_hInst, hr);
-        if (!hg) continue;
-        void* data = LockResource(hg);
-        DWORD sz = SizeofResource(g_hInst, hr);
-        if (!data || sz == 0) continue;
-        DWORD n = 0;
-        HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
-        if (h && n > 0) {
-            *fonts[i].slot = h;
-            g_fontReady = TRUE;
-        }
+    HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(IDR_FONT), MAKEINTRESOURCEW(10));  // RT_RCDATA
+    if (!hr) return;
+    HGLOBAL hg = LoadResource(g_hInst, hr);
+    if (!hg) return;
+    void* data = LockResource(hg);
+    DWORD sz = SizeofResource(g_hInst, hr);
+    if (!data || sz == 0) return;
+    DWORD n = 0;
+    HANDLE h = AddFontMemResourceEx(data, sz, NULL, &n);
+    if (h && n > 0) {
+        g_fontReg = h;
+        g_fontReady = TRUE;
     }
 }
-// 创建 UI 字体。族里放了两个字面：Regular(330) 与 Medium(500)。
-// 强调档请求 FW_MEDIUM（=500，字面自带），**不要请求 FW_BOLD** ——
-// 族里没有 700 的字面，GDI 会拿 Medium 做仿真加粗：描边被撑开、笔画发糊，
-// 就是实机反馈的「GDI+ 字体显示过粗」。也不要在匹配不到时退回 FW_NORMAL（那就没有强调层级了）。
+// 创建 UI 字体。界面只有 Medium(500) 一个字面：正文用它，标题/选中项请求 FW_BOLD 拿到
+// GDI 的仿真加粗（族里没有 700 的字面，这是唯一能让标题比正文更重的办法）。
 static HFONT MakeFont(double size, BOOL bold) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
     const wchar_t* face = g_fontReady ? L"MiSans" : L"Microsoft YaHei";
-    return CreateFontW(h, 0, 0, 0, bold ? FW_MEDIUM : FW_NORMAL,
+    return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, face);
@@ -1627,19 +1617,26 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     if (!ic) return FALSE;
 
     double dpi = GetSystemDpiScale();
-    int iconInline = (int)(18 * dpi);   // 图标+文字里的图标
+    int iconOnly   = (int)(20 * dpi);
+    int iconInline = (int)(18 * dpi);
     int gap        = (int)(6 * dpi);
 
-    // 只有「图标+文字」一种形态（纯图标已按实机反馈去掉）：图标 + 文字并排居中。
-    // 放不下（长标签 + 窄键）时不画图标、交给文字路径，也绝不压边。
-    if (!(text && text[0] && k->w >= (int)(40 * dpi))) return FALSE;
-    int tw = MeasureTextW(dc, text, f);
-    if (iconInline + gap + tw > k->w - (int)(16 * dpi)) return FALSE;
-    int total = iconInline + gap + tw;
-    int x = k->x + (k->w - total) / 2;
-    DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
-               *ic, color, color);
-    DrawTextC(dc, x + iconInline + gap, k->y, tw + 4, k->h, text, f, color);
+    // 图标+文字（唯一的图标形态）：放得下就并排画，放不下**退回只画图标**。
+    // 退格这类键在 1u 宽的布局里塞不下 [⌫ Backspace]，退回图标至少还能一眼认出是退格；
+    // 之前直接放弃图标交给文字路径，反而长标签被裁掉半截 —— 实机反馈的「图标也看不到了」。
+    if (text && text[0] && k->w >= (int)(40 * dpi)) {
+        int tw = MeasureTextW(dc, text, f);
+        if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
+            int total = iconInline + gap + tw;
+            int x = k->x + (k->w - total) / 2;
+            DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
+                       *ic, color, color);
+            DrawTextC(dc, x + iconInline + gap, k->y, tw + 4, k->h, text, f, color);
+            return TRUE;
+        }
+    }
+    DrawHkIcon(dc, (float)(k->x + (k->w - iconOnly) / 2), (float)(k->y + (k->h - iconOnly) / 2),
+               (float)iconOnly, *ic, color, color);
     return TRUE;
 }
 
@@ -1704,8 +1701,9 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x90: return L"Num";
         case 0x1B: return L"Esc";
         case 0x2E: return L"Del";
-        case 0x08: return L"Backspace";   // 不再用 ← 箭头：图标样式的键面本来就是一个带箭头的退格图形，
-                                          // 再叠一个 ← 就成了同一件事画两遍（实机截图里很明显）
+        // 退格：宽键（全尺寸 2u）放得下就写全「Backspace」，窄键（默认布局 1u 多）用业界通用的
+        // 短写 Bksp —— 之前一刀切换成 Backspace，窄键上等于被裁掉半截，只剩 "ckspac"
+        case 0x08: return (k->w >= (int)(110 * GetSystemDpiScale())) ? L"Backspace" : L"Bksp";
         case 0x09: return L"Tab";
         case 0x0D: return L"Enter";
         case 0x14: return L"Caps";
@@ -1713,7 +1711,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x11: return L"Ctrl";
         case 0x12: return L"Alt";
         case 0x5B: return L"";   // Win 键：矢量绘制 Windows 徽标，无文字
-        case 0x5D: return L"";   // Menu 键：矢量绘制汉堡图标，无文字
+        case 0x5D: return L"Menu";       // 三条杠是它的图形；文字模式下要给出名字（原来返回空串）
         case 0x20: return L"";         // 空格键不显示文字
         case 0x25: return L"\x2190";
         case 0x26: return L"\x2191";
@@ -2850,9 +2848,11 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     if (g_sTab == 1 && index == 2 && !g_wallpaperAccent) return (int)(210 * m.dpi);
     int contentDip = SettingsRowCtrlDip(g_sTab, index);
     if (contentDip < 30) contentDip = 30;   // 图标 tile
-    if (contentDip < 34) contentDip = 34;   // 两行文字块（标题 18 + 描述 16）
-    if (SettingsRowDescWraps(g_sTab, index) && contentDip < 50)
-        contentDip = 50;                    // 标题 18 + 描述两行 32
+    // 文字块：标题 18 + 间距 6 + 描述 16 = 40。间距不能省 —— 标题的下缘和描述的上缘
+    // 会顶在一起（实机反馈「文本和描述的间距对吗」）；文字蒙版本身还上下各留了 4px。
+    if (contentDip < 40) contentDip = 40;
+    if (SettingsRowDescWraps(g_sTab, index) && contentDip < 56)
+        contentDip = 56;                    // 标题 18 + 间距 6 + 描述两行 32
     return (int)((12 + contentDip + 12) * m.dpi);
 }
 
@@ -2956,9 +2956,9 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sf14b, C_WHITE);
     if (desc && desc[0]) {
         if (descWrap)
-            DrawTextL(dc, tx, ty + (int)(20 * m.dpi), tw, (int)(30 * m.dpi), desc, g_sf12, C_DIM, TRUE);
+            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sf12, C_DIM, TRUE);
         else
-            DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
+            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
     }
 }
 
@@ -5631,8 +5631,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    if (g_fontRegRegular) RemoveFontMemResourceEx(g_fontRegRegular);
-    if (g_fontRegMedium) RemoveFontMemResourceEx(g_fontRegMedium);
+    if (g_fontReg) RemoveFontMemResourceEx(g_fontReg);
     if (g_timePeriod.end) g_timePeriod.end(1);
     ShutdownGdiPlus();
     return (int)msg.wParam;

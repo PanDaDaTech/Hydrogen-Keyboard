@@ -1421,8 +1421,51 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
 // 收益：任意尺寸、任意色相都可用，加一个图标＝加一段顶点数据，不用重跑字体子集化。
 static const HkIconDef& HkIcon(int id) { return k_hkIcons[id]; }
 
+// 量字串宽度。**必须与绘制同源** —— 文字已经改由 GDI+ 绘制（见 DrawTextGp），
+// 而 DrawString 在 NoWrap 下是「按 GDI+ 自己的布局宽度判断放不放得下，放不下就整字丢弃」。
+//
+// 实测（11pt @175%，MiSans-Medium）：
+//   「常规」 GDI 量 52px（26px/字，与 hmtx 的 1000/1000 = 1.0em 一致，是**对的**）
+//          GDI+ 需要 61.4px（30.7px/字）—— 多出的是 GDI+ 自己的保守余量。
+// 于是旧写法出的事故：Tab 矩形按 GDI 量出 52 + 4dip = 59px，GDI+ 判定放不下两个字，
+// 四个 Tab 各只剩第一个字（常规/布局/主题/关于 → 常/布/主/关）。
+// 同样的坑还藏在「键面图标+文字」与标题栏「设置」pill —— 它们都拿这个偏窄的返回值
+// 当绘制矩形宽度（tw + 4），所以长标签一律被丢尾字。
+//
+// 修法只有一条：量宽也交给 GDI+。多出来的余量不是浪费，它同时充当了字与框之间的呼吸空间。
+static int MeasureTextGp(HDC dc, const wchar_t* s, HFONT f) {
+    if (!s || !s[0] || !f || !g_gdipFonts) return 0;
+    float emPx = FontEmPx(f);
+    if (emPx <= 0.0f) return 0;
+
+    Gdiplus::Graphics g(dc);
+    Gdiplus::FontFamily family(g_fontReady ? L"MiSans" : L"Microsoft YaHei", g_gdipFonts);
+    if (!family.IsAvailable()) return 0;
+    Gdiplus::Font font(&family, emPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    if (font.GetLastStatus() != Gdiplus::Ok) return 0;
+
+    // 与 DrawTextGp 的单行分支用同一组 flag，否则量出来的宽度和绘制的判定条件不一致
+    Gdiplus::StringFormat fmt;
+    fmt.SetFormatFlags((Gdiplus::StringFormatFlags)
+                       (Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoClip));
+
+    Gdiplus::RectF box(0.0f, 0.0f, 4096.0f, emPx * 4.0f);
+    Gdiplus::RectF out;
+    if (g.MeasureString(s, -1, &font, box, &fmt, &out) != Gdiplus::Ok) return 0;
+
+    int w = (int)out.Width;                 // 向上取整：整数宽度才够 DrawString 判定「放得下」
+    if ((float)w < out.Width) w++;
+    return w > 0 ? w + 1 : 0;               // 再留 1px 呼吸空间
+}
+
 static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
     if (!s || !s[0] || !f) return 0;
+
+    int gp = MeasureTextGp(dc, s, f);       // 首选：与绘制同源
+    if (gp > 0) return gp;
+
+    // 回退：GDI+ 未就绪（启动早期 g_gdipFonts 还没建）时仍用 GDI。
+    // 此时文字也画不了 GDI+，会走 DrawTextL/C 的 GDI 回退分支，两边依然同源。
     HFONT old = (HFONT)SelectObject(dc, f);
     SIZE sz = {0, 0};
     GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);

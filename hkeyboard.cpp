@@ -421,7 +421,8 @@ int         g_layoutMode = 0;          // 键盘布局：0=默认 1=小键盘 2=
 int         g_prevLayout = 0;          // 123 按钮切到小键盘前的布局（会话内记忆）
 BOOL        g_showNumBtn = TRUE;       // 标题栏是否显示 123 小键盘切换按钮
 BOOL        g_npTabToggle = TRUE;      // 完整布局：Tab 键显示/隐藏数字区
-BOOL        g_npHidden = FALSE;        // 完整布局：数字区当前是否隐藏
+BOOL        g_npHidden = FALSE;        // 完整布局：数字区隐藏（用户按 Tab / 标题栏按钮，持久化）
+BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动隐藏数字区（不持久化）
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
@@ -481,8 +482,9 @@ static void InitWindowSizeForDpi() {
         g_ww = (int)(430 * dpiScale);
         g_wh = (int)(320 * dpiScale);
     } else if (g_layoutMode == 2) { // 全尺寸（完整键盘）：6 行，主区+导航区+数字区
-        g_ww = (int)(1380 * dpiScale);
-        g_wh = (int)(372 * dpiScale);
+        // 1280 宽下 1u ≈ 56.8px，键帽 52px（原来 1380×372 会算成 46~73px 的五种宽度）
+        g_ww = (int)(1280 * dpiScale);
+        g_wh = (int)(404 * dpiScale);
     } else {                        // 全尺寸
         g_ww = (int)(980 * dpiScale);
         g_wh = (int)(320 * dpiScale);
@@ -545,143 +547,229 @@ static void BuildNumpad(int y) {
 }
 
 // 完整键盘布局（104 键）：主区 + 导航区 + 数字区（6 行：F 行 + 主区 5 行）
-// 导航区 3 列（PrtSc/Ins/Del 三行 + ↑ 居中列 + ←↓→ 底行，↑↓ 天然十字对齐），
-// 数字区 4 列（Num / * -，7 8 9 +(跨2行)，4 5 6，1 2 3 Enter(跨2行)，0(跨2列) .）
-// webFn：Fn 网页布局层——Shift 行字母键换为网址后缀键
-// g_npHidden：隐藏数字区（Tab 键切换），主区扩展占满剩余宽度
-static void BuildComplete(int y, double dpiScale, double scaleX, BOOL webFn) {
-    int gap = g_keyGap;
-    int navW = (int)(52 * dpiScale * scaleX);         // 导航/数字区键宽（与字母键同宽）
-    int navBlockW = navW * 3 + 2 * gap;               // 导航区 3 列总宽
-    int numBlockW = navW * 4 + 3 * gap;               // 数字区 4 列总宽
-    int restBlocks = 2 * gap + navBlockW + (g_npHidden ? 0 : numBlockW);
-    int MAIN_W = KEY_AREA_W - restBlocks;             // 主区宽度（剩余全给主区）
-    if (MAIN_W < 400) MAIN_W = 400;                   // 窗口过窄时保底（允许溢出）
-    int h2 = g_keyHeight * 2 + gap;
-    int mx = KEY_AREA_X;                              // 主区当前 x
-    int nx = KEY_AREA_X + MAIN_W + gap;               // 导航区 x
-    int px = nx + navBlockW + gap;                    // 数字区 x
+// ============================================================================
 
-    // Row 0: Esc, F1~F12, Del | PrtSc ScrLk Pause | Num / * -
-    {
-        int wEsc = (int)(56 * dpiScale * scaleX);
-        int wDel = (int)(56 * dpiScale * scaleX);
-        int aw = (MAIN_W - wEsc - wDel - 13 * gap) / 12;
-        int rem = MAIN_W - wEsc - wDel - 13 * gap - aw * 12;
-        AddKey(mx, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); mx += wEsc + gap;
-        for (int i = 0; i < 12; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            AddKey(mx, y, w, g_keyHeight, (short)(0x70 + i), K_NORMAL);
-            mx += w + gap;
+// 数字区当前是否隐藏：「用户手动按 Tab / 标题栏按钮」与「窗口过窄自动隐藏」是两件事，
+// 合成一个生效值再往外用 —— 只在 G 处改一份，绘制 / 命中 / 帧缓存签名才不会互相打架。
+static BOOL NumpadHidden() { return (g_npHidden || g_npHiddenAuto); }
+
+// 窄屏自适应：键帽 44px 是触摸安全下限，反解「22u + 2gap + 2×键区边距」得 1090 DIP；
+// 低于这个宽度就把数字区收起来（复用同一套显隐机制，而不是让键位溢出窗口）。
+// 只在全尺寸布局下生效；由窗口宽度推导，因此不落盘。
+static void UpdateNumpadAuto(int ww, double dpiScale) {
+    if (g_layoutMode != 2) { g_npHiddenAuto = FALSE; return; }
+    g_npHiddenAuto = (ww < (int)(1090 * dpiScale));
+}
+
+// ============================================================================
+// 全尺寸（ANSI 104）布局：1u 单位网格
+//
+// 列位是单一真源：主区 15u / 导航区 3u / 数字区 4u，块间 1 个 gap；
+// 1u 由键区宽度反解一次，所有 x = KEY_AREA_X + round(列位 × u) + 跨块 gap。
+// 于是「列永远对齐、行尾永远齐平」，也不再需要逐行 rem / 逐行除法。
+//
+// 旧写法是每行各算各的「剩余宽度 ÷ 键数」，同一把键盘上 1u 键的实际宽度
+// 从 46px 游走到 73px（差 59%），字母键最多偏出一整个键位 —— 这次连根换掉。
+//
+// vrow = 2 表示竖向跨两行（数字区的 + 与回车）。
+// ============================================================================
+struct KbKeySpec { float col; float w; short vk; KeyType type; unsigned char vrow; };
+struct KbRowSpec { const KbKeySpec* keys; int n; };
+
+#define FULL_U_MAIN  15.0f
+#define FULL_U_NAV    3.0f
+#define FULL_U_NUM    4.0f
+
+// 列位（单位 u）→ 像素 x；跨块（导航区 / 数字区）补一个 gap
+static int FullColX(float col, double u, int gap, const float* bc, int nb) {
+    int b = 0;
+    for (int i = 0; i < nb; i++) if (bc[i] <= col + 0.001f) b++;
+    return KEY_AREA_X + (int)floor(col * u + 0.5) + b * gap;
+}
+
+// 放一个键：宽度由「列位到列位」直接相减，不再由「本行键数」除出来。
+// base 是这一块（主区 0 / 导航区 15 / 数字区 18）的起始列，表里写块内列位更好读，
+// 但换算必须用全局列位 —— 否则导航区/数字区会被画到主区左边那一列上。
+static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, int gap,
+                    const float* bc, int nb) {
+    int xa = FullColX(base + s.col, u, gap, bc, nb);
+    int xb = FullColX(base + s.col + s.w, u, gap, bc, nb);
+    AddKey(xa, yy, xb - xa - gap, kh, s.vk, s.type);
+}
+
+// ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）--------------------
+static const KbKeySpec kFullMain0[] = {      // F 行：Esc + 1u 空档 + F1~F12 + Del
+    { 0.00f, 1.00f, 0x1B, K_SPECIAL, 1 },
+    { 2.00f, 1.00f, 0x70, K_NORMAL , 1 }, { 3.00f, 1.00f, 0x71, K_NORMAL , 1 },
+    { 4.00f, 1.00f, 0x72, K_NORMAL , 1 }, { 5.00f, 1.00f, 0x73, K_NORMAL , 1 },
+    { 6.00f, 1.00f, 0x74, K_NORMAL , 1 }, { 7.00f, 1.00f, 0x75, K_NORMAL , 1 },
+    { 8.00f, 1.00f, 0x76, K_NORMAL , 1 }, { 9.00f, 1.00f, 0x77, K_NORMAL , 1 },
+    { 10.00f, 1.00f, 0x78, K_NORMAL, 1 }, { 11.00f, 1.00f, 0x79, K_NORMAL, 1 },
+    { 12.00f, 1.00f, 0x7A, K_NORMAL, 1 }, { 13.00f, 1.00f, 0x7B, K_NORMAL, 1 },
+    { 14.00f, 1.00f, 0x2E, K_SPECIAL, 1 },
+};
+static const KbKeySpec kFullMain1[] = {      // 数字行
+    { 0.00f, 1.00f, 0xC0, K_NORMAL , 1 },
+    { 1.00f, 1.00f, 0x31, K_NORMAL , 1 }, { 2.00f, 1.00f, 0x32, K_NORMAL , 1 },
+    { 3.00f, 1.00f, 0x33, K_NORMAL , 1 }, { 4.00f, 1.00f, 0x34, K_NORMAL , 1 },
+    { 5.00f, 1.00f, 0x35, K_NORMAL , 1 }, { 6.00f, 1.00f, 0x36, K_NORMAL , 1 },
+    { 7.00f, 1.00f, 0x37, K_NORMAL , 1 }, { 8.00f, 1.00f, 0x38, K_NORMAL , 1 },
+    { 9.00f, 1.00f, 0x39, K_NORMAL , 1 }, { 10.00f, 1.00f, 0x30, K_NORMAL, 1 },
+    { 11.00f, 1.00f, 0xBD, K_NORMAL, 1 }, { 12.00f, 1.00f, 0xBB, K_NORMAL, 1 },
+    { 13.00f, 2.00f, 0x08, K_SPECIAL, 1 },
+};
+static const KbKeySpec kFullMain2[] = {      // Tab 行（qwerty）
+    { 0.00f, 1.50f, 0x09, K_SPECIAL, 1 },
+    { 1.50f, 1.00f, 0x51, K_LETTER , 1 }, { 2.50f, 1.00f, 0x57, K_LETTER , 1 },
+    { 3.50f, 1.00f, 0x45, K_LETTER , 1 }, { 4.50f, 1.00f, 0x52, K_LETTER , 1 },
+    { 5.50f, 1.00f, 0x54, K_LETTER , 1 }, { 6.50f, 1.00f, 0x59, K_LETTER , 1 },
+    { 7.50f, 1.00f, 0x55, K_LETTER , 1 }, { 8.50f, 1.00f, 0x49, K_LETTER , 1 },
+    { 9.50f, 1.00f, 0x4F, K_LETTER , 1 }, { 10.50f, 1.00f, 0x50, K_LETTER, 1 },
+    { 11.50f, 1.00f, 0xDB, K_NORMAL , 1 }, { 12.50f, 1.00f, 0xDD, K_NORMAL , 1 },
+    { 13.50f, 1.50f, 0xDC, K_NORMAL , 1 },
+};
+static const KbKeySpec kFullMain3[] = {      // Caps 行（asdf）
+    { 0.00f, 1.75f, 0x14, K_CAPS, 1 },
+    { 1.75f, 1.00f, 0x41, K_LETTER, 1 }, { 2.75f, 1.00f, 0x53, K_LETTER, 1 },
+    { 3.75f, 1.00f, 0x44, K_LETTER, 1 }, { 4.75f, 1.00f, 0x46, K_LETTER, 1 },
+    { 5.75f, 1.00f, 0x47, K_LETTER, 1 }, { 6.75f, 1.00f, 0x48, K_LETTER, 1 },
+    { 7.75f, 1.00f, 0x4A, K_LETTER, 1 }, { 8.75f, 1.00f, 0x4B, K_LETTER, 1 },
+    { 9.75f, 1.00f, 0x4C, K_LETTER, 1 }, { 10.75f, 1.00f, 0xBA, K_NORMAL, 1 },
+    { 11.75f, 1.00f, 0xDE, K_NORMAL, 1 }, { 12.75f, 2.25f, 0x0D, K_SPECIAL, 1 },
+};
+static const KbKeySpec kFullMain4[] = {      // Shift 行（zxcv）
+    { 0.00f, 2.25f, 0xA0, K_MOD, 1 },
+    { 2.25f, 1.00f, 0x5A, K_LETTER, 1 }, { 3.25f, 1.00f, 0x58, K_LETTER, 1 },
+    { 4.25f, 1.00f, 0x43, K_LETTER, 1 }, { 5.25f, 1.00f, 0x56, K_LETTER, 1 },
+    { 6.25f, 1.00f, 0x42, K_LETTER, 1 }, { 7.25f, 1.00f, 0x4E, K_LETTER, 1 },
+    { 8.25f, 1.00f, 0x4D, K_LETTER, 1 }, { 9.25f, 1.00f, 0xBC, K_NORMAL, 1 },
+    { 10.25f, 1.00f, 0xBE, K_NORMAL, 1 }, { 11.25f, 1.00f, 0xBF, K_NORMAL, 1 },
+    { 12.25f, 2.75f, 0xA1, K_MOD, 1 },
+};
+static const KbKeySpec kFullMain5[] = {      // Ctrl 行（含 6.25u 空格）
+    { 0.00f, 1.25f, 0x00, K_SPECIAL, 1 }, { 1.25f, 1.25f, 0x11, K_MOD, 1 },
+    { 2.50f, 1.25f, 0x5B, K_SPECIAL, 1 }, { 3.75f, 1.25f, 0x12, K_MOD, 1 },
+    { 5.00f, 6.25f, 0x20, K_SPACE  , 1 },
+    { 11.25f, 1.25f, 0x12, K_MOD, 1 }, { 12.50f, 1.25f, 0x5D, K_MOD, 1 },
+    { 13.75f, 1.25f, 0x11, K_MOD, 1 },
+};
+// Fn 网页层：Shift 行的字母键换网址后缀键
+static const KbKeySpec kFullWebShift[] = {
+    { 0.00f, 2.25f, 0xA0, K_MOD, 1 },
+    { 2.25f, 1.00f, 0x200, K_SPECIAL, 1 }, { 3.25f, 1.00f, 0x201, K_SPECIAL, 1 },
+    { 4.25f, 1.00f, 0x202, K_SPECIAL, 1 }, { 5.25f, 1.00f, 0x203, K_SPECIAL, 1 },
+    { 6.25f, 1.00f, 0x204, K_SPECIAL, 1 }, { 7.25f, 1.00f, 0x205, K_SPECIAL, 1 },
+    { 8.25f, 1.00f, 0x0BF, K_NORMAL , 1 }, { 9.25f, 1.00f, 0x0BC, K_NORMAL , 1 },
+    { 10.25f, 1.00f, 0x0BE, K_NORMAL, 1 }, { 11.25f, 1.00f, 0x02F, K_NORMAL, 1 },
+    { 12.25f, 2.75f, 0xA1, K_MOD, 1 },
+};
+static const KbRowSpec kFullMainRows[6] = {
+    { kFullMain0, (int)(sizeof(kFullMain0) / sizeof(KbKeySpec)) },
+    { kFullMain1, (int)(sizeof(kFullMain1) / sizeof(KbKeySpec)) },
+    { kFullMain2, (int)(sizeof(kFullMain2) / sizeof(KbKeySpec)) },
+    { kFullMain3, (int)(sizeof(kFullMain3) / sizeof(KbKeySpec)) },
+    { kFullMain4, (int)(sizeof(kFullMain4) / sizeof(KbKeySpec)) },
+    { kFullMain5, (int)(sizeof(kFullMain5) / sizeof(KbKeySpec)) },
+};
+// Fn 网页层用到的那一行
+#define kFullWebShiftN ((int)(sizeof(kFullWebShift) / sizeof(KbKeySpec)))
+
+// ---- 导航区 3u：行位与主区对齐（PrtSc 在 F 行、Ins 在数字行、Del 在 Tab 行、
+//      ↑ 在 Shift 行、←↓→ 在 Ctrl 行）—— 这一点现状就是对的，保持不动 ----
+static const KbKeySpec kFullNav0[] = {
+    { 0.00f, 1.00f, 0x2C, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x46, K_SPECIAL, 1 },
+    { 2.00f, 1.00f, 0x13, K_SPECIAL, 1 },
+};
+static const KbKeySpec kFullNav1[] = {
+    { 0.00f, 1.00f, 0x2D, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x24, K_SPECIAL, 1 },
+    { 2.00f, 1.00f, 0x21, K_SPECIAL, 1 },
+};
+static const KbKeySpec kFullNav2[] = {
+    { 0.00f, 1.00f, 0x2E, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x23, K_SPECIAL, 1 },
+    { 2.00f, 1.00f, 0x22, K_SPECIAL, 1 },
+};
+static const KbKeySpec kFullNav4[] = { { 1.00f, 1.00f, 0x26, K_ARROW, 1 } };
+static const KbKeySpec kFullNav5[] = {
+    { 0.00f, 1.00f, 0x25, K_ARROW, 1 }, { 1.00f, 1.00f, 0x28, K_ARROW, 1 },
+    { 2.00f, 1.00f, 0x27, K_ARROW, 1 },
+};
+
+// ---- 数字区 4u：5 行，对齐主区的「数字行 ↔ Ctrl 行」（= 真实 104）--------
+// 旧写法把 NumLock 行放在 F 行，整块被拉成 6 行，回车底边停在「0 行之上整整一行」，
+// 与 0 键、与键盘底边都不齐；F 行右侧那 4 列现在空着（真 104 那里就是空的）。
+static const KbKeySpec kFullNum0[] = {
+    { 0.00f, 1.00f, 0x90, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x6F, K_NORMAL, 1 },
+    { 2.00f, 1.00f, 0x6A, K_NORMAL , 1 }, { 3.00f, 1.00f, 0x6D, K_NORMAL, 1 },
+};
+static const KbKeySpec kFullNum1[] = {       // + 跨「789 行 + 456 行」
+    { 0.00f, 1.00f, 0x67, K_NORMAL, 1 }, { 1.00f, 1.00f, 0x68, K_NORMAL, 1 },
+    { 2.00f, 1.00f, 0x69, K_NORMAL, 1 }, { 3.00f, 1.00f, 0x6B, K_NORMAL, 2 },
+};
+static const KbKeySpec kFullNum2[] = {
+    { 0.00f, 1.00f, 0x64, K_NORMAL, 1 }, { 1.00f, 1.00f, 0x65, K_NORMAL, 1 },
+    { 2.00f, 1.00f, 0x66, K_NORMAL, 1 },
+};
+static const KbKeySpec kFullNum3[] = {       // 回车跨「123 行 + 0 行」
+    { 0.00f, 1.00f, 0x61, K_NORMAL, 1 }, { 1.00f, 1.00f, 0x62, K_NORMAL, 1 },
+    { 2.00f, 1.00f, 0x63, K_NORMAL, 1 }, { 3.00f, 1.00f, 0x0D, K_SPECIAL, 2 },
+};
+static const KbKeySpec kFullNum4[] = {
+    { 0.00f, 2.00f, 0x60, K_NORMAL, 1 }, { 2.00f, 1.00f, 0x6E, K_NORMAL, 1 },
+};
+
+// webFn：Fn 网页布局层——Shift 行字母键换为网址后缀键
+// 数字区显隐取「生效值」= 用户按 Tab 手动隐藏 || 窗口过窄自动隐藏（见 NumpadHidden）
+static void BuildComplete(int y, BOOL webFn) {
+    const int  gap = g_keyGap;
+    const int  KH  = g_keyHeight;
+    const int  h2  = KH * 2 + gap;
+    const BOOL npVisible = !NumpadHidden();
+
+    // 1u 反解：宽度 = 22u + 2*gap（隐藏数字区时 18u + gap）。用 double，不截断。
+    const int    nb    = npVisible ? 2 : 1;
+    const float  units = FULL_U_MAIN + FULL_U_NAV + (npVisible ? FULL_U_NUM : 0.0f);
+    const double u     = (double)(KEY_AREA_W - nb * gap) / (double)units;
+    const float  bc[2] = { FULL_U_MAIN, FULL_U_MAIN + FULL_U_NAV };
+
+    // 主区 6 行
+    for (int r = 0; r < 6; r++) {
+        int yy = y + r * (KH + gap);
+        if (r == 4 && webFn) {                 // Fn 网页层换掉 Shift 行
+            for (int i = 0; i < kFullWebShiftN; i++)
+                FullPut(0.0f, kFullWebShift[i], yy, KH, u, gap, bc, nb);
+            continue;
         }
-        AddKey(mx, y, wDel, g_keyHeight, 0x2E, K_SPECIAL);
-        { int cx = nx; short v[3] = {0x2C, 0x46, 0x13};
-          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v[i], K_SPECIAL); cx += navW + gap; } }
-        if (!g_npHidden) {
-            int cx = px; short v[4] = {0x90, 0x6F, 0x6A, 0x6D};
-            KeyType t[4] = {K_SPECIAL, K_NORMAL, K_NORMAL, K_NORMAL};
-            for (int i = 0; i < 4; i++) { AddKey(cx, y, navW, g_keyHeight, v[i], t[i]); cx += navW + gap; }
-        }
-        y += g_keyHeight + gap;
+        const KbRowSpec& row = kFullMainRows[r];
+        for (int i = 0; i < row.n; i++)
+            FullPut(0.0f, row.keys[i], yy, row.keys[i].vrow == 2 ? h2 : KH, u, gap, bc, nb);
     }
-    // Row Digits: `, 1~0, -, =, Backspace（双符号键，Shift 符号功能）| Ins Home PgUp | 7 8 9 +(跨2行)
+
+    // 导航区（6 行里第 4 行空着 —— 那里是真键盘的品牌位）
     {
-        int wBk = (int)(68 * dpiScale * scaleX);
-        int aw = (MAIN_W - wBk - 13 * gap) / 13;
-        int rem = MAIN_W - wBk - 13 * gap - aw * 13;
-        short v[13] = {0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB};
-        mx = KEY_AREA_X;   // 主区每行 x 归位
-        for (int i = 0; i < 13; i++) { int w = aw + (i <= rem ? 1 : 0); AddKey(mx, y, w, g_keyHeight, v[i], K_NORMAL); mx += w + gap; }
-        AddKey(mx, y, wBk, g_keyHeight, 0x08, K_SPECIAL);
-        { int cx = nx; short v2[3] = {0x2D, 0x24, 0x21};
-          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v2[i], K_SPECIAL); cx += navW + gap; } }
-        if (!g_npHidden) {
-            int cx = px;
-            for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, (short)(0x67 + i), K_NORMAL); cx += navW + gap; }
-            AddKey(cx, y, navW, h2, 0x6B, K_NORMAL);
+        static const struct { const KbKeySpec* k; int n; int r; } nav[6] = {
+            { kFullNav0, 3, 0 }, { kFullNav1, 3, 1 }, { kFullNav2, 3, 2 },
+            { NULL,      0, 3 }, { kFullNav4, 1, 4 }, { kFullNav5, 3, 5 },
+        };
+        for (int i = 0; i < 6; i++) {
+            if (!nav[i].k) continue;
+            int yy = y + nav[i].r * (KH + gap);
+            for (int j = 0; j < nav[i].n; j++)
+                FullPut(FULL_U_MAIN, nav[i].k[j], yy, KH, u, gap, bc, nb);
         }
-        y += g_keyHeight + gap;
     }
-    // Row 1: Tab, q~p, [\ | Del End PgDn | 4 5 6
-    {
-        int wTab = (int)(68 * dpiScale * scaleX);
-        int aw = (MAIN_W - wTab - 13 * gap) / 13;
-        int rem = MAIN_W - wTab - 13 * gap - aw * 13;
-        short v[14] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC};
-        KeyType t[14] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
-        mx = KEY_AREA_X;   // 主区每行 x 归位
-        AddKey(mx, y, wTab, g_keyHeight, v[0], t[0]); mx += wTab + gap;
-        for (int i = 1; i < 14; i++) { int w = aw + (i <= rem ? 1 : 0); AddKey(mx, y, w, g_keyHeight, v[i], t[i]); mx += w + gap; }
-        { int cx = nx; short v2[3] = {0x2E, 0x23, 0x22};
-          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v2[i], K_SPECIAL); cx += navW + gap; } }
-        if (!g_npHidden) {
-            int cx = px;
-            for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, (short)(0x64 + i), K_NORMAL); cx += navW + gap; }
-        }
-        y += g_keyHeight + gap;
-    }
-    // Row 2: Caps, a~l, ;', Enter | Del End PgDn | 4 5 6
-    {
-        int wCaps = (int)(80 * dpiScale * scaleX);
-        int wEnt  = (int)(90 * dpiScale * scaleX);
-        int aw = (MAIN_W - wCaps - wEnt - 12 * gap) / 11;
-        int rem = MAIN_W - wCaps - wEnt - 12 * gap - aw * 11;
-        short v[13] = {0x14,0x41,0x53,0x44,0x46,0x47,0x48,0x4A,0x4B,0x4C,0xBA,0xDE,0x0D};
-        mx = KEY_AREA_X;   // 主区每行 x 归位
-        AddKey(mx, y, wCaps, g_keyHeight, v[0], K_CAPS); mx += wCaps + gap;
-        for (int i = 1; i <= 11; i++) {
-            int w = aw + (i <= rem ? 1 : 0);
-            AddKey(mx, y, w, g_keyHeight, v[i], i <= 9 ? K_LETTER : K_NORMAL);
-            mx += w + gap;
-        }
-        AddKey(mx, y, wEnt, g_keyHeight, v[12], K_SPECIAL);
-        if (!g_npHidden) {
-            int cx = px;
-            for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, (short)(0x61 + i), K_NORMAL); cx += navW + gap; }
-            AddKey(cx, y, navW, h2, 0x0D, K_SPECIAL);   // 数字区 Enter 跨 Caps+Shift 两行
-        }
-        y += g_keyHeight + gap;
-    }
-    // Row 3: Shift, z~/, Shift | ↑（居中列，正对下方 ↓）
-    {
-        int wLSh = (int)(95 * dpiScale * scaleX);
-        int wRSh = (int)(52 * dpiScale * scaleX);
-        int aw = (MAIN_W - wLSh - wRSh - 11 * gap) / 10;
-        int rem = MAIN_W - wLSh - wRSh - 11 * gap - aw * 10;
-        short vN[10] = {0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF};
-        short vW[10] = {0x200,0x201,0x202,0x203,0x204,0x205,0xBF,0xBC,0xBE,0x2F};
-        KeyType tN[10] = {K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
-        KeyType tW[10] = {K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL};
-        mx = KEY_AREA_X;   // 主区每行 x 归位
-        AddKey(mx, y, wLSh, g_keyHeight, 0xA0, K_MOD); mx += wLSh + gap;
-        for (int i = 0; i < 10; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            AddKey(mx, y, w, g_keyHeight, webFn ? vW[i] : vN[i], webFn ? tW[i] : tN[i]);
-            mx += w + gap;
-        }
-        AddKey(mx, y, wRSh, g_keyHeight, 0xA1, K_MOD);
-        AddKey(nx + navW + gap, y, navW, g_keyHeight, 0x26, K_ARROW);   // ↑ 正对下方 ↓
-        y += g_keyHeight + gap;
-    }
-    // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl | ← ↓ → | 0(跨2列) .
-    {
-        int wFn   = (int)(46 * dpiScale * scaleX);
-        int wCtl  = (int)(56 * dpiScale * scaleX);
-        int wWin  = (int)(46 * dpiScale * scaleX);
-        int wAlt  = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(56 * dpiScale * scaleX);
-        int left = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-        int spaceW = MAIN_W - left - 7 * gap; if (spaceW < 60) spaceW = 60;
-        int w[8] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl};
-        short v[8] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11};
-        KeyType t[8] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 8; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + gap; }
-        { int cx = nx; short v2[3] = {0x25, 0x28, 0x27};   // ↓ 正对上方 ↑
-          for (int i = 0; i < 3; i++) { AddKey(cx, y, navW, g_keyHeight, v2[i], K_ARROW); cx += navW + gap; } }
-        if (!g_npHidden) {
-            AddKey(px, y, navW * 2 + gap, g_keyHeight, 0x60, K_NORMAL);
-            AddKey(px + navW * 2 + 2 * gap, y, navW, g_keyHeight, 0x6E, K_NORMAL);
+
+    // 数字区 5 行：从「数字行」起，不是 F 行
+    if (npVisible) {
+        static const struct { const KbKeySpec* k; int n; } num[5] = {
+            { kFullNum0, 4 }, { kFullNum1, 4 }, { kFullNum2, 3 },
+            { kFullNum3, 4 }, { kFullNum4, 2 },
+        };
+        for (int i = 0; i < 5; i++) {
+            int yy = y + (i + 1) * (KH + gap);
+            for (int j = 0; j < num[i].n; j++) {
+                const KbKeySpec& s = num[i].k[j];
+                FullPut(FULL_U_MAIN + FULL_U_NAV, s, yy, s.vrow == 2 ? h2 : KH, u, gap, bc, nb);
+            }
         }
     }
 }
@@ -789,6 +877,8 @@ static void BuildKeys() {
     double baseW = 980.0 * dpiScale;
     double baseH = 320.0 * dpiScale;
 
+    UpdateNumpadAuto(g_ww, dpiScale);   // 窄屏自动收起数字区（在算 rows / 建键位之前）
+
     double scaleX = (double)g_ww / baseW;
     double scaleY = (double)g_wh / baseH;
 
@@ -817,7 +907,7 @@ static void BuildKeys() {
     }
 
     if (g_layoutMode == 2) {   // 完整键盘（主区+导航区+数字区；Fn 网页层换 Shift 行网址键）
-        BuildComplete(y, dpiScale, scaleX, g_fnLayer && g_fnWebLayout);
+        BuildComplete(y, g_fnLayer && g_fnWebLayout);
         return;
     }
 
@@ -975,6 +1065,28 @@ static void BuildKeys() {
             for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
         }
     }
+}
+
+// 全尺寸布局下「数字区显隐」的唯一入口：标题栏「小键盘」按钮与 Tab 键都走这里。
+// 之前两条路径各改一遍 g_npHidden，迟早分叉；收成一个函数（故放在 BuildKeys 之后）。
+// ⚠ 顺序：needW 用闭式解，绝不能在改 g_ww 之前去读 g_keyGap —— 它由 g_ww 反算，
+//    这时还是旧值，算出的 needW 会偏小，数字区照样被挤出去。
+static void SetFullNumpadHidden(HWND hWnd, BOOL hidden) {
+    g_npHidden = hidden;
+    IniSetInt(L"Keyboard", L"NpHidden", hidden ? 1 : 0);
+    if (!hidden) {
+        // 主区保底 400 DIP 反解：ww ≥ 700·dpi 时才放得下整块数字区
+        int needW = (int)(700.0 * GetSystemDpiScale()) + 8;
+        if (g_ww < needW) {                     // 只加宽，不缩窄（缩回去是「手比你快」）
+            g_ww = needW;
+            if (hWnd && IsWindow(hWnd)) {
+                SetWindowPos(hWnd, NULL, 0, 0, g_ww, g_wh,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    }
+    BuildKeys();
+    if (hWnd && IsWindow(hWnd)) InvalidateRect(hWnd, NULL, TRUE);
 }
 
 // 注册内嵌字体（MiSans Medium 精简子集，单一字面）到当前进程；失败则回退系统字体
@@ -1362,6 +1474,19 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
     GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
     SelectObject(dc, old);
     return sz.cx;
+}
+
+// 键面标签自适应字号：从现有字体里挑最小的可用档，不新建 GDI 对象。
+// 起因：全尺寸布局改成 1u 网格后，导航区键宽从 73px 收到与字母键相同的 52px，
+// 「PrtSc / ScrLk / Pause」在 14px 下（约 44px）会撑破键帽 —— 之前是靠
+// 「导航区比字母键宽 59%」把这个矛盾盖住的。
+// 主键盘走 KbFrameSig 帧缓存、只在内容变化时重绘，105 次测量不构成性能问题。
+static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW, BOOL bold) {
+    if (!s || !s[0] || maxW <= 0) return bold ? g_f14b : g_f14;
+    HFONT ladder[3] = { bold ? g_f14b : g_f14, g_f13, g_f12 };
+    for (int i = 0; i < 3; i++)
+        if (MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
+    return ladder[2];      // 仍放不下就交给 DrawTextC 的省略逻辑
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -1854,11 +1979,8 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         if (k->vk == 0x09 && g_layoutMode == 2 && g_npTabToggle) {
-            // 完整布局：Tab 键显示/隐藏右侧数字区（小键盘）
-            g_npHidden = !g_npHidden;
-            IniSetInt(L"Keyboard", L"NpHidden", g_npHidden ? 1 : 0);
-            BuildKeys();
-            InvalidateRect(g_hWnd, 0, TRUE);
+            // 完整布局：Tab 键显示/隐藏右侧数字区 —— 与标题栏「小键盘」按钮同一个入口
+            SetFullNumpadHidden(g_hWnd, !g_npHidden);
             break;
         }
         if (k->vk == 0) {  // Fn 键：切换 F1~F12 功能层（或网页布局层）
@@ -1976,7 +2098,8 @@ static HeaderMetrics GetHeaderMetrics() {
 
     hm.xClose = g_ww - rMargin - hm.wClose;
     hm.xMin   = hm.xClose - gap - hm.wMin;
-    hm.numBtnVisible = (g_showNumBtn && g_layoutMode != 2);   // 完整布局自带数字区：默认隐藏 123
+    // 全尺寸布局下也常驻：它是数字区唯一的界面开关（也给「窄屏自动收起」留了恢复入口）。
+    hm.numBtnVisible = g_showNumBtn;
     hm.xNum   = hm.numBtnVisible ? (hm.xMin - gap - hm.wNum) : hm.xMin;
     hm.xMenu  = (int)(6 * dpi);
 
@@ -1997,28 +2120,47 @@ static int HitHeader(int x, int y) {
     return -1;
 }
 
+// 「小键盘」按钮当前算不算「开着的」：
+//   独立小键盘布局 —— 整块界面就是小键盘，算开；
+//   全尺寸布局     —— 数字区可见才算开（窄屏自动收起时按钮不该显示成激活态）；
+//   默认布局       —— 没开。
+// 这个语义让同一个按钮在三种布局下自洽：它回答的始终是「小键盘现在开着吗」。
+static BOOL NumBtnActive() {
+    if (g_layoutMode == 1) return TRUE;
+    if (g_layoutMode == 2) return !NumpadHidden();
+    return FALSE;
+}
+
 // 标题栏胶囊按钮：底色 + 矢量图标 + 文字，三者同一配方。
 // 「设置」与「小键盘」共用这一份 —— 两个按钮的观感必须一致。
 // 设置按钮恒定显示「齿轮 + 设置」（设置页页头也是齿轮，两处观感才对得上）。
 // 宽度由调用方从 HeaderMetrics 取（绘制与命中同源，见 GetHeaderMetrics 上方的说明）。
+// active：「小键盘开着」的实底态（主色底 + 主色上的文字，零新增令牌）。
 static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL hov,
-                           const HkIconDef& icon, const wchar_t* label) {
-    DrawRoundRect(dc, x, hm.btnY, w, hm.btnH,
-                  hov ? C_REGULAR_HOV : C_REGULAR, hov ? C_REGULAR_HOV : C_REGULAR, hm.btnH / 2);
+                           const HkIconDef& icon, const wchar_t* label, BOOL active) {
+    DWORD bg, fg;
+    if (active) {
+        // 激活态悬停必须「向白混」：向 cardBg 混在深色主题下只有 4.54:1（踩在 AA 线上）
+        bg = hov ? BlendColor(C_HOT, RGB(255, 255, 255), 0.12) : C_HOT;
+        fg = C_ON_PRIMARY;
+    } else {
+        bg = hov ? C_REGULAR_HOV : C_REGULAR;
+        fg = C_BTN_CONTENT;
+    }
+    DrawRoundRect(dc, x, hm.btnY, w, hm.btnH, bg, bg, hm.btnH / 2);
 
     int iconSz = (int)(17 * GetSystemDpiScale());
     int gap    = (int)(6 * GetSystemDpiScale());
     int tw     = MeasureTextW(dc, label, g_f12);
-    int total  = iconSz + gap + tw;
-    int cx     = x + (w - total) / 2;
+    int cx     = x + (w - (iconSz + gap + tw)) / 2;
     DrawHkIcon(dc, (float)cx, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
-               icon, C_BTN_CONTENT, C_BTN_CONTENT);
-    DrawTextC(dc, cx + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, C_BTN_CONTENT);
+               icon, fg, fg);
+    DrawTextC(dc, cx + iconSz + gap, hm.btnY, tw + 4, hm.btnH, label, g_f12, fg);
 }
 
 static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
     DrawHeaderPill(dc, hm, hm.xMenu, hm.wMenu, (g_hdrHov == HDR_DOCK),
-                   HkIcon(HKICON_GEAR), T(L"\x8BBE\x7F6E", L"Settings"));
+                   HkIcon(HKICON_GEAR), T(L"\x8BBE\x7F6E", L"Settings"), FALSE);
 }
 
 static void DrawHeader(HDC dc) {
@@ -2032,11 +2174,12 @@ static void DrawHeader(HDC dc) {
         DrawTextC(dc, hm.xTitle, 0, hm.wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
-    // 小键盘按钮：与「设置」同款（图标 + 文字），点击在当前布局与小键盘间切换。
-    // 标签用「小键盘」而不是「123」：它切的是整个布局，图标 + 名称比一个数字清楚。
+    // 小键盘按钮：三种布局下都常驻（全尺寸下它是数字区唯一的界面开关）。
+    // 激活态 = 「小键盘开着」：独立小键盘布局或在全尺寸下数字区可见时是主色实底。
     if (hm.numBtnVisible) {
         DrawHeaderPill(dc, hm, hm.xNum, hm.wNum, (g_hdrHov == HDR_NUM),
-                       HkIcon(HKICON_NUMPAD), T(L"\x5C0F\x952E\x76D8", L"Numpad"));
+                       HkIcon(HKICON_NUMPAD), T(L"\x5C0F\x952E\x76D8", L"Numpad"),
+                       NumBtnActive());
     }
 
     // 最小化 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
@@ -2098,9 +2241,12 @@ static void DrawKeys(HDC dc) {
 
         const wchar_t* txt = KeyText(k);
         // 字体粗细跟随键面底色：普通键（字母/数字/标点/空格/网址后缀）用常规字重，
-        // 修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体
-        HFONT f = (isMod || k->type == K_HIDE) ? g_f14b : g_f14;
-        if (k->vk == 0x08) f = g_f18b;   // 退格：大号粗体箭头
+        // 修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体。
+        // 放不下时按 FitKeyFont 降档 —— 全尺寸布局的导航区只有 1u 宽（52px）。
+        BOOL boldFont = (isMod || k->type == K_HIDE);
+        HFONT f = (k->vk == 0x08)
+                ? g_f18b                                                       // 退格：大号粗体箭头
+                : FitKeyFont(dc, txt, k->w - (int)(14 * GetSystemDpiScale()), boldFont);
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -2176,6 +2322,9 @@ struct KbFrameSig {
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, fnLayer, showFKeys,
          fnWebLayout, shiftSymbols, lang;
+    // 数字区显隐（生效值）：之前没进签名，靠「17 个键消失 → nk 变」侥幸触发重绘；
+    // 窄屏自动收起与手动收起是两条路径，显式纳入才不依赖这个巧合。
+    BOOL npHidden;
     BOOL operator!=(const KbFrameSig& o) const { return memcmp(this, &o, sizeof(*this)) != 0; }
 };
 static KbFrameSig g_kbSig = {};
@@ -2242,6 +2391,7 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.winKey = g_winKey; sig.physShift = g_physShift; sig.physWin = g_physWin;
     sig.fnLayer = g_fnLayer; sig.showFKeys = g_showFKeys; sig.fnWebLayout = g_fnWebLayout;
     sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
+    sig.npHidden = NumpadHidden();
     if (g_kbCacheBmp && g_kbCacheW == g_ww && g_kbCacheH == g_wh && !(sig != g_kbSig)) return;
 
     HDC dc = GetDC(hWnd);
@@ -3280,9 +3430,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
 
         r = SettingsRowRect(m, 3);
-        DrawSettingRowContent(dc, m, r, HKICON_PANEL, NULL,
-                              T(L"小键盘切换按钮", L"Numpad Toggle Button"),
-                              T(L"在标题栏显示小键盘按钮，点击在当前布局与小键盘间切换", L"Show a numpad button in the title bar to toggle the numpad"),
+        DrawSettingRowContent(dc, m, r, HKICON_NUMPAD, NULL,
+                              T(L"小键盘按钮", L"Numpad Button"),
+                              T(L"在标题栏显示小键盘按钮；默认布局下切换到小键盘，全尺寸下显示或隐藏数字区", L"Show a numpad button in the title bar; switches to the numpad layout, or shows/hides the numpad section in the full layout"),
                               g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
 
@@ -3290,7 +3440,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             r = SettingsRowRect(m, 4);
             DrawSettingRowContent(dc, m, r, -1, L"F",   // Tab 切换小键盘同样保留手绘 F
                                   T(L"Tab 切换小键盘", L"Tab Toggles Numpad"),
-                                  T(L"完整布局下按 Tab 键显示/隐藏右侧数字区", L"Press Tab in the full layout to show or hide the numpad section"),
+                                  T(L"全尺寸布局下按 Tab 键显示或隐藏右侧数字区（与标题栏按钮效果相同）", L"Press Tab in the full layout to show or hide the numpad section (same as the title-bar button)"),
                                   g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r));
             DrawSettingSwitch(dc, m, r, g_npTabToggle, S_HIT_NPTAB);
         }
@@ -4960,14 +5110,18 @@ static void OnLDown(HWND hWnd, int x, int y) {
         case HDR_DOCK: OpenSettings(); break;
         case HDR_MIN: UserHideKeyboard(); break;   // 手动收起（自动收起开启时同输入框内不回弹）
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
-        case HDR_NUM:   // 123：当前布局 ↔ 小键盘
-            if (g_layoutMode != 1) {
-                g_prevLayout = g_layoutMode;
-                g_layoutMode = 1;
+        case HDR_NUM:   // 「小键盘」按钮：语义统一为「小键盘开着吗」
+            if (g_layoutMode == 2) {
+                // 全尺寸布局：切换右侧数字区（与 Tab 键同一个入口）
+                SetFullNumpadHidden(hWnd, !g_npHidden);
+            } else if (g_layoutMode == 1) {
+                g_layoutMode = g_prevLayout;   // 独立小键盘 → 切回上次用的布局
+                ApplyKeyboardLayout(TRUE);
             } else {
-                g_layoutMode = g_prevLayout;
+                g_prevLayout = g_layoutMode;   // 默认布局 → 切到独立小键盘
+                g_layoutMode = 1;
+                ApplyKeyboardLayout(TRUE);
             }
-            ApplyKeyboardLayout(TRUE);   // 按布局重置窗口大小并重建键位
             break;
         }
         return;
@@ -5056,10 +5210,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO mmi = (LPMINMAXINFO)l;
+        // 允许自由缩小（小键盘布局等），仅挡住过小尺寸。
+        // 全尺寸布局必须单独给下限：键帽 44px 的触摸安全线反解出 1090 宽（含数字区）/
+        // 870 宽（数字区收起后）。写死 300 的话窗口一窄，整块数字区就被推出窗口看不见了。
         double dpiScale = GetSystemDpiScale();
-        // 允许自由缩小（小键盘布局等），仅挡住过小尺寸
-        mmi->ptMinTrackSize.x = (int)(300 * dpiScale);
-        mmi->ptMinTrackSize.y = (int)(150 * dpiScale);
+        if (g_layoutMode == 2) {
+            mmi->ptMinTrackSize.x = (int)(870 * dpiScale);
+            mmi->ptMinTrackSize.y = (int)(300 * dpiScale);
+        } else {
+            mmi->ptMinTrackSize.x = (int)(300 * dpiScale);
+            mmi->ptMinTrackSize.y = (int)(150 * dpiScale);
+        }
         return 0;
     }
     case WM_DPICHANGED: {

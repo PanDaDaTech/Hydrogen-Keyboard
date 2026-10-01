@@ -437,8 +437,6 @@ HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
-// 小号档：只给 FitKeyFont 用（全尺寸导航区键宽 1u，PrtSc/ScrLk/Pause 这类长标签要能缩下来）
-HFONT       g_f10 = 0, g_f9 = 0;
 static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -600,15 +598,18 @@ static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, in
 }
 
 // ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）--------------------
-static const KbKeySpec kFullMain0[] = {      // F 行：Esc + 1u 空档 + F1~F12 + Del
+static const KbKeySpec kFullMain0[] = {      // F 行：Esc + F1~F12 + Del(2u)
+    // Esc 紧接 F1，中间不留空档：网格里那 1u 空档是一整个键宽，看着就是一个「缺了键」
+    // 的洞（报告里按真 104 建议留，实机反馈「看着难受」）。F1 落在 1.00 这一列，
+    // 与数字行的 `1` 对齐；Del 补成 2u 收满 15u，正好压在退格上方。
     { 0.00f, 1.00f, 0x1B, K_SPECIAL, 1 },
-    { 2.00f, 1.00f, 0x70, K_NORMAL , 1 }, { 3.00f, 1.00f, 0x71, K_NORMAL , 1 },
-    { 4.00f, 1.00f, 0x72, K_NORMAL , 1 }, { 5.00f, 1.00f, 0x73, K_NORMAL , 1 },
-    { 6.00f, 1.00f, 0x74, K_NORMAL , 1 }, { 7.00f, 1.00f, 0x75, K_NORMAL , 1 },
-    { 8.00f, 1.00f, 0x76, K_NORMAL , 1 }, { 9.00f, 1.00f, 0x77, K_NORMAL , 1 },
-    { 10.00f, 1.00f, 0x78, K_NORMAL, 1 }, { 11.00f, 1.00f, 0x79, K_NORMAL, 1 },
-    { 12.00f, 1.00f, 0x7A, K_NORMAL, 1 }, { 13.00f, 1.00f, 0x7B, K_NORMAL, 1 },
-    { 14.00f, 1.00f, 0x2E, K_SPECIAL, 1 },
+    { 1.00f, 1.00f, 0x70, K_NORMAL , 1 }, { 2.00f, 1.00f, 0x71, K_NORMAL , 1 },
+    { 3.00f, 1.00f, 0x72, K_NORMAL , 1 }, { 4.00f, 1.00f, 0x73, K_NORMAL , 1 },
+    { 5.00f, 1.00f, 0x74, K_NORMAL , 1 }, { 6.00f, 1.00f, 0x75, K_NORMAL , 1 },
+    { 7.00f, 1.00f, 0x76, K_NORMAL , 1 }, { 8.00f, 1.00f, 0x77, K_NORMAL , 1 },
+    { 9.00f, 1.00f, 0x78, K_NORMAL , 1 }, { 10.00f, 1.00f, 0x79, K_NORMAL, 1 },
+    { 11.00f, 1.00f, 0x7A, K_NORMAL , 1 }, { 12.00f, 1.00f, 0x7B, K_NORMAL, 1 },
+    { 13.00f, 2.00f, 0x2E, K_SPECIAL, 1 },
 };
 static const KbKeySpec kFullMain1[] = {      // 数字行
     { 0.00f, 1.00f, 0xC0, K_NORMAL , 1 },
@@ -1142,15 +1143,19 @@ static void RecreateFontsAndLayout() {
     if (g_f14b) DeleteObject(g_f14b);
     if (g_f16b) DeleteObject(g_f16b);
     if (g_f18b) DeleteObject(g_f18b);
-    if (g_f10) DeleteObject(g_f10);
-    if (g_f9) DeleteObject(g_f9);
 
     double dpiScale = GetSystemDpiScale();
-    double baseH = 320.0 * dpiScale;
-    double scaleY = (double)g_wh / baseH;
-    if (scaleY < 0.4) scaleY = 0.4;
 
-    double finalFontScale = dpiScale * scaleY;
+    // 字号跟「键高」走，不跟窗口高度走 —— 这一条就是默认布局的字号规则。
+    // 先算布局拿到 g_keyHeight，再按它定字号：默认布局 5 行 @320 DIP 的键高是 48，
+    // 正好是参考值（finalFontScale = dpiScale，与改动前完全一致，默认布局观感不变）；
+    // 全尺寸 6 行、同样窗口高度下键更矮，字号自动按比例收回来 —— 否则键面标签会比默认
+    // 布局明显偏大，挤到只能逐键降档，「字体大小不统一」就是这么来的。
+    BuildKeys();
+
+    double refKeyH = 48.0 * dpiScale;              // 默认布局（5 行 / 320 DIP）的键高
+    double finalFontScale = dpiScale * ((double)g_keyHeight / refKeyH);
+    if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
     g_f12  = MakeFont((int)(12 * finalFontScale), 0);
     g_f13  = MakeFont((int)(13 * finalFontScale), 0);
@@ -1158,10 +1163,6 @@ static void RecreateFontsAndLayout() {
     g_f14b = MakeFont((int)(14 * finalFontScale), 1);
     g_f16b = MakeFont((int)(16 * finalFontScale), 1);
     g_f18b = MakeFont((int)(18 * finalFontScale), 1);
-    g_f10  = MakeFont((int)(10 * finalFontScale), 0);
-    g_f9   = MakeFont((int)(9  * finalFontScale), 0);
-
-    BuildKeys();
 }
 
 static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
@@ -1484,20 +1485,21 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
     return sz.cx;
 }
 
-// 键面标签自适应字号：从现有字体里挑最小的可用档，不新建 GDI 对象。
-// 起因：全尺寸布局改成 1u 网格后，导航区键宽从 73px 收到与字母键相同的 52px，
-// 「PrtSc / ScrLk / Pause」在 14px 下（约 44px）会撑破键帽 —— 之前是靠
-// 「导航区比字母键宽 59%」把这个矛盾盖住的。
-// 实测（用内嵌字体按程序真实字号量）：默认 1280×404 下 14b/13/12 分别是 18/16/15px，
-// 「PrtSc」实测 66/53/51px，而键内可用宽只有 38px —— 三档全放不下，
-// 所以再补 10/9 两档（13px/11px），最短的那档才能让 PrtSc/Pause 落到实处。
-// 主键盘走 KbFrameSig 帧缓存、只在内容变化时重绘，上百次测量不构成性能问题。
+// 键面标签自适应字号：只用来救「PrtSc / ScrLk / Pause / Home / PgUp / PgDn」这类
+// 塞不进 1u 键的长标签。全尺寸布局的导航区键宽只有与字母键相同的 52px，
+// 而在默认布局里，这些位置是靠「导航区比字母键宽 59%」把矛盾盖住的。
+//
+// 阶梯刻意只有三档：基础档 → 13 → 12（12 是地板，不再往下掉）。
+// 掉到 9pt 那种深度会让同一排导航键冒出 4 种字号，反而更「不统一」；
+// 停在 12 时，最宽的 Pause 约 48px，仍在 52px 键内（两侧各 2px 余量）。
+// 注意真正决定观感的是上面 RecreateFontsAndLayout 的字号缩放：字号跟键高走，
+// 这里只是收尾，不是主力。
 static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW, BOOL bold) {
     if (!s || !s[0] || maxW <= 0) return bold ? g_f14b : g_f14;
-    HFONT ladder[5] = { bold ? g_f14b : g_f14, g_f13, g_f12, g_f10, g_f9 };
-    for (int i = 0; i < 5; i++)
+    HFONT ladder[3] = { bold ? g_f14b : g_f14, g_f13, g_f12 };
+    for (int i = 0; i < 3; i++)
         if (MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
-    return ladder[4];      // 仍放不下就交给 DrawTextC 的省略逻辑
+    return ladder[2];
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -2257,7 +2259,7 @@ static void DrawKeys(HDC dc) {
         BOOL boldFont = (isMod || k->type == K_HIDE);
         HFONT f = (k->vk == 0x08)
                 ? g_f18b                                                       // 退格：大号粗体箭头
-                : FitKeyFont(dc, txt, k->w - (int)(14 * GetSystemDpiScale()), boldFont);
+                : FitKeyFont(dc, txt, k->w - (int)(6 * GetSystemDpiScale()), boldFont);
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -5437,7 +5439,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
-        DeleteObject(g_f10); DeleteObject(g_f9);
         DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
         PostQuitMessage(0);
         return 0;

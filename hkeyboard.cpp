@@ -427,9 +427,6 @@ static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=默认 1=小键盘 2=全尺寸（完整）
-// 小键盘布局的排布方案（临时对比开关，ini Keyboard/NumpadStyle，0=A 1=B）：
-// 用户要求「两个方案都做出来看」，先一次构建里同时能出两版截图，选定后删掉这个开关与 B 版。
-int         g_npStyle = 0;
 int         g_prevLayout = 0;          // 123 按钮切到小键盘前的布局（会话内记忆）
 BOOL        g_showNumBtn = TRUE;       // 标题栏是否显示 123 小键盘切换按钮
 BOOL        g_npHidden = FALSE;        // 完整布局：数字区隐藏（标题栏按钮，持久化）
@@ -514,75 +511,22 @@ static int AddKey(int x, int y, int w, int h, short vk, KeyType type, BOOL symSh
 }
 
 // ============================================================================
-// 小键盘布局（layoutMode==1，430×320 DIP）：两套排布，靠 g_npStyle 切换对比
+// 小键盘布局（layoutMode==1，430×320 DIP）：4 列数字盘 + 底部动作行，共 6 行
 // ----------------------------------------------------------------------------
-// 方案 A（g_npStyle=0，照 2026-10-01 用户给的参考图）：T9 三列数字盘 + 右侧动作列
+//     Bksp   /      *      -
+//     7      8      9      +      ← `+` 竖跨 Row1~Row2
+//     4      5      6
+//     1      2      3      Enter  ← `Enter` 竖跨 Row3~Row4
+//     0 (横跨 2 列)         .
+//     Tab    Shift  空格 (横跨 2 列)
 //
-//     1 (1,?!)   2 (abc2)   3 (def3)   ←
-//     4 (ghi4)   5 (jkl5)   6 (mno6)   Enter
-//     7 (pqrs7)  8 (tuv8)   9 (wxyz9)  Tab
-//     123        0 (0+-_)   空格       Shift
-//
-//   4 列 × 4 行等宽等高 —— 参考图的关键就是「数字格大」：键盘只有 16 个格，
-//   键高就能给到 62 DIP（原方案 5 行只有 49），触摸命中面积 +27%。
-//   数字格下的 T9 字母副标签照抄参考图（DrawKeys 里画，纯标注）。
-//   左下角 `123` 是参考图里的层切换键：按下切到符号页（键面变 `abc`），
-//   复用现成的 g_fnLayer 状态（它本来就带高亮 / 重建 / 帧签名，不用再造一个层变量）。
-//
-// 方案 B（g_npStyle=1）：保留原 4 列数字盘（含 + 与 .），下面补一整行 Tab / Shift / 空格。
-//   两条路线都不改窗口尺寸，因此可以直接对照。
+//   没有采用 3×3 的 T9 九宫格：小键盘最常见的用法是连续敲数字（端口号 / IP / 金额），
+//   保持「7-8-9 在上、1-2-3 在下」与实体数字区一致的排布最不容易按错；顺带也腾出了
+//   一整行放 Tab / Shift / 空格 —— 纯数字输入里这三个组合键同样要按。
+//   两套排布都实机出图对比过，用户选了这一套（T9 那版连同它的符号页已删除）。
 // ============================================================================
 
-// 方案 A 的数字格 → 符号页（三层九格，顺序 = 行优先）
-// 全部走 K_SYM：键面由 (vk, symShift) 唯一决定，点击发同一个字符。
-// ⚠ 不能留 K_NORMAL：符号页是复用 g_fnLayer 实现的，而 g_fnLayer 在本布局下
-//   （g_fnWebLayout 为假）还会触发 KeyText 的「数字行 → F1~F12」改写 ——
-//   `=`(0xBB) 的 FnMap 是 12，实机直接把 `=` 画成了 **F12**；
-//   同时 K_NORMAL 还会进「双符号随 Shift 换面」分支：0xBC（主字符 , 副符号 <）
-//   被画成 `<` 上、`,` 下两行，与周围单符号格完全不同。
-// 数字与运算符（0x6x / 0x3x）本来就查不到 FnMap，保留各自类型即可。
-struct NpSymSpec { short vk; KeyType type; unsigned char symShift; };
-static const NpSymSpec kNpSymPage[9] = {
-    { 0x6B, K_NORMAL, 0 }, { 0x6D, K_NORMAL, 0 }, { 0x6A, K_NORMAL, 0 },   // + - *
-    { 0x6F, K_NORMAL, 0 }, { 0xBB, K_SYM   , 0 }, { 0x35, K_SYM   , 1 },   // / = %
-    { 0x39, K_SYM   , 1 }, { 0x30, K_SYM   , 1 }, { 0xBC, K_SYM   , 0 },   // ( ) ,
-};
-
-// 小键盘方案 A：T9 数字盘 + 动作列
-static void BuildNumpadT9(int y) {
-    const int colW   = (KEY_AREA_W - 3 * g_keyGap) / 4;
-    const int pitch  = g_keyHeight + g_keyGap;
-    const int yLast  = y + 3 * pitch;
-    const BOOL sym   = g_fnLayer;      // TRUE = 符号页
-
-    // 9 个数字（或符号）格；右下那一列是动作键
-    for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) {
-            int x  = KEY_AREA_X + c * (colW + g_keyGap);
-            int yy = y + r * pitch;
-            if (!sym) {
-                AddKey(x, yy, colW, g_keyHeight, (short)(0x61 + r * 3 + c), K_NORMAL);
-            } else {
-                const NpSymSpec& s = kNpSymPage[r * 3 + c];
-                AddKey(x, yy, colW, g_keyHeight, s.vk, s.type, s.symShift);
-            }
-        }
-    }
-    // 动作列：← / Enter / Tab（逐行）
-    {
-        int x = KEY_AREA_X + 3 * (colW + g_keyGap);
-        AddKey(x, y,            colW, g_keyHeight, 0x08, K_SPECIAL);
-        AddKey(x, y + pitch,    colW, g_keyHeight, 0x0D, K_SPECIAL);
-        AddKey(x, y + 2 * pitch, colW, g_keyHeight, 0x09, K_SPECIAL);
-        AddKey(x, yLast,        colW, g_keyHeight, 0xA0, K_MOD);
-    }
-    // 底行左三格：层切换（123 / abc）、0、空格
-    AddKey(KEY_AREA_X, yLast, colW, g_keyHeight, 0x00, K_SPECIAL);
-    AddKey(KEY_AREA_X + (colW + g_keyGap), yLast, colW, g_keyHeight, 0x60, K_NORMAL);
-    AddKey(KEY_AREA_X + 2 * (colW + g_keyGap), yLast, colW, g_keyHeight, 0x20, K_SPACE);
-}
-
-// 小键盘方案 B：原 4 列 × 5 行数字盘（含 + 与 .）+ 底行 Tab / Shift / 空格
+// 小键盘：4 列 × 5 行数字盘（含 + 与 .）+ 底行 Tab / Shift / 空格
 static void BuildNumpadPlus(int y) {
     const int colW  = (KEY_AREA_W - 3 * g_keyGap) / 4;
     const int pitch = g_keyHeight + g_keyGap;
@@ -641,8 +585,7 @@ static void BuildNumpadPlus(int y) {
 }
 
 static void BuildNumpad(int y) {
-    if (g_npStyle == 1) BuildNumpadPlus(y);
-    else                BuildNumpadT9(y);
+    BuildNumpadPlus(y);
 }
 
 // 完整键盘布局（104 键）：主区 + 导航区 + 数字区（6 行：F 行 + 主区 5 行）
@@ -1064,10 +1007,10 @@ static void BuildKeys() {
     g_keyGap = (int)(4.0 * dpiScale * scaleX); if (g_keyGap < 2) g_keyGap = 2;
     g_keyAreaX = (int)(10 * dpiScale); if (g_keyAreaX < 6) g_keyAreaX = 6;
 
-    // 行数：全尺寸 6 行；小键盘方案 A 4 行 / 方案 B 6 行；默认 5 行 + 可选 F1~F12 顶行
+    // 行数：全尺寸 6 行；小键盘 6 行；默认 5 行 + 可选 F1~F12 顶行
     BOOL webSurf = g_fnLayer && g_fnWebLayout && g_layoutMode == 0;
     int rows = (g_layoutMode == 2) ? 6
-             : (g_layoutMode == 1) ? (g_npStyle == 1 ? 6 : 4)
+             : (g_layoutMode == 1) ? 6
              : 5 + (g_showFKeys && !webSurf ? 1 : 0);
 
     // 竖向留白统一成 10 DIP（与左右留白同节奏），基准取**页头里胶囊按钮的底边**，不是页头盒底：
@@ -1347,8 +1290,16 @@ static void RecreateFontsAndLayout() {
     // 布局明显偏大，挤到只能逐键降档，「字体大小不统一」就是这么来的。
     BuildKeys();
 
-    double refKeyH = 48.0 * dpiScale;              // 默认布局（5 行 / 320 DIP）的键高
-    double finalFontScale = dpiScale * ((double)g_keyHeight / refKeyH);
+    // 字号跟「键高」走，但增长**封顶在 90 DIP**：窗口 8 向可拖拽，键高被拉到 125 DIP
+    // （980×700）时按比例算出的基准字号是 64pt，而 104 DIP 宽的 Esc / Caps / Enter 可用宽
+    // 只有 171px —— 五档降档全放不下，下方 GDI+ 在 NoWrap 下就把标签**整字截断**
+    // （Esc → Es、Caps → Cap、Enter → Ente、Shift → Sh、Ctrl → Ct、Fn → F）。
+    // 封顶后大键上的文字偏小，但标签永远完整；48~90 DIP 这一段（含全尺寸 53 DIP）比例不变。
+    const double kFontRefKeyH  = 48.0;   // 默认布局（5 行 / 320 DIP）的键高，字号基准
+    const double kFontGrowCapH = 90.0;   // 字号随键高增长的上限（DIP）
+    double keyHDip = (double)g_keyHeight / dpiScale;
+    if (keyHDip > kFontGrowCapH) keyHDip = kFontGrowCapH;
+    double finalFontScale = dpiScale * (keyHDip / kFontRefKeyH);
     if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
     // 单字重：g_f14 是唯一主档，修饰键与普通键的区分交给底色 + 文字色（与设置页 Tab 同一套逻辑）。
@@ -1918,31 +1869,6 @@ static const wchar_t* LetterKeyText(short vk) {
 // 网页布局的网址后缀键（vk 0x200 起为索引哨兵）
 static const wchar_t* g_domainTexts[6] = { L"www.", L".com", L".cn", L".org", L".cc", L".net" };
 
-// 小键盘方案 A 的 T9 副标签（下标 = 数字，照 2026-10-01 的参考图）。
-// 纯标注：本程序没有「多次按键循环选字」的 T9 输入法，这里只复刻参考图的观感，
-// 让方案 A / 方案 B 的差异一眼能看出来；不想要的话删掉这张表与 DrawKeyMainSub 调用即可。
-static const wchar_t* g_t9Sub[10] = {
-    L"0+-_", L"1,?!", L"abc2", L"def3", L"ghi4",
-    L"jkl5", L"mno6", L"pqrs7", L"tuv8", L"wxyz9",
-};
-static const wchar_t* T9SubLabel(short vk) {
-    if (g_layoutMode != 1 || g_npStyle != 0 || g_fnLayer) return NULL;
-    if (vk < 0x60 || vk > 0x69) return NULL;
-    return g_t9Sub[vk - 0x60];
-}
-
-// 键面标签的一种变体：主字符占上 3/5，下面再压一行小字注释（T9 数字格）。
-// 小字复用设置页的描述字体 g_sfBase（10·dpi）—— 它是全程序唯一的「小字注释」档，
-// 比 g_f12 明显小一圈，主次才分得开。
-static void DrawKeyMainSub(HDC dc, const KeyDef* k, HFONT f,
-                           const wchar_t* main, const wchar_t* sub, DWORD mainC) {
-    int topH = (int)(k->h * 0.60);
-    DrawTextC(dc, k->x, k->y, k->w, topH, main, f, mainC);
-    HFONT fSub = g_sfBase ? g_sfBase : g_f12;
-    DrawTextC(dc, k->x, k->y + topH - (int)(3 * GetSystemDpiScale()),
-              k->w, k->h - topH, sub, fSub, C_DIM);
-}
-
 // 网页布局层是否生效（Fn 层 + 「Fn 网页布局」开关）。
 // 这一层的键面是「画什么就发什么」——符号已经全铺在键面上（K_SYM），
 // 所以**整个层都不随 Shift 换字**。
@@ -2021,11 +1947,8 @@ static const wchar_t* KeyText(const KeyDef* k) {
 
     if (k->type == K_HIDE) return T(L"\x6536\x8D77", L"Hide");
     if (k->type == K_SPACE) return L"";
-    if (k->type == K_SPECIAL && k->vk == 0) {
-        // 小键盘方案 A 落的是参考图那个层切换键：数字页显示 123、符号页显示 abc
-        if (g_layoutMode == 1 && g_npStyle == 0) return g_fnLayer ? L"abc" : L"123";
-        return L"Fn";
-    }
+    // vk==0 是 Fn 键（Fn 网页层 / F1~F12 层的入口）
+    if (k->type == K_SPECIAL && k->vk == 0) return L"Fn";
     return L"";
 }
 
@@ -2667,10 +2590,7 @@ static void DrawKeys(HDC dc) {
                 DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
             }
         } else if (!DrawKeyLabel(dc, k, f, txt, textC)) {
-            // 小键盘方案 A 的数字格：主字符 + T9 副标签
-            const wchar_t* sub = T9SubLabel(k->vk);
-            if (sub) DrawKeyMainSub(dc, k, f, txt, sub, textC);
-            else DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
+            DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
         }
     }
 }
@@ -2696,7 +2616,7 @@ static int       g_kbCacheRow = 0;
 static int       g_kbCacheW = 0, g_kbCacheH = 0;
 
 struct KbFrameSig {
-    int w, h, hk, pk, hdrHov, layoutMode, nk, hue, keyIconStyle, npStyle;
+    int w, h, hk, pk, hdrHov, layoutMode, nk, hue, keyIconStyle;
     DWORD themeBg;
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, physNum, fnLayer, showFKeys,
@@ -2758,7 +2678,6 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.fnLayer = g_fnLayer; sig.showFKeys = g_showFKeys; sig.fnWebLayout = g_fnWebLayout;
     sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
     sig.npHidden = NumpadHidden();
-    sig.npStyle = g_npStyle;             // 小键盘两套排布（临时对比开关）
     if (g_kbCacheBmp && g_kbCacheW == g_ww && g_kbCacheH == g_wh && !(sig != g_kbSig)) return;
 
     HDC dc = GetDC(hWnd);
@@ -3263,8 +3182,8 @@ static int SettingsComboX(const SettingsMetrics& m, const RECT& row) {
 
 // 行的「头部」高度 = 12 + 40 + 12 DIP。图标 tile、文字块、行内控件（开关 / 分段 / 下拉）
 // 全都只在这段里居中，**行因为描述折行而变高时不跟着变**。
-// 布局页的「小键盘按钮」「Tab 切换小键盘」两行描述要占两行，整行高 80 DIP；控件若按
-// 整行居中，就会比 tile 与文字块低 (80-64)/2 = 8 DIP（实机实测 8.3 DIP）。
+// 布局页的「Fn 网页布局」「小键盘按钮」两行：换文案后描述折成两行，整行高 80 DIP；
+// 控件若按整行居中，就会比 tile 与文字块低 (80-64)/2 = 8 DIP（实机实测 8.3 DIP）。
 // 主题页的色相行是可展开行（210 DIP），同理。
 static int SettingsRowHeadH(const SettingsMetrics& m, const RECT& row) {
     int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
@@ -4305,10 +4224,6 @@ static void LoadConfig() {
     // 旧配置里的 1（纯图标）已取消 —— 迁移到 2，别让它落回「文字」丢掉用户的选择。
     if (g_keyIconStyle == 1) g_keyIconStyle = 2;
     if (g_keyIconStyle != 2) g_keyIconStyle = 0;
-    // 小键盘布局的两套排布（0=A 照参考图的 T9 盘，1=B 原数字盘 + 底行动作键）。
-    // 临时对比开关：没有界面入口，只在 ini 里切；用户选定后连同 B 版一起删掉。
-    g_npStyle = IniGetInt(L"Keyboard", L"NumpadStyle", 0);
-    if (g_npStyle < 0 || g_npStyle > 1) g_npStyle = 0;
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
     g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
     g_lang = IniGetInt(L"General", L"Language", 0);

@@ -1651,8 +1651,12 @@ static int TextInkShiftPx(float emPx, const wchar_t* s) {
     return (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
 }
 
+// GDI+ 单行水平对齐模式。贴边标签必须用 Near/Far 而不是 Center：
+// 见 DrawTextKey 里关于「矩形边 vs 墨迹边」的说明。
+enum TextAlignMode { TAL_Near = 0, TAL_Center = 1, TAL_Far = 2 };
+
 static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
-                       float emPx, DWORD color, BOOL center, BOOL wrap) {
+                       float emPx, DWORD color, int align, BOOL wrap) {
     if (!s || !s[0] || w <= 0 || h <= 0 || emPx <= 0.0f) return FALSE;
     if (!g_gdipFonts) return FALSE;          // GDI+ 私有字体未就绪 → 调用方回退 GDI 直绘
 
@@ -1675,7 +1679,9 @@ static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
     if (!wrap)
         fmt.SetFormatFlags((Gdiplus::StringFormatFlags)(fmt.GetFormatFlags()
                                                         | Gdiplus::StringFormatFlagsNoWrap));
-    fmt.SetAlignment(center ? Gdiplus::StringAlignmentCenter : Gdiplus::StringAlignmentNear);
+    fmt.SetAlignment(align == TAL_Center ? Gdiplus::StringAlignmentCenter
+                    : align == TAL_Far    ? Gdiplus::StringAlignmentFar
+                                          : Gdiplus::StringAlignmentNear);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
 
     Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color),
@@ -1691,7 +1697,7 @@ static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
 }
 
 static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
-    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, TRUE, FALSE)) return;
+    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, TAL_Center, FALSE)) return;
     RECT r = {x, y, x + w, y + h};        // 回退：GDI+ 未就绪 / 字体不可用
     SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
@@ -1699,24 +1705,44 @@ static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
     DrawTextW(dc, s, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+// 左对齐版。原定义在设置页那一段，因 DrawTextKey 的贴边标签要用而提到这里
+// （DrawTextC / DrawTextR / DrawTextL 三者相邻，贴边与居中的行为差异一眼可比）。
+static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c,
+                      BOOL wrap = FALSE) {
+    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, TAL_Near, wrap)) return;
+    RECT r = {x, y, x + w, y + h};        // 回退：GDI+ 未就绪 / 字体不可用
+    SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, c);
+    DrawTextW(dc, s, -1, &r, (wrap ? (DT_LEFT | DT_WORDBREAK | DT_TOP)
+                                   : (DT_LEFT | DT_VCENTER | DT_SINGLELINE)) | DT_NOPREFIX);
+}
+
+// 右对齐版（贴右边缘的键面标签用，与 DrawTextL 成对）。
+static void DrawTextR(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c) {
+    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, TAL_Far, FALSE)) return;
+    RECT r = {x, y, x + w, y + h};        // 回退：GDI+ 未就绪 / 字体不可用
+    SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, c);
+    DrawTextW(dc, s, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
 // 按键的对齐方式把标签摆到键面的左端 / 右端（k->align，见 KeyAlign）。
 // 参考图里左列的 Esc / Tab / Caps / Shift 名字贴着左边缘、右列的 Backspace / Del /
 // Enter / Shift 贴着右边缘 —— 宽键居中会让名字独自飘在一条缝上，反而看不出是哪个键。
 //
-// ⚠ 两个「文字宽度」不能混用，两个坑都踩过：
-//   tw  = MeasureTextW     → GDI+ MeasureString，含约 0.2em 溢出留白，是**容纳宽度**。
-//                            DrawString 在 NoWrap 下的判据就是它，绘制矩形的宽必须 ≥ tw。
-//   adv = MeasureTextAdvW  → GDI 推进宽（advance），是**布局宽度**：它不带 GDI+ 那圈留白。
-//   ① 矩形宽若按 adv 给（`rw = adv + 4`），NoWrap 一次判定放不下就**整字丢掉尾部**：
-//      实机现形 Esc→Es、Del→De、Ctrl→Ctr、Alt→Al、Fn→F。故 rw 必须 = tw + 4。
-//   ② 但「居中」这一步不能自己算矩形：tw 比 adv 宽约 10px（175% DPI 实测），
-//      若按 x = k->x + (k->w - adv)/2 定位、再让 DrawTextC 在宽度 tw+4 的矩形里居中，
-//      墨迹中心会落到 k->x + k->w/2 + (tw - adv)/2 + 2 ≈ **键心右侧 7px**。
-//      实机现象正是「白色按钮（字母键）文本不居中」，且 Ctrl/Alt/Fn 与带图标的
-//      Win/Menu 在同一行里位置对不齐。→ 居中键直接把整键矩形交给 DrawTextC，
-//      与 DrawKeys 里「双符号键」那条路径（DrawTextC(k->x, k->y, k->w, k->h, …)）同源，
-//      两条路径的居中量因而完全一致（残余的 -1px 是 GDI+ 量宽左右不对称的固有量）。
-//   KA_LEFT / KA_RIGHT 才需要自己算矩形起点：这里按 adv 定位（贴边看的是墨迹边缘）。
+// ⚠ 贴边锚点只有一个：DrawKeyLabel（图标+文字那一路）的 edge = 6 DIP。
+//   两条路径必须共用同一个值，否则同一列的 Esc（纯文字）与 Tab / Caps（带图标）
+//   留白会差一倍 —— 这是踩过的坑，记在这里免得下次又改回去。
+//
+// ⚠ 贴边看的是**墨迹边缘**，所以这里不能用 DrawTextC（它在矩形里居中）：
+//   DrawTextC 会按 MeasureTextW 的「容纳宽度」给矩形，而容纳宽度比实际墨迹宽约
+//   0.2em（175% DPI 下 ≈ 9px），居中之后墨迹又往键心缩回去半个余量 ——
+//   Esc 的墨迹离键左因此变成 inset(10 DIP) + 9px ≈ 27px，而带图标的 Tab 只有 14px。
+//   故左对齐用 DrawTextL、右对齐用 DrawTextR，让墨迹边直接落在 edge 上。
+//   （曾经只把右侧改成「减去容纳宽度」，结果左 24 / 右 11，图标键与文字键分了家，
+//     木已成舟地劣化了默认档 —— 那个提交已被回退，切勿再走那条路。）
 static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
     if (!s || !s[0]) return;
 
@@ -1725,17 +1751,12 @@ static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWOR
         return;
     }
 
-    int tw = MeasureTextW(dc, s, f);          // 容纳宽度：绘制矩形的宽必须 ≥ 它
-    if (tw <= 0) return;
-    int rw = tw + 4;
-    int adv = MeasureTextAdvW(dc, s, f);      // 布局宽度：贴边定位用它才准
-    if (adv <= 0) adv = tw;
-
-    int inset = (int)(10 * GetSystemDpiScale());
-    int x = (k->align == KA_LEFT) ? k->x + inset
-                                  : k->x + k->w - inset - adv;
-    if (x < k->x) x = k->x;
-    DrawTextC(dc, x, k->y, rw, k->h, s, f, c);
+    // 贴边留白：与 DrawKeyLabel 的 edge 同一常量；留出两侧余量后余下宽度交给对齐函数。
+    int edge = (int)(6 * GetSystemDpiScale());
+    int w = k->w - 2 * edge;
+    if (w < 8) w = k->w;                      // 极窄键（理论上不会出现）退回整键
+    if (k->align == KA_LEFT) DrawTextL(dc, k->x + edge, k->y, w, k->h, s, f, c);
+    else                     DrawTextR(dc, k->x + edge, k->y, w, k->h, s, f, c);
 }
 
 // 双符号键绘制：上=副符号（Shift 未触发时灰色，触发后白色），下=主字符（始终正常显示）
@@ -1748,7 +1769,7 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     buf[0] = shiftCh;
     RECT rt = {x, y, x + w, y + h / 2};
     if (!DrawTextGp(dc, rt.left, rt.top, rt.right - rt.left, rt.bottom - rt.top,
-                          buf, FontEmPx(fShift), shiftC, TRUE, FALSE)) {
+                          buf, FontEmPx(fShift), shiftC, TAL_Center, FALSE)) {
         SelectObject(dc, fShift);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, shiftC);
@@ -1759,7 +1780,7 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
     buf[0] = baseCh;
     RECT rb = {x, y + h / 2, x + w, y + h};
     if (!DrawTextGp(dc, rb.left, rb.top, rb.right - rb.left, rb.bottom - rb.top,
-                          buf, FontEmPx(fBase), baseC, TRUE, FALSE)) {
+                          buf, FontEmPx(fBase), baseC, TAL_Center, FALSE)) {
         SelectObject(dc, fBase);
         SetTextColor(dc, baseC);
         DrawTextW(dc, buf, -1, &rb, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -3169,17 +3190,6 @@ static int g_switchAnimHit = S_HIT_NONE;
 static LONGLONG g_switchAnimStart = 0;
 static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
-
-static void DrawTextL(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, DWORD c,
-                      BOOL wrap = FALSE) {
-    if (DrawTextGp(dc, x, y, w, h, s, FontEmPx(f), c, FALSE, wrap)) return;
-    RECT r = {x, y, x + w, y + h};        // 回退：GDI+ 未就绪 / 字体不可用
-    SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, c);
-    DrawTextW(dc, s, -1, &r, (wrap ? (DT_LEFT | DT_WORDBREAK | DT_TOP)
-                                   : (DT_LEFT | DT_VCENTER | DT_SINGLELINE)) | DT_NOPREFIX);
-}
 
 static void DrawRadio(HDC dc, int x, int cy, int r, BOOL on, DWORD bg) {
     // GDI+ 抗锯齿圆环：外圈 + 内圈挖空 + 选中实心点

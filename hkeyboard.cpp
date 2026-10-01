@@ -914,7 +914,7 @@ static void BuildComplete(int y, BOOL webFn) {
 //
 // 符号格 = (基础虚拟键, 取不取副符号)。取副符号的格子点击时自动带 Shift 发出。
 struct WebSymSpec { short vk; unsigned char shifted; };
-// Row1：数字行 10 格的副符号 + 主符号的 [ ] \
+// Row1：数字行 10 格的副符号 + 主符号的 [ ] 与反斜杠
 static const WebSymSpec kWebSym1[13] = {
     { 0x31, 1 }, { 0x32, 1 }, { 0x33, 1 }, { 0x34, 1 }, { 0x35, 1 },
     { 0x36, 1 }, { 0x37, 1 }, { 0x38, 1 }, { 0x39, 1 }, { 0x30, 1 },

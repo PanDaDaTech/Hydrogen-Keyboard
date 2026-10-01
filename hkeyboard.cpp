@@ -1943,6 +1943,14 @@ static void DrawKeyMainSub(HDC dc, const KeyDef* k, HFONT f,
               k->w, k->h - topH, sub, fSub, C_DIM);
 }
 
+// 网页布局层是否生效（Fn 层 + 「Fn 网页布局」开关）。
+// 这一层的键面是「画什么就发什么」——符号已经全铺在键面上（K_SYM），
+// 所以**整个层都不随 Shift 换字**。
+// ⚠ 判定点有两处，必须同源，否则会出现「大部分键面不动、个别键（如 `~）还在跟着变」：
+//   1) KeyText 里 K_NORMAL 的 GetSymForKey(vk, g_sh && g_shiftSymbols)
+//   2) DrawKeys 里 K_NORMAL 的双符号换面（baseCh / shiftCh / shiftOn）
+static BOOL IsWebFnLayer() { return (g_fnLayer && g_fnWebLayout); }
+
 static const wchar_t* KeyText(const KeyDef* k) {
     static wchar_t buf[16];
     if (k->vk >= 0x200 && k->vk <= 0x205) return g_domainTexts[k->vk - 0x200];
@@ -1959,7 +1967,7 @@ static const wchar_t* KeyText(const KeyDef* k) {
             int fn = FnMap(k->vk);
             if (fn) { swprintf(buf, 16, L"F%d", fn); return buf; }
         }
-        wchar_t ch = GetSymForKey(k->vk, g_sh && g_shiftSymbols);
+        wchar_t ch = GetSymForKey(k->vk, (g_sh && g_shiftSymbols && !IsWebFnLayer()) ? TRUE : FALSE);
         if (ch) { buf[0] = ch; buf[1] = 0; return buf; }
     }
     // F1~F12 顶行 / 小键盘数字
@@ -2612,11 +2620,12 @@ static void DrawKeys(HDC dc) {
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
         //
-        // ⚠ 网页布局层（g_fnLayer && g_fnWebLayout）整个不做「随 Shift 换面」：
+        // ⚠ 网页布局层（IsWebFnLayer）整个不做「随 Shift 换面」：
         //   那一层的符号是全铺在键面上的（K_SYM，键面画什么就发什么），
         //   再让残留的双符号键（如 `~）跟着 Shift 换面，就变成
         //   「点一下 Shift，键面反而变花」—— 正是用户要求去掉的行为。
-        const BOOL webLayer = (g_fnLayer && g_fnWebLayout);
+        //   与 KeyText 的同名判定共用 IsWebFnLayer()，两处不能各写一份。
+        const BOOL webLayer = IsWebFnLayer();
         wchar_t baseCh = 0, shiftCh = 0;
         if (k->type == K_NORMAL && !webLayer && !(g_fnLayer && FnMap(k->vk) != 0)) {
             baseCh = GetSymForKey(k->vk, FALSE);

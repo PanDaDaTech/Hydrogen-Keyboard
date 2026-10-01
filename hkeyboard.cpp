@@ -1737,10 +1737,16 @@ static void DrawTextR(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
 //   留白会差一倍 —— 这是踩过的坑，记在这里免得下次又改回去。
 //
 // ⚠ 贴边看的是**墨迹边缘**，所以这里不能用 DrawTextC（它在矩形里居中）：
-//   DrawTextC 会按 MeasureTextW 的「容纳宽度」给矩形，而容纳宽度比实际墨迹宽约
-//   0.2em（175% DPI 下 ≈ 9px），居中之后墨迹又往键心缩回去半个余量 ——
-//   Esc 的墨迹离键左因此变成 inset(10 DIP) + 9px ≈ 27px，而带图标的 Tab 只有 14px。
-//   故左对齐用 DrawTextL、右对齐用 DrawTextR，让墨迹边直接落在 edge 上。
+//   DrawTextC 会按 MeasureTextW 的「容纳宽度」给矩形，而容纳宽度比实际推进宽约
+//   0.2em（175% DPI 下 ≈ 10px），居中之后墨迹又往键心缩回去半个余量 ——
+//   Esc 的墨迹离键左因此变成 inset(10 DIP) + 10px ≈ 27px，而带图标的 Tab 只有 14px。
+//   故左对齐用 DrawTextL、右对齐用 DrawTextR（GDI+ Near / Far），让墨迹边直接贴上去。
+//
+// ⚠ 但 Near / Far 对齐的是 GDI+ 的「容纳框」，它比推进框（advance）两侧各宽
+//   约 0.2em / 2 ≈ 5px；不补偿的话右贴边会凭空多出这 5px（实测 Del 的右侧留白
+//   从 11 涨到 18px）。故把 (tw − adv) / 2 这圈内缩量加回矩形，让对齐边落在
+//   「推进边」上 —— 与 DrawKeyLabel 里「整组按 adv 计算宽度」是同一个坐标基准，
+//   两条路径的贴边留白因此严格一致（都等于 edge + 该字形自身的边距）。
 //   （曾经只把右侧改成「减去容纳宽度」，结果左 24 / 右 11，图标键与文字键分了家，
 //     木已成舟地劣化了默认档 —— 那个提交已被回退，切勿再走那条路。）
 static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
@@ -1751,12 +1757,20 @@ static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWOR
         return;
     }
 
-    // 贴边留白：与 DrawKeyLabel 的 edge 同一常量；留出两侧余量后余下宽度交给对齐函数。
+    // 贴边留白：与 DrawKeyLabel 的 edge 同一常量。
     int edge = (int)(6 * GetSystemDpiScale());
-    int w = k->w - 2 * edge;
-    if (w < 8) w = k->w;                      // 极窄键（理论上不会出现）退回整键
-    if (k->align == KA_LEFT) DrawTextL(dc, k->x + edge, k->y, w, k->h, s, f, c);
-    else                     DrawTextR(dc, k->x + edge, k->y, w, k->h, s, f, c);
+
+    int tw  = MeasureTextW(dc, s, f);         // 容纳宽度（含 GDI+ 两侧留白）
+    int adv = MeasureTextAdvW(dc, s, f);      // 推进宽度（真实布局宽度）
+    if (tw <= 0) return;
+    if (adv <= 0) adv = tw;
+    int p = (tw > adv) ? (tw - adv) / 2 : 0;  // 容纳框相对推进框的单侧内缩量
+
+    int x = k->x + edge - p;
+    int w = k->w - 2 * edge + 2 * p;
+    if (w < 8) { x = k->x; w = k->w; }        // 极窄键（理论上不会出现）退回整键
+    if (k->align == KA_LEFT) DrawTextL(dc, x, k->y, w, k->h, s, f, c);
+    else                     DrawTextR(dc, x, k->y, w, k->h, s, f, c);
 }
 
 // 双符号键绘制：上=副符号（Shift 未触发时灰色，触发后白色），下=主字符（始终正常显示）

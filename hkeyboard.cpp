@@ -2845,15 +2845,6 @@ static int SettingsSwitchTextRight(const SettingsMetrics& m, const RECT& row) {
     return row.right - (int)(20 * m.dpi) - m.switchW - (int)(42 * m.dpi);
 }
 
-static int SettingsComboListY(const SettingsMetrics& m, int comboY, int itemH, int count) {
-    int listH = itemH * count + 4;
-    int below = comboY + m.comboH + 4;
-    if (below + listH <= m.H - (int)(12 * m.dpi)) return below;
-    int above = comboY - listH - 4;
-    int minY = m.tabsY + m.tabH + 4;
-    return above >= minY ? above : minY;
-}
-
 // 行悬停底色：铺满整行、左右直接贴到卡片边缘（不再内缩，否则会切到图标 tile），
 // 圆角取卡片同款半径 —— 首行/末行因此与卡片圆角正好嵌套，不会凸出到卡片外面。
 static void DrawSettingsRowHover(HDC dc, const SettingsMetrics& m, const RECT& row) {
@@ -3181,39 +3172,6 @@ static void DrawHueSlider(HDC dc, const RECT& r, int hue) {
     int radius = h / 2 + 3;
     DrawCircleAA(dc, cx, cy, radius, C_WHITE);
     DrawCircleAA(dc, cx, cy, radius - 2, HueAccentBgr(hue));
-}
-
-// 下拉框：高 40、圆角 12、左右 padding 14、主色描边
-static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, BOOL open, BOOL hover) {
-    double dpi = GetSystemDpiScale();
-    DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_DARK, C_BORDER_HOVER, (int)(12 * dpi));
-    DrawTextL(dc, x + (int)(14 * dpi), y, w - (int)(46 * dpi), h, text, g_sfBase, C_WHITE);
-    int sz = (int)(16 * dpi);
-    DrawHkIcon(dc, (float)(x + w - (int)(14 * dpi) - sz), (float)(y + (h - sz) / 2), (float)sz,
-               HkIcon(HKICON_CHEVRONDOWN), C_DIM, C_DIM);
-}
-
-// 下拉列表（参考下拉菜单样式：悬停圆角高亮 + 选中项左侧强调条）
-static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t** items, int count, int sel, int hov) {
-    double dpi = GetSystemDpiScale();
-    DrawRoundRect(dc, x, y, w, itemH * count + 4, C_FLOAT, C_BORDER_HOVER, (int)(12 * dpi));
-    for (int i = 0; i < count; i++) {
-        int iy = y + 2 + i * itemH;
-        if (i == hov || i == sel) {
-            // 圆角悬停高亮
-            DrawRoundRectAlpha(dc, x + 3, iy + 1, w - 6, itemH - 2,
-                               C_HOVER, C_HOVER, (int)(5 * dpi), 255, 255);
-        }
-        if (i == sel) {
-            // 选中项左侧强调条
-            int barH = (int)(14 * dpi);
-            int barW = (int)(3 * dpi);
-            int cy = iy + itemH / 2;
-            DrawRoundRectAlpha(dc, x + (int)(8 * dpi), cy - barH / 2, barW, barH,
-                               C_HOT, C_HOT, barW / 2, 255, 255);
-        }
-        DrawTextL(dc, x + (int)(17 * dpi), iy, w - (int)(24 * dpi), itemH, items[i], g_sfCtrl, C_WHITE);
-    }
 }
 
 // ===== 十六进制颜色输入辅助（GDI 用 BGR 存储，#RRGGBB 为 RGB） =====
@@ -3604,64 +3562,6 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawTextC(dc, m.contentX, al.card2.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sfMeta, C_DIM);
     }
-
-    // 下拉列表最后绘制，确保覆盖后续卡片。
-    if (g_sTab == 0) {
-        RECT r;
-        if (g_dropClose) {
-            int closeRow = g_af ? 2 : 1;
-            r = SettingsRowRect(m, closeRow);
-            const wchar_t* names[2] = {T(L"直接退出程序", L"Exit program"), T(L"隐藏到系统托盘", L"Hide to tray")};
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
-                          m.comboW, m.comboH, names, 2, g_closeToTray ? 1 : 0, g_dropCloseHov);
-        }
-        if (g_dropLang) {
-            int langRow = g_af ? 6 : 5;
-            r = SettingsRowRect(m, langRow);
-            const wchar_t* names[2];
-            for (int i = 0; i < 2; i++) names[i] = g_lang ? g_langNamesEn[i] : g_langNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
-                          m.comboW, m.comboH, names, 2, g_lang, g_dropLangHov);
-        }
-    } else if (g_sTab == 3) {
-        RECT r;
-        if (g_dropLayout) {
-            r = SettingsRowRect(m, 0);
-            const wchar_t* names[3];
-            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
-                          m.comboW, m.comboH, names, 3, g_layoutMode, g_dropLayoutHov);
-        }
-    } else if (g_sTab == 1) {
-        RECT r;
-        if (g_dropTheme) {
-            r = SettingsRowRect(m, 0);
-            const wchar_t* names[3];
-            for (int i = 0; i < 3; i++) names[i] = g_lang ? g_themeNamesEn[i] : g_themeNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 3),
-                          m.comboW, m.comboH, names, 3, g_themeMode, g_dropThemeHov);
-        }
-        if (g_dropOpacity) {
-            r = SettingsRowRect(m, 1);
-            const wchar_t* names[6];
-            for (int i = 0; i < 6; i++) names[i] = g_lang ? g_opacityNamesEn[i] : g_opacityNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 6),
-                          m.comboW, m.comboH, names, 6, OpacityIndex(), g_dropOpacityHov);
-        }
-        if (g_dropHl) {
-            r = SettingsRowRect(m, 2);
-            const wchar_t* names[2];
-            for (int i = 0; i < 2; i++) names[i] = g_lang ? g_hlModeNamesEn[i] : g_hlModeNames[i];
-            int cy = SettingsComboY(m, r);
-            DrawComboList(dc, SettingsComboX(m, r), SettingsComboListY(m, cy, m.comboH, 2),
-                          m.comboW, m.comboH, names, 2, HlSel(), g_dropHlHov);
-        }
-    }
 }
 
 static int SettingsHitTest(HWND hWnd, int x, int y) {
@@ -3683,25 +3583,6 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
     if (g_sTab == 0) {
         RECT r;
         int closeRow = g_af ? 2 : 1;   // 自动收起行仅在自动呼出开启时存在
-        // 下拉列表优先命中，避免列表翻到上方或覆盖相邻卡片时被底层项目抢先处理。
-        if (g_dropClose) {
-            r = SettingsRowRect(m, closeRow);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
-            for (int i = 0; i < 2; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_CLOSE_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
-        if (g_dropLang) {
-            r = SettingsRowRect(m, closeRow + 4);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 2) + 2;
-            for (int i = 0; i < 2; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LANG_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
 
         r = SettingsRowRect(m, 0);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTO;
@@ -3732,15 +3613,6 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 按钮 4=Tab 切换小键盘
         RECT r;
         // 下拉列表优先命中
-        if (g_dropLayout) {
-            r = SettingsRowRect(m, 0);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 3) + 2;
-            for (int i = 0; i < 3; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_LAYOUT_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
         r = SettingsRowRect(m, 0);
         { const wchar_t* it[3]; int n = LayoutSegItems(it);
           RECT sr = RowSegRect(m, r, it, n);
@@ -3766,31 +3638,6 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
     } else if (g_sTab == 1) {
         RECT r;
-        struct DropHit { BOOL open; int row; int count; int firstHit; } drops[2] = {
-            {g_dropTheme, 0, 3, S_HIT_THEME_OPT0},
-            {g_dropHl, 2, 2, S_HIT_HL_OPT0}
-        };
-        for (int d = 0; d < 2; d++) {
-            if (!drops[d].open) continue;
-            r = SettingsRowRect(m, drops[d].row);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, drops[d].count) + 2;
-            for (int i = 0; i < drops[d].count; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH)
-                    return drops[d].firstHit + i;
-                ly += m.comboH;
-            }
-        }
-        if (g_dropOpacity) {
-            r = SettingsRowRect(m, 1);
-            int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-            int ly = SettingsComboListY(m, comboY, m.comboH, 6) + 2;
-            for (int i = 0; i < 6; i++) {
-                if (x >= comboX && x < comboX + m.comboW && y >= ly && y < ly + m.comboH) return S_HIT_OPACITY_OPT0 + i;
-                ly += m.comboH;
-            }
-        }
-
         r = SettingsRowRect(m, 0);
         { const wchar_t* it[3]; int n = ThemeSegItems(it);
           RECT sr = RowSegRect(m, r, it, n);
@@ -4372,27 +4219,12 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
     if (hit == S_HIT_TABL || (hit >= S_HIT_TAB0 && hit <= S_HIT_TAB2)) {
         // Tab 即时切换（不做逐帧过渡，避免配色异常）
         g_sTab = (hit == S_HIT_TABL) ? 3 : (hit - S_HIT_TAB0);
-        g_dropTheme = FALSE;
-        g_dropLayout = FALSE;
-        g_dropOpacity = FALSE;
-        g_dropLang = FALSE;
-        g_dropHl = FALSE;
-        g_dropClose = FALSE;
         SettingsFitHeight(hWnd);   // 各 tab 内容高度不同：切 tab 时把窗口收到刚好包住内容
         RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }
     if (hit != S_HIT_NONE) {
         SettingsApplyHit(hWnd, hit, x);   // 画框选择需要点击的横向位置来定位段
-    } else if (g_dropTheme || g_dropLayout || g_dropOpacity || g_dropLang || g_dropHl || g_dropClose) {
-        // 点击空白处关闭下拉
-        g_dropTheme = FALSE;
-        g_dropLayout = FALSE;
-        g_dropOpacity = FALSE;
-        g_dropLang = FALSE;
-        g_dropHl = FALSE;
-        g_dropClose = FALSE;
-        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
     }
 }
 
@@ -4568,12 +4400,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_settingsMoving = FALSE;
         g_sHov = -1;
         g_sTracking = FALSE;
-        g_dropTheme = FALSE;
-        g_dropLayout = FALSE;
-        g_dropOpacity = FALSE;
-        g_dropLang = FALSE;
-        g_dropHl = FALSE;
-        g_dropClose = FALSE;
         g_hlEditFocus = FALSE;
         g_hlSliderDrag = S_HIT_NONE;
         return 0;

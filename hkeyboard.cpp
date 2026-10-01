@@ -2824,10 +2824,43 @@ static int SettingsRowCtrlDip(int tab, int index) {
     return 0;
 }
 
-// 描述需要两行的行（文案本身就长，一行放不下会被硬截断）：
+// 描述**可能**需要两行的行（文案本身长，窗口窄时一行放不下会被硬截断）：
 // 行高、绘制、命中三处都读这一份判断，才不会出现「字画到行外 / 热区对不上」。
 static BOOL SettingsRowDescWraps(int tab, int index) {
     return (tab == 3 && (index == 3 || index == 4));   // 小键盘按钮 / Tab 切换小键盘
+}
+
+// 这两行的描述文案。必须是**唯一**的定义处：行高要不要按两行留白，靠实测这段文本
+// 来定（见 SettingsRowDescTwoLines），绘制处再抄一遍就会两边不一致。
+static const wchar_t* SettingsRowDescText(int tab, int index) {
+    if (tab != 3) return NULL;
+    if (index == 3)
+        return T(L"在标题栏显示；默认布局切小键盘，全尺寸显隐数字区",
+                 L"Show it in the title bar; toggles the numpad section");
+    if (index == 4)
+        return T(L"全尺寸布局下按 Tab 键显示或隐藏数字区",
+                 L"Press Tab in the full layout to show or hide the numpad");
+    return NULL;
+}
+
+// 「需要两行」只是可能性 —— 中文短、英文长，窗口宽度也会变。真放得下一行时还按两行
+// 留白，描述下方就会空出一大块（实机 30 DIP，一眼可见）：行高 80 DIP 而内容只占 52。
+// 所以行高按实测决定：一行 → 64 DIP，两行 → 80 DIP。
+// 命中测试与窗口高度都走 SettingsRowHeight，因此这个判断必须与绘制**同一时刻**成立。
+static BOOL SettingsRowDescTwoLines(const SettingsMetrics& m, int tab, int index) {
+    if (!SettingsRowDescWraps(tab, index)) return FALSE;
+    const wchar_t* desc = SettingsRowDescText(tab, index);
+    if (!desc || !desc[0]) return FALSE;
+    // 文本列可用宽：卡片右内边距(20) − 开关(46) −「开/关」与开关之间的留白(42)
+    // − 控件前间距(12)，左边是文字列起点（tile 内边距 20 + tile 30 + tileGap 18）。
+    int tx = m.contentX + (int)(20 * m.dpi) + m.tileSize + m.tileGap;
+    int right = m.contentX + m.contentW - (int)(20 * m.dpi) - m.switchW
+                - (int)(42 * m.dpi) - (int)(12 * m.dpi);
+    HDC dc = GetDC(0);
+    // 字体还没建时（极早的尺寸询问）按两行算：宁可多留 16 DIP，也不要把字挤出窗口。
+    int need = g_sfBase ? MeasureTextAdvW(dc, desc, g_sfBase) : 0x7fffffff;
+    ReleaseDC(0, dc);
+    return need > right - tx;
 }
 
 // 行高 = (12 + max(图标 tile 30, 控件高, 文字块高) + 12) 个 DIP，最后统一乘 dpi。
@@ -2842,7 +2875,9 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     // 文字块：标题 18 + 间距 6 + 描述 16 = 40。间距不能省 —— 标题的下缘和描述的上缘
     // 会顶在一起（实机反馈「文本和描述的间距对吗」）；文字蒙版本身还上下各留了 4px。
     if (contentDip < 40) contentDip = 40;
-    if (SettingsRowDescWraps(g_sTab, index) && contentDip < 56)
+    // 只有描述**真的**会折成两行时才多留 16 DIP。原来这里是「可能折行就留」，
+    // 于是中文单行的「小键盘按钮」行高 80 DIP、内容只占 52，描述下方空 30 DIP。
+    if (SettingsRowDescTwoLines(m, g_sTab, index) && contentDip < 56)
         contentDip = 56;                    // 标题 18 + 间距 6 + 描述两行 32
     return (int)((12 + contentDip + 12) * m.dpi);
 }
@@ -3554,16 +3589,18 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         r = SettingsRowRect(m, 3);
         DrawSettingRowContent(dc, m, r, HKICON_NUMPAD, NULL,
                               T(L"小键盘按钮", L"Numpad Button"),
-                              T(L"在标题栏显示；默认布局切小键盘，全尺寸显隐数字区", L"Show it in the title bar; toggles the numpad section"),
-                              g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r), TRUE);
+                              SettingsRowDescText(3, 3),
+                              g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r),
+                              SettingsRowDescTwoLines(m, 3, 3));
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
 
         if (g_layoutMode == 2) {
             r = SettingsRowRect(m, 4);
             DrawSettingRowContent(dc, m, r, -1, L"F",   // Tab 切换小键盘同样保留手绘 F
                                   T(L"Tab 切换小键盘", L"Tab Toggles Numpad"),
-                                  T(L"全尺寸布局下按 Tab 键显示或隐藏数字区", L"Press Tab in the full layout to show or hide the numpad"),
-                                  g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r), TRUE);
+                                  SettingsRowDescText(3, 4),
+                                  g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r),
+                                  SettingsRowDescTwoLines(m, 3, 4));
             DrawSettingSwitch(dc, m, r, g_npTabToggle, S_HIT_NPTAB);
         }
     } else if (g_sTab == 1) {
@@ -3600,7 +3637,10 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSegmented(dc, m, hsegR, hseg, hsegn, HlSel());
 
         if (customHue) {
-            Fill(dc, r.left + (int)(20 * m.dpi), r.top + (int)(56 * m.dpi),
+            // 分隔线是「标题区 / 展开区」的分界，要落在两者正中间：上方到描述盒底
+            // （块顶+52）、下方到色板顶（76），两边都留 12 DIP。原来画在 56，
+            // 离描述只有 4 DIP —— 实机上看着像给描述加的下划线。
+            Fill(dc, r.left + (int)(20 * m.dpi), r.top + (int)(64 * m.dpi),
                  r.right - r.left - (int)(40 * m.dpi), 1, C_META);
 
             int palX, palY, palS, palGap;

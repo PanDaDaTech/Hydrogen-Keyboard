@@ -2652,8 +2652,8 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
     return m;
 }
 
-// 每行的「控件高」：开关 26 / 下拉与分段 40；无控件行给 0（由两行文字块决定）
-static int SettingsRowCtrlHeight(int tab, int index) {
+// 每行的「控件高」，单位 DIP（不乘 dpi）：开关 26 / 下拉与分段 40；无控件行给 0
+static int SettingsRowCtrlDip(int tab, int index) {
     if (tab == 0) {                                 // 常规
         int closeRow = g_af ? 2 : 1;
         if (index == closeRow) return 40;           // 关闭按钮下拉
@@ -2668,14 +2668,17 @@ static int SettingsRowCtrlHeight(int tab, int index) {
     return 0;
 }
 
-// 行高 = 12*2 + max(tile 30, 控件高, 两行文字块 34)
-// 主题 tab 的色相行是可展开行：展开态固定 210（内含分隔线 + 色板 + 滑轨 + HEX），收起态按普通行算
+// 行高 = (12 + max(图标 tile 30, 控件高, 两行文字块 34) + 12) 个 DIP，最后统一乘 dpi。
+// ⚠ 全长度必须同单位再乘 dpi：这里曾经写成 `m.rowPadY * 2 + content`，
+//   其中 rowPadY 已乘过 dpi、content 还是 DIP，于是高 DPI 下行高偏小 ——
+//   表现为整张卡比预期矮一截、底部留一大片空白、两行文字挤在一起。
+// 主题 tab 的色相行是可展开行：展开态固定 210 DIP（内含分隔线 + 色板 + 滑轨 + HEX）
 static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     if (g_sTab == 1 && index == 2 && !g_wallpaperAccent) return (int)(210 * m.dpi);
-    int content = SettingsRowCtrlHeight(g_sTab, index);
-    if (content < 30) content = 30;
-    if (content < 34) content = 34;
-    return m.rowPadY * 2 + content;
+    int contentDip = SettingsRowCtrlDip(g_sTab, index);
+    if (contentDip < 30) contentDip = 30;   // 图标 tile
+    if (contentDip < 34) contentDip = 34;   // 两行文字块（标题 18 + 描述 16）
+    return (int)((12 + contentDip + 12) * m.dpi);
 }
 
 static int SettingsRowCount(int tab) {
@@ -2811,17 +2814,19 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
     SettingsTabLabels(labels);
     RECT tr[4];
     SettingsTabRects(m, labels, tr);
+    int rule  = (int)(3 * m.dpi); if (rule < 2) rule = 2;   // 选中项下的主色横线
+    int inset = (int)(3 * m.dpi);                           // 横线与文字之间的空隙
     int active = (g_sTab == 0) ? 0 : (g_sTab == 3 ? 1 : (g_sTab == 1 ? 2 : 3));
     for (int i = 0; i < 4; i++) {
         BOOL on = (i == active);
-        DrawTextC(dc, tr[i].left, tr[i].top, tr[i].right - tr[i].left, m.tabH - 6,
+        DrawTextC(dc, tr[i].left, tr[i].top, tr[i].right - tr[i].left, m.tabH - rule - inset,
                   labels[i], g_sf13b, (on || g_sHov == k_settingsTabHits[i]) ? C_WHITE : C_DIM);
     }
-    // strip 下缘 1px 分隔线，选中项底部 3px 主色横线压在上面
+    // strip 下缘 1px 分隔线；选中项底部主色横线压在它上面
     Fill(dc, m.contentX, m.tabsY + m.tabH, m.contentW, 1, C_LINE_DIV);
     if (active >= 0) {
-        DrawRoundRect(dc, tr[active].left, m.tabsY + m.tabH - 3, tr[active].right - tr[active].left,
-                      3, C_HOT, C_HOT, 2);
+        DrawRoundRect(dc, tr[active].left, m.tabsY + m.tabH - rule,
+                      tr[active].right - tr[active].left, rule, C_HOT, C_HOT, rule / 2);
     }
 }
 
@@ -2950,11 +2955,12 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
     }
     DWORD track = BlendColor(C_DARK, C_HOT, value);
     DrawRoundRect(dc, x, y, m.switchW, m.switchH, track, C_KEY_BORDER, m.switchH / 2);
-    int knob = m.switchH - 6;
-    int travel = m.switchW - knob - 6;
-    int kx = x + 3 + (int)(travel * value + 0.5);
+    int pad = (int)(3 * m.dpi);                  // 圆钮四周的留白（DIP，跟 dpi 走）
+    int knob = m.switchH - pad * 2;
+    int travel = m.switchW - knob - pad * 2;
+    int kx = x + pad + (int)(travel * value + 0.5);
     DWORD knobColor = BlendColor(C_DIM, C_KEY, value);
-    DrawRoundRect(dc, kx, y + 3, knob, knob, knobColor, knobColor, knob / 2);
+    DrawRoundRect(dc, kx, y + pad, knob, knob, knobColor, knobColor, knob / 2);
 }
 
 // 预设色相（对齐 panda-core 的 PRESET_HUES），色板按 oklch(0.70 0.14 H) 渲染

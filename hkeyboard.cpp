@@ -448,6 +448,7 @@ HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0;   // 键面字体（单字重，见字体显示方案 v6）
+HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：只给 1u 键塞不下的长标签用（见 FitKeyFont）
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
 static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
@@ -533,12 +534,18 @@ static int AddKey(int x, int y, int w, int h, short vk, KeyType type, BOOL symSh
 // ============================================================================
 
 // 方案 A 的数字格 → 符号页（三层九格，顺序 = 行优先）
-// % ( ) 用 K_SYM 取副符号：点击自动带 Shift，与「按 Shift 再点数字」等价
+// 全部走 K_SYM：键面由 (vk, symShift) 唯一决定，点击发同一个字符。
+// ⚠ 不能留 K_NORMAL：符号页是复用 g_fnLayer 实现的，而 g_fnLayer 在本布局下
+//   （g_fnWebLayout 为假）还会触发 KeyText 的「数字行 → F1~F12」改写 ——
+//   `=`(0xBB) 的 FnMap 是 12，实机直接把 `=` 画成了 **F12**；
+//   同时 K_NORMAL 还会进「双符号随 Shift 换面」分支：0xBC（主字符 , 副符号 <）
+//   被画成 `<` 上、`,` 下两行，与周围单符号格完全不同。
+// 数字与运算符（0x6x / 0x3x）本来就查不到 FnMap，保留各自类型即可。
 struct NpSymSpec { short vk; KeyType type; unsigned char symShift; };
 static const NpSymSpec kNpSymPage[9] = {
     { 0x6B, K_NORMAL, 0 }, { 0x6D, K_NORMAL, 0 }, { 0x6A, K_NORMAL, 0 },   // + - *
-    { 0x6F, K_NORMAL, 0 }, { 0xBB, K_NORMAL, 0 }, { 0x35, K_SYM   , 1 },   // / = %
-    { 0x39, K_SYM   , 1 }, { 0x30, K_SYM   , 1 }, { 0xBC, K_NORMAL, 0 },   // ( ) ,
+    { 0x6F, K_NORMAL, 0 }, { 0xBB, K_SYM   , 0 }, { 0x35, K_SYM   , 1 },   // / = %
+    { 0x39, K_SYM   , 1 }, { 0x30, K_SYM   , 1 }, { 0xBC, K_SYM   , 0 },   // ( ) ,
 };
 
 // 小键盘方案 A：T9 数字盘 + 动作列
@@ -996,7 +1003,9 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
         int w[13]; w[0] = wLSh;
         for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
         w[11] = wUp; w[12] = wRSh;
-        short v[13] = {0xA0, 0x200,0x201,0x202,0x203,0x204,0x205, 0xBF,0xBC,0xBE,0x2F, 0x26, 0xA1};
+        // ⚠ `/` 的虚拟键码是 VK_OEM_2 = 0xBF，**不是** 0x2F —— 0x2F 是 ASCII 的 '/'，
+        //    不是虚拟键码：GetSymForKey 查不到它 → 键面空白；点下去也发不出任何字符。
+        short v[13] = {0xA0, 0x200,0x201,0x202,0x203,0x204,0x205, 0xBF,0xBC,0xBE,0xBF, 0x26, 0xA1};
         KeyType t[13] = {K_MOD, K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,
                          K_SYM,K_SYM,K_SYM,K_SYM, K_ARROW, K_MOD};
         // 网址后缀是整串文字，其余 4 格是单符号：? 取副符号，, . / 取主符号
@@ -1326,6 +1335,8 @@ static void RecreateFontsAndLayout() {
     if (g_f12) DeleteObject(g_f12);
     if (g_f13) DeleteObject(g_f13);
     if (g_f14) DeleteObject(g_f14);
+    if (g_f10) DeleteObject(g_f10);
+    if (g_f9)  DeleteObject(g_f9);
 
     double dpiScale = GetSystemDpiScale();
 
@@ -1344,6 +1355,14 @@ static void RecreateFontsAndLayout() {
     g_f12 = MakeFont((int)(12 * finalFontScale + 0.5));   // 四舍五入，别让非整数缩放累积偏差
     g_f13 = MakeFont((int)(13 * finalFontScale + 0.5));
     g_f14 = MakeFont((int)(14 * finalFontScale + 0.5));   // 主档
+    // 深降档：全尺寸布局的 1u 键是**方形**（52 DIP 宽 × 53 DIP 高），字号却按键高算，
+    // 于是「PrtSc / ScrLk / Pause / Home / Enter」这类 4~5 字标签在 12pt 档也放不下，
+    // GDI+ NoWrap 会**整字丢弃尾部**（PrtSc → PrtS、Home → Hom、Pause → Pa）。
+    // 实测（MiSans-Medium，em 36/33/30/25/22）：1u 可用宽 80px 时，「Home」需要
+    //   97(f14) / 91(f13) / 87(f12) / 81(f11) / 74(f10) / 68(f9)
+    // —— 12pt 地板不够，必须在下面再补两档，否则这些键只能画残缺标签。
+    g_f10 = MakeFont((int)(10 * finalFontScale + 0.5));
+    g_f9  = MakeFont((int)( 9 * finalFontScale + 0.5));
 
     // 「Backspace」在最小字号档（g_f12）下的实际容纳宽，字体一改就重量一次。
     // 退格标签要不要缩写成 Bksp**只能**跟这个实测值比：
@@ -1704,21 +1723,24 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
     return MeasureTextAdvW(dc, s, f);
 }
 
-// 键面标签自适应字号：只用来救「PrtSc / ScrLk / Pause / Home / PgUp / PgDn」这类
-// 塞不进 1u 键的长标签。全尺寸布局的导航区键宽只有与字母键相同的 52px，
-// 而在默认布局里，这些位置是靠「导航区比字母键宽 59%」把矛盾盖住的。
+// 键面标签自适应字号：救「PrtSc / ScrLk / Pause / Home / PgUp / PgDn / Enter」这类
+// 塞不进 1u 键的长标签。全尺寸布局的导航区与数字区键宽只有与字母键相同的 1u。
 //
-// 阶梯刻意只有三档：基础档 → 13 → 12（12 是地板，不再往下掉）。
-// 掉到 9pt 那种深度会让同一排导航键冒出 4 种字号，反而更「不统一」；
-// 停在 12 时，最宽的 Pause 约 48px，仍在 52px 键内（两侧各 2px 余量）。
-// 注意真正决定观感的是上面 RecreateFontsAndLayout 的字号缩放：字号跟键高走，
-// 这里只是收尾，不是主力。
+// 阶梯五档：基础档 → 13 → 12 → 10 → 9（9 是地板）。
+//
+// ⚠ 这里曾经「刻意只有三档」（地板 12），理由是「掉到 9pt 会让同一排导航键冒出 4 种字号」。
+//   但那个结论是按 52px 键宽算的（注释里「最宽的 Pause 约 48px，仍在 52px 键内」），
+//   而实机 1u 是 ~90px、可用宽 80px —— 12pt 档下 Home 要 87px、Pause 要 98px，
+//   照样放不下，GDI+ NoWrap 会把尾部**整字丢掉**（实机截图：PrtSc→PrtS、Home→Hom、Pause→Pa）。
+//   残缺标签比「同一排字号不齐」严重得多，所以补回 10 / 9 两档：
+//   每个键取「放得下的最大档」，放得下的键仍停在 14，只有真正长的标签才往下掉。
+// 真正决定观感的是上面 RecreateFontsAndLayout 的字号缩放：字号跟键高走，这里只是收尾。
 static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW) {
     if (!s || !s[0] || maxW <= 0) return g_f14;
-    HFONT ladder[3] = { g_f14, g_f13, g_f12 };
-    for (int i = 0; i < 3; i++)
+    HFONT ladder[5] = { g_f14, g_f13, g_f12, g_f10, g_f9 };
+    for (int i = 0; i < 5; i++)
         if (MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
-    return ladder[2];
+    return ladder[4];
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -1971,7 +1993,9 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x12: return L"Alt";
         case 0x5B: return L"";   // Win 键：矢量绘制 Windows 徽标，无文字
         case 0x5D: return L"Menu";       // 三条杠是它的图形；文字模式下要给出名字（原来返回空串）
-        case 0x20: return L"";         // 空格键不显示文字
+        // 独立小键盘是 4 列网格，纯空白的一格看着像画错了（参考图那里写着「空格」）；
+        // 默认布局 / 全尺寸的空格键很宽，沿用屏幕键盘的惯例不写字。
+        case 0x20: return (g_layoutMode == 1) ? T(L"\x7A7A\x683C", L"Space") : L"";
         case 0x25: return L"\x2190";
         case 0x26: return L"\x2191";
         case 0x27: return L"\x2192";
@@ -2318,17 +2342,24 @@ static void DoKeyAction(const KeyDef* k) {
             //  - 未处于 Shift 状态：点击进入 Shift 锁定（后续按键为 Shift+组合键）；
             //  - 已处于 Shift 状态：再次点击切换中/英输入法，并退出 Shift 锁定。
             // 任意 Shift+组合键使用后会退出 Shift 状态，因此下次点击 Shift 可再次正常进入，不会失步。
+            //
+            // ⚠ 网页布局层里 Shift 不再兼作「退出 Fn 层」：
+            //   那个层的符号本来就全铺在键面上（K_SYM），Shift 只用来做
+            //   Shift+方向键这类组合；原来无条件 `g_fnLayer = FALSE`，
+            //   点一下 Shift 整层就退回默认布局，实机反馈「点了 Shift 键面全变了」。
+            //   退出的唯一入口留给那一层 Row4 的 Fn 键。
+            BOOL keepFn = (g_fnLayer && g_fnWebLayout);
             BOOL wasFn = g_fnLayer;
             if (g_sh) {
                 g_sh = FALSE;
-                g_fnLayer = FALSE;
+                if (!keepFn) g_fnLayer = FALSE;
                 ToggleImeLang();
             } else {
                 g_sh = TRUE;
-                g_fnLayer = FALSE;
+                if (!keepFn) g_fnLayer = FALSE;
             }
-            if (wasFn) {
-                BuildKeys();   // 若正处网页布局层，退出后需重建键位表
+            if (wasFn && !keepFn) {
+                BuildKeys();   // 退出网页布局层后需重建键位表
                 InvalidateRect(g_hWnd, 0, TRUE);
             }
         } else if (k->vk == 0x11) {
@@ -2580,8 +2611,14 @@ static void DrawKeys(HDC dc) {
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
+        //
+        // ⚠ 网页布局层（g_fnLayer && g_fnWebLayout）整个不做「随 Shift 换面」：
+        //   那一层的符号是全铺在键面上的（K_SYM，键面画什么就发什么），
+        //   再让残留的双符号键（如 `~）跟着 Shift 换面，就变成
+        //   「点一下 Shift，键面反而变花」—— 正是用户要求去掉的行为。
+        const BOOL webLayer = (g_fnLayer && g_fnWebLayout);
         wchar_t baseCh = 0, shiftCh = 0;
-        if (k->type == K_NORMAL && !(g_fnLayer && !g_fnWebLayout && FnMap(k->vk) != 0)) {
+        if (k->type == K_NORMAL && !webLayer && !(g_fnLayer && FnMap(k->vk) != 0)) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }
@@ -5390,8 +5427,13 @@ static void OnLDown(HWND hWnd, int x, int y) {
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         case HDR_NUM:   // 「小键盘」按钮：语义统一为「小键盘开着吗」
             if (g_layoutMode == 2) {
-                // 全尺寸布局：切换右侧数字区（与 Tab 键同一个入口）
-                SetFullNumpadHidden(hWnd, !g_npHidden);
+                // 全尺寸布局：切换右侧数字区。
+                // ⚠ 取反的必须是**生效状态** NumpadHidden()，不是手动标志 g_npHidden ——
+                //   按钮显示（NumBtnActive → !NumpadHidden()）用的是生效状态，
+                //   点击却翻转 g_npHidden，两者在「窄屏自动收起」时会分叉：
+                //   窗口 700 DIP（自动收起中、g_npHidden=FALSE）时点一下算的是「再隐藏一次」，
+                //   界面毫无变化，用户看到的就是「按钮点了不更新状态」。
+                SetFullNumpadHidden(hWnd, !NumpadHidden());
             } else if (g_layoutMode == 1) {
                 g_layoutMode = g_prevLayout;   // 独立小键盘 → 切回上次用的布局
                 ApplyKeyboardLayout(TRUE);
@@ -5703,6 +5745,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             g_tray = FALSE;
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
+        DeleteObject(g_f10); DeleteObject(g_f9);
         DeleteObject(g_sfBig); DeleteObject(g_sfRow); DeleteObject(g_sfCtrl);
         DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);

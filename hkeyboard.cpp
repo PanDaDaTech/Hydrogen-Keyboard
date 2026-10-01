@@ -2058,15 +2058,12 @@ static void DrawHeader(HDC dc) {
     // 最小化 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
     int iconSz = (int)(18 * dpiScale);
     int hoverR = (int)(6 * dpiScale);
-    // Minimize 这个 glyph 在 12 网格里画在 y=8（网格中心是 6），直接用会比 Close 低 2/12；
-    // 按图标尺寸上移同样的比例，「−」才和「✕」在同一条水平线上。
-    int minLift = iconSz * 2 / 12;
     if (g_hdrHov == HDR_MIN) {
         DrawRoundRect(dc, hm.xMin, hm.btnY, hm.wMin, hm.btnH,
                       C_REGULAR_HOV, C_REGULAR_HOV, hoverR);
     }
     DrawHkIcon(dc, (float)(hm.xMin + (hm.wMin - iconSz) / 2),
-               (float)(hm.btnY + (hm.btnH - iconSz) / 2 - minLift), (float)iconSz,
+               (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
                HkIcon(HKICON_MINIMIZE), C_DIM, C_DIM);
     if (g_hdrHov == HDR_CLOSE) {
         DrawRoundRect(dc, hm.xClose, hm.btnY, hm.wClose, hm.btnH,

@@ -258,10 +258,10 @@ static const HkIconNode k_icon_Clock[] = {
 
 static const HkIconNode k_icon_Close[] = {
     { HKIC_BEGIN, 0.0f, 1.3f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_MOVE, 3.0f, 3.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_LINE, 9.0f, 9.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_MOVE, 9.0f, 3.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_LINE, 3.0f, 9.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_MOVE, 2.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_LINE, 10.0f, 10.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_MOVE, 10.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_LINE, 2.0f, 10.0f, 0.0f, 0.0f, 0.0f, 0.0f },
     { HKIC_END, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
 };
 
@@ -660,12 +660,12 @@ static const HkIconNode k_icon_Globe[] = {
 
 static const HkIconNode k_icon_Hamburger[] = {
     { HKIC_BEGIN, 0.0f, 1.9f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_MOVE, 4.6f, 7.4f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_LINE, 19.4f, 7.4f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_MOVE, 4.6f, 12.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_LINE, 19.4f, 12.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_MOVE, 4.6f, 16.6f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_LINE, 19.4f, 16.6f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_MOVE, 3.4f, 7.4f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_LINE, 20.6f, 7.4f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_MOVE, 3.4f, 12.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_LINE, 20.6f, 12.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_MOVE, 3.4f, 16.6f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_LINE, 20.6f, 16.6f, 0.0f, 0.0f, 0.0f, 0.0f },
     { HKIC_END, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
 };
 
@@ -911,8 +911,8 @@ static const HkIconNode k_icon_MadeMark[] = {
 
 static const HkIconNode k_icon_Minimize[] = {
     { HKIC_BEGIN, 0.0f, 1.3f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_MOVE, 2.0f, 8.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    { HKIC_LINE, 10.0f, 8.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_MOVE, 2.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+    { HKIC_LINE, 10.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f },
     { HKIC_END, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
 };
 

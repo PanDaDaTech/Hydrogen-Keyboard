@@ -503,9 +503,12 @@ static void BuildNumpad(int y) {
     int colW = (KEY_AREA_W - 3 * g_keyGap) / 4;
     int x = KEY_AREA_X;
 
-    // Row 0: NumLock, /, *, -
+    // Row 0: 回退, /, *, -
+    // 原来是 NumLock：这块布局本身就是数字键盘、NumLock 恒开，那一格等于废键；
+    // 而整块布局**没有回退键**，输错一位只能切回主键盘 —— 实机反馈
+    // 「Num 开关功能没啥用，反而没有回退键有点麻烦」。这一格 101 DIP 宽，放得下整词 Backspace。
     {
-        short v[4] = {0x90, 0x6F, 0x6A, 0x6D};
+        short v[4] = {0x08, 0x6F, 0x6A, 0x6D};
         KeyType t[4] = {K_SPECIAL, K_NORMAL, K_NORMAL, K_NORMAL};
         int cx = x;
         for (int i = 0; i < 4; i++) { AddKey(cx, y, colW, g_keyHeight, v[i], t[i]); cx += colW + g_keyGap; }
@@ -702,7 +705,10 @@ static const KbKeySpec kFullNav5[] = {
 // 旧写法把 NumLock 行放在 F 行，整块被拉成 6 行，回车底边停在「0 行之上整整一行」，
 // 与 0 键、与键盘底边都不齐；F 行右侧那 4 列现在空着（真 104 那里就是空的）。
 static const KbKeySpec kFullNum0[] = {
-    { 0.00f, 1.00f, 0x90, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x6F, K_NORMAL, 1 },
+    // 0x08 而不是 0x90(NumLock)：数字区里用数字的人比锁 NumLock 的人多得多，
+    // 而这块 4u 有 5 行、每行都排满了，腾出这一格给回退键收益最大（与独立小键盘一致）。
+    // 主区已有 2u 的退格，这里是「右手不离开数字区」的第二入口。
+    { 0.00f, 1.00f, 0x08, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x6F, K_NORMAL, 1 },
     { 2.00f, 1.00f, 0x6A, K_NORMAL , 1 }, { 3.00f, 1.00f, 0x6D, K_NORMAL, 1 },
 };
 static const KbKeySpec kFullNum1[] = {       // + 跨「789 行 + 456 行」
@@ -874,6 +880,12 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     }
 }
 
+// 页头里胶囊按钮的位置（DIP）：上留白 10 + 按钮高 28，底边 = 38。
+// 键位竖向留白以「按钮底边」为基准，所以这两个常量必须与 GetHeaderMetrics 同源
+// —— 两处各写一遍数值，改一处就会让整个键盘在窗口里偏上/偏下。
+#define HDR_BTN_TOP_DIP 10
+#define HDR_BTN_H_DIP   28
+
 static void BuildKeys() {
     g_nk = 0;
 
@@ -887,23 +899,33 @@ static void BuildKeys() {
     double scaleY = (double)g_wh / baseH;
 
     // 页头只随 DPI 缩放，**不随窗口高度缩放** —— 标题栏不该在窗口拉高时变厚。
-    // 44 = 按钮上留白 10 + 按钮 28 + 6，剩下的下留白由第一排键 y 里的
-    // `g_keyGap + 2` 补齐，所以「按钮底 → 第一排键」任何窗口尺寸下都稳定在约 12 DIP。
+    // 44 = 按钮上留白 10 + 按钮 28 + 6 页头内部留白（见 HDR_BTN_* 与下面的竖向留白）。
     g_headerH = (int)(44.0 * dpiScale); if (g_headerH < 34) g_headerH = 34;
     g_keyGap = (int)(4.0 * dpiScale * scaleX); if (g_keyGap < 2) g_keyGap = 2;
-    // 键区左右留白 10 DIP。底部不能直接填 10：行高是整数除法，且第一排键的 y 里
-    // 有 `g_keyGap + 2`，所以「实际」底边距 = bottomPad − g_keyGap − 2 + 余数。
-    // 要让实际底边距也等于 10，设定值必须补回 g_keyGap + 2。
     g_keyAreaX = (int)(10 * dpiScale); if (g_keyAreaX < 6) g_keyAreaX = 6;
-    int bottomPad = (int)(16 * dpiScale); if (bottomPad < 8) bottomPad = 8;
 
     // 行数：全尺寸 5 行 + 可选 F1~F12 顶行；小键盘 5 行；完整布局固定 6 行（F 行 + 主区 5 行）
     BOOL webSurf = g_fnLayer && g_fnWebLayout && g_layoutMode == 0;
     int rows = (g_layoutMode == 2) ? 6 : 5 + (g_layoutMode == 0 && g_showFKeys && !webSurf ? 1 : 0);
-    g_keyHeight = (g_wh - g_headerH - bottomPad - (rows - 1) * g_keyGap) / rows;
-    if (g_keyHeight < 20) g_keyHeight = 20;
 
-    int y = g_headerH + g_keyGap + 2;
+    // 竖向留白统一成 10 DIP（与左右留白同节奏），基准取**页头里胶囊按钮的底边**，不是页头盒底：
+    // 页头盒 44 DIP 里按钮只占 10+28=38，余下 6 DIP 是页头内部留白，以盒底为基准会让
+    // 「按钮 → 第一排键」比「最后一排键 → 窗口底」小一截。
+    // 旧写法是 `bottomPad = 16 DIP` 且第一排 y 里硬塞一个 `+2`（px！与 DIP 混算），
+    // 实测小键盘布局上边距 8.67 / 下边距 14.67 DIP —— 肉眼就是「整体偏下、上下间距不合理」。
+    // 行高是整数除法，余数不再全堆到底部，改为上下各分一半（误差 ≤1px）。
+    const int padV   = (int)(10 * dpiScale);
+    const int hdrBot = (int)((HDR_BTN_TOP_DIP + HDR_BTN_H_DIP) * dpiScale);   // 胶囊按钮底边
+    int vAvail = (g_wh - padV) - (hdrBot + padV);
+    if (vAvail < 20 * rows) vAvail = 20 * rows;          // 窗口极矮时兜底，别算出负键高
+    vAvail -= (rows - 1) * g_keyGap;
+    g_keyHeight = vAvail / rows;
+    if (g_keyHeight < 20) g_keyHeight = 20;
+    vAvail -= g_keyHeight * rows;
+    int vRem = vAvail < 0 ? 0 : vAvail;                  // 上下各分一半的余量（px）
+
+    // 第一排键的 y：按钮底边 + padV，再加「上下各分一半」的余量
+    int y = hdrBot + padV + vRem / 2;
 
     if (g_layoutMode == 1) {   // 小键盘
         BuildNumpad(y);
@@ -1641,23 +1663,29 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     int iconInline = (int)(18 * dpi);
     int gap        = (int)(6 * dpi);
 
-    // 图标+文字（唯一的图标形态）：放得下就并排画，放不下**退回只画图标**。
-    // 退格这类键在 1u 宽的布局里塞不下 [⌫ Backspace]，退回图标至少还能一眼认出是退格；
-    // 之前直接放弃图标交给文字路径，反而长标签被裁掉半截 —— 实机反馈的「图标也看不到了」。
-    if (text && text[0] && k->w >= (int)(40 * dpi)) {
-        int tw  = MeasureTextW(dc, text, f);              // 容纳宽度（放得下判定 + 绘制矩形）
-        int adv = MeasureTextAdvW(dc, text, f);           // 布局宽度（整组居中）
-        if (adv <= 0) adv = tw;
-        if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
-            // 与标题栏 pill 同一套：整组按「图标 + 间距 + 文字实际占宽」居中，
-            // 文字矩形再左移半个余量，墨迹才接在间距之后。
-            int x = k->x + (k->w - (iconInline + gap + adv)) / 2;
-            DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
-                       *ic, color, color);
-            DrawTextC(dc, x + iconInline + gap + adv / 2 - (tw + 4) / 2, k->y, tw + 4, k->h,
-                      text, f, color);
-            return TRUE;
+    // 图标+文字（唯一的图标形态）：放得下就并排画；放不下就**退回「只画文字」**，
+    // 把决定权交回调用方的文字路径（FitKeyFont 会自动降档）。
+    // 文字才是信息载体、图标只是修饰，所以「挤不下」时该牺牲的是图标而不是文字。
+    // 原来这里退成「只画图标」：完整布局里 1u/1.5u 的 Tab、Caps、数字区回车、退格
+    // 全变成光秃秃一个图标 —— 实机反馈「该出现文本描述的怎么没描述了」。
+    // 只有完全没有文字的键（空格键这类）才落到「只画图标」。
+    if (text && text[0]) {
+        if (k->w >= (int)(40 * dpi)) {
+            int tw  = MeasureTextW(dc, text, f);              // 容纳宽度（放得下判定 + 绘制矩形）
+            int adv = MeasureTextAdvW(dc, text, f);           // 布局宽度（整组居中）
+            if (adv <= 0) adv = tw;
+            if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
+                // 与标题栏 pill 同一套：整组按「图标 + 间距 + 文字实际占宽」居中，
+                // 文字矩形再左移半个余量，墨迹才接在间距之后。
+                int x = k->x + (k->w - (iconInline + gap + adv)) / 2;
+                DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
+                           *ic, color, color);
+                DrawTextC(dc, x + iconInline + gap + adv / 2 - (tw + 4) / 2, k->y, tw + 4, k->h,
+                          text, f, color);
+                return TRUE;
+            }
         }
+        return FALSE;   // 交给文字路径（含键太窄、长标签放不下这两种情况）
     }
     DrawHkIcon(dc, (float)(k->x + (k->w - iconOnly) / 2), (float)(k->y + (k->h - iconOnly) / 2),
                (float)iconOnly, *ic, color, color);
@@ -1725,8 +1753,11 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x90: return L"Num";
         case 0x1B: return L"Esc";
         case 0x2E: return L"Del";
-        // 退格：始终显示全称 Backspace。放不下由 FitKeyFont 降档，不再缩写成 Bksp
-        case 0x08: return L"Backspace";
+        // 退格：宽键显示全称 Backspace（主区 104 DIP 那档），窄键用 Bksp。
+        // 判据用**键宽**而不是布局名：同一份键位表在三种布局里宽度不同，认宽度才不会分叉。
+        // 12pt 地板档下「Backspace」约占 5em，全尺寸数字区的 1u 键（56.9 DIP）需要 154px、
+        // 只有 89px 可用，硬画会被裁成「Backspa」；「Bksp」只要 70px，放得下。
+        case 0x08: return (k->w >= (int)(80 * GetSystemDpiScale())) ? L"Backspace" : L"Bksp";
         case 0x09: return L"Tab";
         case 0x0D: return L"Enter";
         case 0x14: return L"Caps";
@@ -2026,9 +2057,17 @@ static void DoKeyAction(const KeyDef* k) {
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;
         }
-        if (k->vk == 0x09 && g_layoutMode == 2 && g_npTabToggle) {
-            // 完整布局：Tab 键显示/隐藏右侧数字区 —— 与标题栏「小键盘」按钮同一个入口
+        // 数字区显隐的键盘入口是「Fn + Tab」，不是光秃秃的 Tab：
+        // 原来这里在 SendKey 之前 break，等于把 Tab 整个吞掉 —— 完整布局下按 Tab
+        // 永远打不出制表符，只把右侧数字区藏起来（该设置还默认开启），实机表现为
+        // 「按 Tab 键就自动隐藏小键盘区」。标题栏「小键盘」按钮本来就提供同一个开关，
+        // 手势挪到 Fn 层即可：Tab 回归 Tab，切换能力也还在。
+        // 与 Fn+F1 同一套守卫（!g_fnWebLayout）：网页层的 Fn 是「换整张键位表」，
+        // 由 Fn 键自己 BuildKeys 重建，不参与组合键，否则会出现「表已换、Fn 状态已清」的错位。
+        if (k->vk == 0x09 && g_layoutMode == 2 && g_npTabToggle && g_fnLayer && !g_fnWebLayout) {
             SetFullNumpadHidden(g_hWnd, !g_npHidden);
+            g_fnLayer = FALSE;                      // 与 Fn+F1 一致：用完即退出 Fn 层
+            g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;
         }
         if (k->vk == 0) {  // Fn 键：切换 F1~F12 功能层（或网页布局层）
@@ -2125,10 +2164,10 @@ static HeaderMetrics GetHeaderMetrics() {
     double dpiScale = GetSystemDpiScale();
     double dpi = dpiScale;
     HeaderMetrics hm = {};
-    hm.btnH = (int)(28 * dpi);
+    hm.btnH = (int)(HDR_BTN_H_DIP * dpi);
     // 按钮上留白固定 10 DIP（原来是 (header-btnH)/2 居中，页头 36 时只剩 4 DIP，贴顶）；
     // 页头被压得很矮时退回居中，免得按钮溢出页头。
-    hm.btnY = (int)(10 * dpi);
+    hm.btnY = (int)(HDR_BTN_TOP_DIP * dpi);
     if (hm.btnY + hm.btnH > g_headerH) {
         hm.btnY = (g_headerH - hm.btnH) / 2;
         if (hm.btnY < 0) hm.btnY = 0;
@@ -2838,8 +2877,8 @@ static const wchar_t* SettingsRowDescText(int tab, int index) {
         return T(L"在标题栏显示；默认布局切小键盘，全尺寸显隐数字区",
                  L"Show it in the title bar; toggles the numpad section");
     if (index == 4)
-        return T(L"全尺寸布局下按 Tab 键显示或隐藏数字区",
-                 L"Press Tab in the full layout to show or hide the numpad");
+        return T(L"全尺寸布局下按 Fn + Tab 显隐数字区，Tab 照常输入制表符",
+                 L"Press Fn + Tab in the full layout to hide or show the numpad");
     return NULL;
 }
 
@@ -3596,8 +3635,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
 
         if (g_layoutMode == 2) {
             r = SettingsRowRect(m, 4);
-            DrawSettingRowContent(dc, m, r, -1, L"F",   // Tab 切换小键盘同样保留手绘 F
-                                  T(L"Tab 切换小键盘", L"Tab Toggles Numpad"),
+            DrawSettingRowContent(dc, m, r, -1, L"F",   // Fn + Tab 同样保留手绘 F
+                                  T(L"Fn + Tab 切换小键盘", L"Fn + Tab Toggles Numpad"),
                                   SettingsRowDescText(3, 4),
                                   g_sHov == S_HIT_NPTAB, SettingsSwitchTextRight(m, r),
                                   SettingsRowDescTwoLines(m, 3, 4));

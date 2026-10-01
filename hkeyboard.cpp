@@ -1414,6 +1414,11 @@ static void DrawHkIcon(HDC dc, float x, float y, float size,
         while (n->op != HKIC_BEGIN && n->op != HKIC_END) {
             switch (n->op) {
             case HKIC_MOVE:
+                // ⛔ GDI+ 的 GraphicsPath::AddLine 是「接到当前点」的：同一个 <path> 里第二个
+                // 子路径若直接 AddLine，会被从上一个子路径的终点拉一条线连过来（符号和汉堡都
+                // 因此画错 —— X 多一条边、三条杠之间多两道斜线）。换子路径必须先 StartFigure()
+                // 显式断开。实测 PathTypes 才是判据：断开前 0,1,1,1；断开后 0,1,0,1。
+                if (path.GetPointCount() > 0) path.StartFigure();
                 px = n->a; py = n->b; have = TRUE;
                 break;
             case HKIC_LINE:
@@ -2135,10 +2140,9 @@ static void DrawKeys(HDC dc) {
         if (k->vk == 0x5D) {
             // Menu 键：原本靠图标字体的 \xE700 画汉堡，取消图标字体后一律改矢量，
             // 三种图标样式下外观一致（它本身没有可用文字，不参与「图标+文字」）。
-            // 汉堡的墨迹只占自身网格的 62%×38%，按 20 DIP 画会明显比旁边 14px 标签轻，
-            // 所以这里给到 24 DIP，视觉重量才和 Ctrl / Alt 这些键面对齐。
+            // 尺寸与键面 14px 标签同档（20 DIP）：三条杠的观感问题在渲染（连线），不在尺寸。
             double dpi = GetSystemDpiScale();
-            int s = (int)(24 * dpi);
+            int s = (int)(20 * dpi);
             DrawHkIcon(dc, (float)(k->x + (k->w - s) / 2), (float)(k->y + (k->h - s) / 2),
                        (float)s, HkIcon(HKICON_HAMBURGER), textC, textC);
         } else if (k->vk == 0x5B) {

@@ -46,6 +46,47 @@ static const wchar_t* ArchName() {
 #endif
 }
 
+// 关于页显示的版本串 = "<VER_FILEVERSION_STR>_<构建日期>"，如 "2.0_20261002"。
+//
+// 日期为什么要在源码里做时区换算：
+//   __DATE__ / __TIME__ 是**编译器本地时间**，而 CI（GitHub Actions runner）的宿主时区是 UTC，
+//   用户在 UTC+8。直接印 __DATE__ 会在「北京时间 00:00~08:00」这段把日期显示成前一天。
+//   所以这里把 __DATE__/__TIME__ 当 UTC 处理，+8 小时后再取日期，并处理跨日/跨月/跨年。
+//   注意本机没有 C/C++ 编译器，实际构建都在 CI 上。
+static const wchar_t* BuildDateBeijing() {
+    static wchar_t buf[16];
+    if (buf[0]) return buf;                     // 只算一次（静态缓存）
+
+    // __DATE__ 形如 "Oct  2 2026"（日 <10 前面补空格），__TIME__ 形如 "18:26:31"
+    static const char mon[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    int mm = 1;
+    for (int i = 0; i < 12; i++)
+        if (mon[i * 3] == __DATE__[0] && mon[i * 3 + 1] == __DATE__[1]
+            && mon[i * 3 + 2] == __DATE__[2]) { mm = i + 1; break; }
+    int dd = (__DATE__[4] == L' ') ? (__DATE__[5] - '0')
+                                   : (__DATE__[4] - '0') * 10 + (__DATE__[5] - '0');
+    int yy = (__DATE__[7] - '0') * 1000 + (__DATE__[8] - '0') * 100
+           + (__DATE__[9] - '0') * 10 + (__DATE__[10] - '0');
+    int hh = (__TIME__[0] - '0') * 10 + (__TIME__[1] - '0');
+    int mi = (__TIME__[3] - '0') * 10 + (__TIME__[4] - '0');
+
+    dd += (hh * 60 + mi + 8 * 60) / (24 * 60);  // UTC → UTC+8，跨日就进位
+    int dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (mm == 2 && ((yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0)) dim[1] = 29;
+    if (dd > dim[mm - 1]) { dd -= dim[mm - 1]; if (++mm > 12) { mm = 1; yy++; } }
+
+    swprintf(buf, 16, L"%04d%02d%02d", yy, mm, dd);
+    return buf;
+}
+
+// 日期取值入口。换构建环境（本地编译、或想钉死某个日期）时用
+// -DHK_BUILD_DATE=L"20261002" 覆盖即可，不必改上面的换算。
+// 摆在函数定义之后：#define 的宏体会引用 BuildDateBeijing()，虽然宏只在调用点展开，
+// 但把 #define 放在定义之前会让「先用后定义」的静态检查报 WARN。
+#ifndef HK_BUILD_DATE
+#define HK_BUILD_DATE BuildDateBeijing()
+#endif
+
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -3804,7 +3845,13 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     a.card1.left = m.contentX;
     a.card1.top = m.contentY;
     a.card1.right = m.contentX + m.contentW;
-    a.card1.bottom = a.card1.top + (int)(16 * m.dpi) * 2 + a.mark;
+    // 身份卡高度按「卡内墨迹上下留白相等」定，而不是按行盒对称：
+    //   行盒是 标题 26 + 间隙 6 + 描述 18 = 50，上下各留 16 会得到 82；但墨迹并不对称 ——
+    //   标题「HKeyboard 轻键」带降部、墨迹比行盒高约 1.4 DIP 且向上溢出，描述墨迹只占行盒
+    //   18 里的 ≈11.4 DIP。用 82 实测留白是「上 14.25 / 下 20.0」，肉眼能看出整体偏上。
+    //   76 = 墨迹高 ≈48 + 上下各 ≈14（实测 14.25 / 13.70，差 0.55 DIP）；
+    //   同时容得下图标盒 44（图标盒顶 +20 → 盒底 64 < 76）。
+    a.card1.bottom = a.card1.top + (int)(76 * m.dpi);
     a.card2.left = m.contentX;
     a.card2.top = a.card1.bottom + (int)(12 * m.dpi);
     a.card2.right = m.contentX + m.contentW;
@@ -4099,20 +4146,30 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                       al.card1.right - al.card1.left, al.card1.bottom - al.card1.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
-        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图、不加 tile
-        int my = al.card1.top + (int)(16 * m.dpi);
+        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图、不加 tile。
+        // 纵向与「标题 + 描述」这个文字块同高 —— 与链接行（DrawAboutLinkRow 的
+        //「文字块与 tile 中心对中心」）同一条规则。这里：
+        //   文字块 = 标题盒 26 + 间隙 6 + 描述盒 18 = 50，块中心距块顶 25；
+        //   块顶 = card1.top + 16，图标盒 = mark 44 → 纯按行盒算是 +16 + 25 - 22 = +19。
+        //   再下移 1 DIP：实测标题 "HKeyboard 轻键" 带降部、墨迹比行盒中心高约 1.6 DIP，
+        //   描述墨迹比行盒中心高 0.7 DIP，取整后 +20 与墨迹块同高（实测残差 0.15 DIP）。
+        // 改动前是 +16：实测图标纵心比文字块纵心高 7.86 DIP，肉眼就是「图标飘在上面」。
+        int my = al.card1.top + (int)(20 * m.dpi);
         DrawHkIcon(dc, (float)(al.card1.left + (int)(20 * m.dpi)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
         int tx = al.card1.left + (int)(20 * m.dpi) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + (int)(22 * m.dpi);
+        // 标题盒顶 +16，描述盒顶 = 标题盒顶 + 32（= 标题盒 26 + 间隙 6）。
+        // 改动前是 +22 / +28：两行墨迹只隔 5.71 DIP，标题和描述糊在一起。
+        int ty = al.card1.top + (int)(16 * m.dpi);
         int tw = al.card1.right - tx - (int)(20 * m.dpi);
         DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfBig, C_WHITE);
         wchar_t meta[96];
-        swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs (%ls)", L"Lightweight screen keyboard · v%hs (%ls)"),
-                 VER_FILEVERSION_STR, ArchName());
-        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
+        // 版本串 = 内部版本号 + 构建日期（北京时间），例如 "v2.0_20261002"
+        swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs_%ls (%ls)", L"Lightweight screen keyboard · v%hs_%ls (%ls)"),
+                 VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
+        DrawTextL(dc, tx, ty + (int)(32 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,

@@ -4106,7 +4106,7 @@ static void UpdateHueSlider(HWND hWnd, int mouseX) {
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
 }
 
-static void SettingsApplyHit(HWND hWnd, int hit) {
+static void SettingsApplyHit(HWND hWnd, int hit, int x) {
     BOOL themeChanged = FALSE;
     BOOL layoutChanged = FALSE;        // 布局模式切换：按布局重置窗口大小
     BOOL keyRowsChanged = FALSE;       // 仅增减键行（功能键行）：保持窗口大小
@@ -4138,10 +4138,11 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         SaveCloseSettings();   // 持久化“记住我的选择”
         break;
     case S_HIT_LAYOUT_DROP: {
-        // 画框选择：直接按点击的段应用（原来的下拉展开+选项两级已经作废）
-        RECT lr = SettingsRowRect(GetSettingsMetrics(hWnd), 0);
+        // 画框选择：直接按点击的段应用（原来的「展开下拉 → 再点选项」两级已经作废）
+        SettingsMetrics lm = GetSettingsMetrics(hWnd);
+        RECT lr = SettingsRowRect(lm, 0);
         const wchar_t* it[3]; int n = LayoutSegItems(it);
-        int idx = RowSegIndex(GetSettingsMetrics(hWnd), lr, it, n, x);
+        int idx = RowSegIndex(lm, lr, it, n, x);
         if (idx >= 0 && idx != g_layoutMode) { g_layoutMode = idx; layoutChanged = TRUE; }
         break;
     }
@@ -4387,7 +4388,7 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         return;
     }
     if (hit != S_HIT_NONE) {
-        SettingsApplyHit(hWnd, hit);
+        SettingsApplyHit(hWnd, hit, x);   // 画框选择需要点击的横向位置来定位段
     } else if (g_dropTheme || g_dropLayout || g_dropOpacity || g_dropLang || g_dropHl || g_dropClose) {
         // 点击空白处关闭下拉
         g_dropTheme = FALSE;

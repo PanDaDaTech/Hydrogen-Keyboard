@@ -80,7 +80,6 @@ int g_keyHeight = 46;
 
 #define ID_MENU_TOGGLE 10001
 #define ID_MENU_AUTO   10002
-#define ID_MENU_THEME  10004
 #define ID_MENU_ABOUT  10008
 #define ID_MENU_EXIT   10009
 #define ID_MENU_SETTINGS 10010
@@ -436,7 +435,7 @@ BOOL        g_tray = FALSE;
 HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
-HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f18 = 0;   // 键面字体（单字重，见字体显示方案 v6）
+HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0;   // 键面字体（单字重，见字体显示方案 v6）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
 static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
 static HANDLE g_fontReg = 0;
@@ -786,7 +785,7 @@ static void BuildFnSurf(int y, double dpiScale, double scaleX) {
     // Row 1: Esc, `, F1~F12, Backspace (15 keys)
     {
         int wEsc = (int)(50 * dpiScale * scaleX);
-        int wBksp = (int)(68 * dpiScale * scaleX);
+        int wBksp = (int)(104 * dpiScale * scaleX);   // 要放得下整词 Backspace（不再缩写成 Bksp）
         int fixed = wEsc + wBksp;
         int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
         int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
@@ -944,7 +943,7 @@ static void BuildKeys() {
     // Row 0: Esc, `, 1-0, -, =, Backspace  (15 keys)；F 行开启时隐藏原 Esc
     {
         int wEsc = (int)(50 * dpiScale * scaleX);
-        int wBksp = (int)(68 * dpiScale * scaleX);
+        int wBksp = (int)(104 * dpiScale * scaleX);   // 要放得下整词 Backspace（不再缩写成 Bksp）
         if (g_showFKeys) {
             // 无 Esc：`, 1-0, -, =, Backspace (14 keys)
             int aw = (KEY_AREA_W - wBksp - 13 * g_keyGap) / 13;
@@ -1148,7 +1147,6 @@ static void RecreateFontsAndLayout() {
     if (g_f12) DeleteObject(g_f12);
     if (g_f13) DeleteObject(g_f13);
     if (g_f14) DeleteObject(g_f14);
-    if (g_f18) DeleteObject(g_f18);
 
     double dpiScale = GetSystemDpiScale();
 
@@ -1163,12 +1161,10 @@ static void RecreateFontsAndLayout() {
     double finalFontScale = dpiScale * ((double)g_keyHeight / refKeyH);
     if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
-    // 单字重：不再有 g_f14b / g_f16b / g_f18b（后者本来就是没人引用的死变量）。
-    // 修饰键与普通键的区分交给底色 + 文字色（见 DrawKeyFace），与设置页 Tab 同一套逻辑。
+    // 单字重：g_f14 是唯一主档，修饰键与普通键的区分交给底色 + 文字色（与设置页 Tab 同一套逻辑）。
     g_f12 = MakeFont((int)(12 * finalFontScale + 0.5));   // 四舍五入，别让非整数缩放累积偏差
     g_f13 = MakeFont((int)(13 * finalFontScale + 0.5));
     g_f14 = MakeFont((int)(14 * finalFontScale + 0.5));   // 主档
-    g_f18 = MakeFont((int)(18 * finalFontScale + 0.5));   // 退格大箭头
 }
 
 static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
@@ -1642,9 +1638,8 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x90: return L"Num";
         case 0x1B: return L"Esc";
         case 0x2E: return L"Del";
-        // 退格：宽键（全尺寸 2u）放得下就写全「Backspace」，窄键（默认布局 1u 多）用业界通用的
-        // 短写 Bksp —— 之前一刀切换成 Backspace，窄键上等于被裁掉半截，只剩 "ckspac"
-        case 0x08: return (k->w >= (int)(110 * GetSystemDpiScale())) ? L"Backspace" : L"Bksp";
+        // 退格：始终显示全称 Backspace。放不下由 FitKeyFont 降档，不再缩写成 Bksp
+        case 0x08: return L"Backspace";
         case 0x09: return L"Tab";
         case 0x0D: return L"Enter";
         case 0x14: return L"Caps";
@@ -2209,9 +2204,9 @@ static void DrawKeys(HDC dc) {
         // 界面只有一个字面：不加粗。修饰键靠底色（C_REGULAR）与文字色（C_BTN_CONTENT）
         // 区分，与设置页 Tab 的选中态同一套逻辑 —— 少了「有些字粗有些字细」的杂音。
         // 放不下时按 FitKeyFont 降档 —— 全尺寸布局的导航区只有 1u 宽。
-        HFONT f = (k->vk == 0x08)
-                ? g_f18
-                : FitKeyFont(dc, txt, k->w - (int)(6 * GetSystemDpiScale()));
+        // 全部键（含退格）走同一个降档阶梯：不再给退格单独用大号字，
+        // 否则「Backspace」这个长词会顶出键帽。
+        HFONT f = FitKeyFont(dc, txt, k->w - (int)(6 * GetSystemDpiScale()));
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -4600,12 +4595,6 @@ static void ShowMenu(HWND hWnd) {
     // 自动呼出：菜单勾选项（主界面不再显示开关按钮）
     AppendMenuW(m, MF_STRING | (g_af ? MF_CHECKED : 0), ID_MENU_AUTO, T(L"\x81EA\x52A8\x547C\x51FA", L"Auto Pop-up"));
 
-    // 主题切换子菜单
-    HMENU themeMenu = CreatePopupMenu();
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 0 ? MF_CHECKED : 0), ID_MENU_THEME + 1, T(L"\x8DDF\x968F\x7CFB\x7EDF", L"Follow System"));
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 1 ? MF_CHECKED : 0), ID_MENU_THEME + 2, T(L"\x6DF1\x8272\x4E3B\x9898", L"Dark Theme"));
-    AppendMenuW(themeMenu, MF_STRING | (g_themeMode == 2 ? MF_CHECKED : 0), ID_MENU_THEME + 3, T(L"\x6D45\x8272\x4E3B\x9898", L"Light Theme"));
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)themeMenu, T(L"\x4E3B\x9898", L"Theme"));
     AppendMenuW(m, MF_STRING, ID_MENU_SETTINGS, T(L"\x8BBE\x7F6E", L"Settings"));
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -4624,12 +4613,6 @@ static void ShowMenu(HWND hWnd) {
         IniSetInt(L"General", L"AutoPopup", g_af ? 1 : 0);
         if (g_af) UpdateAutoVisibility();
         InvalidateRect(hWnd, 0, TRUE);
-    } else if (id == ID_MENU_THEME + 1) {
-        g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
-    } else if (id == ID_MENU_THEME + 2) {
-        g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
-    } else if (id == ID_MENU_THEME + 3) {
-        g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_SETTINGS) {
         OpenSettings();
     } else if (id == ID_MENU_ABOUT) {
@@ -5220,9 +5203,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             if (g_af) UpdateAutoVisibility();
             InvalidateRect(hWnd, 0, TRUE);
             break;
-        case ID_MENU_THEME + 1: g_themeMode = 0; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 2: g_themeMode = 1; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
-        case ID_MENU_THEME + 3: g_themeMode = 2; ApplyTheme(); SaveThemeConfig(); InvalidateRect(hWnd, 0, TRUE); break;
         case ID_MENU_SETTINGS: OpenSettings(); break;
         case ID_MENU_ABOUT: OpenSettingsTab(2); break;
         case ID_MENU_EXIT: ExitApplicationAnimated(); break;
@@ -5248,7 +5228,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             g_tray = FALSE;
         }
-        DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14); DeleteObject(g_f18);
+        DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_sfBig); DeleteObject(g_sfRow); DeleteObject(g_sfCtrl);
         DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);

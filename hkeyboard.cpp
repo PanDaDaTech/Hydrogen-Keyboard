@@ -3088,6 +3088,27 @@ static RECT AboutLinkRowRect(const SettingsMetrics& m, const RECT& card, int ind
     return r;
 }
 
+// 关于 tab 的两张卡：绘制与命中必须取自同一份几何，避免两边各算一遍
+struct AboutLayout {
+    RECT card1;   // 身份卡
+    RECT card2;   // 链接卡
+    int  mark;    // 矢量键盘标识边长
+};
+
+static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
+    AboutLayout a = {};
+    a.mark = (int)(44 * m.dpi);
+    a.card1.left = m.contentX;
+    a.card1.top = m.contentY;
+    a.card1.right = m.contentX + m.contentW;
+    a.card1.bottom = a.card1.top + (int)(16 * m.dpi) * 2 + a.mark;
+    a.card2.left = m.contentX;
+    a.card2.top = a.card1.bottom + (int)(12 * m.dpi);
+    a.card2.right = m.contentX + m.contentW;
+    a.card2.bottom = a.card2.top + AboutLinkRowHeight(m) * 2;
+    return a;
+}
+
 // 链接行：整行可点（触摸场景下命中区必须够大），右侧 34×34 圆形 External 按钮
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
@@ -3338,44 +3359,42 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         }
     } else {
         // 关于 tab：两张卡（身份 / 链接），版权行在卡片下方居中
-        int mark = (int)(44 * m.dpi);
-        RECT card1 = { m.contentX, m.contentY, m.contentX + m.contentW, 0 };
-        card1.bottom = card1.top + (int)(16 * m.dpi) * 2 + mark;
-        DrawRoundRect(dc, card1.left, card1.top, card1.right - card1.left, card1.bottom - card1.top,
+        AboutLayout al = GetAboutLayout(m);
+        DrawRoundRect(dc, al.card1.left, al.card1.top,
+                      al.card1.right - al.card1.left, al.card1.bottom - al.card1.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
         // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图、不加 tile
-        int my = card1.top + (int)(16 * m.dpi);
-        DrawHkIcon(dc, (float)(card1.left + (int)(20 * m.dpi)), (float)my, (float)mark,
+        int my = al.card1.top + (int)(16 * m.dpi);
+        DrawHkIcon(dc, (float)(al.card1.left + (int)(20 * m.dpi)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
-        int tx = card1.left + (int)(20 * m.dpi) + mark + (int)(18 * m.dpi);
-        int ty = card1.top + (int)(22 * m.dpi);
-        DrawTextL(dc, tx, ty, card1.right - tx - (int)(20 * m.dpi), (int)(26 * m.dpi),
+        int tx = al.card1.left + (int)(20 * m.dpi) + al.mark + (int)(18 * m.dpi);
+        int ty = al.card1.top + (int)(22 * m.dpi);
+        int tw = al.card1.right - tx - (int)(20 * m.dpi);
+        DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sf20b, C_WHITE);
         wchar_t meta[96];
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs (%ls)", L"Lightweight screen keyboard · v%hs (%ls)"),
                  VER_FILEVERSION_STR, ArchName());
-        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), card1.right - tx - (int)(20 * m.dpi), (int)(18 * m.dpi),
-                  meta, g_sf12, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sf12, C_DIM);
 
-        RECT card2 = { m.contentX, card1.bottom + (int)(12 * m.dpi), m.contentX + m.contentW, 0 };
-        card2.bottom = card2.top + AboutLinkRowHeight(m) * 2;
-        DrawRoundRect(dc, card2.left, card2.top, card2.right - card2.left, card2.bottom - card2.top,
+        DrawRoundRect(dc, al.card2.left, al.card2.top,
+                      al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
-        Fill(dc, card2.left + (int)(20 * m.dpi), card2.top + AboutLinkRowHeight(m),
-             (card2.right - card2.left) - (int)(40 * m.dpi), 1, C_LINE_DIV);
-        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, card2, 0), HKICON_GITHUB,
+        Fill(dc, al.card2.left + (int)(20 * m.dpi), al.card2.top + AboutLinkRowHeight(m),
+             (al.card2.right - al.card2.left) - (int)(40 * m.dpi), 1, C_LINE_DIV);
+        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, al.card2, 0), HKICON_GITHUB,
                          T(L"项目地址", L"Project URL"),
                          L"github.com/PanDaDaTech/Hydrogen-Keyboard",
                          g_sHov == S_HIT_URL);
-        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, card2, 1), HKICON_INFO,
+        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, al.card2, 1), HKICON_INFO,
                          T(L"问题反馈", L"Feedback"),
                          T(L"遇到 bug 或有建议，到 Issues 提一个", L"Report bugs or ideas on GitHub Issues"),
                          g_sHov == S_HIT_FEEDBACK);
 
         // 版权行：文字逐字保留（含 2026 与结尾句点），12px C_DIM 居中，放在卡片下方
-        DrawTextC(dc, m.contentX, card2.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
+        DrawTextC(dc, m.contentX, al.card2.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sf12, C_DIM);
     }
 
@@ -3589,14 +3608,10 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
     } else {
         // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）
-        int mark = (int)(44 * m.dpi);
-        RECT card1 = { m.contentX, m.contentY, m.contentX + m.contentW, 0 };
-        card1.bottom = card1.top + (int)(16 * m.dpi) * 2 + mark;
-        RECT card2 = { m.contentX, card1.bottom + (int)(12 * m.dpi), m.contentX + m.contentW, 0 };
-        card2.bottom = card2.top + AboutLinkRowHeight(m) * 2;
-        RECT r0 = AboutLinkRowRect(m, card2, 0);
+        AboutLayout al = GetAboutLayout(m);
+        RECT r0 = AboutLinkRowRect(m, al.card2, 0);
         if (x >= r0.left && x < r0.right && y >= r0.top && y < r0.bottom) return S_HIT_URL;
-        RECT r1 = AboutLinkRowRect(m, card2, 1);
+        RECT r1 = AboutLinkRowRect(m, al.card2, 1);
         if (x >= r1.left && x < r1.right && y >= r1.top && y < r1.bottom) return S_HIT_FEEDBACK;
     }
     return S_HIT_NONE;

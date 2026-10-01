@@ -2586,10 +2586,8 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_TAB1           3
 #define S_HIT_TAB2           4
 #define S_HIT_AUTO           10
+// 下面这些 *_DROP 命中码现在表示「点了该行的画框选择」，段下标在点击时按 x 算
 #define S_HIT_LAYOUT_DROP    14
-#define S_HIT_LAYOUT_OPT0    15
-#define S_HIT_LAYOUT_OPT1    16
-#define S_HIT_LAYOUT_OPT2    17
 #define S_HIT_FKEYS          18
 #define S_HIT_FNWEB          94
 #define S_HIT_NPBTN          24   // 布局 Tab：显示标题栏 123 切换按钮
@@ -2597,44 +2595,23 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_KEYICON        26   // 布局 Tab：按键图标样式（分段控件，整条一个命中码）
 #define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
-#define S_HIT_THEME_OPT0     21
-#define S_HIT_THEME_OPT1     22
-#define S_HIT_THEME_OPT2     23
 #define S_HIT_URL            30
 #define S_HIT_FEEDBACK       31
 #define S_HIT_CLOSE_DROP     70
-#define S_HIT_CLOSE_OPT0     71
-#define S_HIT_CLOSE_OPT1     72
-#define S_HIT_LANG_DROP       50
-#define S_HIT_LANG_OPT0       51
-#define S_HIT_LANG_OPT1       52
-#define S_HIT_HL_DROP         60
-#define S_HIT_HL_OPT0         61
-#define S_HIT_HL_OPT1         62
-#define S_HIT_HL_BOX          64
-#define S_HIT_HL_HUE          65
-#define S_HIT_HL_PAL0         80
-#define S_HIT_REMEMBER        95
-#define S_HIT_OPACITY_DROP    96
-#define S_HIT_OPACITY_OPT0    97   // ~ OPT5（6 档透明度）
+#define S_HIT_LANG_DROP      50
+#define S_HIT_HL_DROP        60
+#define S_HIT_HL_BOX         64
+#define S_HIT_HL_HUE         65
+#define S_HIT_HL_PAL0        80
+#define S_HIT_REMEMBER       95
+#define S_HIT_OPACITY_DROP   96
 
 static int  g_sTab = 0;        // 0=常规 1=主题 2=关于
 static int  g_sHov = -1;       // 悬停元素，-1=无
 static BOOL g_sTracking = FALSE;
 static BOOL g_settingsClosing = FALSE;
 static BOOL g_settingsMoving = FALSE;
-static BOOL g_dropTheme = FALSE;    // 主题下拉是否展开
-static BOOL g_dropLayout = FALSE;   // 布局下拉是否展开
-static int  g_dropThemeHov = -1;
-static int  g_dropLayoutHov = -1;
-static BOOL g_dropLang = FALSE;        // 语言下拉
-static int  g_dropLangHov = -1;
-static BOOL g_dropHl = FALSE;          // 高亮颜色下拉
-static int  g_dropHlHov = -1;
-static BOOL g_dropClose = FALSE;        // 关闭按钮操作下拉
-static int  g_dropCloseHov = -1;
-static BOOL g_dropOpacity = FALSE;      // 主界面透明度下拉
-static int  g_dropOpacityHov = -1;
+// 设置页各行的命中码（分段控件一个码，段下标在点击时按 x 算）
 static BOOL g_hlEditFocus = FALSE;     // HEX 输入框是否处于编辑态
 static wchar_t g_hlEditBuf[8] = {0};   // 编辑中的 HEX 文本（#RRGGBB）
 static int g_hlSliderDrag = S_HIT_NONE;
@@ -3935,12 +3912,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         }
         break;
     }
-    case S_HIT_CLOSE_OPT0:
-    case S_HIT_CLOSE_OPT1:
-        g_closeToTray = (hit == S_HIT_CLOSE_OPT1);
-        g_dropClose = FALSE;
-        if (g_rememberClose) SaveCloseSettings();
-        break;
     case S_HIT_REMEMBER:
         BeginSwitchAnimation(hWnd, hit, g_rememberClose, !g_rememberClose);
         g_rememberClose = !g_rememberClose;
@@ -3955,13 +3926,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         if (idx >= 0 && idx != g_layoutMode) { g_layoutMode = idx; layoutChanged = TRUE; }
         break;
     }
-    case S_HIT_LAYOUT_OPT0:
-    case S_HIT_LAYOUT_OPT1:
-    case S_HIT_LAYOUT_OPT2:
-        g_layoutMode = hit - S_HIT_LAYOUT_OPT0;
-        g_dropLayout = FALSE;
-        layoutChanged = TRUE;
-        break;
     case S_HIT_FKEYS:
         BeginSwitchAnimation(hWnd, hit, g_showFKeys, !g_showFKeys);
         g_showFKeys = !g_showFKeys;
@@ -4006,12 +3970,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         if (idx >= 0 && idx != g_themeMode) { g_themeMode = idx; themeChanged = TRUE; }
         break;
     }
-    case S_HIT_THEME_OPT0:
-    case S_HIT_THEME_OPT1:
-    case S_HIT_THEME_OPT2:
-        if (g_themeMode != hit - S_HIT_THEME_OPT0) { g_themeMode = hit - S_HIT_THEME_OPT0; themeChanged = TRUE; }
-        g_dropTheme = FALSE;
-        break;
     case S_HIT_OPACITY_DROP: {
         SettingsMetrics om = GetSettingsMetrics(hWnd);
         RECT orr = SettingsRowRect(om, 1);
@@ -4027,20 +3985,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         }
         break;
     }
-    case S_HIT_OPACITY_OPT0:
-    case S_HIT_OPACITY_OPT0 + 1:
-    case S_HIT_OPACITY_OPT0 + 2:
-    case S_HIT_OPACITY_OPT0 + 3:
-    case S_HIT_OPACITY_OPT0 + 4:
-    case S_HIT_OPACITY_OPT0 + 5:
-        g_mainOpacity = g_opacityValues[hit - S_HIT_OPACITY_OPT0];
-        g_dropOpacity = FALSE;
-        IniSetInt(L"Theme", L"Opacity", g_mainOpacity);
-        if (g_hWnd && IsWindow(g_hWnd)) {   // 立即应用透明度
-            ApplyWindowOpacity(g_hWnd, g_mainOpacity < 100);
-            RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
-        }
-        break;
     case S_HIT_LANG_DROP: {
         SettingsMetrics gm = GetSettingsMetrics(hWnd);
         RECT gr = SettingsRowRect(gm, (g_af ? 2 : 1) + 4);
@@ -4053,13 +3997,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         }
         break;
     }
-    case S_HIT_LANG_OPT0:
-    case S_HIT_LANG_OPT1:
-        g_lang = hit - S_HIT_LANG_OPT0;
-        g_dropLang = FALSE;
-        IniSetInt(L"General", L"Language", g_lang);
-        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);   // 主键盘文本立即切换
-        break;
     case S_HIT_HL_DROP: {
         SettingsMetrics hm = GetSettingsMetrics(hWnd);
         RECT hr = SettingsRowRect(hm, 2);
@@ -4074,15 +4011,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         }
         break;
     }
-    case S_HIT_HL_OPT0:
-    case S_HIT_HL_OPT1:
-        g_wallpaperAccent = (hit == S_HIT_HL_OPT1);
-        g_dropHl = FALSE;
-        if (g_wallpaperAccent) g_hlEditFocus = FALSE;
-        ApplyTheme();
-        SaveThemeConfig();
-        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
-        break;
     case S_HIT_HL_BOX:
         if (!g_wallpaperAccent) {
             if (g_hlEditFocus) {
@@ -4278,23 +4206,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         if (!g_sTracking) { TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hWnd, 0}; TrackMouseEvent(&tme); g_sTracking = TRUE; }
         int hov = SettingsHitTest(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (hov != g_sHov) { g_sHov = hov; InvalidateRect(hWnd, NULL, TRUE); }
-        int thov = (hov >= S_HIT_THEME_OPT0 && hov <= S_HIT_THEME_OPT2) ? hov - S_HIT_THEME_OPT0 : -1;
-        int lhov = (hov >= S_HIT_LAYOUT_OPT0 && hov <= S_HIT_LAYOUT_OPT2) ? hov - S_HIT_LAYOUT_OPT0 : -1;
-        int langov = (hov >= S_HIT_LANG_OPT0 && hov <= S_HIT_LANG_OPT1) ? hov - S_HIT_LANG_OPT0 : -1;
-        int hlov = (hov >= S_HIT_HL_OPT0 && hov <= S_HIT_HL_OPT1) ? hov - S_HIT_HL_OPT0 : -1;
-        int clov = (hov >= S_HIT_CLOSE_OPT0 && hov <= S_HIT_CLOSE_OPT1) ? hov - S_HIT_CLOSE_OPT0 : -1;
-        int ohov = (hov >= S_HIT_OPACITY_OPT0 && hov <= S_HIT_OPACITY_OPT0 + 5) ? hov - S_HIT_OPACITY_OPT0 : -1;
-        if (thov != g_dropThemeHov || lhov != g_dropLayoutHov ||
-            langov != g_dropLangHov || hlov != g_dropHlHov || clov != g_dropCloseHov ||
-            ohov != g_dropOpacityHov) {
-            g_dropThemeHov = thov;
-            g_dropLayoutHov = lhov;
-            g_dropLangHov = langov;
-            g_dropHlHov = hlov;
-            g_dropCloseHov = clov;
-            g_dropOpacityHov = ohov;
-            InvalidateRect(hWnd, NULL, TRUE);
-        }
         return 0;
     }
     case WM_SETCURSOR: {

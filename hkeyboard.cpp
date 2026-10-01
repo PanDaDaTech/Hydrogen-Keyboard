@@ -446,6 +446,7 @@ HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0;   // 键面字体（单字重，见字体显示方案 v6）
 HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：只给 1u 键塞不下的长标签用（见 FitKeyFont）
+HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
 static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
@@ -1280,6 +1281,9 @@ static void RecreateFontsAndLayout() {
     if (g_f14) DeleteObject(g_f14);
     if (g_f10) DeleteObject(g_f10);
     if (g_f9)  DeleteObject(g_f9);
+    if (g_f8)  DeleteObject(g_f8);
+    if (g_f7)  DeleteObject(g_f7);
+    if (g_f6)  DeleteObject(g_f6);
 
     double dpiScale = GetSystemDpiScale();
 
@@ -1314,6 +1318,14 @@ static void RecreateFontsAndLayout() {
     // —— 12pt 地板不够，必须在下面再补两档，否则这些键只能画残缺标签。
     g_f10 = MakeFont((int)(10 * finalFontScale + 0.5));
     g_f9  = MakeFont((int)( 9 * finalFontScale + 0.5));
+    // 更深的兜底三档：键「宽」不跟着窗口长高，所以把窗口拖得极高时，1u 键会变成
+    // 「窄而高」（1280×900 DIP 时键宽 99px、高 238px）。这时即使字号增长已封顶在
+    // 90 DIP，9pt 档仍放不下 PrtSc / Home / PgUp（实测 116px > 89px 可用宽）。
+    // 阶梯一路降到 6pt 才能保证「任何尺寸下标签都完整」；正常尺寸下前几档就已命中，
+    // 不会走到这里（全尺寸 2240×707 的出图在加深阶梯前后逐字节相同）。
+    g_f8 = MakeFont((int)(8 * finalFontScale + 0.5));
+    g_f7 = MakeFont((int)(7 * finalFontScale + 0.5));
+    g_f6 = MakeFont((int)(6 * finalFontScale + 0.5));
 
     // 「Backspace」在最小字号档（g_f12）下的实际容纳宽，字体一改就重量一次。
     // 退格标签要不要缩写成 Bksp**只能**跟这个实测值比：
@@ -1688,10 +1700,12 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
 // 真正决定观感的是上面 RecreateFontsAndLayout 的字号缩放：字号跟键高走，这里只是收尾。
 static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW) {
     if (!s || !s[0] || maxW <= 0) return g_f14;
-    HFONT ladder[5] = { g_f14, g_f13, g_f12, g_f10, g_f9 };
-    for (int i = 0; i < 5; i++)
-        if (MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
-    return ladder[4];
+    // 8 档降档阶梯：正常尺寸命中前几档，越靠后只在「键窄而窗口极高」时才用得上。
+    // 地板给到 6pt 是为了兑现「标签永远完整」（见 RecreateFontsAndLayout 里的说明）。
+    HFONT ladder[8] = { g_f14, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
+    for (int i = 0; i < 8; i++)
+        if (ladder[i] && MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
+    return g_f6;
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -5670,6 +5684,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_f10); DeleteObject(g_f9);
+        DeleteObject(g_f8); DeleteObject(g_f7); DeleteObject(g_f6);
         DeleteObject(g_sfBig); DeleteObject(g_sfRow); DeleteObject(g_sfCtrl);
         DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);

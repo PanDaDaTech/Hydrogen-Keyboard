@@ -1130,17 +1130,17 @@ static HFONT MakeFont(double size) {
         DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
-// 设置页五档：22 大标题 / 15 行主文本 / 12 控件标签 / 11 行描述 / 10 元信息。
+// 设置页五档：18 大标题 / 12.5 行主文本 / 11 控件标签 / 10 行描述 / 9 元信息。
 // 单字重下层级完全由「字号 + 颜色」承担，相邻档至少差 1pt。
-// 「控件标签」是独立一档：Tab、开关的「开/关」、分段、按钮和行描述原来挤在同一个 10.5pt 上，
-// 于是整页只剩三档、层级是平的。
+// 基准对齐 Windows 设置页：本窗口只有 700 DIP 宽（系统设置约 1024），字号不能照抄它的绝对值，
+// 但也不该按 1024 的宽窗口取值 —— 这一档比首版整体下移一档，阶梯形状不变。
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
-    g_sfBig  = MakeFont(22 * dpi);   // 页面大标题
-    g_sfRow  = MakeFont(15 * dpi);   // 行主文本
-    g_sfCtrl = MakeFont(12 * dpi);   // 控件标签：Tab / 开·关 / 分段 / 按钮
-    g_sfBase = MakeFont(11 * dpi);   // 行描述
-    g_sfMeta = MakeFont(10 * dpi);   // 版本号 / Copyright
+    g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
+    g_sfRow  = MakeFont(12.5 * dpi);   // 行主文本
+    g_sfCtrl = MakeFont(11 * dpi);     // 控件标签：Tab / 开关「开·关」/ 分段 / 按钮 / 弹窗
+    g_sfBase = MakeFont(10 * dpi);     // 行描述
+    g_sfMeta = MakeFont(9 * dpi);      // 版本号 / Copyright
 }
 
 static void RecreateFontsAndLayout() {
@@ -2887,7 +2887,7 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
     for (int i = 0; i < 4; i++) {
         BOOL on = (i == active);
         DrawTextC(dc, tr[i].left, tr[i].top, tr[i].right - tr[i].left, m.tabH - rule - inset,
-                  labels[i], g_sfBase, (on || g_sHov == k_settingsTabHits[i]) ? C_WHITE : C_DIM);
+                  labels[i], g_sfCtrl, (on || g_sHov == k_settingsTabHits[i]) ? C_WHITE : C_DIM);
     }
     // strip 下缘 1px 分隔线；选中项底部主色横线压在它上面
     Fill(dc, m.contentX, m.tabsY + m.tabH, m.contentW, 1, C_LINE_DIV);

@@ -1661,19 +1661,25 @@ static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
 // 按键的对齐方式把标签摆到键面的左端 / 右端（k->align，见 KeyAlign）。
 // 参考图里左列的 Esc / Tab / Caps / Shift 名字贴着左边缘、右列的 Backspace / Del /
 // Enter / Shift 贴着右边缘 —— 宽键居中会让名字独自飘在一条缝上，反而看不出是哪个键。
-// 绘制矩形的宽仍用「容纳宽度 + 4」，与 DrawTextC 的居中路径同源，只是矩形不再居中。
+//
+// ⚠ 绘制矩形的宽必须用「容纳宽度」（MeasureTextW / GDI+），**不能**用 advance：
+//   GDI+ 的 DrawString 在 NoWrap 下一次判定放不下就**整字丢掉尾部**，而它判据用的
+//   正是 MeasureString 的量宽（比 advance 两侧各多约 0.2em）。这里曾经图省事写成
+//   `rw = adv + 4`，实机立刻现形：Esc→Es、Del→De、Ctrl→Ctr、Alt→Al、Fn→F。
+//   位置按 advance 摆（居中/贴边才准），矩形宽按容纳宽给 —— 两个宽度各司其职。
 static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
     if (!s || !s[0]) return;
-    int tw = MeasureTextW(dc, s, f);
+    int tw = MeasureTextW(dc, s, f);          // 容纳宽度：绘制矩形的宽必须 ≥ 它
     if (tw <= 0) return;
-    int adv = MeasureTextAdvW(dc, s, f);
-    int rw  = (adv > 0 ? adv : tw) + 4;
+    int rw = tw + 4;                          // 与 DrawTextC 的居中路径同一套取值
+    int adv = MeasureTextAdvW(dc, s, f);      // 布局宽度：整块墨迹实际占多宽
+    if (adv <= 0) adv = tw;
 
     int inset = (int)(10 * GetSystemDpiScale());
     int x;
     if (k->align == KA_LEFT)       x = k->x + inset;
-    else if (k->align == KA_RIGHT) x = k->x + k->w - inset - rw;
-    else                           x = k->x + (k->w - rw) / 2;
+    else if (k->align == KA_RIGHT) x = k->x + k->w - inset - adv;
+    else                           x = k->x + (k->w - adv) / 2;
     if (x < k->x) x = k->x;
     DrawTextC(dc, x, k->y, rw, k->h, s, f, c);
 }

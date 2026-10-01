@@ -436,8 +436,8 @@ BOOL        g_tray = FALSE;
 HWINEVENTHOOK g_winHook = 0;
 HWINEVENTHOOK g_fgHook = 0;
 HANDLE      g_mutex = 0;
-HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f14b = 0, g_f16b = 0, g_f18b = 0;
-static HFONT g_sf12 = 0, g_sf13 = 0, g_sf13b = 0, g_sf14b = 0, g_sf20b = 0;   // 设置/关闭窗口固定字号字体
+HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0, g_f18 = 0;   // 键面字体（单字重，见字体显示方案 v6）
+static HFONT g_sfBig = 0, g_sfHead = 0, g_sfRow = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
 static HANDLE g_fontReg = 0;           // AddFontMemResourceEx 句柄（内嵌字体）
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
@@ -1109,36 +1109,39 @@ static void LoadEmbeddedFonts() {
         g_fontReady = TRUE;
     }
 }
-// 创建 UI 字体。界面只有 Medium(500) 一个字面：正文用它，标题/选中项请求 FW_BOLD 拿到
-// GDI 的仿真加粗（族里没有 700 的字面，这是唯一能让标题比正文更重的办法）。
-static HFONT MakeFont(double size, BOOL bold) {
+// 创建 UI 字体。界面只有一个字面（MiSans Medium），族里**不存在** 700：
+// 请求 FW_BOLD 只会拿到 GDI 的仿真加粗（轮廓等距外扩），实测墨迹 +30~38%、
+// 连通域 21→16（笔画被填死）、字宽 +6~13% —— 中文小字号受害最重，
+// 而且「量宽用粗体、绘制用常规」会让 FitKeyFont 误判降档。
+// 所以本函数**只提供 FW_NORMAL**，层级一律由「字号 + 颜色」承担（见字体显示方案 v6）。
+static HFONT MakeFont(double size) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
     ReleaseDC(0, hdc);
     const wchar_t* face = g_fontReady ? L"MiSans" : L"Microsoft YaHei";
-    return CreateFontW(h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL,
+    return CreateFontW(h, 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
-// 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）
+// 设置/关闭窗口使用固定字号字体（不随主键盘窗口缩放，仅随 DPI）。
+// 五个字号就是设置页的全部层级：20 大标题 / 13 面板标题 / 12 行主文本 /
+// 10.5 描述·Tab·按钮·分段 / 10 元信息。相邻层级差 1~1.5pt，再配上颜色分工。
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
-    g_sf12  = MakeFont(10.5 * dpi, 0);   // 灰色小字（提示/正文）
-    g_sf13  = MakeFont(10.5 * dpi, 0);   // 行文本/开关标签
-    g_sf13b = MakeFont(10.5 * dpi, 1);   // Tab / 按钮
-    g_sf14b = MakeFont(11.5 * dpi, 1);   // 面板标题
-    g_sf20b = MakeFont(20 * dpi, 1);     // 设置页大标题
+    g_sfBig  = MakeFont(20   * dpi);   // 页面大标题
+    g_sfHead = MakeFont(13   * dpi);   // 面板标题（原 11.5 粗体 —— 去粗体后 +1.5pt 补回来）
+    g_sfRow  = MakeFont(12   * dpi);   // 行主文本（原 10.5）
+    g_sfBase = MakeFont(10.5 * dpi);   // 行描述 / Tab / 按钮 / 分段 / 开关标签
+    g_sfMeta = MakeFont(10   * dpi);   // 版本号 / Copyright
 }
 
 static void RecreateFontsAndLayout() {
     if (g_f12) DeleteObject(g_f12);
     if (g_f13) DeleteObject(g_f13);
     if (g_f14) DeleteObject(g_f14);
-    if (g_f14b) DeleteObject(g_f14b);
-    if (g_f16b) DeleteObject(g_f16b);
-    if (g_f18b) DeleteObject(g_f18b);
+    if (g_f18) DeleteObject(g_f18);
 
     double dpiScale = GetSystemDpiScale();
 
@@ -1153,12 +1156,12 @@ static void RecreateFontsAndLayout() {
     double finalFontScale = dpiScale * ((double)g_keyHeight / refKeyH);
     if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
-    g_f12  = MakeFont((int)(12 * finalFontScale), 0);
-    g_f13  = MakeFont((int)(13 * finalFontScale), 0);
-    g_f14  = MakeFont((int)(14 * finalFontScale), 0);
-    g_f14b = MakeFont((int)(14 * finalFontScale), 1);
-    g_f16b = MakeFont((int)(16 * finalFontScale), 1);
-    g_f18b = MakeFont((int)(18 * finalFontScale), 1);
+    // 单字重：不再有 g_f14b / g_f16b / g_f18b（后者本来就是没人引用的死变量）。
+    // 修饰键与普通键的区分交给底色 + 文字色（见 DrawKeyFace），与设置页 Tab 同一套逻辑。
+    g_f12 = MakeFont((int)(12 * finalFontScale));
+    g_f13 = MakeFont((int)(13 * finalFontScale));
+    g_f14 = MakeFont((int)(14 * finalFontScale));   // 主档
+    g_f18 = MakeFont((int)(18 * finalFontScale));   // 退格大箭头
 }
 
 static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
@@ -1502,9 +1505,9 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
 // 停在 12 时，最宽的 Pause 约 48px，仍在 52px 键内（两侧各 2px 余量）。
 // 注意真正决定观感的是上面 RecreateFontsAndLayout 的字号缩放：字号跟键高走，
 // 这里只是收尾，不是主力。
-static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW, BOOL bold) {
-    if (!s || !s[0] || maxW <= 0) return bold ? g_f14b : g_f14;
-    HFONT ladder[3] = { bold ? g_f14b : g_f14, g_f13, g_f12 };
+static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW) {
+    if (!s || !s[0] || maxW <= 0) return g_f14;
+    HFONT ladder[3] = { g_f14, g_f13, g_f12 };
     for (int i = 0; i < 3; i++)
         if (MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
     return ladder[2];
@@ -1584,7 +1587,7 @@ static void DrawIconTile(HDC dc, int x, int y, int size, int iconSize, int iconI
         DrawHkIcon(dc, (float)(x + pad), (float)(y + pad), (float)iconSize,
                    HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
     } else if (text) {
-        DrawTextC(dc, x, y, size, size, text, g_sf13b, C_BTN_CONTENT);
+        DrawTextC(dc, x, y, size, size, text, g_sfBase, C_BTN_CONTENT);
     }
 }
 
@@ -2265,13 +2268,12 @@ static void DrawKeys(HDC dc) {
         DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, outline, 8);
 
         const wchar_t* txt = KeyText(k);
-        // 字体粗细跟随键面底色：普通键（字母/数字/标点/空格/网址后缀）用常规字重，
-        // 修饰与功能键（Esc/Tab/Caps/Shift/Ctrl/Alt/Win/Fn/Menu/方向键等）保留粗体。
-        // 放不下时按 FitKeyFont 降档 —— 全尺寸布局的导航区只有 1u 宽（52px）。
-        BOOL boldFont = (isMod || k->type == K_HIDE);
+        // 界面只有一个字面：不加粗。修饰键靠底色（C_REGULAR）与文字色（C_BTN_CONTENT）
+        // 区分，与设置页 Tab 的选中态同一套逻辑 —— 少了「有些字粗有些字细」的杂音。
+        // 放不下时按 FitKeyFont 降档 —— 全尺寸布局的导航区只有 1u 宽。
         HFONT f = (k->vk == 0x08)
-                ? g_f18b                                                       // 退格：大号粗体箭头
-                : FitKeyFont(dc, txt, k->w - (int)(6 * GetSystemDpiScale()), boldFont);
+                ? g_f18
+                : FitKeyFont(dc, txt, k->w - (int)(6 * GetSystemDpiScale()));
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -2715,7 +2717,7 @@ static BOOL g_hlEditFocus = FALSE;     // HEX 输入框是否处于编辑态
 static wchar_t g_hlEditBuf[8] = {0};   // 编辑中的 HEX 文本（#RRGGBB）
 static int g_hlSliderDrag = S_HIT_NONE;
 static const wchar_t* g_langNames[2] = { L"简体中文", L"English" };
-static const wchar_t* g_langNamesEn[2] = { L"Simplified Chinese", L"English" };
+static const wchar_t* g_langNamesEn[2] = { L"Chinese", L"English" };   // 与中文侧「简体中文 / English」对称
 static const wchar_t* g_hlModeNames[2] = { L"自定义色相", L"跟随壁纸" };
 static const wchar_t* g_hlModeNamesEn[2] = { L"Custom Hue", L"Follow Wallpaper" };
 static const wchar_t* g_themeNames[3] = { L"跟随系统", L"深色主题", L"浅色主题" };
@@ -2953,12 +2955,12 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     int rightLimit = (ctrlLeft > 0) ? ctrlLeft - (int)(12 * m.dpi) : row.right - (int)(20 * m.dpi);
     int tw = rightLimit - tx;
     if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
-    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sf14b, C_WHITE);
+    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sfHead, C_WHITE);
     if (desc && desc[0]) {
         if (descWrap)
-            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sf12, C_DIM, TRUE);
+            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
         else
-            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
+            DrawTextL(dc, tx, ty + (int)(24 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
     }
 }
 
@@ -2973,7 +2975,7 @@ static void SettingsTabLabels(const wchar_t* out[4]) {
 static const int k_settingsTabHits[4] = {S_HIT_TAB0, S_HIT_TABL, S_HIT_TAB1, S_HIT_TAB2};
 
 static int MeasureTabWidth(HDC dc, const wchar_t* label, double dpi) {
-    return MeasureTextW(dc, label, g_sf13b) + (int)(4 * dpi);
+    return MeasureTextW(dc, label, g_sfBase) + (int)(4 * dpi);
 }
 
 // 返回每个 tab 的矩形（顺序：常规 / 布局 / 主题 / 关于）
@@ -3000,7 +3002,7 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
     for (int i = 0; i < 4; i++) {
         BOOL on = (i == active);
         DrawTextC(dc, tr[i].left, tr[i].top, tr[i].right - tr[i].left, m.tabH - rule - inset,
-                  labels[i], g_sf13b, (on || g_sHov == k_settingsTabHits[i]) ? C_WHITE : C_DIM);
+                  labels[i], g_sfBase, (on || g_sHov == k_settingsTabHits[i]) ? C_WHITE : C_DIM);
     }
     // strip 下缘 1px 分隔线；选中项底部主色横线压在它上面
     Fill(dc, m.contentX, m.tabsY + m.tabH, m.contentW, 1, C_LINE_DIV);
@@ -3015,7 +3017,7 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
 static int SegmentedWidth(const SettingsMetrics& m, const wchar_t** items, int count) {
     HDC dc = GetDC(0);
     int w = (int)(6 * m.dpi);   // 轨道左右 padding 3
-    for (int i = 0; i < count; i++) w += MeasureTextW(dc, items[i], g_sf13b) + (int)(36 * m.dpi);
+    for (int i = 0; i < count; i++) w += MeasureTextW(dc, items[i], g_sfBase) + (int)(36 * m.dpi);
     ReleaseDC(0, dc);
     return w;
 }
@@ -3028,11 +3030,11 @@ static void DrawSegmented(HDC dc, const SettingsMetrics& m, const RECT& r,
     int x = r.left + pad;
     int h = (r.bottom - r.top) - pad * 2;
     for (int i = 0; i < count; i++) {
-        int w = MeasureTextW(dc, items[i], g_sf13b) + (int)(36 * m.dpi);
+        int w = MeasureTextW(dc, items[i], g_sfBase) + (int)(36 * m.dpi);
         if (i == sel) {
             DrawRoundRect(dc, x, r.top + pad, w, h, C_KEY, C_KEY, (int)(8 * m.dpi));
         }
-        DrawTextC(dc, x, r.top + pad, w, h, items[i], g_sf13b, (i == sel) ? C_BTN_CONTENT : C_DIM);
+        DrawTextC(dc, x, r.top + pad, w, h, items[i], g_sfBase, (i == sel) ? C_BTN_CONTENT : C_DIM);
         x += w;
     }
 }
@@ -3045,7 +3047,7 @@ static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
     int cx = r.left + pad;
     int hit = -1;
     for (int i = 0; i < count; i++) {
-        int w = MeasureTextW(dc, items[i], g_sf13b) + (int)(36 * m.dpi);
+        int w = MeasureTextW(dc, items[i], g_sfBase) + (int)(36 * m.dpi);
         if (x >= cx && x < cx + w) { hit = i; break; }
         cx += w;
     }
@@ -3077,7 +3079,7 @@ static int CloseSegItems(const wchar_t** out) {
     return 2;
 }
 static int LangSegItems(const wchar_t** out) {
-    out[0] = T(L"简体中文", L"S.Chinese");
+    out[0] = T(L"简体中文", L"Chinese");
     out[1] = L"English";
     return 2;
 }
@@ -3190,7 +3192,7 @@ static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row,
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
     int y = row.top + (row.bottom - row.top - m.switchH) / 2;
     DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), row.bottom - row.top,
-              on ? T(L"开", L"On") : T(L"关", L"Off"), g_sf13, C_WHITE);
+              on ? T(L"开", L"On") : T(L"关", L"Off"), g_sfBase, C_WHITE);
     double value = on ? 1.0 : 0.0;
     if (g_switchAnimHit == hit && !g_settingsMoving) {
         double t = (double)(QpcNowMs() - g_switchAnimStart) / 180.0;
@@ -3263,7 +3265,7 @@ static void DrawHueSlider(HDC dc, const RECT& r, int hue) {
 static void DrawCombo(HDC dc, int x, int y, int w, int h, const wchar_t* text, BOOL open, BOOL hover) {
     double dpi = GetSystemDpiScale();
     DrawRoundRect(dc, x, y, w, h, (open || hover) ? C_HOVER : C_DARK, C_BORDER_HOVER, (int)(12 * dpi));
-    DrawTextL(dc, x + (int)(14 * dpi), y, w - (int)(46 * dpi), h, text, g_sf13, C_WHITE);
+    DrawTextL(dc, x + (int)(14 * dpi), y, w - (int)(46 * dpi), h, text, g_sfBase, C_WHITE);
     int sz = (int)(16 * dpi);
     DrawHkIcon(dc, (float)(x + w - (int)(14 * dpi) - sz), (float)(y + (h - sz) / 2), (float)sz,
                HkIcon(HKICON_CHEVRONDOWN), C_DIM, C_DIM);
@@ -3288,7 +3290,7 @@ static void DrawComboList(HDC dc, int x, int y, int w, int itemH, const wchar_t*
             DrawRoundRectAlpha(dc, x + (int)(8 * dpi), cy - barH / 2, barW, barH,
                                C_HOT, C_HOT, barW / 2, 255, 255);
         }
-        DrawTextL(dc, x + (int)(17 * dpi), iy, w - (int)(24 * dpi), itemH, items[i], g_sf13, C_WHITE);
+        DrawTextL(dc, x + (int)(17 * dpi), iy, w - (int)(24 * dpi), itemH, items[i], g_sfBase, C_WHITE);
     }
 }
 
@@ -3415,9 +3417,9 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
 
     int tx = SettingsRowTextX(m);
     int tw = bx - (int)(12 * m.dpi) - tx;
-    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sf14b, C_WHITE);
+    DrawTextL(dc, tx, ty, tw, (int)(18 * m.dpi), title, g_sfHead, C_WHITE);
     if (desc && desc[0])
-        DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sf12, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
@@ -3430,7 +3432,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                  aboutTab ? HKICON_INFO : HKICON_GEAR, NULL);
     int titleX = m.margin + m.headIcon + (int)(16 * m.dpi);
     DrawTextL(dc, titleX, m.titleY, m.closeX - (int)(12 * m.dpi) - titleX, m.titleH,
-              aboutTab ? T(L"关于", L"About") : T(L"设置", L"Settings"), g_sf20b, C_WHITE);
+              aboutTab ? T(L"关于", L"About") : T(L"设置", L"Settings"), g_sfBig, C_WHITE);
     if (g_sHov == S_HIT_CLOSE) {
         DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH,
                       C_REGULAR_HOV, C_REGULAR_HOV, (int)(6 * m.dpi));
@@ -3481,7 +3483,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         RECT r2 = SettingsRowRect(m, closeRow + 1);
         DrawSettingRowContent(dc, m, r2, HKICON_CHECK, NULL,
                               T(L"记住我的选择", L"Remember My Choice"),
-                              T(L"记住关闭按钮的操作，下次直接执行", L"Remember the close action and skip asking next time"),
+                              T(L"记住关闭按钮的操作，下次直接执行", L"Remember the action and skip asking next time"),
                               g_sHov == S_HIT_REMEMBER, SettingsSwitchTextRight(m, r2));
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
@@ -3495,7 +3497,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         r = SettingsRowRect(m, closeRow + 3);
         DrawSettingRowContent(dc, m, r, HKICON_SHIFT, NULL,
                               T(L"Shift 符号", L"Shift Symbols"),
-                              T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols on number keys while Shift is active"),
+                              T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols while Shift is held"),
                               g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
 
@@ -3505,7 +3507,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         RECT gsegR = RowSegRect(m, r, gseg, gsegn);
         DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
                               T(L"界面语言", L"Language"),
-                              T(L"切换设置与键盘的显示语言", L"Change the language used by settings and keyboard"),
+                              T(L"切换设置与键盘的显示语言", L"Language of settings and keyboard"),
                               g_sHov == S_HIT_LANG_DROP, gsegR.left);
         DrawSegmented(dc, m, gsegR, gseg, gsegn, g_lang);
     } else if (g_sTab == 3) {
@@ -3541,7 +3543,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         r = SettingsRowRect(m, 3);
         DrawSettingRowContent(dc, m, r, HKICON_NUMPAD, NULL,
                               T(L"小键盘按钮", L"Numpad Button"),
-                              T(L"在标题栏显示；默认布局切到小键盘，全尺寸显示或隐藏数字区", L"Show it in the title bar; toggles the numpad layout / section"),
+                              T(L"在标题栏显示；默认布局切小键盘，全尺寸显隐数字区", L"Show it in the title bar; toggles the numpad section"),
                               g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r), TRUE);
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
 
@@ -3629,7 +3631,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DrawCircleAA(dc, colorCx, colorCy, (int)(11 * m.dpi), C_KEY_BORDER);
             DrawCircleAA(dc, colorCx, colorCy, (int)(9 * m.dpi), preview);
             DrawTextC(dc, r.left + (int)(55 * m.dpi), input.top, (int)(18 * m.dpi), inputH,
-                      L"#", g_sf13b, C_DIM);
+                      L"#", g_sfBase, C_DIM);
             DrawRoundRect(dc, input.left, input.top, inputW, inputH,
                           g_hlEditFocus ? C_HOVER : C_DARK,
                           g_hlEditFocus ? C_HOT : C_BORDER_HOVER, (int)(12 * m.dpi));
@@ -3638,7 +3640,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             const wchar_t* shown = hexbuf[0] == L'#' ? hexbuf + 1 : hexbuf;
             BOOL showHint = g_hlEditFocus && shown[0] == 0;
             DrawTextL(dc, input.left + (int)(12 * m.dpi), input.top, inputW - (int)(20 * m.dpi), inputH,
-                      showHint ? L"RRGGBB" : shown, g_sf13, showHint ? C_DIM : C_WHITE);
+                      showHint ? L"RRGGBB" : shown, g_sfBase, showHint ? C_DIM : C_WHITE);
         }
     } else {
         // 关于 tab：两张卡（身份 / 链接），版权行在卡片下方居中
@@ -3656,11 +3658,11 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         int ty = al.card1.top + (int)(22 * m.dpi);
         int tw = al.card1.right - tx - (int)(20 * m.dpi);
         DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
-                  T(L"HKeyboard 轻键", L"HKeyboard"), g_sf20b, C_WHITE);
+                  T(L"HKeyboard 轻键", L"HKeyboard"), g_sfBig, C_WHITE);
         wchar_t meta[96];
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs (%ls)", L"Lightweight screen keyboard · v%hs (%ls)"),
                  VER_FILEVERSION_STR, ArchName());
-        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sf12, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,
@@ -3678,7 +3680,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
 
         // 版权行：文字逐字保留（含 2026 与结尾句点），12px C_DIM 居中，放在卡片下方
         DrawTextC(dc, m.contentX, al.card2.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
-                  L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sf12, C_DIM);
+                  L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sfMeta, C_DIM);
     }
 
     // 下拉列表最后绘制，确保覆盖后续卡片。
@@ -4730,7 +4732,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int hdr = (int)(36 * dpi);
     (void)hWnd;
     // 标题区不再铺独立底色，与窗口背景/材质一体化
-    DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sf13, C_WHITE);
+    DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sfBase, C_WHITE);
     int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
     int bx = W - bw - 8, by = (hdr - bh) / 2;
     // 与设置页 / 主键盘标题栏一致：平时不铺底，悬停才给一层 btn_regular_bg_hover
@@ -4745,25 +4747,25 @@ static void PromptDraw(HDC dc, HWND hWnd) {
 
     int x0 = 20, y = hdr + 12, cw = W - 40;
     int rowH = (int)(24 * dpi);
-    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), T(L"请选择关闭方式：", L"Choose how to close:"), g_sf13, C_DIM); y += (int)(22 * dpi);
+    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), T(L"请选择关闭方式：", L"Choose how to close:"), g_sfBase, C_DIM); y += (int)(22 * dpi);
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0, C_BG);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sf13, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sfBase, C_WHITE);
     y += rowH;
     DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1, C_BG);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sf13, C_WHITE);
+    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sfBase, C_WHITE);
     y += rowH + (int)(4 * dpi);
     int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
     int swX = x0 + cw - swW;
     DrawSwitch(dc, swX, y + (rowH - swH) / 2, swW, swH, g_pRemember);
-    DrawTextL(dc, x0, y, (swX - 12) - x0, rowH, T(L"记住我的选择", L"Remember my choice"), g_sf13, C_WHITE);
+    DrawTextL(dc, x0, y, (swX - 12) - x0, rowH, T(L"记住我的选择", L"Remember my choice"), g_sfBase, C_WHITE);
     y += rowH + (int)(8 * dpi);
     int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
     int bxCancel = W - 20 - bw2;                    // 按钮右对齐
     int bxOk = bxCancel - (int)(12 * dpi) - bw2;
     DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sf13, C_ON_PRIMARY);
+    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sfBase, C_ON_PRIMARY);
     DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sf13, C_WHITE);
+    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sfBase, C_WHITE);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {
@@ -5587,9 +5589,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             g_tray = FALSE;
         }
-        DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
-        DeleteObject(g_f14b); DeleteObject(g_f16b); DeleteObject(g_f18b);
-        DeleteObject(g_sf12); DeleteObject(g_sf13); DeleteObject(g_sf13b); DeleteObject(g_sf14b); DeleteObject(g_sf20b);
+        DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14); DeleteObject(g_f18);
+        DeleteObject(g_sfBig); DeleteObject(g_sfHead); DeleteObject(g_sfRow);
+        DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);
         return 0;
     }

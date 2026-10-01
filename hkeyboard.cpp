@@ -341,9 +341,15 @@ enum KeyType {
     K_SYM
 };
 
+// 键面标签的水平对齐：只对「宽键」有意义。
+// 默认布局里左列的 Esc / Tab / Caps / Shift 贴左，右列的 Backspace / Del / Enter /
+// Shift 贴右 —— 参考图里这些键的名字都贴着各自那一侧的边缘，而不是飘在键的正中。
+enum KeyAlign { KA_CENTER = 0, KA_LEFT = 1, KA_RIGHT = 2 };
+
 // symShift：仅 K_SYM 有效 —— TRUE 取键盘布局的副（Shift）符号，FALSE 取主符号。
 // 网页层同时要 `[ ] \ ; '`（主符号格）与 `{ } | : "`（副符号格），一个 bool 就能分开。
-struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift; };
+// align：键面标签的对齐（见 KeyAlign），由布局表给出，绘制时落在 DrawTextKey。
+struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift; unsigned char align; };
 
 // C++ 函数前置声明
 static void ShowKB(BOOL show, BOOL isManual = FALSE);
@@ -362,6 +368,7 @@ static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
 static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f);
+static int MeasureTextAdvW(HDC dc, const wchar_t* s, HFONT f);   // 布局宽度（键面标签对齐要用）
 // 配置读写（实现位于文件后半段，此处提前声明供键位处理逻辑调用）
 static void GetConfigPath(wchar_t* buf, int cch);
 static void IniSetInt(const wchar_t* section, const wchar_t* key, int val);
@@ -434,7 +441,7 @@ BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动�
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
-int         g_keyIconStyle = 0;        // 按键图标样式：0=文字（默认）1=图标 2=图标+文字（ini Keyboard/KeyIconStyle）
+int         g_keyIconStyle = 2;        // 按键图标样式：0=文字 2=图标+文字（默认，ini Keyboard/KeyIconStyle）
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
 static int  g_hdrHov = -1;            // 标题栏按钮悬停（HDR_*，-1=无）
@@ -503,11 +510,13 @@ static void InitWindowSizeForDpi() {
     }
 }
 
-static int AddKey(int x, int y, int w, int h, short vk, KeyType type, BOOL symShift = FALSE) {
+static int AddKey(int x, int y, int w, int h, short vk, KeyType type, BOOL symShift = FALSE,
+                  int align = KA_CENTER) {
     if (g_nk >= MAX_KEYS) return g_nk;
     KeyDef* k = &g_keys[g_nk++];
     k->x = x; k->y = y; k->w = w; k->h = h; k->vk = vk; k->type = type;
     k->symShift = symShift ? 1 : 0;
+    k->align = (unsigned char)align;
     return g_nk;
 }
 
@@ -878,110 +887,279 @@ static const WebSymSpec kWebSym2[11] = {
     { 0xBA, 0 }, { 0xDE, 0 },
 };
 
-static void BuildFnSurf(int y, double dpiScale, double scaleX) {
+// ============================================================================
+// 默认布局（layoutMode==0，980×320 DIP）：1u 单位网格
+//
+// 列位是单一真源：每行合计 15.5u，1u 的列距由窗口宽度反解一次，
+//   左右留白各 0.30u  →  2×0.30u + 15.5u = g_ww + gap  →  u = (g_ww + gap) / 16.1
+// 所有 x = KEY_AREA_X + round(列位 × u)，键面宽 = 两个列位各自取整后相减再扣一个 gap。
+// 于是「每行白键严格等宽、行尾永远齐平、↑ 与 ↓ 自动落在同一列」。
+//
+// 旧写法是每行各算各的「剩余宽度 ÷ 键数」，四行白键因此各不一样
+// （980 DIP 实测 57.3 / 59.1 / 67.5 / 71.3 DIP，最大差 24.6%）——
+// 用户要求「白色的数字、字母、按钮大小统一」，差异的根源就在这里。
+//
+// 宽键按真键盘比例：Esc 1u、Backspace 1.5u、Tab 1.5u、Del 1u、Caps 2u、
+// Enter 2.5u、LShift 2.5u、↑ 1u、RShift 2u、空格 5.5u。
+// 参考图实测的是 Tab 1.5u / Caps 2u / LShift 2.4u / RShift 1.8u / Enter 2.5u，
+// 只有 Shift 取整成 2.5 与 2 —— 这样 ↑ 与 ↓ 才正好同列（13.5u 处）。
+//
+// 底行键序 = 参考图：Ctrl Fn Win Alt [空格] Menu Alt ← ↓ → Ctrl
+// （Menu 落在空格右侧、右 Alt 之前；最后一个 Ctrl 贴到最右端）。
+// ============================================================================
+#define DEF_ROW_U   15.5    // 每行合计 u 数
+#define DEF_PAD_U    0.30   // 左右留白（u 的倍数）
+
+// col：起始列位（u）；w：跨几个 u；align：见 KeyAlign；symShift：仅 K_SYM 用。
+struct DefKeySpec { float col; float w; short vk; KeyType type; KeyAlign align; unsigned char symShift; };
+
+// 放一行：键面宽由「列位到列位」直接相减，不再由「本行键数」除出来。
+static void DefPutRow(int y, const DefKeySpec* ks, int n, double u) {
+    const int gap = g_keyGap;
+    for (int i = 0; i < n; i++) {
+        int xa = KEY_AREA_X + (int)floor((double)ks[i].col * u + 0.5);
+        int xb = KEY_AREA_X + (int)floor((double)(ks[i].col + ks[i].w) * u + 0.5);
+        AddKey(xa, y, xb - xa - gap, g_keyHeight, ks[i].vk, ks[i].type,
+               ks[i].symShift ? TRUE : FALSE, ks[i].align);
+    }
+}
+
+// ---- F 行（可选，g_showFKeys）：Esc + F1~F12 + Del = 15.5u ----
+// Del 取 1.5u，与下一行的 Backspace 同宽；腾出来的 1u 平分给三处组间缝
+// （Esc|F1、F4|F5、F8|F9 各 1/3 u）—— F 键因此仍全是 1u，末格 F12 又正好与
+// 数字行的 `=` 列位重合。与全尺寸布局的 F 行是同一套做法。
+static const DefKeySpec kDefRowF[] = {
+    {  0.0000f, 1.00f, 0x1B, K_SPECIAL, KA_LEFT  , 0 },
+    {  1.3333f, 1.00f, 0x70, K_NORMAL , KA_CENTER, 0 },
+    {  2.3333f, 1.00f, 0x71, K_NORMAL , KA_CENTER, 0 },
+    {  3.3333f, 1.00f, 0x72, K_NORMAL , KA_CENTER, 0 },
+    {  4.3333f, 1.00f, 0x73, K_NORMAL , KA_CENTER, 0 },
+    {  5.6667f, 1.00f, 0x74, K_NORMAL , KA_CENTER, 0 },
+    {  6.6667f, 1.00f, 0x75, K_NORMAL , KA_CENTER, 0 },
+    {  7.6667f, 1.00f, 0x76, K_NORMAL , KA_CENTER, 0 },
+    {  8.6667f, 1.00f, 0x77, K_NORMAL , KA_CENTER, 0 },
+    { 10.0000f, 1.00f, 0x78, K_NORMAL , KA_CENTER, 0 },
+    { 11.0000f, 1.00f, 0x79, K_NORMAL , KA_CENTER, 0 },
+    { 12.0000f, 1.00f, 0x7A, K_NORMAL , KA_CENTER, 0 },
+    { 13.0000f, 1.00f, 0x7B, K_NORMAL , KA_CENTER, 0 },
+    { 14.0000f, 1.50f, 0x2E, K_SPECIAL, KA_RIGHT , 0 },
+};
+#define kDefRowFN ((int)(sizeof(kDefRowF) / sizeof(DefKeySpec)))
+
+// ---- Row0：Esc, `, 1~0, -, =, Backspace = 15.5u ----
+static const DefKeySpec kDefRow0[] = {
+    {  0.00f, 1.00f, 0x1B, K_SPECIAL, KA_LEFT  , 0 },
+    {  1.00f, 1.00f, 0xC0, K_NORMAL , KA_CENTER, 0 },
+    {  2.00f, 1.00f, 0x31, K_NORMAL , KA_CENTER, 0 },
+    {  3.00f, 1.00f, 0x32, K_NORMAL , KA_CENTER, 0 },
+    {  4.00f, 1.00f, 0x33, K_NORMAL , KA_CENTER, 0 },
+    {  5.00f, 1.00f, 0x34, K_NORMAL , KA_CENTER, 0 },
+    {  6.00f, 1.00f, 0x35, K_NORMAL , KA_CENTER, 0 },
+    {  7.00f, 1.00f, 0x36, K_NORMAL , KA_CENTER, 0 },
+    {  8.00f, 1.00f, 0x37, K_NORMAL , KA_CENTER, 0 },
+    {  9.00f, 1.00f, 0x38, K_NORMAL , KA_CENTER, 0 },
+    { 10.00f, 1.00f, 0x39, K_NORMAL , KA_CENTER, 0 },
+    { 11.00f, 1.00f, 0x30, K_NORMAL , KA_CENTER, 0 },
+    { 12.00f, 1.00f, 0xBD, K_NORMAL , KA_CENTER, 0 },
+    { 13.00f, 1.00f, 0xBB, K_NORMAL , KA_CENTER, 0 },
+    { 14.00f, 1.50f, 0x08, K_SPECIAL, KA_RIGHT , 0 },
+};
+#define kDefRow0N ((int)(sizeof(kDefRow0) / sizeof(DefKeySpec)))
+
+// 开了 F 行就不再重复画 Esc，空出来的 1u 并进退格（1.5 → 2.5u），行仍是 15.5u。
+static const DefKeySpec kDefRow0NoEsc[] = {
+    {  0.00f, 1.00f, 0xC0, K_NORMAL , KA_CENTER, 0 },
+    {  1.00f, 1.00f, 0x31, K_NORMAL , KA_CENTER, 0 },
+    {  2.00f, 1.00f, 0x32, K_NORMAL , KA_CENTER, 0 },
+    {  3.00f, 1.00f, 0x33, K_NORMAL , KA_CENTER, 0 },
+    {  4.00f, 1.00f, 0x34, K_NORMAL , KA_CENTER, 0 },
+    {  5.00f, 1.00f, 0x35, K_NORMAL , KA_CENTER, 0 },
+    {  6.00f, 1.00f, 0x36, K_NORMAL , KA_CENTER, 0 },
+    {  7.00f, 1.00f, 0x37, K_NORMAL , KA_CENTER, 0 },
+    {  8.00f, 1.00f, 0x38, K_NORMAL , KA_CENTER, 0 },
+    {  9.00f, 1.00f, 0x39, K_NORMAL , KA_CENTER, 0 },
+    { 10.00f, 1.00f, 0x30, K_NORMAL , KA_CENTER, 0 },
+    { 11.00f, 1.00f, 0xBD, K_NORMAL , KA_CENTER, 0 },
+    { 12.00f, 1.00f, 0xBB, K_NORMAL , KA_CENTER, 0 },
+    { 13.00f, 2.50f, 0x08, K_SPECIAL, KA_RIGHT , 0 },
+};
+#define kDefRow0NoEscN ((int)(sizeof(kDefRow0NoEsc) / sizeof(DefKeySpec)))
+
+// ---- Row1：Tab, q~p, [, ], \, Del = 15.5u ----
+static const DefKeySpec kDefRow1[] = {
+    {  0.00f, 1.50f, 0x09, K_SPECIAL, KA_LEFT  , 0 },
+    {  1.50f, 1.00f, 0x51, K_LETTER , KA_CENTER, 0 },
+    {  2.50f, 1.00f, 0x57, K_LETTER , KA_CENTER, 0 },
+    {  3.50f, 1.00f, 0x45, K_LETTER , KA_CENTER, 0 },
+    {  4.50f, 1.00f, 0x52, K_LETTER , KA_CENTER, 0 },
+    {  5.50f, 1.00f, 0x54, K_LETTER , KA_CENTER, 0 },
+    {  6.50f, 1.00f, 0x59, K_LETTER , KA_CENTER, 0 },
+    {  7.50f, 1.00f, 0x55, K_LETTER , KA_CENTER, 0 },
+    {  8.50f, 1.00f, 0x49, K_LETTER , KA_CENTER, 0 },
+    {  9.50f, 1.00f, 0x4F, K_LETTER , KA_CENTER, 0 },
+    { 10.50f, 1.00f, 0x50, K_LETTER , KA_CENTER, 0 },
+    { 11.50f, 1.00f, 0xDB, K_NORMAL , KA_CENTER, 0 },
+    { 12.50f, 1.00f, 0xDD, K_NORMAL , KA_CENTER, 0 },
+    { 13.50f, 1.00f, 0xDC, K_NORMAL , KA_CENTER, 0 },
+    { 14.50f, 1.00f, 0x2E, K_SPECIAL, KA_RIGHT , 0 },
+};
+#define kDefRow1N ((int)(sizeof(kDefRow1) / sizeof(DefKeySpec)))
+
+// 开了 F 行就不再重复画 Del，空出来的 1u 并进反斜杠（1 → 2u），行仍是 15.5u。
+static const DefKeySpec kDefRow1NoDel[] = {
+    {  0.00f, 1.50f, 0x09, K_SPECIAL, KA_LEFT  , 0 },
+    {  1.50f, 1.00f, 0x51, K_LETTER , KA_CENTER, 0 },
+    {  2.50f, 1.00f, 0x57, K_LETTER , KA_CENTER, 0 },
+    {  3.50f, 1.00f, 0x45, K_LETTER , KA_CENTER, 0 },
+    {  4.50f, 1.00f, 0x52, K_LETTER , KA_CENTER, 0 },
+    {  5.50f, 1.00f, 0x54, K_LETTER , KA_CENTER, 0 },
+    {  6.50f, 1.00f, 0x59, K_LETTER , KA_CENTER, 0 },
+    {  7.50f, 1.00f, 0x55, K_LETTER , KA_CENTER, 0 },
+    {  8.50f, 1.00f, 0x49, K_LETTER , KA_CENTER, 0 },
+    {  9.50f, 1.00f, 0x4F, K_LETTER , KA_CENTER, 0 },
+    { 10.50f, 1.00f, 0x50, K_LETTER , KA_CENTER, 0 },
+    { 11.50f, 1.00f, 0xDB, K_NORMAL , KA_CENTER, 0 },
+    { 12.50f, 1.00f, 0xDD, K_NORMAL , KA_CENTER, 0 },
+    { 13.50f, 2.00f, 0xDC, K_NORMAL , KA_CENTER, 0 },
+};
+#define kDefRow1NoDelN ((int)(sizeof(kDefRow1NoDel) / sizeof(DefKeySpec)))
+
+// ---- Row2：Caps, a~l, ;, ', Enter = 15.5u ----
+static const DefKeySpec kDefRow2[] = {
+    {  0.00f, 2.00f, 0x14, K_CAPS  , KA_LEFT  , 0 },
+    {  2.00f, 1.00f, 0x41, K_LETTER, KA_CENTER, 0 },
+    {  3.00f, 1.00f, 0x53, K_LETTER, KA_CENTER, 0 },
+    {  4.00f, 1.00f, 0x44, K_LETTER, KA_CENTER, 0 },
+    {  5.00f, 1.00f, 0x46, K_LETTER, KA_CENTER, 0 },
+    {  6.00f, 1.00f, 0x47, K_LETTER, KA_CENTER, 0 },
+    {  7.00f, 1.00f, 0x48, K_LETTER, KA_CENTER, 0 },
+    {  8.00f, 1.00f, 0x4A, K_LETTER, KA_CENTER, 0 },
+    {  9.00f, 1.00f, 0x4B, K_LETTER, KA_CENTER, 0 },
+    { 10.00f, 1.00f, 0x4C, K_LETTER, KA_CENTER, 0 },
+    { 11.00f, 1.00f, 0xBA, K_NORMAL, KA_CENTER, 0 },
+    { 12.00f, 1.00f, 0xDE, K_NORMAL, KA_CENTER, 0 },
+    { 13.00f, 2.50f, 0x0D, K_SPECIAL, KA_RIGHT, 0 },
+};
+#define kDefRow2N ((int)(sizeof(kDefRow2) / sizeof(DefKeySpec)))
+
+// ---- Row3：LShift, z~m, ,, ., /, ↑, RShift = 15.5u ----
+// ↑ 落在 12.5u 处，与下一行的 ↓ 完全同列（旧写法要靠 xUp 变量把 ↓ 手动对齐）。
+static const DefKeySpec kDefRow3[] = {
+    {  0.00f, 2.50f, 0xA0, K_MOD   , KA_LEFT  , 0 },
+    {  2.50f, 1.00f, 0x5A, K_LETTER, KA_CENTER, 0 },
+    {  3.50f, 1.00f, 0x58, K_LETTER, KA_CENTER, 0 },
+    {  4.50f, 1.00f, 0x43, K_LETTER, KA_CENTER, 0 },
+    {  5.50f, 1.00f, 0x56, K_LETTER, KA_CENTER, 0 },
+    {  6.50f, 1.00f, 0x42, K_LETTER, KA_CENTER, 0 },
+    {  7.50f, 1.00f, 0x4E, K_LETTER, KA_CENTER, 0 },
+    {  8.50f, 1.00f, 0x4D, K_LETTER, KA_CENTER, 0 },
+    {  9.50f, 1.00f, 0xBC, K_NORMAL, KA_CENTER, 0 },
+    { 10.50f, 1.00f, 0xBE, K_NORMAL, KA_CENTER, 0 },
+    { 11.50f, 1.00f, 0xBF, K_NORMAL, KA_CENTER, 0 },
+    { 12.50f, 1.00f, 0x26, K_ARROW , KA_CENTER, 0 },
+    { 13.50f, 2.00f, 0xA1, K_MOD   , KA_RIGHT , 0 },
+};
+#define kDefRow3N ((int)(sizeof(kDefRow3) / sizeof(DefKeySpec)))
+
+// ---- Row4：底行（参考图键序）----
+// 带 Fn：Ctrl Fn Win Alt [空格 5.5u] Menu Alt ← ↓ → Ctrl = 15.5u
+static const DefKeySpec kDefRow4[] = {
+    {  0.00f, 1.00f, 0x11, K_MOD    , KA_CENTER, 0 },
+    {  1.00f, 1.00f, 0x00, K_SPECIAL, KA_CENTER, 0 },   // Fn
+    {  2.00f, 1.00f, 0x5B, K_SPECIAL, KA_CENTER, 0 },   // Win
+    {  3.00f, 1.00f, 0x12, K_MOD    , KA_CENTER, 0 },
+    {  4.00f, 5.50f, 0x20, K_SPACE  , KA_CENTER, 0 },
+    {  9.50f, 1.00f, 0x5D, K_MOD    , KA_CENTER, 0 },   // Menu（空格右侧、右 Alt 之前）
+    { 10.50f, 1.00f, 0x12, K_MOD    , KA_CENTER, 0 },
+    { 11.50f, 1.00f, 0x25, K_ARROW  , KA_CENTER, 0 },
+    { 12.50f, 1.00f, 0x28, K_ARROW  , KA_CENTER, 0 },
+    { 13.50f, 1.00f, 0x27, K_ARROW  , KA_CENTER, 0 },
+    { 14.50f, 1.00f, 0x11, K_MOD    , KA_CENTER, 0 },
+};
+#define kDefRow4N ((int)(sizeof(kDefRow4) / sizeof(DefKeySpec)))
+
+// 开了 F 行就藏 Fn（Fn 的正职「出 F1~F12」已由顶行完成），空出来的 1u 并进空格
+// （5.5 → 6.5u）；右半段列位一字不动，↑↓ 同列的约束继续成立。
+static const DefKeySpec kDefRow4NoFn[] = {
+    {  0.00f, 1.00f, 0x11, K_MOD    , KA_CENTER, 0 },
+    {  1.00f, 1.00f, 0x5B, K_SPECIAL, KA_CENTER, 0 },   // Win
+    {  2.00f, 1.00f, 0x12, K_MOD    , KA_CENTER, 0 },
+    {  3.00f, 6.50f, 0x20, K_SPACE  , KA_CENTER, 0 },
+    {  9.50f, 1.00f, 0x5D, K_MOD    , KA_CENTER, 0 },   // Menu
+    { 10.50f, 1.00f, 0x12, K_MOD    , KA_CENTER, 0 },
+    { 11.50f, 1.00f, 0x25, K_ARROW  , KA_CENTER, 0 },
+    { 12.50f, 1.00f, 0x28, K_ARROW  , KA_CENTER, 0 },
+    { 13.50f, 1.00f, 0x27, K_ARROW  , KA_CENTER, 0 },
+    { 14.50f, 1.00f, 0x11, K_MOD    , KA_CENTER, 0 },
+};
+#define kDefRow4NoFnN ((int)(sizeof(kDefRow4NoFn) / sizeof(DefKeySpec)))
+
+static void BuildFnSurf(int y, double u) {
     // Row 0: Esc, `, F1~F12, Backspace (15 keys)
     {
-        int wEsc = (int)(50 * dpiScale * scaleX);
-        int wBksp = (int)(104 * dpiScale * scaleX);   // 要放得下整词 Backspace（不再缩写成 Bksp）
-        int fixed = wEsc + wBksp;
-        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-        int x = KEY_AREA_X;
-        AddKey(x, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); x += wEsc + g_keyGap;
-        for (int i = 0; i < 13; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            if (i == 0) AddKey(x, y, w, g_keyHeight, 0xC0, K_NORMAL);
-            else AddKey(x, y, w, g_keyHeight, (short)(0x70 + i - 1), K_NORMAL);   // F1~F12
-            x += w + g_keyGap;
-        }
-        AddKey(x, y, wBksp, g_keyHeight, 0x08, K_SPECIAL);
+        DefKeySpec ks[15];
+        static const short v0[13] = {0xC0, 0x70,0x71,0x72,0x73,0x74,0x75,0x76,
+                                     0x77,0x78,0x79,0x7A,0x7B};
+        ks[0] = DefKeySpec{ 0.00f, 1.00f, 0x1B, K_SPECIAL, KA_LEFT, 0 };
+        for (int i = 0; i < 13; i++) ks[1 + i] = DefKeySpec{ (float)(1.00f + i), 1.00f, v0[i], K_NORMAL, KA_CENTER, 0 };
+        ks[14] = DefKeySpec{ 14.00f, 1.50f, 0x08, K_SPECIAL, KA_RIGHT, 0 };
+        DefPutRow(y, ks, 15, u);
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 1: Tab, ! @ # $ % ^ & * ( ) [ ] \, Del (15 keys)
+    // Row 1: Tab, 13 个符号格, Del (15 keys)
     {
-        int wTab = (int)(68 * dpiScale * scaleX);
-        int wDel = (int)(68 * dpiScale * scaleX);
-        int fixed = wTab + wDel;
-        int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-        int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-        int x = KEY_AREA_X;
-        AddKey(x, y, wTab, g_keyHeight, 0x09, K_SPECIAL); x += wTab + g_keyGap;
+        DefKeySpec ks[15];
+        ks[0] = DefKeySpec{ 0.00f, 1.50f, 0x09, K_SPECIAL, KA_LEFT, 0 };
         for (int i = 0; i < 13; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            const WebSymSpec& s = kWebSym1[i];
-            AddKey(x, y, w, g_keyHeight, s.vk, K_SYM, s.shifted);
-            x += w + g_keyGap;
+            ks[1 + i] = DefKeySpec{ (float)(1.50f + i), 1.00f, kWebSym1[i].vk, K_SYM,
+                                      KA_CENTER, (unsigned char)(kWebSym1[i].shifted ? 1 : 0) };
         }
-        AddKey(x, y, wDel, g_keyHeight, 0x2E, K_SPECIAL);
+        ks[14] = DefKeySpec{ 14.50f, 1.00f, 0x2E, K_SPECIAL, KA_RIGHT, 0 };
+        DefPutRow(y, ks, 15, u);
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 2: Caps, _ + { } | : " < > ; ', Enter (13 keys)
+    // Row 2: Caps, 11 个符号格, Enter (13 keys)
     {
-        int wCaps = (int)(80 * dpiScale * scaleX);
-        int wEnter = (int)(90 * dpiScale * scaleX);
-        int fixed = wCaps + wEnter;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 11;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 11;
-        int x = KEY_AREA_X;
-        AddKey(x, y, wCaps, g_keyHeight, 0x14, K_CAPS); x += wCaps + g_keyGap;
+        DefKeySpec ks[13];
+        ks[0] = DefKeySpec{ 0.00f, 2.00f, 0x14, K_CAPS, KA_LEFT, 0 };
         for (int i = 0; i < 11; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            const WebSymSpec& s = kWebSym2[i];
-            AddKey(x, y, w, g_keyHeight, s.vk, K_SYM, s.shifted);
-            x += w + g_keyGap;
+            ks[1 + i] = DefKeySpec{ (float)(2.00f + i), 1.00f, kWebSym2[i].vk, K_SYM,
+                                      KA_CENTER, (unsigned char)(kWebSym2[i].shifted ? 1 : 0) };
         }
-        AddKey(x, y, wEnter, g_keyHeight, 0x0D, K_SPECIAL);
+        ks[12] = DefKeySpec{ 13.00f, 2.50f, 0x0D, K_SPECIAL, KA_RIGHT, 0 };
+        DefPutRow(y, ks, 13, u);
         y += g_keyHeight + g_keyGap;
     }
 
     // Row 3: Shift, 网址后缀×6, ? , . /, ↑, Shift (13 keys)
     {
-        int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(52 * dpiScale * scaleX);   // 与 ↓ 同宽对齐
-        int wRSh = (int)(52 * dpiScale * scaleX);   // 右 Shift 与 → 同宽，保证 ↓ 正对 ↑（十字对齐）
-        int fixed = wLSh + wRSh + wUp;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
-        int w[13]; w[0] = wLSh;
-        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[11] = wUp; w[12] = wRSh;
         // ⚠ `/` 的虚拟键码是 VK_OEM_2 = 0xBF，**不是** 0x2F —— 0x2F 是 ASCII 的 '/'，
         //    不是虚拟键码：GetSymForKey 查不到它 → 键面空白；点下去也发不出任何字符。
-        short v[13] = {0xA0, 0x200,0x201,0x202,0x203,0x204,0x205, 0xBF,0xBC,0xBE,0xBF, 0x26, 0xA1};
-        KeyType t[13] = {K_MOD, K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,K_SPECIAL,
-                         K_SYM,K_SYM,K_SYM,K_SYM, K_ARROW, K_MOD};
-        // 网址后缀是整串文字，其余 4 格是单符号：? 取副符号，, . / 取主符号
-        unsigned char sh[13] = {0, 0,0,0,0,0,0, 1,0,0,0, 0, 0};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) {
-            AddKey(x, y, w[i], g_keyHeight, v[i], t[i], sh[i]);
-            x += w[i] + g_keyGap;
-        }
+        static const DefKeySpec ks[13] = {
+            {  0.00f, 2.50f, 0xA0 , K_MOD    , KA_LEFT  , 0 },
+            {  2.50f, 1.00f, 0x200, K_SPECIAL, KA_CENTER, 0 },
+            {  3.50f, 1.00f, 0x201, K_SPECIAL, KA_CENTER, 0 },
+            {  4.50f, 1.00f, 0x202, K_SPECIAL, KA_CENTER, 0 },
+            {  5.50f, 1.00f, 0x203, K_SPECIAL, KA_CENTER, 0 },
+            {  6.50f, 1.00f, 0x204, K_SPECIAL, KA_CENTER, 0 },
+            {  7.50f, 1.00f, 0x205, K_SPECIAL, KA_CENTER, 0 },
+            {  8.50f, 1.00f, 0xBF , K_SYM    , KA_CENTER, 1 },   // ?（取副符号）
+            {  9.50f, 1.00f, 0xBC , K_SYM    , KA_CENTER, 0 },
+            { 10.50f, 1.00f, 0xBE , K_SYM    , KA_CENTER, 0 },
+            { 11.50f, 1.00f, 0xBF , K_SYM    , KA_CENTER, 0 },
+            { 12.50f, 1.00f, 0x26 , K_ARROW  , KA_CENTER, 0 },
+            { 13.50f, 2.00f, 0xA1 , K_MOD    , KA_RIGHT , 0 },
+        };
+        DefPutRow(y, ks, 13, u);
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (11 keys)
-    // Fn 必须留：它是这个层的唯一出口（网页层 = Fn 层，「已有 F 行就藏 Fn」不适用在这里）。
-    {
-        int wFn  = (int)(46 * dpiScale * scaleX);
-        int wCtl = (int)(56 * dpiScale * scaleX);
-        int wWin = (int)(46 * dpiScale * scaleX);
-        int wAlt = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);   // ← 与 ↑/↓ 同宽
-        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽
-        int wRSh  = (int)(52 * dpiScale * scaleX);   // → 与右 Shift 同宽（十字对齐约束）
-        int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-        int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
-        if (spaceW < 60) spaceW = 60;
-        int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
-        short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-        KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-    }
+    // Row 4: 与默认布局的底行完全同一张表 —— 网页层只是字母区换了内容，
+    // 底行的键序/宽度必须逐像素一致，否则切层时下半张键盘会跳一下。
+    // Fn 必须留：它是这个层的唯一出口（「已有 F 行就藏 Fn」的规则不适用于这里）。
+    DefPutRow(y, kDefRow4, kDefRow4N, u);
 }
 
 // 页头里胶囊按钮的位置（DIP）：上留白 10 + 按钮高 28，底边 = 38。
@@ -1043,160 +1221,47 @@ static void BuildKeys() {
         return;
     }
 
-    // Fn 网页布局层（按 Fn 键切换，全尺寸布局下生效）
+    // ===== 默认布局（layoutMode==0）与其 Fn 网页层：统一 1u 单位网格 =====
+    // 留白与 u 互相依赖（u 要用键区宽度反解，而键区宽度要先减去留白），先联立解出 u：
+    //   2×0.30u + 15.5u = g_ww + gap   →   u = (g_ww + gap) / 16.1
+    // 表与逐键列位见文件上方「默认布局：1u 单位网格」那一段。
+    const double u = ((double)g_ww + g_keyGap) / (DEF_ROW_U + 2 * DEF_PAD_U);
+    g_keyAreaX = (int)(DEF_PAD_U * u + 0.5);
+    if (g_keyAreaX < 6) g_keyAreaX = 6;
+
+    // Fn 网页布局层（按 Fn 键切换；只有默认布局有这一层）
     if (g_fnLayer && g_fnWebLayout) {
-        BuildFnSurf(y, dpiScale, scaleX);
+        BuildFnSurf(y, u);
         return;
     }
 
-    // F1~F12 顶行（可选）：Esc, F1~F12, Del（F12 后面为 Del）
+    // F1~F12 顶行（可选）：Esc + F1~F12 + Del
     if (g_showFKeys) {
-        int wEsc = (int)(56 * dpiScale * scaleX);
-        int wDel = (int)(56 * dpiScale * scaleX);
-        int fixed = wEsc + wDel;
-        int aw = (KEY_AREA_W - fixed - 13 * g_keyGap) / 12;
-        int rem = KEY_AREA_W - fixed - 13 * g_keyGap - aw * 12;
-        int x = KEY_AREA_X;
-        AddKey(x, y, wEsc, g_keyHeight, 0x1B, K_SPECIAL); x += wEsc + g_keyGap;
-        for (int i = 0; i < 12; i++) {
-            int w = aw + (i < rem ? 1 : 0);
-            AddKey(x, y, w, g_keyHeight, (short)(0x70 + i), K_NORMAL);
-            x += w + g_keyGap;
-        }
-        AddKey(x, y, wDel, g_keyHeight, 0x2E, K_SPECIAL);   // Del
+        DefPutRow(y, kDefRowF, kDefRowFN, u);
         y += g_keyHeight + g_keyGap;
     }
 
-    // ===== Win10 屏幕键盘风格布局 =====
-    // Row 0: Esc, `, 1-0, -, =, Backspace  (15 keys)；F 行开启时隐藏原 Esc
-    {
-        int wEsc = (int)(50 * dpiScale * scaleX);
-        int wBksp = (int)(104 * dpiScale * scaleX);   // 要放得下整词 Backspace（不再缩写成 Bksp）
-        if (g_showFKeys) {
-            // 无 Esc：`, 1-0, -, =, Backspace (14 keys)
-            int aw = (KEY_AREA_W - wBksp - 13 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - wBksp - 13 * g_keyGap - aw * 13;
-            short v[14] = {0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
-            KeyType t[14] = {K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 13; i++) { AddKey(x, y, aw + (i < rem ? 1 : 0), g_keyHeight, v[i], t[i]); x += aw + (i < rem ? 1 : 0) + g_keyGap; }
-            AddKey(x, y, wBksp, g_keyHeight, 0x08, K_SPECIAL);
-        } else {
-            int fixed = wEsc + wBksp;
-            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-            int w[15]; w[0] = wEsc;
-            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-            w[14] = wBksp;
-            short v[15] = {0x1B,0xC0,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0xBD,0xBB,0x08};
-            KeyType t[15] = {K_SPECIAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        }
-    }
+    // Row 0：数字行（开着 F 行时不再重复画 Esc，腾出的 1u 并进退格）
+    DefPutRow(y, g_showFKeys ? kDefRow0NoEsc : kDefRow0,
+                 g_showFKeys ? kDefRow0NoEscN : kDefRow0N, u);
     y += g_keyHeight + g_keyGap;
 
-    // Row 1: Tab, q-p, [, ], \, Del  (15 keys)；F 行开启时隐藏原 Del
-    {
-        int wTab = (int)(68 * dpiScale * scaleX);
-        int wDel = (int)(68 * dpiScale * scaleX);
-        if (g_showFKeys) {
-            // 无 Del：Tab, q-p, [, ], \ (14 keys)
-            int aw = (KEY_AREA_W - wTab - 13 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - wTab - 13 * g_keyGap - aw * 13;
-            int w[14]; w[0] = wTab;
-            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-            short v[14] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC};
-            KeyType t[14] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 14; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            int fixed = wTab + wDel;
-            int aw = (KEY_AREA_W - fixed - 14 * g_keyGap) / 13;
-            int rem = KEY_AREA_W - fixed - 14 * g_keyGap - aw * 13;
-            int w[15]; w[0] = wTab;
-            for (int i = 1; i <= 13; i++) w[i] = aw + (i <= rem ? 1 : 0);
-            w[14] = wDel;
-            short v[15] = {0x09,0x51,0x57,0x45,0x52,0x54,0x59,0x55,0x49,0x4F,0x50,0xDB,0xDD,0xDC,0x2E};
-            KeyType t[15] = {K_SPECIAL,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_SPECIAL};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 15; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        }
-    }
+    // Row 1：Tab 行（开着 F 行时不再重复画 Del，腾出的 1u 并进反斜杠）
+    DefPutRow(y, g_showFKeys ? kDefRow1NoDel : kDefRow1,
+                 g_showFKeys ? kDefRow1NoDelN : kDefRow1N, u);
     y += g_keyHeight + g_keyGap;
 
-    // Row 2: Caps, a-l, ;, ', Enter  (13 keys)
-    {
-        int wCaps = (int)(80 * dpiScale * scaleX);
-        int wEnter = (int)(90 * dpiScale * scaleX);   // Win11 风格：自然宽度，不强制竖列对齐
-        int fixed = wCaps + wEnter;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 11;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 11;
-        int w[13]; w[0] = wCaps;
-        for (int i = 1; i <= 11; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[12] = wEnter;
-        short v[13] = {0x14,0x41,0x53,0x44,0x46,0x47,0x48,0x4A,0x4B,0x4C,0xBA,0xDE,0x0D};
-        KeyType t[13] = {K_CAPS,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_SPECIAL};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-    }
+    // Row 2：Caps 行
+    DefPutRow(y, kDefRow2, kDefRow2N, u);
     y += g_keyHeight + g_keyGap;
 
-    int xUp = 0;   // ↑ 键左边界，第 5 行的 ↓ 键与其对齐
-    // Row 3: LShift, z-m, ,, ., /, ↑, RShift  (13 keys)
-    {
-        int wLSh = (int)(95 * dpiScale * scaleX);
-        int wUp = (int)(52 * dpiScale * scaleX);   // 与 ↓ 同宽对齐
-        int wRSh = (int)(52 * dpiScale * scaleX);   // 右 Shift 与 → 同宽，保证 ↓ 正对 ↑（十字对齐）
-        int fixed = wLSh + wRSh + wUp;
-        int aw = (KEY_AREA_W - fixed - 12 * g_keyGap) / 10;
-        int rem = KEY_AREA_W - fixed - 12 * g_keyGap - aw * 10;
-        int w[13]; w[0] = wLSh;
-        for (int i = 1; i <= 10; i++) w[i] = aw + (i <= rem ? 1 : 0);
-        w[11] = wUp; w[12] = wRSh;
-        short v[13] = {0xA0,0x5A,0x58,0x43,0x56,0x42,0x4E,0x4D,0xBC,0xBE,0xBF,0x26,0xA1};
-        KeyType t[13] = {K_MOD,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_LETTER,K_NORMAL,K_NORMAL,K_NORMAL,K_ARROW,K_MOD};
-        int x = KEY_AREA_X;
-        for (int i = 0; i < 13; i++) {
-            if (i == 11) xUp = x;   // 记录 ↑ 起始 x，供第 4 行对齐
-            AddKey(x, y, w[i], g_keyHeight, v[i], t[i]);
-            x += w[i] + g_keyGap;
-        }
-    }
+    // Row 3：Shift 行（↑ 落在 12.5u 处，与下一行的 ↓ 同列）
+    DefPutRow(y, kDefRow3, kDefRow3N, u);
     y += g_keyHeight + g_keyGap;
 
-    // Row 4: (Fn), Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, →；F 行开启时隐藏 Fn
-    {
-        int wFn  = (int)(46 * dpiScale * scaleX);
-        int wCtl = (int)(56 * dpiScale * scaleX);
-        int wWin = (int)(46 * dpiScale * scaleX);
-        int wAlt = (int)(58 * dpiScale * scaleX);
-        int wMenu = (int)(56 * dpiScale * scaleX);
-        int wArw = (int)(52 * dpiScale * scaleX);   // ← 与 ↑/↓ 同宽
-        int wUp   = (int)(52 * dpiScale * scaleX);   // ↓ 与上方 ↑ 同宽
-        int wRSh  = (int)(52 * dpiScale * scaleX);   // → 与右 Shift 同宽（十字对齐约束）
-        if (g_showFKeys) {
-            // 无 Fn：Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (10 keys)
-            int leftOfArrows = wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 9 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[10] = {wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
-            short v[10] = {0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[10] = {K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 10; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        } else {
-            // 有 Fn：Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, → (11 keys)
-            int leftOfArrows = wFn + wCtl + wWin + wAlt + wAlt + wMenu + wCtl;
-            int spaceW = KEY_AREA_W - leftOfArrows - wArw - wUp - wRSh - 10 * g_keyGap;
-            if (spaceW < 60) spaceW = 60;
-            int w[11] = {wFn, wCtl, wWin, wAlt, spaceW, wAlt, wMenu, wCtl, wArw, wUp, wRSh};
-            short v[11] = {0, 0x11, 0x5B, 0x12, 0x20, 0x12, 0x5D, 0x11, 0x25, 0x28, 0x27};
-            KeyType t[11] = {K_SPECIAL, K_MOD, K_SPECIAL, K_MOD, K_SPACE, K_MOD, K_MOD, K_MOD, K_ARROW, K_ARROW, K_ARROW};
-            int x = KEY_AREA_X;
-            for (int i = 0; i < 11; i++) { AddKey(x, y, w[i], g_keyHeight, v[i], t[i]); x += w[i] + g_keyGap; }
-        }
-    }
+    // Row 4：底行（开着 F 行时藏 Fn，腾出的 1u 并进空格）
+    DefPutRow(y, g_showFKeys ? kDefRow4NoFn : kDefRow4,
+                 g_showFKeys ? kDefRow4NoFnN : kDefRow4N, u);
 }
 
 // 全尺寸布局下「数字区显隐」的唯一入口：标题栏「小键盘」按钮与 Tab 键都走这里。
@@ -1593,6 +1658,26 @@ static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
     DrawTextW(dc, s, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+// 按键的对齐方式把标签摆到键面的左端 / 右端（k->align，见 KeyAlign）。
+// 参考图里左列的 Esc / Tab / Caps / Shift 名字贴着左边缘、右列的 Backspace / Del /
+// Enter / Shift 贴着右边缘 —— 宽键居中会让名字独自飘在一条缝上，反而看不出是哪个键。
+// 绘制矩形的宽仍用「容纳宽度 + 4」，与 DrawTextC 的居中路径同源，只是矩形不再居中。
+static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
+    if (!s || !s[0]) return;
+    int tw = MeasureTextW(dc, s, f);
+    if (tw <= 0) return;
+    int adv = MeasureTextAdvW(dc, s, f);
+    int rw  = (adv > 0 ? adv : tw) + 4;
+
+    int inset = (int)(10 * GetSystemDpiScale());
+    int x;
+    if (k->align == KA_LEFT)       x = k->x + inset;
+    else if (k->align == KA_RIGHT) x = k->x + k->w - inset - rw;
+    else                           x = k->x + (k->w - rw) / 2;
+    if (x < k->x) x = k->x;
+    DrawTextC(dc, x, k->y, rw, k->h, s, f, c);
+}
+
 // 双符号键绘制：上=副符号（Shift 未触发时灰色，触发后白色），下=主字符（始终正常显示）
 static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
                         wchar_t baseCh, wchar_t shiftCh,
@@ -1806,45 +1891,94 @@ static const HkIconDef* KeyIconFor(const KeyDef* k) {
     return NULL;
 }
 
+// 这个键有没有可画的图形。Win 键是特例：Windows 徽标字体里没有对应字形，
+// 一直是矢量特绘（见 DrawKeyGlyph），所以它不在 KeyIconFor 的 switch 里。
+static BOOL KeyHasGlyph(const KeyDef* k) {
+    if (!k) return FALSE;
+    if (k->vk == 0x5B) return TRUE;                     // Win
+    return KeyIconFor(k) != NULL;
+}
+
+// 键面图形。size 是正方形边长（与图标盒同义），图形在盒内居中。
+static void DrawKeyGlyph(HDC dc, int x, int y, int size, const KeyDef* k, DWORD color) {
+    if (!k || size <= 0) return;
+    if (k->vk == 0x5B) {
+        // Win11 风格四格徽标：四块圆角方块 + 中间一条缝
+        int sq = (int)(size * 0.44 + 0.5);
+        int gp = (int)(size * 0.12 + 0.5);
+        if (sq < 2) sq = 2;
+        if (gp < 1) gp = 1;
+        int total = sq * 2 + gp;
+        int ox = x + (size - total) / 2;
+        int oy = y + (size - total) / 2;
+        int rr = (int)(sq * 0.18);
+        DrawRoundRect(dc, ox, oy, sq, sq, color, color, rr);
+        DrawRoundRect(dc, ox + sq + gp, oy, sq, sq, color, color, rr);
+        DrawRoundRect(dc, ox, oy + sq + gp, sq, sq, color, color, rr);
+        DrawRoundRect(dc, ox + sq + gp, oy + sq + gp, sq, sq, color, color, rr);
+        return;
+    }
+    const HkIconDef* ic = KeyIconFor(k);
+    if (ic) DrawHkIcon(dc, (float)x, (float)y, (float)size, *ic, color, color);
+}
+
 // 键面标签的图标形态；返回 FALSE 表示该键不参与图标化（调用方继续走文字路径）。
 // 颜色只有 textC 一个来源，所以「普通/修饰/按下」三态与深色主题都自动跟随，零分支。
 // 注意：局部变量不要叫 small / pure —— <windows.h> 的 rpcndr.h 里有 `#define small char`。
+//
+// 三档落位（默认「图标+文字」，见 g_keyIconStyle）：
+//   1) 图标 + 文字并排；宽度不够就**逐档降字号**（用户要求「挤不了就缩小字体」）；
+//   2) 一路降到最小档仍放不下 → 只画图形（用户明确允许的最后一档，也是方向键的常态）；
+//   3) 该键本身没有公认图形 → 返回 FALSE，交回纯文字路径。
+// 旧实现里没有第 1 档的降字号：放不下就直接退回纯文字，于是参考图上
+// 「⌫ Backspace / ⇥ Tab / ⇪ Caps」这类「图形 + 名字」的键全都丢了图形。
 static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, DWORD color) {
     if (g_keyIconStyle == 0) return FALSE;
-    const HkIconDef* ic = KeyIconFor(k);
-    if (!ic) return FALSE;
+    if (!KeyHasGlyph(k)) return FALSE;
 
     double dpi = GetSystemDpiScale();
+    // 尺寸按「1u 键（默认布局 57 DIP 宽）也要放得下『图标 + Win』」反推：
+    // 图标 15 DIP + 间距 4 DIP + 两侧各 6 DIP 边距 = 31 DIP，留给文字 26 DIP ≈ 2 个字。
+    int iconInline = (int)(15 * dpi);
     int iconOnly   = (int)(20 * dpi);
-    int iconInline = (int)(18 * dpi);
-    int gap        = (int)(6 * dpi);
+    int gap        = (int)(4 * dpi);
+    int edge       = (int)(6 * dpi);    // 「图标+文字」整组两侧的呼吸边距
 
-    // 图标+文字（唯一的图标形态）：放得下就并排画；放不下就**退回「只画文字」**，
-    // 把决定权交回调用方的文字路径（FitKeyFont 会自动降档）。
-    // 文字才是信息载体、图标只是修饰，所以「挤不下」时该牺牲的是图标而不是文字。
-    // 原来这里退成「只画图标」：完整布局里 1u/1.5u 的 Tab、Caps、数字区回车、退格
-    // 全变成光秃秃一个图标 —— 实机反馈「该出现文本描述的怎么没描述了」。
-    // 只有完全没有文字的键（空格键这类）才落到「只画图标」。
-    if (text && text[0]) {
-        if (k->w >= (int)(40 * dpi)) {
-            int tw  = MeasureTextW(dc, text, f);              // 容纳宽度（放得下判定 + 绘制矩形）
-            int adv = MeasureTextAdvW(dc, text, f);           // 布局宽度（整组居中）
-            if (adv <= 0) adv = tw;
-            if (iconInline + gap + tw <= k->w - (int)(16 * dpi)) {
-                // 与标题栏 pill 同一套：整组按「图标 + 间距 + 文字实际占宽」居中，
-                // 文字矩形再左移半个余量，墨迹才接在间距之后。
-                int x = k->x + (k->w - (iconInline + gap + adv)) / 2;
-                DrawHkIcon(dc, (float)x, (float)(k->y + (k->h - iconInline) / 2), (float)iconInline,
-                           *ic, color, color);
-                DrawTextC(dc, x + iconInline + gap + adv / 2 - (tw + 4) / 2, k->y, tw + 4, k->h,
-                          text, f, color);
-                return TRUE;
-            }
+    // 方向键：键面标签本身就是那个箭头，画成「图标 + ←」等于同一个信息写两遍，只画图形。
+    BOOL hasText = (k->type != K_ARROW) && text && text[0];
+
+    if (hasText) {
+        // 降档阶梯：从调用方已经挑好的档位开始往下找第一个放得下的组合。
+        HFONT ladder[8] = { f, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
+        for (int i = 0; i < 8; i++) {
+            HFONT ff = ladder[i];
+            if (!ff) continue;
+            int tw = MeasureTextW(dc, text, ff);      // 容纳宽度：绘制矩形的宽必须 ≥ 它
+            if (tw <= 0) continue;
+            if (iconInline + gap + tw > k->w - 2 * edge) continue;
+
+            int adv = MeasureTextAdvW(dc, text, ff);  // 布局宽度：整组按它居中
+            int drawn = (adv > 0) ? adv : tw;
+            int groupW = iconInline + gap + drawn;
+            int gx;
+            if (k->align == KA_LEFT)       gx = k->x + edge;
+            else if (k->align == KA_RIGHT) gx = k->x + k->w - edge - groupW;
+            else                           gx = k->x + (k->w - groupW) / 2;
+            if (gx < k->x) gx = k->x;
+
+            DrawKeyGlyph(dc, gx, k->y + (k->h - iconInline) / 2, iconInline, k, color);
+            // 与标题栏 pill 同一套：文字矩形左移半个余量，墨迹才正好接在间距之后
+            DrawTextC(dc, gx + iconInline + gap + drawn / 2 - (tw + 4) / 2, k->y, tw + 4, k->h,
+                      text, ff, color);
+            return TRUE;
         }
-        return FALSE;   // 交给文字路径（含键太窄、长标签放不下这两种情况）
     }
-    DrawHkIcon(dc, (float)(k->x + (k->w - iconOnly) / 2), (float)(k->y + (k->h - iconOnly) / 2),
-               (float)iconOnly, *ic, color, color);
+
+    // 只画图形（没有文字 / 箭头键 / 降到底仍放不下）
+    int gx = k->x + (k->w - iconOnly) / 2;
+    if (k->align == KA_LEFT)       gx = k->x + edge;
+    else if (k->align == KA_RIGHT) gx = k->x + k->w - edge - iconOnly;
+    DrawKeyGlyph(dc, gx, k->y + (k->h - iconOnly) / 2, iconOnly, k, color);
     return TRUE;
 }
 
@@ -1939,7 +2073,9 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x10: case 0xA0: case 0xA1: return L"Shift";
         case 0x11: return L"Ctrl";
         case 0x12: return L"Alt";
-        case 0x5B: return L"";   // Win 键：矢量绘制 Windows 徽标，无文字
+        // Win 键：键面是矢量四格徽标 + 这个名字（见 DrawKeyGlyph）。
+        // 原来这里返回空串（只有徽标、没有名字），「图标+文字」档下就少了一半信息。
+        case 0x5B: return L"Win";
         case 0x5D: return L"Menu";       // 三条杠是它的图形；文字模式下要给出名字（原来返回空串）
         // 独立小键盘是 4 列网格，纯空白的一格看着像画错了（参考图那里写着「空格」）；
         // 默认布局 / 全尺寸的空格键很宽，沿用屏幕键盘的惯例不写字。
@@ -2573,29 +2709,10 @@ static void DrawKeys(HDC dc) {
         BOOL shiftOn = (g_sh || g_physShift);
         BOOL dual = (baseCh && shiftCh && shiftCh != baseCh);
 
-        if (k->vk == 0x5D) {
-            // Menu 键：原本靠图标字体的 \xE700 画汉堡，取消图标字体后一律改矢量，
-            // 三种图标样式下外观一致（它本身没有可用文字，不参与「图标+文字」）。
-            // 尺寸与键面 14px 标签同档（20 DIP）：三条杠的观感问题在渲染（连线），不在尺寸。
-            double dpi = GetSystemDpiScale();
-            int s = (int)(20 * dpi);
-            DrawHkIcon(dc, (float)(k->x + (k->w - s) / 2), (float)(k->y + (k->h - s) / 2),
-                       (float)s, HkIcon(HKICON_HAMBURGER), textC, textC);
-        } else if (k->vk == 0x5B) {
-            // Win 键：字体无 Windows 徽标字形，直接矢量绘制 Win11 风格四格徽标
-            double u = (double)k->h * 0.32;   // 缩小：徽标占键高 32%
-            int sq = (int)(u * 0.44);
-            int gp = (int)(u * 0.12);
-            if (sq < 2) sq = 2;
-            int total = sq * 2 + gp;
-            int ox = k->x + (k->w - total) / 2;
-            int oy = k->y + (k->h - total) / 2;
-            int rr = (int)(sq * 0.18);
-            DrawRoundRect(dc, ox, oy, sq, sq, textC, textC, rr);
-            DrawRoundRect(dc, ox + sq + gp, oy, sq, sq, textC, textC, rr);
-            DrawRoundRect(dc, ox, oy + sq + gp, sq, sq, textC, textC, rr);
-            DrawRoundRect(dc, ox + sq + gp, oy + sq + gp, sq, sq, textC, textC, rr);
-        } else if (dual) {
+        // Menu 与 Win 不再在这里特判：它们和 Tab/Caps/Shift 一样走 DrawKeyLabel 的
+        // 「图形 + 名字」（Win 徽标由 DrawKeyGlyph 矢量特绘 —— 字体里没有那个字形）。
+        // 图标样式选「文字」时 DrawKeyLabel 返回 FALSE，两者自然落回纯文字。
+        if (dual) {
             // 双符号键在三态下都是文字：主字符 + 副符号本身就是两个信息，图标化会毁数据
             if (shiftOn) {
                 wchar_t single[2] = { g_shiftSymbols ? shiftCh : baseCh, 0 };
@@ -2604,7 +2721,7 @@ static void DrawKeys(HDC dc) {
                 DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
             }
         } else if (!DrawKeyLabel(dc, k, f, txt, textC)) {
-            DrawTextC(dc, k->x, k->y, k->w, k->h, txt, f, textC);
+            DrawTextKey(dc, k, txt, f, textC);
         }
     }
 }
@@ -4190,6 +4307,14 @@ static void EnsureConfigFile() {
             WritePrivateProfileStringW(L"Theme", L"Material", NULL, path);
             IniSetInt(L"General", L"ConfigVersion", 5);
         }
+        if (ver < 6) {
+            // 默认「按键图标样式」由「文字」改为「图标+文字」（参考图里 Tab / Caps /
+            // Shift / 退格 / 回车这些宽键都是「图形 + 名字」）。
+            // 旧配置里几乎都写着 0 —— 那是旧默认值灌进去的，不代表用户的选择，
+            // 所以这里一并改成 2；不喜欢可在设置页一键切回「文字」。
+            IniSetInt(L"Keyboard", L"KeyIconStyle", 2);
+            IniSetInt(L"General", L"ConfigVersion", 6);
+        }
         return;
     }
     IniSetInt(L"General", L"RememberClose", 0);
@@ -4201,12 +4326,12 @@ static void EnsureConfigFile() {
     IniSetInt(L"Keyboard", L"Layout", 0);
     IniSetInt(L"Keyboard", L"FKeys", 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", 0);
-    IniSetInt(L"Keyboard", L"KeyIconStyle", 0);
+    IniSetInt(L"Keyboard", L"KeyIconStyle", 2);
     IniSetInt(L"General", L"ShiftSymbols", 1);
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"AutoPopup", 1);
     IniSetInt(L"General", L"AutoHide", 1);
-    IniSetInt(L"General", L"ConfigVersion", 5);
+    IniSetInt(L"General", L"ConfigVersion", 6);
 }
 
 // 读取上次的窗口大小 / 主题 / 关闭行为
@@ -4233,8 +4358,8 @@ static void LoadConfig() {
     g_npHidden = IniGetInt(L"Keyboard", L"NpHidden", 0) != 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
-    g_keyIconStyle = IniGetInt(L"Keyboard", L"KeyIconStyle", 0);
-    // 0=文字（默认，= 升级前的现状）2=图标+文字。
+    g_keyIconStyle = IniGetInt(L"Keyboard", L"KeyIconStyle", 2);
+    // 0=文字 2=图标+文字（默认）。
     // 旧配置里的 1（纯图标）已取消 —— 迁移到 2，别让它落回「文字」丢掉用户的选择。
     if (g_keyIconStyle == 1) g_keyIconStyle = 2;
     if (g_keyIconStyle != 2) g_keyIconStyle = 0;

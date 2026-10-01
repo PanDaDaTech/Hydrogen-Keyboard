@@ -1675,7 +1675,7 @@ static void DrawTextC(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
 //      Win/Menu 在同一行里位置对不齐。→ 居中键直接把整键矩形交给 DrawTextC，
 //      与 DrawKeys 里「双符号键」那条路径（DrawTextC(k->x, k->y, k->w, k->h, …)）同源，
 //      两条路径的居中量因而完全一致（残余的 -1px 是 GDI+ 量宽左右不对称的固有量）。
-//   KA_LEFT / KA_RIGHT 才需要自己算矩形起点：这里按 adv 定位（贴边看的是墨迹边缘）。
+//   KA_LEFT / KA_RIGHT 才需要自己算矩形起点：两侧同样用「矩形边」当尺子（见下方说明）。
 static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
     if (!s || !s[0]) return;
 
@@ -1687,12 +1687,17 @@ static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWOR
     int tw = MeasureTextW(dc, s, f);          // 容纳宽度：绘制矩形的宽必须 ≥ 它
     if (tw <= 0) return;
     int rw = tw + 4;
-    int adv = MeasureTextAdvW(dc, s, f);      // 布局宽度：贴边定位用它才准
-    if (adv <= 0) adv = tw;
 
+    // 左右两侧都用「矩形边」定位，贴边留白才对称：
+    //   左：矩形左边 = 键左边 + inset
+    //   右：矩形右边 = 键右边 − inset
+    // ⚠ 右侧不能改用 adv 定位（x = k->x + k->w - inset - adv）：矩形宽是 tw+4 > adv，
+    //   多出来的 (tw+4-adv)/2 会把墨迹整体往右推、把 inset 吃掉。实测纯文字档里
+    //   左对齐键（Tab/Caps/Shift）墨迹离键左 25px，右对齐键（Del/Enter）离键右只有 8px，
+    //   同一屏左右明显不对称。改成同一把尺子后两侧都落在 22~25px。
     int inset = (int)(10 * GetSystemDpiScale());
     int x = (k->align == KA_LEFT) ? k->x + inset
-                                  : k->x + k->w - inset - adv;
+                                  : k->x + k->w - inset - rw;
     if (x < k->x) x = k->x;
     DrawTextC(dc, x, k->y, rw, k->h, s, f, c);
 }

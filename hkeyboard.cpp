@@ -2630,17 +2630,19 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
     m.dpi = GetSystemDpiScale();
     m.W = rc.right; m.H = rc.bottom;
     m.margin = (int)(30 * m.dpi);
-    m.titleY = (int)(10 * m.dpi);
+    // 顶部留白比左右边距略小即可：原来只有 10 DIP，页头会顶在窗口上沿，
+    // 与 30 DIP 的左右/下边距不成比例。这里给到 20 DIP，其余间距按同一节奏排。
+    m.titleY = (int)(20 * m.dpi);
     m.titleH = (int)(34 * m.dpi);
     m.headIcon = (int)(38 * m.dpi);
     m.closeW = m.closeH = (int)(28 * m.dpi);
     m.closeX = m.W - m.margin - m.closeW;
-    m.closeY = (int)(14 * m.dpi);
-    m.tabsY = (int)(56 * m.dpi);
+    m.closeY = m.titleY + (m.titleH - m.closeH) / 2;   // 与页面标题垂直居中对齐
+    m.tabsY = m.titleY + m.headIcon + (int)(10 * m.dpi);
     m.tabH = (int)(42 * m.dpi);
     m.tabGap = (int)(28 * m.dpi);
     m.contentX = m.margin;
-    m.contentY = (int)(112 * m.dpi);
+    m.contentY = m.tabsY + m.tabH + (int)(14 * m.dpi);
     m.contentW = m.W - m.margin * 2;
     m.rowPadY = (int)(12 * m.dpi);
     m.tileSize = (int)(30 * m.dpi);
@@ -3177,12 +3179,14 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
 static void SettingsDraw(HDC dc, HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
 
-    // 页面头：38×38 图标 tile + 26px 标题（关于 tab 用 Info，其余用设置齿轮）
+    // 页面头：38×38 图标 tile + 26px 标题。
+    // 关于是一块独立页面，标题与图标都跟着改成「关于 / Info」；其余三个 tab 同属「设置」。
+    BOOL aboutTab = (g_sTab == 2);
     DrawIconTile(dc, m.margin, m.titleY, m.headIcon, (int)(20 * m.dpi),
-                 (g_sTab == 2) ? HKICON_INFO : HKICON_GEAR, NULL);
+                 aboutTab ? HKICON_INFO : HKICON_GEAR, NULL);
     int titleX = m.margin + m.headIcon + (int)(16 * m.dpi);
-    DrawTextL(dc, titleX, m.titleY, m.closeX - (int)(12 * m.dpi) - titleX,
-              m.titleH, T(L"设置", L"Settings"), g_sf20b, C_WHITE);
+    DrawTextL(dc, titleX, m.titleY, m.closeX - (int)(12 * m.dpi) - titleX, m.titleH,
+              aboutTab ? T(L"关于", L"About") : T(L"设置", L"Settings"), g_sf20b, C_WHITE);
     if (g_sHov == S_HIT_CLOSE) {
         DrawRoundRect(dc, m.closeX, m.closeY, m.closeW, m.closeH, C_HOVER, C_KEY_BORDER, 6);
     }

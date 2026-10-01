@@ -3053,6 +3053,43 @@ static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
     return hit;
 }
 
+// ===== 设置行的「画框选择」（替代下拉框）=====
+// 各选择类行统一走这几个函数：右对齐、垂直居中、宽度按选项文字量出来。
+// 绘制与命中读同一份矩形算法（RowSegRect），不会再出现「画在左、热区在右」。
+static RECT RowSegRect(const SettingsMetrics& m, const RECT& row,
+                       const wchar_t** items, int count) {
+    int w = SegmentedWidth(m, items, count);
+    int x = row.right - (int)(20 * m.dpi) - w;
+    int y = SettingsComboY(m, row);
+    RECT r = {x, y, x + w, y + m.comboH};
+    return r;
+}
+static int RowSegIndex(const SettingsMetrics& m, const RECT& row,
+                       const wchar_t** items, int count, int x) {
+    RECT r = RowSegRect(m, row, items, count);
+    return SegmentedHitIndex(m, r, items, count, x);
+}
+
+// 各选择行的选项文案（中 / 英），返回项数
+static int CloseSegItems(const wchar_t** out) {
+    out[0] = T(L"退出程序", L"Exit");
+    out[1] = T(L"隐藏到托盘", L"Tray");
+    return 2;
+}
+static int LangSegItems(const wchar_t** out) {
+    out[0] = T(L"简体中文", L"S.Chinese");
+    out[1] = L"English";
+    return 2;
+}
+static int LayoutSegItems(const wchar_t** out) {
+    for (int i = 0; i < 3; i++) out[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
+    return 3;
+}
+static int ThemeSegItems(const wchar_t** out) {
+    for (int i = 0; i < 3; i++) out[i] = g_lang ? g_themeNamesEn[i] : g_themeNames[i];
+    return 3;
+}
+
 // 「按键图标样式」的两段文案与控件矩形：绘制 / 命中 / 点击必须共用（画与热区同源）。
 // 只有两段：文字 / 图标+文字 —— 纯图标（键面只剩一个裸图形，没有文字兜底）已按实机反馈去掉。
 // 段下标与 g_keyIconStyle 不再相等，收在下面两个小函数里，别在调用点各写一遍映射。
@@ -3448,14 +3485,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=123 按钮 4=Tab 切换小键盘
         RECT r = SettingsRowRect(m, 0);
-        int ctrlL = SettingsComboX(m, r);
+        const wchar_t* lseg[3];
+        int lsegn = LayoutSegItems(lseg);
+        RECT lsegR = RowSegRect(m, r, lseg, lsegn);
         DrawSettingRowContent(dc, m, r, HKICON_KEYBOARD, NULL,
                               T(L"键盘布局", L"Keyboard Layout"),
                               T(L"选择主键盘的按键排列", L"Choose the main keyboard arrangement"),
-                              g_sHov == S_HIT_LAYOUT_DROP, ctrlL);
-        DrawCombo(dc, ctrlL, SettingsComboY(m, r), m.comboW, m.comboH,
-                  g_lang ? g_layoutNamesEn[g_layoutMode] : g_layoutNames[g_layoutMode],
-                  g_dropLayout, g_sHov == S_HIT_LAYOUT_DROP);
+                              g_sHov == S_HIT_LAYOUT_DROP, lsegR.left);
+        DrawSegmented(dc, m, lsegR, lseg, lsegn, g_layoutMode);
 
         // 按键图标样式：分段控件二选一，改完立即重绘主键盘
         r = SettingsRowRect(m, 1);
@@ -3753,8 +3790,9 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             }
         }
         r = SettingsRowRect(m, 0);
-        int comboX = SettingsComboX(m, r), comboY = SettingsComboY(m, r);
-        if (x >= comboX && x < comboX + m.comboW && y >= comboY && y < comboY + m.comboH) return S_HIT_LAYOUT_DROP;
+        { const wchar_t* it[3]; int n = LayoutSegItems(it);
+          RECT sr = RowSegRect(m, r, it, n);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LAYOUT_DROP; }
 
         // 按键图标样式：整条分段控件一个命中码，段下标在点击时按 x 算
         {
@@ -4099,10 +4137,14 @@ static void SettingsApplyHit(HWND hWnd, int hit) {
         g_rememberClose = !g_rememberClose;
         SaveCloseSettings();   // 持久化“记住我的选择”
         break;
-    case S_HIT_LAYOUT_DROP:
-        g_dropLayout = !g_dropLayout;
-        if (g_dropLayout) { g_dropTheme = FALSE; g_dropLang = FALSE; g_dropHl = FALSE; g_dropClose = FALSE; g_dropLayoutHov = -1; }
+    case S_HIT_LAYOUT_DROP: {
+        // 画框选择：直接按点击的段应用（原来的下拉展开+选项两级已经作废）
+        RECT lr = SettingsRowRect(GetSettingsMetrics(hWnd), 0);
+        const wchar_t* it[3]; int n = LayoutSegItems(it);
+        int idx = RowSegIndex(GetSettingsMetrics(hWnd), lr, it, n, x);
+        if (idx >= 0 && idx != g_layoutMode) { g_layoutMode = idx; layoutChanged = TRUE; }
         break;
+    }
     case S_HIT_LAYOUT_OPT0:
     case S_HIT_LAYOUT_OPT1:
     case S_HIT_LAYOUT_OPT2:

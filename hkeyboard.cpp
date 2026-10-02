@@ -2101,7 +2101,7 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     // 尺寸自适应：**本来有名字**的键（Win / Menu …）退到这一档时沿用 inline 档，不再放大 ——
     // 同排的字都在，单独一个放大的徽标会显得大一号（实机图：Win 徽标明显大于 Fn/Alt 的字）。
     // 只有本来就没名字的键（方向键）才用更大的独占尺寸，并且仍受键盒约束。
-    int iconOnly = (text && text[0]) ? iconInline : (k->h * 42 / 100);
+    iconOnly = (text && text[0]) ? iconInline : (k->h * 42 / 100);   // 上面已声明
     if (iconOnly > k->w - 2 * edge) iconOnly = k->w - 2 * edge;
     if (iconOnly < 6) iconOnly = 6;
     int gx = k->x + (k->w - iconOnly) / 2;

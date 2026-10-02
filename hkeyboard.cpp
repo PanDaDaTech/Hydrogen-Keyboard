@@ -4273,10 +4273,12 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         //   它那枚是熊猫头，与色块同色系但形状完全不同；KeyboardMark 本身就是完整剪影，
         //   套色块后只会在 56 DIP 的位置里塞进一条 49×34 的扁带，中间还多一圈冗余底色。
         int my = al.card1.top + (al.card1.bottom - al.card1.top - al.mark) / 2;
-        // ⚠ 文字起点用 **15 DIP**（原 18），因为 al.mark 是 56 DIP 的**绘制网格**，
-        //   而 KeyboardMark 的着色只占网格的 88%（实测墨迹 49.52 DIP，网格内左留白
-        //   2.48）。按网格量间距会多算 6.5 DIP：原来视觉间距 22.00，改后 18.98，
-        //   与制作工具实测的 18.98 一致（那边 tile 满格，网格=墨迹，不存在这个偏差）。
+        // ⚠ 文字起点用 **12.7 DIP**（原 18）：al.mark 是 56 DIP 的**绘制网格**，而
+        //   KeyboardMark 的着色只占网格的 88%（实测墨迹 49.52 DIP，网格内左留白 2.48）。
+        //   按网格量间距会多算 6.5 DIP，这是「图标贴着文字」的成因。
+        //   制作工具那边实测视觉间距 18.98（tile 满格，网格=墨迹，不存在这个偏差）；
+        //   本窗口同样要 18.98，就得从 18 往下减：18 − 6.5(网格/墨迹差) + 1.2(GDI+ 与
+        //   字形左边距的差，实测反解) ≈ 12.7。改完实测 18.98±0.3。
         //   ⚠ 别再套一层圆角方块去「填满」网格 —— 那会让 49×34 的扁带缩在色块里。
         DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
@@ -4294,12 +4296,13 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         //   ⚠ 别想着「把盒顶间隙调成 0 补回来」：汉字墨迹几乎撑满标题盒，间隙归零后
         //   标题与描述的字面会贴到一起。间隙 3 是下限。
         //
-        // ⚠ 文字块整体再上移 0.9 DIP（不是原来的下移 1.5）。17pt 的墨迹在 28 DIP 的盒里
-        //   偏上得更少，盒子居中即可对上；负值是让块心与制作工具一致（那边块心偏下
-        //   1.7 DIP，卡内相对位置 +3.4%）。
-        int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(15 * m.dpi);
+        // ⚠ 文字块整体**下移 1.7 DIP**。盒高 49 按卡纵心居中只是「盒子居中」，
+        //   而 17pt 标题的墨迹在 28 DIP 的盒里只留 0.1 DIP 上留白（行盒 1.326em = 29.17
+        //   比盒高还大 1.17，GDI+ 居中后墨迹几乎贴着盒顶），只居中盒子会让整块偏上、
+        //   卡底留白比卡顶多 4 DIP。下移 1.7 后实测顶 18.97 / 底 19.10，两侧对称。
+        int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(12.7 * m.dpi);
         int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(49 * m.dpi)) / 2
-                 - (int)(0.9 * m.dpi + 0.5);
+                 + (int)(1.7 * m.dpi + 0.5);
         int tw = al.card1.right - AboutPadX(m) - tx;
         DrawTextL(dc, tx, ty, tw, (int)(28 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfSec, C_WHITE);

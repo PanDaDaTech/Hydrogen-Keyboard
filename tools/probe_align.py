@@ -16,7 +16,7 @@ except ImportError:
     raise SystemExit("需要 Pillow：pip install pillow")
 
 
-def content_bands(im, min_band=10, quiet=0.02):
+def content_bands(im, min_band=10, quiet=0.02, merge_gap=22):
     """按"墨水剖面"切行：以**该行自己的底色**为基准数非底色像素，有内容的行连成一条带。
 
     为什么不用"整行同色"判分隔线：设置页行之间的 1px 分隔线是抗锯齿的，实际占 2~3 行
@@ -46,12 +46,22 @@ def content_bands(im, min_band=10, quiet=0.02):
         if has_ink[y] and start is None:
             start = y
         elif not has_ink[y] and start is not None:
-            if y - start >= min_band:
+            if y - start >= 3:
                 bands.append((start, y))
             start = None
-    if start is not None and h - start >= min_band:
+    if start is not None and h - start >= 3:
         bands.append((start, h))
-    return bands
+
+    # 合并被"行内小间隙"切开的带：描述折成两行时，两行文字之间也会出现一段空白，
+    # 但它远小于行与行之间 24 DIP 的内边距。不合并的话，一行会被切成多段，
+    # 后半段没有图标 tile，探针就会拿文字当 tile 去比 —— 得到假的 FAIL（实机验证过）。
+    merged, gap_merge = [], merge_gap
+    for b in bands:
+        if merged and b[0] - merged[-1][1] <= gap_merge:
+            merged[-1] = (merged[-1][0], b[1])
+        else:
+            merged.append(b)
+    return [(a, b) for (a, b) in merged if b - a >= min_band]
 
 
 def measure(im, y0, y1):

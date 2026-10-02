@@ -3312,6 +3312,22 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
     return m;
 }
 
+// 全尺寸(2) / 小键盘(1) 布局下「不存在」的行 —— 它们只对默认布局有意义：
+//   常规 Tab：功能键行、Shift 符号     布局 Tab：Fn 网页布局
+// 这些行**高度给 0**、绘制与命中也一并跳过：SettingsRowRect 是按行高累加出来的，
+// 高度归零后后面的行自动上移，绘制 / 命中 / 点击读的仍是同一份几何，不会出现「画一行点一行」。
+static BOOL SettingsRowHidden(int tab, int index) {
+    BOOL onlyDefault = (g_layoutMode != 0);
+    if (tab == 0) {
+        int closeRow = g_af ? 2 : 1;
+        if (index == closeRow + 2) return onlyDefault;   // 功能键行
+        if (index == closeRow + 3) return onlyDefault;   // Shift 符号
+        return FALSE;
+    }
+    if (tab == 3) return onlyDefault && index == 2;      // Fn 网页布局
+    return FALSE;
+}
+
 // 每行的「控件高」，单位 DIP（不乘 dpi）：开关 26 / 下拉与分段 40；无控件行给 0
 static int SettingsRowCtrlDip(int tab, int index) {
     if (tab == 0) {                                 // 常规
@@ -3375,6 +3391,7 @@ static BOOL SettingsRowDescTwoLines(const SettingsMetrics& m, int tab, int index
 //   表现为整张卡比预期矮一截、底部留一大片空白、两行文字挤在一起。
 // 主题 tab 的色相行是可展开行：展开态固定 210 DIP（内含分隔线 + 色板 + 滑轨 + HEX）
 static int SettingsRowHeight(const SettingsMetrics& m, int index) {
+    if (SettingsRowHidden(g_sTab, index)) return 0;      // 见 SettingsRowHidden：后续行随之上移
     if (g_sTab == 1 && index == 2 && !g_wallpaperAccent) return (int)(210 * m.dpi);
     int contentDip = SettingsRowCtrlDip(g_sTab, index);
     if (contentDip < 30) contentDip = 30;   // 图标 tile
@@ -3422,6 +3439,7 @@ static void DrawSettingsCard(HDC dc, const SettingsMetrics& m) {
                   C_KEY, C_KEY, (int)(16 * m.dpi));
     int n = SettingsRowCount(g_sTab);
     for (int i = 0; i + 1 < n; i++) {
+        if (SettingsRowHidden(g_sTab, i + 1)) continue;   // 隐藏行（全尺寸/小键盘下）不画分隔线
         int y = SettingsRowRect(m, i + 1).top;
         Fill(dc, card.left + (int)(20 * m.dpi), y,
              (card.right - card.left) - (int)(40 * m.dpi), 1, C_LINE_DIV);
@@ -4147,7 +4165,10 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               g_sHov == S_HIT_REMEMBER, SettingsSwitchTextRight(m, r2));
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
-        RECT r = SettingsRowRect(m, closeRow + 2);
+        RECT r;
+        // 功能键行 / Shift 符号：全尺寸与小键盘布局下不存在（见 SettingsRowHidden）
+        if (!SettingsRowHidden(0, closeRow + 2)) {
+        r = SettingsRowRect(m, closeRow + 2);
         DrawSettingRowContent(dc, m, r, -1, L"F",   // 功能键行保留手绘 F
                               T(L"功能键行", L"Function Key Row"),
                               T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"),
@@ -4160,6 +4181,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols while Shift is held"),
                               g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
+        }
 
         r = SettingsRowRect(m, closeRow + 4);
         const wchar_t* gseg[2];
@@ -4194,6 +4216,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               FALSE, segR.left);
         DrawSegmented(dc, m, segR, seg, KEYICON_SEG_COUNT, KeyIconSegOfStyle(g_keyIconStyle));
 
+        // Fn 网页布局：全尺寸与小键盘布局下不存在（见 SettingsRowHidden）
+        if (!SettingsRowHidden(3, 2)) {
         r = SettingsRowRect(m, 2);
         DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
                               T(L"Fn 网页布局", L"Fn Web Layout"),
@@ -4201,6 +4225,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               g_sHov == S_HIT_FNWEB, SettingsSwitchTextRight(m, r),
                               SettingsRowDescTwoLines(m, 3, 2));
         DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
+        }
 
         r = SettingsRowRect(m, 3);
         DrawSettingRowContent(dc, m, r, HKICON_NUMPAD, NULL,
@@ -4395,10 +4420,12 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         r = SettingsRowRect(m, closeRow + 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_REMEMBER;
 
-        r = SettingsRowRect(m, closeRow + 2);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
-        r = SettingsRowRect(m, closeRow + 3);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
+        if (!SettingsRowHidden(0, closeRow + 2)) {       // 全尺寸 / 小键盘下这两行不存在
+            r = SettingsRowRect(m, closeRow + 2);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
+            r = SettingsRowRect(m, closeRow + 3);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
+        }
 
         r = SettingsRowRect(m, closeRow + 4);
         { const wchar_t* it[2]; int n = LangSegItems(it);
@@ -4422,8 +4449,10 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_KEYICON;
         }
 
-        r = SettingsRowRect(m, 2);
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+        if (!SettingsRowHidden(3, 2)) {                  // 全尺寸 / 小键盘下不存在
+            r = SettingsRowRect(m, 2);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
+        }
 
         r = SettingsRowRect(m, 3);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_NPBTN;

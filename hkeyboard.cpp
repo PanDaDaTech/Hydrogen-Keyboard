@@ -5580,11 +5580,13 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    // 340x263：与 PromptComputeLayout 的推进链对齐 ——
+    // 480x263：与 PromptComputeLayout 的推进链对齐 ——
     // 20 + 38(标题行) + 18 + 109(卡片：两行 54 + 分隔线 1) + 16 + 1(分隔线)
     // + 12 + 30(按钮) + 20 = 263。上下留白各 20 DIP。
+    // 宽度 480：设置页是 705 DIP，这里要能一行放下「记住关闭按钮的操作，下次直接执行」
+    // （16 字），340 会把它挤成两行、行高对不齐。行内可用宽度 = 480 - 88 - 58 = 306 DIP。
     // ⚠ 改这个数必须同步 PromptComputeLayout 里的推进链。
-    int w = (int)(340 * dpi), h = (int)(263 * dpi);
+    int w = (int)(480 * dpi), h = (int)(263 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;

@@ -4274,11 +4274,19 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
 
         // 产品名用 g_sfSec（20pt ≈ 26.7 DIP）而不是页面标题那一档：制作工具的名称 20 /
         // 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），卡里的名字会和页面
-        // 大标题打架。文字块 = 名 32 + 间隙 6 + 版本 18 = 56，按卡纵心居中
+        // 大标题打架。文字块 = 名 32 + 间隙 3 + 版本 18 = 53，按卡纵心居中
         // （卡高 76 = 方块 56 + 上下各 10），再按墨迹下移 1.5 DIP：20pt 标题的墨迹在
         // 32 DIP 的盒里天然偏上，只居中盒子不居中墨迹，视觉上就是「没对齐」。
+        //
+        // ⚠ 盒顶间隙只有 **3 DIP**，别看着「挤」就调回 6。制作工具那边量到 9.14 DIP 的
+        //   墨迹间隙，看着比这个大，但它的产品名「PanDa PE」**全是拉丁字母** ——
+        //   墨迹只有 cap height（20 DIP 字号下 ≈ 15.4 DIP），上下都留白；
+        //   而本行含「轻键」两个**汉字**，墨迹高 29.36 DIP、几乎撑满 32 DIP 的盒。
+        //   墨迹间隙 = 盒顶间隙 + 标题盒内下留白 + 描述盒内上留白
+        //            = 3 + (32−29.36) + (18−12.09)/2 = 8.6 DIP ≈ 制作工具的 9.14。
+        //   用 6 会算成 11.6 DIP（实测 11.52），肉眼就是「标题和版本号离得太开」。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(56 * m.dpi)) / 2
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(53 * m.dpi)) / 2
                  + (int)(1.5 * m.dpi + 0.5);
         int tw = al.card1.right - AboutPadX(m) - tx;
         DrawTextL(dc, tx, ty, tw, (int)(32 * m.dpi),
@@ -4287,7 +4295,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         // 版本串 = 内部版本号 + 构建日期（北京时间），例如 "v2.0_20261002"
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs_%ls (%ls)", L"Lightweight screen keyboard · v%hs_%ls (%ls)"),
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
-        DrawTextL(dc, tx, ty + (int)(38 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(35 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,

@@ -548,7 +548,7 @@ static void InitWindowSizeForDpi() {
         g_ww = (int)(430 * dpiScale);
         g_wh = (int)(320 * dpiScale);
     } else if (g_layoutMode == 2) { // 全尺寸（完整键盘）：6 行，主区+导航区+数字区
-        // 1280 宽下 1u ≈ 56.8px，键帽 52px（原来 1380×372 会算成 46~73px 的五种宽度）
+        // 1280×404：宽高比接近常见全尺寸板，键帽不会被横向拉扁
         g_ww = (int)(1280 * dpiScale);
         g_wh = (int)(404 * dpiScale);
     } else {                        // 全尺寸
@@ -1090,7 +1090,7 @@ static const DefKeySpec kDefRow2[] = {
 #define kDefRow2N ((int)(sizeof(kDefRow2) / sizeof(DefKeySpec)))
 
 // ---- Row3：LShift, z~m, ,, ., /, ↑, RShift = 15.5u ----
-// ↑ 落在 12.5u 处，与下一行的 ↓ 完全同列（旧写法要靠 xUp 变量把 ↓ 手动对齐）。
+// ↑ 落在 12.5u 处，与下一行的 ↓ 完全同列（无需额外对齐变量）
 static const DefKeySpec kDefRow3[] = {
     {  0.00f, 2.50f, 0xA0, K_MOD   , KA_LEFT  , 0 },
     {  2.50f, 1.00f, 0x5A, K_LETTER, KA_CENTER, 0 },
@@ -1242,8 +1242,6 @@ static void BuildKeys() {
     // 竖向留白统一成 10 DIP（与左右留白同节奏），基准取**页头里胶囊按钮的底边**，不是页头盒底：
     // 页头盒 44 DIP 里按钮只占 10+28=38，余下 6 DIP 是页头内部留白，以盒底为基准会让
     // 「按钮 → 第一排键」比「最后一排键 → 窗口底」小一截。
-    // 旧写法是 `bottomPad = 16 DIP` 且第一排 y 里硬塞一个 `+2`（px！与 DIP 混算），
-    // 实测小键盘布局上边距 8.67 / 下边距 14.67 DIP —— 肉眼就是「整体偏下、上下间距不合理」。
     // 行高是整数除法，余数不再全堆到底部，改为上下各分一半（误差 ≤1px）。
     const int padV   = (int)(10 * dpiScale);
     const int hdrBot = (int)((HDR_BTN_TOP_DIP + HDR_BTN_H_DIP) * dpiScale);   // 胶囊按钮底边
@@ -2248,13 +2246,12 @@ static BOOL IsActive(const KeyDef* k) {
 }
 
 // ========== IME-Compatible Input Injection ==========
-// 修复 #2: 使用 SendInput 替代已废弃的 keybd_event()
-// 修复 #5: 使用 MapVirtualKeyW (Unicode 版本) 并正确设置扫描码与扩展键标志
+// ⚠ 必须用 SendInput（keybd_event 已废弃且拦不到高权限窗口），扫描码走
+//   MapVirtualKeyW(MAPVK_VK_TO_VSC) —— 部分 IME 依赖正确扫描码。
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
     INPUT inputs[12] = {};
     int count = 0;
 
-    // 使用 MapVirtualKeyW 获取正确扫描码（修复 #5: 部分 IME 依赖正确扫描码）
     UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 
     // 判断扩展键（右 Ctrl/Alt、方向键、Win 等；右 Shift 不带 E0 扩展标志）
@@ -2388,19 +2385,9 @@ static void SendWinToggle() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// 关闭开始菜单：发送 Esc。
-// 开始菜单打开且处于前台时，Esc 是可靠关闭它的系统行为（注入的 Win 键在部分环境下“能开不能关”）。
-static void CloseStartMenu() {
-    INPUT in = {};
-    in.type = INPUT_KEYBOARD;
-    in.ki.wVk = VK_ESCAPE;
-    in.ki.wScan = (WORD)MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC);
-    SendInput(1, &in, sizeof(INPUT));
-    in.ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(1, &in, sizeof(INPUT));
-}
-
-// 清除 Win 锁定：解锁并重置点击计数（使用 Win+快捷键或检测到开始菜单时调用）
+// 清除 Win 锁定：解锁并重置点击计数（使用 Win+快捷键或检测到开始菜单时调用）。
+// ⚠ 别再用「注入 Esc 关开始菜单」那套：曾这么做过，但注入的 Win 键在部分环境下
+//   「能开不能关」，后来改成按 Win 键本身开合，锁定态只由这里统一清。
 static void ClearWinLock() {
     g_winKey = FALSE;
     g_winCount = 0;
@@ -3256,18 +3243,6 @@ static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
     DrawRoundRect(dc, kx, y + 3, knob, knob, on ? C_KEY : C_DIM, on ? C_KEY : C_DIM, knob / 2);
 }
 
-static void DrawCheck(HDC dc, int x, int y, int s, BOOL on) {
-    DrawRoundRect(dc, x, y, s, s, on ? C_HOT : C_KEY, C_KEY_BORDER, s / 3);
-    if (on) {
-        HPEN p = CreatePen(PS_SOLID, 2, C_ON_PRIMARY);
-        HPEN op = (HPEN)SelectObject(dc, p);
-        MoveToEx(dc, x + 3, y + s / 2, NULL);
-        LineTo(dc, x + s / 2, y + s - 3);
-        LineTo(dc, x + s - 2, y + 2);
-        SelectObject(dc, op); DeleteObject(p);
-    }
-}
-
 // ========== 设置页度量与布局 ==========
 // 语法对齐制作工具：一个 tab 就是一张卡，卡内逐行，行间画 1px 分隔线。
 // 行高不再是常数（下拉/分段行 40 高，比开关行高），所以行位置由累计高度算出；
@@ -3453,12 +3428,6 @@ static void DrawSettingsCard(HDC dc, const SettingsMetrics& m) {
 // 行内元素定位：tile 在左，文字块起点 = 卡左 + 20 + 30 + 18
 static int SettingsRowTileX(const SettingsMetrics& m) { return m.contentX + (int)(20 * m.dpi); }
 static int SettingsRowTextX(const SettingsMetrics& m) { return SettingsRowTileX(m) + m.tileSize + m.tileGap; }
-static int SettingsRowPadY(const SettingsMetrics& m) { return m.rowPadY; }
-
-// 控件统一右对齐，右边界 = 卡片右内边距（20）
-static int SettingsComboX(const SettingsMetrics& m, const RECT& row) {
-    return row.right - (int)(20 * m.dpi) - m.comboW;
-}
 
 // 行的「头部」高度 = 12 + 40 + 12 DIP。图标 tile、文字块、行内控件（开关 / 分段 / 下拉）
 // 全都只在这段里居中，**行因为描述折行而变高时不跟着变**。
@@ -3713,8 +3682,8 @@ static int RowSegIndexTop(const SettingsMetrics& m, const RECT& row,
     return SegmentedHitIndex(m, r, items, count, x);
 }
 
-// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」），相关分段控件的辅助函数
-// 一并删除；g_keyIconStyle 固定为 2，见 LoadConfig 与 DrawKeyLabel。
+// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」）；g_keyIconStyle 固定为 2，
+// 见 LoadConfig 与 DrawKeyLabel。
 
 static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
     int w = (int)(150 * m.dpi), h = (int)(32 * m.dpi);
@@ -4522,7 +4491,6 @@ static void EnsureConfigFile() {
             IniSetInt(L"Window", L"Height", 0);
         }
         if (ver < 3) {
-            // 删除已废弃的自动隐藏延迟键（值传 NULL 即删除）
             WritePrivateProfileStringW(L"General", L"HideDelay", NULL, path);
             IniSetInt(L"General", L"ConfigVersion", 3);
         }
@@ -4714,7 +4682,7 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         SaveCloseSettings();   // 持久化“记住我的选择”
         break;
     case S_HIT_LAYOUT_DROP: {
-        // 画框选择：直接按点击的段应用（原来的「展开下拉 → 再点选项」两级已经作废）
+        // 画框选择：直接按点击的段应用
         SettingsMetrics lm = GetSettingsMetrics(hWnd);
         RECT lr = SettingsRowRect(lm, 0);
         const wchar_t* it[3]; int n = LayoutSegItems(it);

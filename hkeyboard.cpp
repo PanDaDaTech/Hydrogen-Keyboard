@@ -152,6 +152,7 @@ struct HkbTokens {
     DWORD metaDivider;       // 次强分隔线
     DWORD text;              // 主文字
     DWORD textMuted;         // 弱化文字
+    DWORD titleActive;       // 章节标题（title-active：比主色深一档、比正文淡）
 };
 
 // oklch(L, C, h) → sRGB，与 panda-core 的 Tokens::with_hue 结果一致
@@ -241,6 +242,9 @@ static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
     out->lineDivider     = OverlayBgr(out->pageBg, dark, 0.08);
     out->metaDivider     = OverlayBgr(out->pageBg, dark, 0.20);
     out->textMuted       = OverlayBgr(out->pageBg, dark, 0.60);   // t60：black/white @ 60%
+    // 章节标题（制作工具的 title-active，oklch 0.60/0.10）：比主色 0.70/0.14 深且淡一档。
+    // 18 DIP 的标题压在浅色页底上，直接用主色会偏「按钮字」；深一档才有标题的份量。
+    out->titleActive     = dark ? OklchToBgr(0.75, 0.100, h) : OklchToBgr(0.60, 0.100, h);
     // Enter / 确认键：浅色底压深字（5.7:1），深色底用黑 70% 混主色（5.4:1）
     out->primaryFg       = dark ? BlendColor(out->primary, RGB(0, 0, 0), 0.70) : out->text;
 }
@@ -372,6 +376,7 @@ static void RefreshThemeAndRepaint(HWND hWnd) {
 #define C_FLOAT        (g_theme->floatPanelBg)
 #define C_LINE_DIV     (g_theme->lineDivider)
 #define C_META         (g_theme->metaDivider)
+#define C_TITLE        (g_theme->titleActive)
 
 enum KeyType {
     K_NORMAL, K_LETTER, K_MOD, K_CAPS,
@@ -497,6 +502,7 @@ HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：
 HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
+static HFONT g_sfSec = 0;                                                          // 章节标题（关于页「社区交流 / 开源许可」）
 static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
 static HANDLE g_fontReg = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -1368,13 +1374,17 @@ static HFONT MakeFont(double size) {
         DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
-// 设置页五档：18 大标题 / 12.5 行主文本 / 11 控件标签 / 10 行描述 / 9 元信息。
+// 设置页六档：18 大标题 / 14 章节标题 / 12.5 行主文本 / 11 控件标签 / 10 行描述 / 9 元信息。
 // 单字重下层级完全由「字号 + 颜色」承担，相邻档至少差 1pt。
 // 基准对齐 Windows 设置页：本窗口只有 700 DIP 宽（系统设置约 1024），字号不能照抄它的绝对值，
 // 但也不该按 1024 的宽窗口取值 —— 这一档比首版整体下移一档，阶梯形状不变。
+// 14 这一档是为关于页的章节标题（「社区交流 / 开源许可」）加的：制作工具的同一处是
+// 18 DIP（页标题 26），比例 0.69；本窗口页标题 18，按同一比例落在 12.4 —— 但那与行主文本
+// 同号，层级就没了。取 14：站得住「比行标题大一档」，又实实在在小于页面标题的 18。
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
     g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
+    g_sfSec  = MakeFont(14 * dpi);     // 章节标题
     g_sfRow  = MakeFont(12.5 * dpi);   // 行主文本
     g_sfCtrl = MakeFont(11 * dpi);     // 控件标签：Tab / 开关「开·关」/ 分段 / 按钮 / 弹窗
     g_sfBase = MakeFont(10 * dpi);     // 行描述
@@ -3170,6 +3180,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_THEME_DROP     20
 #define S_HIT_URL            30
 #define S_HIT_FEEDBACK       31
+#define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
 #define S_HIT_CLOSE_DROP     70
 #define S_HIT_LANG_DROP      50
 #define S_HIT_HL_DROP        60
@@ -3845,44 +3856,109 @@ static const wchar_t* CloseActionName() {
     return T(g_closeToTray ? L"隐藏到系统托盘" : L"直接退出程序",
              g_closeToTray ? L"Hide to tray" : L"Exit program");
 }
-// 关于页链接行：行高 = 12*2 + max(tile 30, 圆形按钮 34, 两行文字 34)
-static int AboutLinkRowHeight(const SettingsMetrics& m) {
-    return m.rowPadY * 2 + (int)(34 * m.dpi);
+// ===== 关于页几何（与制作工具 PanDa PE 的 about 页同一套语法）=====
+// 卡片内边距 16 / 20、堆叠间距 16、章节标题「4×16 主色圆角条 + 标签」、
+// 行「标题 + 说明 + 右侧 34 DIP 圆钮」、许可行「标签 + MIT + 查看按钮」。
+// 下面全部是 DIP，实机再乘 dpi。
+static int AboutPadY(const SettingsMetrics& m) { return (int)(16 * m.dpi); }      // .card-pad 上下
+static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
+static int AboutGap(const SettingsMetrics& m) { return (int)(16 * m.dpi); }       // 卡与章节之间的间距
+static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高
+
+// 页内一行：上 12 + 内容 34 + 下 12；**最后一行只给下 2** —— 制作工具的 form_card 是
+// `.field{padding:12px 0}` 配 `:last-child{padding-bottom:2px}`。末行多出来的 10 DIP 会变成
+// 卡片底部的死白（一行字下面空 24 DIP，肉眼就是「卡片下半边空着」）。
+static int AboutRowH(const SettingsMetrics& m, BOOL last) {
+    return m.rowPadY + (int)(34 * m.dpi) + (last ? (int)(2 * m.dpi) : m.rowPadY);
 }
 
-static RECT AboutLinkRowRect(const SettingsMetrics& m, const RECT& card, int index) {
-    int h = AboutLinkRowHeight(m);
-    RECT r = {card.left, card.top + h * index, card.right, card.top + h * (index + 1)};
+static RECT AboutRowRect(const SettingsMetrics& m, const RECT& card, int index) {
+    int h0 = AboutRowH(m, FALSE);
+    int top = card.top + AboutPadY(m) + (index == 0 ? 0 : h0 + 1);   // 两行之间 1px 分隔线
+    int h = (index == 0) ? h0 : AboutRowH(m, TRUE);
+    RECT r = {card.left, top, card.right, top + h};
     return r;
 }
 
-// 关于 tab 的两张卡：绘制与命中必须取自同一份几何，避免两边各算一遍
+static int AboutCommunityCardH(const SettingsMetrics& m) {
+    return AboutPadY(m) * 2 + AboutRowH(m, FALSE) + 1 + AboutRowH(m, TRUE);
+}
+
+// 许可行：上 12 + 按钮 32 + 下 2；卡高 = 上下 16 + 行。
+static int AboutLicenceRowH(const SettingsMetrics& m) {
+    return m.rowPadY + (int)(32 * m.dpi) + (int)(2 * m.dpi);
+}
+static int AboutLicenceCardH(const SettingsMetrics& m) {
+    return AboutPadY(m) * 2 + AboutLicenceRowH(m);
+}
+
+static RECT AboutLicenceRowRect(const SettingsMetrics& m, const RECT& card) {
+    RECT r = {card.left, card.top + AboutPadY(m), card.right,
+              card.top + AboutPadY(m) + AboutLicenceRowH(m)};
+    return r;
+}
+
+// 「查看」按钮：高 32 / 圆角 8 / 左右内边距各 14（制作工具的 .btn-sm）。
+// 宽度按文字**推进宽**算（容纳宽度两侧各含约 0.2em 的绘制余量，当内边距用会凭空宽 10px），
+// 绘制与命中读同一份 —— 量宽用 GetDC(0)，与 SegmentedWidth 同法。
+static int AboutBtnW(const wchar_t* label, double dpi) {
+    HDC dc = GetDC(0);
+    int adv = MeasureTextAdvW(dc, label, g_sfCtrl);
+    if (adv <= 0) adv = MeasureTextW(dc, label, g_sfCtrl);   // GDI+ 未就绪时的回退
+    ReleaseDC(0, dc);
+    return adv + (int)(28 * dpi);
+}
+
+static RECT AboutLicenceBtnRect(const SettingsMetrics& m, int rowTop) {
+    int w = AboutBtnW(T(L"查看", L"View"), m.dpi);
+    int h = (int)(32 * m.dpi);
+    int x = m.contentX + m.contentW - AboutPadX(m) - w;
+    int y = rowTop + ((AboutLicenceRowH(m) - h) / 2);
+    RECT r = {x, y, x + w, y + h};
+    return r;
+}
+
+// 关于 tab 的卡与章节：绘制与命中必须取自同一份几何，避免两边各算一遍
 struct AboutLayout {
     RECT card1;   // 身份卡
-    RECT card2;   // 链接卡
+    RECT sec1;    // 「社区交流」章节标题行
+    RECT card2;   // 社区交流卡（两行链接）
+    RECT sec2;    // 「开源许可」章节标题行
+    RECT card3;   // 许可卡（一行）
     int  mark;    // 矢量键盘标识边长
 };
 
 static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     AboutLayout a = {};
-    a.mark = (int)(44 * m.dpi);
+    int padY = AboutPadY(m), gap = AboutGap(m), secH = AboutSectionH(m);
+    int y;
+
+    // 身份标识 56 DIP（= 制作工具的 ABOUT_TILE）：卡高 = 上下 16 + 标识 56 = 88，
+    // 标识正好落在内边距上；「标题 + 说明」的文字块（26 + 6 + 18 = 50）按卡纵心居中，
+    // 与标识同高同轴 —— 见 SettingsDraw 里为什么不能再拿行盒中心去对齐。
+    a.mark = (int)(56 * m.dpi);
     a.card1.left = m.contentX;
     a.card1.top = m.contentY;
     a.card1.right = m.contentX + m.contentW;
-    // 身份卡高度按「卡内墨迹上下留白相等」定，而不是按行盒对称：
-    //   行盒是 标题 26 + 间隙 6 + 描述 18 = 50，上下各留 16 会得到 82；但墨迹并不对称 ——
-    //   标题「HKeyboard 轻键」带降部、墨迹比行盒高约 1.4 DIP 且向上溢出，描述墨迹只占行盒
-    //   18 里的 ≈11 DIP。用 82 实测留白是「上 14.25 / 下 20.0」，肉眼能看出整体偏上。
-    //   78 → 卡高 136px，实测墨迹留白「上 26 / 下 25 px」（差 1px）；76 时是 26 / 22 px。
-    //   78 也容得下图标盒 mark 44（图标盒按卡纵心居中 → 盒顶 +17、盒底 +61 < 78）。
-    a.card1.bottom = a.card1.top + (int)(78 * m.dpi);
-    a.card2.left = m.contentX;
-    // 卡间距 12 → 16 DIP。原来的 12 比「卡内内容到卡边」的留白（链接行 tile 上下各
-    // rowPadY = 12、卡 1 文字上下各 14）还小，于是两张卡看起来是贴在一起的、分组感不清。
-    // 改后整页竖直节奏是 14（tab→卡1）/ 16（卡1→卡2）/ 18（卡2→版权），逐级放大。
-    a.card2.top = a.card1.bottom + (int)(16 * m.dpi);
-    a.card2.right = m.contentX + m.contentW;
-    a.card2.bottom = a.card2.top + AboutLinkRowHeight(m) * 2;
+    a.card1.bottom = a.card1.top + padY * 2 + a.mark;
+
+    // 卡片之间是「间距 16 → 章节 16 → 间距 16」的节奏（制作工具同款），
+    // 章节因此永远贴在自己那张卡的上方，而不是落在两张卡的正中。
+    y = a.card1.bottom + gap;
+    a.sec1.left = m.contentX; a.sec1.right = m.contentX + m.contentW;
+    a.sec1.top = y;           a.sec1.bottom = y + secH;
+
+    y += secH + gap;
+    a.card2.left = m.contentX; a.card2.right = m.contentX + m.contentW;
+    a.card2.top = y;           a.card2.bottom = y + AboutCommunityCardH(m);
+
+    y = a.card2.bottom + gap;
+    a.sec2.left = m.contentX; a.sec2.right = m.contentX + m.contentW;
+    a.sec2.top = y;           a.sec2.bottom = y + secH;
+
+    y += secH + gap;
+    a.card3.left = m.contentX; a.card3.right = m.contentX + m.contentW;
+    a.card3.top = y;           a.card3.bottom = y + AboutLicenceCardH(m);
     return a;
 }
 
@@ -3895,7 +3971,7 @@ static int SettingsDesiredHeight(HWND hWnd) {
     int bottom;
     if (g_sTab == 2) {
         AboutLayout al = GetAboutLayout(m);
-        bottom = al.card2.bottom + (int)(18 * m.dpi) * 2;   // 版权行（18 间距 + 18 行高）
+        bottom = al.card3.bottom + (int)(18 * m.dpi) * 2;   // 版权行（18 间距 + 18 行高）
     } else {
         bottom = SettingsCardRect(m).bottom;
     }
@@ -3920,31 +3996,66 @@ static void SettingsFitHeight(HWND hWnd) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-// 链接行：整行可点（触摸场景下命中区必须够大），右侧 34×34 圆形 External 按钮
+// 章节标题：4×16 主色圆角条 + 14 DIP 标题（制作工具 widgets::section 的同款语法：
+// 条 4×16 / 圆角 2 / 间距 10 / 文字取 title-active）。主色实心条是整页唯一一处「不描边」的
+// 强调块，分组由它说清楚，不再靠卡片之间空一行来表达。
+static void DrawAboutSection(HDC dc, const SettingsMetrics& m, const RECT& r, const wchar_t* label) {
+    int barW = (int)(4 * m.dpi), barH = (int)(16 * m.dpi);
+    int by = r.top + ((r.bottom - r.top) - barH) / 2;
+    DrawRoundRect(dc, r.left, by, barW, barH, C_HOT, C_HOT, (int)(2 * m.dpi));
+    int lx = r.left + barW + (int)(10 * m.dpi);
+    DrawTextL(dc, lx, r.top, r.right - lx, r.bottom - r.top, label, g_sfSec, C_TITLE);
+}
+
+// 链接行：左「标题 + 说明」，右一枚 34 DIP 主色淡底圆钮，圆钮里的图标 = 去哪里。
+//
+// ⚠ 这里刻意不再用「行首图标 tile + 通用外链箭头」那一套（那是旧样式，照的是制作工具改版前
+//   的关于页）：行首 tile 和右侧箭头说的是同一件事（「这是个链接」，说两遍），说明位又放网址，
+//   整行读下来是「地址 + 打开」—— 得先认字才知道点去哪儿。改版后的形态是
+//   「标题 + 一句说明 + 目的地自己的图标」：圆圈里的 GitHub 标一眼就够，说明句用来讲清用途。
+//   命中区仍是整行（触摸场景下按钮不能只有 34×34 DIP）。
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
     if (hover) DrawSettingsRowHover(dc, m, row);
-    int headH = SettingsRowHeadH(m, row);
-    int ty = row.top + (headH - m.tileSize) / 2;   // 与设置页行同一条居中规则
-    DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, NULL);
 
     int btn = (int)(34 * m.dpi);
-    int bx = row.right - (int)(20 * m.dpi) - btn;
-    int by = row.top + (headH - btn) / 2;          // 外链按钮同用头部基准，别跟整行跑
+    int bx = row.right - AboutPadX(m) - btn;
+    int by = row.top + ((row.bottom - row.top) - btn) / 2;   // 圆钮在行内居中
     DrawRoundRect(dc, bx, by, btn, btn, hover ? C_REGULAR_HOV : C_REGULAR,
                   hover ? C_REGULAR_HOV : C_REGULAR, btn / 2);
     int isz = (int)(17 * m.dpi);
     DrawHkIcon(dc, (float)(bx + (btn - isz) / 2), (float)(by + (btn - isz) / 2), (float)isz,
-               HkIcon(HKICON_EXTERNAL), C_BTN_CONTENT, C_BTN_CONTENT);
+               HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
 
-    int tx = SettingsRowTextX(m);
+    // 文字块（标题盒 17 + 说明盒 13 = 30，行距补到 33）与圆钮中心对中心 ——
+    // 两块取整后与圆钮直径同量级，于是「标题 + 说明」这个块和右边圆钮同一根轴、同高。
+    int tx = row.left + AboutPadX(m);
     int tw = bx - (int)(12 * m.dpi) - tx;
-    // 同 DrawSettingRowContent：文字块与 tile 中心对中心。
-    // 本行盒高 18 / 描述盒顶偏移 18 / 描述盒高 16 → 块中心 = 块顶 + 17.5dpi。
-    int tyText = ty + m.tileSize / 2 - (int)(17.5 * m.dpi);
-    DrawTextL(dc, tx, tyText, tw, (int)(18 * m.dpi), title, g_sfRow, C_WHITE);
+    int blockH = (int)(33 * m.dpi);
+    int tyText = row.top + ((row.bottom - row.top) - blockH) / 2;
+    DrawTextL(dc, tx, tyText, tw, (int)(17 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0])
-        DrawTextL(dc, tx, tyText + (int)(18 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
+        DrawTextL(dc, tx, tyText + (int)(20 * m.dpi), tw, (int)(13 * m.dpi), desc, g_sfBase, C_DIM);
+}
+
+// 许可行：「许可协议」标签列（110 DIP，与制作工具 widgets::field 的标签列同宽）+ 主色值
+// + 右侧 32 DIP「查看」按钮。标签与值分两列而不是连成一句：MIT 是**值**，颜色交回主色，
+// 扫一行就知道许可是什么；按钮才是动作。
+static void DrawAboutLicenceRow(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL hover) {
+    int labelW = (int)(110 * m.dpi);
+    int lx = row.left + AboutPadX(m);
+    RECT btn = AboutLicenceBtnRect(m, row.top);
+    int bw = btn.right - btn.left, bh = btn.bottom - btn.top;
+
+    DrawRoundRect(dc, btn.left, btn.top, bw, bh, hover ? C_REGULAR_HOV : C_REGULAR,
+                  hover ? C_REGULAR_HOV : C_REGULAR, (int)(8 * m.dpi));
+    DrawTextC(dc, btn.left, btn.top, bw, bh, T(L"查看", L"View"), g_sfCtrl, C_BTN_CONTENT);
+
+    DrawTextL(dc, lx, row.top, labelW, row.bottom - row.top,
+              T(L"许可协议", L"Licence"), g_sfRow, C_WHITE);
+    int vx = lx + labelW + (int)(18 * m.dpi);
+    DrawTextL(dc, vx, row.top, btn.left - (int)(12 * m.dpi) - vx, row.bottom - row.top,
+              L"MIT", g_sfCtrl, C_HOT);
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
@@ -4167,33 +4278,31 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                       showHint ? L"RRGGBB" : shown, g_sfBase, showHint ? C_DIM : C_WHITE);
         }
     } else {
-        // 关于 tab：两张卡（身份 / 链接），版权行在卡片下方居中
+        // 关于 tab：身份卡 → 「社区交流」→ 链接卡 → 「开源许可」→ 许可卡，版权行在最下方居中。
+        // 语法整体照制作工具（PanDa PE）改版后的关于页：章节标题带主色条、行是「标题 + 说明
+        // + 目的地图标圆钮」、许可是独立一行；卡片内边距 16/20、堆叠间距 16，见 GetAboutLayout。
         AboutLayout al = GetAboutLayout(m);
         DrawRoundRect(dc, al.card1.left, al.card1.top,
                       al.card1.right - al.card1.left, al.card1.bottom - al.card1.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
-        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图、不加 tile。
+        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图。
         //
         // 纵向**居中于卡片本身**，而不是居中于「标题 + 描述」的行盒：
-        //   card1 的高度（78 DIP）本来就是按「卡内墨迹上下留白相等」定的（见 GetAboutLayout），
-        //   所以卡纵心 ≈ 文字墨迹的视觉纵心 —— 实机实测卡纵心 +38.6 DIP、文字墨迹纵心 +39.1 DIP。
-        //   图标按卡纵心居中，就同时满足「图标居中于卡片」与「图标与文字同高」。
+        //   卡高 88 = 上下内边距 16 + 标识 56，标识盒正好落在内边距上；
+        //   文字块（标题盒 26 + 间隙 6 + 描述盒 18 = 50）也按卡纵心居中，两者同轴。
         //
-        //   ⚠ 不要再拿行盒中心去对齐。行盒是 +16..+66、中心 +41 DIP，但标题墨迹向上溢出行盒
-        //     （带降部）、描述墨迹只占 18 DIP 行盒里的 13 DIP，墨迹中心其实在 +39。照行盒中心
-        //     对齐会写成 +20（= 41 − 22 + 1 的对齐量），实测图标比文字墨迹低 2.9 DIP（5px）：
-        //     图标上留白 50px、下留白 38px，肉眼就是「图标陷在卡片下半边、上下间距不匀」。
-        //   更早的 +16 是另一个极端（图标偏高 7.9 DIP）。现在直接由卡高算，改字号或改卡高都自洽。
+        //   ⚠ 不要拿行盒中心去对齐。行盒中心比文字**墨迹**中心高约 2 DIP（标题带降部、
+        //     墨迹向上溢出，描述墨迹只占 18 DIP 行盒里的 13 DIP），照行盒中心摆图标会低 3 DIP：
+        //     实测图标上留白 50px、下留白 38px，肉眼就是「图标陷在卡片下半边」。
+        //   直接由卡高算，改字号或改卡高都自洽。
         int my = al.card1.top + ((al.card1.bottom - al.card1.top) - al.mark) / 2;
-        DrawHkIcon(dc, (float)(al.card1.left + (int)(20 * m.dpi)), (float)my, (float)al.mark,
+        DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
-        int tx = al.card1.left + (int)(20 * m.dpi) + al.mark + (int)(18 * m.dpi);
-        // 标题盒顶 +16，描述盒顶 = 标题盒顶 + 32（= 标题盒 26 + 间隙 6）。
-        // 改动前是 +22 / +28：两行墨迹只隔 5.71 DIP，标题和描述糊在一起。
-        int ty = al.card1.top + (int)(16 * m.dpi);
-        int tw = al.card1.right - tx - (int)(20 * m.dpi);
+        int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(50 * m.dpi)) / 2;
+        int tw = al.card1.right - AboutPadX(m) - tx;
         DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfBig, C_WHITE);
         wchar_t meta[96];
@@ -4202,22 +4311,31 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
         DrawTextL(dc, tx, ty + (int)(32 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
+        DrawAboutSection(dc, m, al.sec1, T(L"社区交流", L"Community"));
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
-        Fill(dc, al.card2.left + (int)(20 * m.dpi), al.card2.top + AboutLinkRowHeight(m),
-             (al.card2.right - al.card2.left) - (int)(40 * m.dpi), 1, C_LINE_DIV);
-        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, al.card2, 0), HKICON_GITHUB,
+        // 两行之间的 1px 分隔线：左右两端内缩到卡片内边距上（与制作工具的 form_card 一致）
+        Fill(dc, al.card2.left + AboutPadX(m), AboutRowRect(m, al.card2, 1).top - 1,
+             (al.card2.right - al.card2.left) - AboutPadX(m) * 2, 1, C_LINE_DIV);
+        // 说明句代替网址：图标已经说明「去哪儿」，说明句用来讲清「去那儿干什么」。
+        DrawAboutLinkRow(dc, m, AboutRowRect(m, al.card2, 0), HKICON_GITHUB,
                          T(L"项目地址", L"Project URL"),
-                         L"github.com/PanDaDaTech/Hydrogen-Keyboard",
+                         T(L"源码、版本发布与使用说明", L"Source, releases and documentation"),
                          g_sHov == S_HIT_URL);
-        DrawAboutLinkRow(dc, m, AboutLinkRowRect(m, al.card2, 1), HKICON_INFO,
+        DrawAboutLinkRow(dc, m, AboutRowRect(m, al.card2, 1), HKICON_GITHUB,
                          T(L"问题反馈", L"Feedback"),
-                         T(L"遇到 bug 或有建议，到 Issues 提一个", L"Report bugs or ideas on GitHub Issues"),
+                         T(L"遇到 bug 或有建议，到 GitHub 提一个 issue", L"Report bugs or ideas on GitHub Issues"),
                          g_sHov == S_HIT_FEEDBACK);
 
-        // 版权行：文字逐字保留（含 2026 与结尾句点），12px C_DIM 居中，放在卡片下方
-        DrawTextC(dc, m.contentX, al.card2.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
+        DrawAboutSection(dc, m, al.sec2, T(L"开源许可", L"Licence"));
+        DrawRoundRect(dc, al.card3.left, al.card3.top,
+                      al.card3.right - al.card3.left, al.card3.bottom - al.card3.top,
+                      C_KEY, C_KEY, (int)(16 * m.dpi));
+        DrawAboutLicenceRow(dc, m, AboutLicenceRowRect(m, al.card3), g_sHov == S_HIT_LICENSE);
+
+        // 版权行：文字逐字保留（含 2026 与结尾句点），9px C_DIM 居中，放在最后一张卡下方
+        DrawTextC(dc, m.contentX, al.card3.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sfMeta, C_DIM);
     }
 }
@@ -4322,12 +4440,15 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
                 return S_HIT_HL_HUE;
         }
     } else {
-        // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）
+        // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）；
+        // 许可行的热区只有「查看」按钮本身 —— 行内的「许可协议 / MIT」是读数，不是动作
         AboutLayout al = GetAboutLayout(m);
-        RECT r0 = AboutLinkRowRect(m, al.card2, 0);
+        RECT r0 = AboutRowRect(m, al.card2, 0);
         if (x >= r0.left && x < r0.right && y >= r0.top && y < r0.bottom) return S_HIT_URL;
-        RECT r1 = AboutLinkRowRect(m, al.card2, 1);
+        RECT r1 = AboutRowRect(m, al.card2, 1);
         if (x >= r1.left && x < r1.right && y >= r1.top && y < r1.bottom) return S_HIT_FEEDBACK;
+        RECT rb = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3).top);
+        if (x >= rb.left && x < rb.right && y >= rb.top && y < rb.bottom) return S_HIT_LICENSE;
     }
     return S_HIT_NONE;
 }
@@ -4718,6 +4839,9 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
     case S_HIT_FEEDBACK:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/issues", NULL, NULL, SW_SHOWNORMAL);
         break;
+    case S_HIT_LICENSE:
+        ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/blob/main/LICENSE", NULL, NULL, SW_SHOWNORMAL);
+        break;
     default: return;
     }
     if (themeChanged) {
@@ -4892,7 +5016,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ScreenToClient(hWnd, &pt);
         if (g_sTab == 2) {
             int hv = SettingsHitTest(hWnd, pt.x, pt.y);
-            if (hv == S_HIT_URL || hv == S_HIT_FEEDBACK) {
+            if (hv == S_HIT_URL || hv == S_HIT_FEEDBACK || hv == S_HIT_LICENSE) {
                 SetCursor(LoadCursor(NULL, IDC_HAND));
                 return TRUE;
             }

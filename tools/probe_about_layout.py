@@ -43,7 +43,9 @@ LIC_BTN = licBtn_src                  # 许可行的按钮高 32
 # 行高：上 12 + 内容 36 + 下 12；末行只给下 2（制作工具 form_card 的 :last-child）
 row_h = ROWPAD + ROW_CONTENT + ROWPAD
 row_h_last = ROWPAD + ROW_CONTENT + 2
-links_card_h = PADY * 2 + row_h_last                      # AboutLinksCardH
+# 链接卡用哪一档行高由源码决定（单行卡片必须与 AboutRowRect 的第 0 行一致，否则高亮块上下不齐）
+links_flavor = re.search(r"AboutLinksCardH.*?AboutRowH\(m, (FALSE|TRUE)\)", src, re.S).group(1)
+links_card_h = PADY * 2 + (row_h if links_flavor == "FALSE" else row_h_last)   # AboutLinksCardH
 lic_row_h = ROWPAD + LIC_BTN + 2                          # AboutLicenceRowH
 lic_card_h = PADY * 2 + lic_row_h                         # AboutLicenceCardH
 
@@ -91,6 +93,14 @@ print()
 print("★ 你框的那两段空隙")
 show("身份卡 -> 链接卡（项目地址）", card2_top - (card1_top + card1_h))
 show("链接卡 -> 许可卡", card3_top - (card2_top + card2_h))
+print()
+print("★ 高亮块（行背景）在卡里是否上下对称 —— 「高亮对不整齐」看的就是这个")
+show("链接卡：高亮块上边距", PADY)
+show("链接卡：高亮块下边距", card2_h - PADY - row_h)
+show("许可卡：高亮块上边距", PADY)
+show("许可卡：高亮块下边距", card3_h - PADY - lic_row_h)
+if abs((card2_h - PADY - row_h) - PADY) > 1e-9:
+    print("  !! 链接卡高亮块上下不对称")
 print()
 print("  注意：卡内那一圈紫色是行背景（SettingsRowHover），它的上缘距卡顶 = padY = %.0f DIP，" % PADY)
 print("        所以「项目地址文字上方」的视觉空隙 = 卡间距 %.0f + padY %.0f = %.0f DIP。"

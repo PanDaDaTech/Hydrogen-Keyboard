@@ -3905,10 +3905,12 @@ static RECT AboutRowRect(const SettingsMetrics& m, const RECT& card, int index) 
     return r;
 }
 
-// 链接卡现在只有「项目地址」一行（「问题反馈」已按实机反馈去掉）；末行只给下 2 DIP，
-// 与 AboutRowH 的 last 规则一致
+// 链接卡现在只有「项目地址」一行，而 AboutRowRect 的第 0 行用的是**非末行**高度
+// （12 + 36 + 12，上下对称）。卡片高度必须跟它一致 —— 原来是 padY*2 + 末行高（12 + 36 + 2，
+// 底部只给 2 是制作工具 form_card 的 :last-child 规则），于是高亮块上边距 10、下边距 0，
+// 贴着卡片底边，「高亮不出对齐」。单行卡片按非末行算，上下各 10 DIP。
 static int AboutLinksCardH(const SettingsMetrics& m) {
-    return AboutPadY(m) * 2 + AboutRowH(m, TRUE);
+    return AboutPadY(m) * 2 + AboutRowH(m, FALSE);
 }
 
 // 许可行：上 12 + 按钮 32 + 下 2；卡高 = 上下 16 + 行。

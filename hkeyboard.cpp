@@ -3865,11 +3865,14 @@ static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }    
 static int AboutGap(const SettingsMetrics& m) { return (int)(16 * m.dpi); }       // 卡与章节之间的间距
 static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高
 
-// 页内一行：上 12 + 内容 34 + 下 12；**最后一行只给下 2** —— 制作工具的 form_card 是
+// 页内一行：上 12 + 内容 36 + 下 12；**最后一行只给下 2** —— 制作工具的 form_card 是
 // `.field{padding:12px 0}` 配 `:last-child{padding-bottom:2px}`。末行多出来的 10 DIP 会变成
 // 卡片底部的死白（一行字下面空 24 DIP，肉眼就是「卡片下半边空着」）。
+// 内容 36 = 标题盒 15 + 说明盒顶偏移 23 + 说明盒 13：偏移取 23 而不是 20，
+// 是因为本窗口的行标题（g_sfCtrl = 11pt ≈ 14.7 DIP）墨迹比制作工具的 14px 略高，
+// 偏移 20 时两行墨迹只隔 4.6 DIP（制作工具 8.6），肉眼就是「标题和说明糊在一起」。
 static int AboutRowH(const SettingsMetrics& m, BOOL last) {
-    return m.rowPadY + (int)(34 * m.dpi) + (last ? (int)(2 * m.dpi) : m.rowPadY);
+    return m.rowPadY + (int)(36 * m.dpi) + (last ? (int)(2 * m.dpi) : m.rowPadY);
 }
 
 static RECT AboutRowRect(const SettingsMetrics& m, const RECT& card, int index) {
@@ -4027,15 +4030,17 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
     DrawHkIcon(dc, (float)(bx + (btn - isz) / 2), (float)(by + (btn - isz) / 2), (float)isz,
                HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
 
-    // 文字块（标题盒 17 + 说明盒 13 = 30，行距补到 33）与圆钮中心对中心 ——
-    // 两块取整后与圆钮直径同量级，于是「标题 + 说明」这个块和右边圆钮同一根轴、同高。
+    // 文字块（标题盒 15 + 说明盒 13，顶偏移 23 → 块高 36）与圆钮中心对中心。
+    // 标题用 g_sfCtrl（11pt ≈ 14.7 DIP）而不是 g_sfRow：制作工具的行标题是 14px，
+    // 而章节标题是 18 —— 层级比 1.29。本窗口 g_sfRow 实际是 16.7 DIP，与章节的 18.7
+    // 只差 1.12 倍，行标题会顶到章节标题上，读起来像同级。
     int tx = row.left + AboutPadX(m);
     int tw = bx - (int)(12 * m.dpi) - tx;
-    int blockH = (int)(33 * m.dpi);
+    int blockH = (int)(36 * m.dpi);
     int tyText = row.top + ((row.bottom - row.top) - blockH) / 2;
-    DrawTextL(dc, tx, tyText, tw, (int)(17 * m.dpi), title, g_sfRow, C_WHITE);
+    DrawTextL(dc, tx, tyText, tw, (int)(15 * m.dpi), title, g_sfCtrl, C_WHITE);
     if (desc && desc[0])
-        DrawTextL(dc, tx, tyText + (int)(20 * m.dpi), tw, (int)(13 * m.dpi), desc, g_sfBase, C_DIM);
+        DrawTextL(dc, tx, tyText + (int)(23 * m.dpi), tw, (int)(13 * m.dpi), desc, g_sfBase, C_DIM);
 }
 
 // 许可行：「许可协议」标签列（110 DIP，与制作工具 widgets::field 的标签列同宽）+ 主色值
@@ -4052,7 +4057,7 @@ static void DrawAboutLicenceRow(HDC dc, const SettingsMetrics& m, const RECT& ro
     DrawTextC(dc, btn.left, btn.top, bw, bh, T(L"查看", L"View"), g_sfCtrl, C_BTN_CONTENT);
 
     DrawTextL(dc, lx, row.top, labelW, row.bottom - row.top,
-              T(L"许可协议", L"Licence"), g_sfRow, C_WHITE);
+              T(L"许可协议", L"Licence"), g_sfCtrl, C_WHITE);
     int vx = lx + labelW + (int)(18 * m.dpi);
     DrawTextL(dc, vx, row.top, btn.left - (int)(12 * m.dpi) - vx, row.bottom - row.top,
               L"MIT", g_sfCtrl, C_HOT);
@@ -4300,16 +4305,19 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
+        // 产品名用 g_sfSec（14pt ≈ 18.7 DIP）而不是页面标题那一档：
+        // 制作工具的关于页是 名称 20 / 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），
+        // 卡里的名字会和页面大标题打架。文字块 = 名 22 + 间隙 6 + 版本 18 = 46，按卡纵心居中。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(50 * m.dpi)) / 2;
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(46 * m.dpi)) / 2;
         int tw = al.card1.right - AboutPadX(m) - tx;
-        DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
-                  T(L"HKeyboard 轻键", L"HKeyboard"), g_sfBig, C_WHITE);
+        DrawTextL(dc, tx, ty, tw, (int)(22 * m.dpi),
+                  T(L"HKeyboard 轻键", L"HKeyboard"), g_sfSec, C_WHITE);
         wchar_t meta[96];
         // 版本串 = 内部版本号 + 构建日期（北京时间），例如 "v2.0_20261002"
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs_%ls (%ls)", L"Lightweight screen keyboard · v%hs_%ls (%ls)"),
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
-        DrawTextL(dc, tx, ty + (int)(32 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawAboutSection(dc, m, al.sec1, T(L"社区交流", L"Community"));
         DrawRoundRect(dc, al.card2.left, al.card2.top,

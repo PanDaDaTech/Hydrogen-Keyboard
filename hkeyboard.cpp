@@ -3240,13 +3240,9 @@ static LONGLONG g_switchAnimStart = 0;
 static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
-static void DrawRadio(HDC dc, int x, int cy, int r, BOOL on, DWORD bg) {
-    // GDI+ 抗锯齿圆环：外圈 + 内圈挖空 + 选中实心点
-    DrawCircleAA(dc, x, cy, r, C_DIM);
-    DrawCircleAA(dc, x, cy, r - 2, bg);
-    if (on) DrawCircleAA(dc, x, cy, r - 4, C_HOT);
-}
-
+// 关闭对话框的单选圆点已改为「勾选方块 + 整行底色」语法（见 PromptDraw），
+// 原来的 DrawRadio（圆环 + 挖空 + 实心点）随之无调用点，删除。
+//
 // 开关按钮（on=开启；通常右侧对齐显示）
 static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
     DrawRoundRect(dc, x, y, w, h, on ? C_HOT : C_DARK, C_KEY_BORDER, h / 2);
@@ -5192,71 +5188,185 @@ static void ClosePromptAnimated(HWND hWnd) {
     StartWindowFade(hWnd, g_promptFade, TRUE);
 }
 
+// 关闭方式提示窗口的几何 —— **绘制与命中必须读同一份**（PromptDraw / PromptHitTest）。
+//
+// 原来两边各算一遍，尺寸改一处就漏一处（老坑：按钮画在右边、热区还在左边）。
+// 全部 DIP，乘 dpi 后给像素。
+struct PromptLayout {
+    int pad;        // 左右内边距（也等于上下留白）
+    int closeW, closeH, closeX, closeY;   // 右上关闭钮
+    int iconTile;   // 标题图标块边长
+    int subY;       // 副标题盒顶
+    int subH;       // 副标题行高
+    int rowH;       // 选项行高（= 触摸命中区高度）
+    int rowGap;     // 两个选项行之间的间隙
+    int optY;       // 选项 1 盒顶
+    int optX0;      // 选项行左缘
+    int optX1;      // 选项行右缘
+    int markX;      // 勾选方块中心
+    int textX;      // 选项文字左缘
+    int remY;       // 「记住我的选择」盒顶
+    int swW, swH, swX;
+    int lineY;      // 按钮区分隔线
+    int btnW, btnH, okX, cancelX, btnY;
+};
+
+// 纵向推进链（单位 DIP；窗口高 287 = 上下各 20 + 内容 267）：
+//   20 标题图标块(26) → 46 +4 → 50 副标题(20) → 70 +10 → 80 选项1(38)
+//   → 118 +6 → 124 选项2(38) → 162 +14 → 176 记住(38) → 214 +10
+//   → 224 分隔线(1) → 225 +12 → 237 按钮(30) → 267 +20 底留白 = 287
+// ⚠ 改任何一个间距都要重算这条链，并同步 OpenClosePrompt 里的窗口高（287）。
+static PromptLayout PromptComputeLayout(int W, double dpi) {
+    PromptLayout L;
+    L.pad      = (int)(20 * dpi);
+    L.iconTile = (int)(26 * dpi);
+
+    L.closeW = (int)(26 * dpi);
+    L.closeH = (int)(24 * dpi);
+    L.closeX = W - L.pad - L.closeW;
+    L.closeY = L.pad;
+
+    L.subY = L.pad + L.iconTile + (int)(4 * dpi);
+    L.subH = (int)(20 * dpi);
+
+    L.rowH   = (int)(38 * dpi);   // ← 关键：24 → 38。触摸目标从 24 DIP 抬到 38 DIP
+    L.rowGap = (int)(6 * dpi);
+    L.optY   = L.subY + L.subH + (int)(10 * dpi);
+    L.optX0  = L.pad;
+    L.optX1  = W - L.pad;
+    L.markX  = L.optX0 + (int)(18 * dpi);
+    L.textX  = L.optX0 + (int)(32 * dpi);
+
+    L.remY = L.optY + L.rowH * 2 + L.rowGap + (int)(14 * dpi);
+    L.swW = (int)(38 * dpi);
+    L.swH = (int)(20 * dpi);
+    L.swX = W - L.pad - L.swW;
+
+    L.lineY = L.remY + L.rowH + (int)(10 * dpi);
+    L.btnW  = (int)(84 * dpi);
+    L.btnH  = (int)(30 * dpi);
+    L.btnY  = L.lineY + 1 + (int)(12 * dpi);
+    L.cancelX = W - L.pad - L.btnW;
+    L.okX     = L.cancelX - (int)(10 * dpi) - L.btnW;
+    return L;
+}
+
 static void PromptDraw(HDC dc, HWND hWnd) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right, H = rc.bottom;
     double dpi = GetSystemDpiScale();
-    int hdr = (int)(36 * dpi);
-    (void)hWnd;
-    // 标题区不再铺独立底色，与窗口背景/材质一体化
-    DrawTextL(dc, 14, 0, W - 90, hdr, T(L"关闭轻键", L"Close HKeyboard"), g_sfCtrl, C_WHITE);
-    int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
-    int bx = W - bw - 8, by = (hdr - bh) / 2;
-    // 与设置页 / 主键盘标题栏一致：平时不铺底，悬停才给一层 btn_regular_bg_hover
+    (void)H;
+    PromptLayout L = PromptComputeLayout(W, dpi);
+
+    // 窗口底：floatPanelBg（纯白），与 pageBg 拉开层级 —— 浮层感靠明度差，
+    // 不用描边也不用阴影（与设置页卡片同一套语法）。
+    DrawRoundRect(dc, 0, 0, W, H, C_FLOAT, C_FLOAT, (int)(14 * dpi));
+
+    // 标题：图标块 + 文字（与设置页页头同一套配方）
+    DrawRoundRect(dc, L.pad, L.pad, L.iconTile, L.iconTile, C_REGULAR, C_REGULAR, (int)(7 * dpi));
+    {
+        int isz = (int)(12 * dpi);
+        DrawHkIcon(dc, (float)(L.pad + (L.iconTile - isz) / 2),
+                   (float)(L.pad + (L.iconTile - isz) / 2), (float)isz,
+                   HkIcon(HKICON_CLOSE), C_BTN_CONTENT, C_BTN_CONTENT);
+    }
+    DrawTextL(dc, L.pad + L.iconTile + (int)(9 * dpi), L.pad,
+              W - L.closeX + (int)(10 * dpi), L.iconTile,
+              T(L"关闭轻键", L"Close HKeyboard"), g_sfCtrl, C_WHITE);
+
+    // 右上关闭钮：平时不铺底，悬停才给一层 btn_regular_bg_hover（与设置页一致）
     if (g_pHov == P_HIT_CLOSE) {
-        DrawRoundRect(dc, bx, by, bw, bh, C_REGULAR_HOV, C_REGULAR_HOV, (int)(6 * dpi));
+        DrawRoundRect(dc, L.closeX, L.closeY, L.closeW, L.closeH,
+                      C_REGULAR_HOV, C_REGULAR_HOV, (int)(6 * dpi));
     }
     {
-        int sz = (int)(18 * dpi);
-        DrawHkIcon(dc, (float)(bx + (bw - sz) / 2), (float)(by + (bh - sz) / 2), (float)sz,
+        int sz = (int)(14 * dpi);
+        DrawHkIcon(dc, (float)(L.closeX + (L.closeW - sz) / 2),
+                   (float)(L.closeY + (L.closeH - sz) / 2), (float)sz,
                    HkIcon(HKICON_CLOSE), C_DIM, C_DIM);
     }
 
-    int x0 = 20, y = hdr + 12, cw = W - 40;
-    int rowH = (int)(24 * dpi);
-    DrawTextL(dc, x0, y, cw, (int)(20 * dpi), T(L"请选择关闭方式：", L"Choose how to close:"), g_sfBase, C_DIM); y += (int)(22 * dpi);
-    DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 0, C_BG);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"直接退出程序", L"Exit program directly"), g_sfCtrl, C_WHITE);
-    y += rowH;
-    DrawRadio(dc, x0 + (int)(8 * dpi), y + rowH / 2, (int)(7 * dpi), g_pChoice == 1, C_BG);
-    DrawTextL(dc, x0 + (int)(26 * dpi), y, cw - (int)(26 * dpi), rowH, T(L"隐藏到系统托盘", L"Hide to system tray"), g_sfCtrl, C_WHITE);
-    y += rowH + (int)(4 * dpi);
-    int swW = (int)(40 * dpi), swH = (int)(20 * dpi);
-    int swX = x0 + cw - swW;
-    DrawSwitch(dc, swX, y + (rowH - swH) / 2, swW, swH, g_pRemember);
-    DrawTextL(dc, x0, y, (swX - 12) - x0, rowH, T(L"记住我的选择", L"Remember my choice"), g_sfCtrl, C_WHITE);
-    y += rowH + (int)(8 * dpi);
-    int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
-    int bxCancel = W - 20 - bw2;                    // 按钮右对齐
-    int bxOk = bxCancel - (int)(12 * dpi) - bw2;
-    DrawRoundRect(dc, bxOk, y, bw2, bh2, (g_pHov == P_HIT_OK) ? C_HOVER : C_HOT, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxOk, y, bw2, bh2, T(L"确定", L"OK"), g_sfCtrl, C_ON_PRIMARY);
-    DrawRoundRect(dc, bxCancel, y, bw2, bh2, (g_pHov == P_HIT_CANCEL) ? C_HOVER : C_KEY, C_KEY_BORDER, 6);
-    DrawTextC(dc, bxCancel, y, bw2, bh2, T(L"取消", L"Cancel"), g_sfCtrl, C_WHITE);
+    // 副标题：原来是「请选择关闭方式：」，两个选项自解释，说明是冗余 ——
+    // 换成更短的「选择关闭方式」，用 btnContent 色（比 textMuted 醒目一档）。
+    DrawTextL(dc, L.pad, L.subY, W - L.pad * 2, L.subH,
+              T(L"选择关闭方式", L"How to close"), g_sfBase, C_BTN_CONTENT);
+
+    // 两个选项行：整行可点，命中区就是 rowH（38 DIP）
+    int oy = L.optY;
+    for (int i = 0; i < 2; i++) {
+        BOOL sel = (g_pChoice == i);
+        int boxY = oy, boxH = L.rowH;
+        if (sel) {
+            // 选中：整行铺 btnRegularBg（淡紫），不画描边 —— 与设置页分段选中态同一语法
+            DrawRoundRect(dc, L.optX0, boxY, L.optX1 - L.optX0, boxH,
+                          C_REGULAR, C_REGULAR, (int)(8 * dpi));
+            // 勾选方块：primary 圆角方块 + 对勾（on_primary 色）
+            // 对勾画法与设置页色板选中标记完全一致（CreatePen + 折线）。
+            int ms = (int)(8 * dpi);
+            int my = boxY + boxH / 2;
+            DrawRoundRect(dc, L.markX - ms, my - ms, ms * 2, ms * 2, C_HOT, C_HOT, (int)(3 * dpi));
+            HPEN pen = CreatePen(PS_SOLID, 2, C_ON_PRIMARY);
+            HPEN old = (HPEN)SelectObject(dc, pen);
+            MoveToEx(dc, L.markX - (int)(5 * dpi), my, NULL);
+            LineTo(dc, L.markX - (int)(1 * dpi), my + (int)(4 * dpi));
+            LineTo(dc, L.markX + (int)(6 * dpi), my - (int)(5 * dpi));
+            SelectObject(dc, old); DeleteObject(pen);
+        } else {
+            // 未选中：cardBg（白）+ keyOutline 描边
+            DrawRoundRect(dc, L.optX0, boxY, L.optX1 - L.optX0, boxH,
+                          C_KEY, C_KEY_BORDER, (int)(8 * dpi));
+            int ms = (int)(4 * dpi);
+            DrawRoundRect(dc, L.markX - ms, boxY + (boxH - ms * 2) / 2,
+                          ms * 2, ms * 2, C_DARK, C_DARK, (int)(2 * dpi));
+        }
+        DrawTextL(dc, L.textX, boxY, L.optX1 - L.textX - (int)(10 * dpi), boxH,
+                  i == 0 ? T(L"直接退出程序", L"Exit program directly")
+                         : T(L"隐藏到系统托盘", L"Hide to system tray"),
+                  g_sfCtrl, C_WHITE);
+        oy += L.rowH + L.rowGap;
+    }
+
+    // 记住我的选择
+    DrawSwitch(dc, L.swX, L.remY + (L.rowH - L.swH) / 2, L.swW, L.swH, g_pRemember);
+    DrawTextL(dc, L.pad, L.remY, L.swX - (int)(12 * dpi) - L.pad, L.rowH,
+              T(L"记住我的选择", L"Remember my choice"), g_sfCtrl, C_WHITE);
+
+    // 按钮区分隔线：把「操作区」与「内容区」分开
+    Fill(dc, L.pad, L.lineY, W - L.pad * 2, 1, C_LINE_DIV);
+
+    DrawRoundRect(dc, L.okX, L.btnY, L.btnW, L.btnH,
+                  (g_pHov == P_HIT_OK) ? C_REGULAR_ACT : C_HOT, C_KEY_BORDER, (int)(6 * dpi));
+    DrawTextC(dc, L.okX, L.btnY, L.btnW, L.btnH, T(L"确定", L"OK"), g_sfCtrl, C_ON_PRIMARY);
+    // 「取消」改 btnRegularBg：白底描边会与主按钮同权重，主次拉不开
+    DrawRoundRect(dc, L.cancelX, L.btnY, L.btnW, L.btnH,
+                  (g_pHov == P_HIT_CANCEL) ? C_REGULAR_HOV : C_REGULAR, C_KEY_BORDER, (int)(6 * dpi));
+    DrawTextC(dc, L.cancelX, L.btnY, L.btnW, L.btnH, T(L"取消", L"Cancel"), g_sfCtrl, C_BTN_CONTENT);
 }
 
 static int PromptHitTest(HWND hWnd, int x, int y) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right;
     double dpi = GetSystemDpiScale();
-    int hdr = (int)(36 * dpi);
-    int bw = (int)(26 * dpi), bh = hdr - (int)(12 * dpi);
-    int bx = W - bw - 8, by = (hdr - bh) / 2;
-    if (x >= bx && x < bx + bw && y >= by && y < by + bh) return P_HIT_CLOSE;
-    int x0 = 20, yy = hdr + 12, cw = W - 40;
-    int rowH = (int)(24 * dpi);
-    yy += (int)(22 * dpi);
-    if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_DIRECT;
-    yy += rowH;
-    if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_TRAY;
-    yy += rowH + (int)(4 * dpi);
-    if (x >= x0 && x < x0 + cw && y >= yy && y < yy + rowH) return P_HIT_REMEMBER;
-    yy += rowH + (int)(8 * dpi);
-    int bw2 = (int)(84 * dpi), bh2 = (int)(28 * dpi);
-    int bxCancel = W - 20 - bw2;                    // 与绘制一致（右对齐）
-    int bxOk = bxCancel - (int)(12 * dpi) - bw2;
-    if (x >= bxOk && x < bxOk + bw2 && y >= yy && y < yy + bh2) return P_HIT_OK;
-    if (x >= bxCancel && x < bxCancel + bw2 && y >= yy && y < yy + bh2) return P_HIT_CANCEL;
+    // ⚠ 与 PromptDraw 读**同一个** PromptComputeLayout —— 原来两边各算一遍，
+    // 改尺寸必然漏一处（老坑：按钮画在右边、热区还在左边）。
+    PromptLayout L = PromptComputeLayout(W, dpi);
+
+    if (x >= L.closeX && x < L.closeX + L.closeW &&
+        y >= L.closeY && y < L.closeY + L.closeH) return P_HIT_CLOSE;
+
+    // 两个选项行：整行宽都是热区，高度 = rowH（38 DIP，触摸友好）
+    int oy = L.optY;
+    for (int i = 0; i < 2; i++) {
+        if (x >= L.optX0 && x < L.optX1 && y >= oy && y < oy + L.rowH)
+            return i == 0 ? P_HIT_DIRECT : P_HIT_TRAY;
+        oy += L.rowH + L.rowGap;
+    }
+
+    if (x >= L.pad && x < W - L.pad && y >= L.remY && y < L.remY + L.rowH)
+        return P_HIT_REMEMBER;
+
+    if (x >= L.okX && x < L.okX + L.btnW && y >= L.btnY && y < L.btnY + L.btnH) return P_HIT_OK;
+    if (x >= L.cancelX && x < L.cancelX + L.btnW && y >= L.btnY && y < L.btnY + L.btnH) return P_HIT_CANCEL;
     return P_HIT_NONE;
 }
 
@@ -5381,7 +5491,11 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    int w = (int)(300 * dpi), h = (int)(190 * dpi);
+    // 340x287：与 PromptComputeLayout 的推进链对齐 ——
+    // 20 + 26(标题块) + 4 + 20(副标题) + 10 + 38+6+38(两选项) + 14 + 38(记住)
+    // + 10 + 1(分隔线) + 12 + 30(按钮) + 20 = 287。上下留白各 20 DIP。
+    // ⚠ 改这个数必须同步 PromptComputeLayout 里的推进链。
+    int w = (int)(340 * dpi), h = (int)(287 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;

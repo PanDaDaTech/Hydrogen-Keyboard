@@ -487,7 +487,7 @@ BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动�
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
-int         g_keyIconStyle = 2;        // 按键图标样式：0=文字 2=图标+文字（默认，ini Keyboard/KeyIconStyle）
+int         g_keyIconStyle = 2;        // 键面始终「图标+文字」；「仅文字」模式已按实机反馈下线
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
 static int  g_hdrHov = -1;            // 标题栏按钮悬停（HDR_*，-1=无）
@@ -2046,7 +2046,6 @@ static void DrawKeyGlyph(HDC dc, int x, int y, int size, const KeyDef* k, DWORD 
 // 旧实现里没有第 1 档的降字号：放不下就直接退回纯文字，于是参考图上
 // 「⌫ Backspace / ⇥ Tab / ⇪ Caps」这类「图形 + 名字」的键全都丢了图形。
 static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, DWORD color) {
-    if (g_keyIconStyle == 0) return FALSE;
     if (!KeyHasGlyph(k)) return FALSE;
 
     // 尺寸一律**按键高**取值（原来写死 15/20 DIP）：窗口缩小、键帽变矮时，固定尺寸的图标
@@ -3197,7 +3196,6 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_FNWEB          94
 #define S_HIT_NPBTN          24   // 布局 Tab：显示标题栏 123 切换按钮
 #define S_HIT_NPBTN          24   // 布局 Tab：标题栏显示小键盘按钮
-#define S_HIT_KEYICON        26   // 布局 Tab：按键图标样式（分段控件，整条一个命中码）
 #define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
 #define S_HIT_URL            30
@@ -3337,7 +3335,7 @@ static int SettingsRowCtrlDip(int tab, int index) {
         return 26;
     }
     if (tab == 3) {                                 // 布局
-        if (index == 0 || index == 1) return 40;    // 键盘布局下拉 / 按键图标样式分段
+        if (index == 0) return 40;                  // 键盘布局分段
         return 26;
     }
     if (tab == 1) return 40;                        // 主题：模式 / 透明度 / 色相 都是下拉行
@@ -3348,17 +3346,17 @@ static int SettingsRowCtrlDip(int tab, int index) {
 // 行高、绘制、命中三处都读这一份判断，才不会出现「字画到行外 / 热区对不上」。
 static BOOL SettingsRowDescWraps(int tab, int index) {
     // Fn 网页布局（换文案后变长）/ 小键盘按钮：可能折成两行
-    return (tab == 3 && (index == 2 || index == 3));
+    return (tab == 3 && (index == 1 || index == 2));
 }
 
 // 这两行的描述文案。必须是**唯一**的定义处：行高要不要按两行留白，靠实测这段文本
 // 来定（见 SettingsRowDescTwoLines），绘制处再抄一遍就会两边不一致。
 static const wchar_t* SettingsRowDescText(int tab, int index) {
     if (tab != 3) return NULL;
-    if (index == 2)
+    if (index == 1)
         return T(L"按 Fn 切换布局，显示常用符号和常用网站前后缀",
                  L"Press Fn to switch layout: common symbols and website prefixes/suffixes on the keys");
-    if (index == 3)
+    if (index == 2)
         return T(L"在标题栏显示圆角按钮：在默认布局上切换小键盘布局，全尺寸布局下则显示/隐藏数字区",
                  L"Pill button in the title bar: switches to the numpad layout in the default layout, "
                  L"shows/hides the numpad section in the full-size layout");
@@ -3407,7 +3405,7 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
 
 static int SettingsRowCount(int tab) {
     if (tab == 0) return g_af ? 7 : 6;
-    if (tab == 3) return 4;   // 布局 Tab：键盘布局 / 按键图标样式 / Fn 网页布局 / 小键盘按钮
+    if (tab == 3) return 3;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
     if (tab == 1) return 3;
     return 0;
 }
@@ -3711,26 +3709,9 @@ static int RowSegIndexTop(const SettingsMetrics& m, const RECT& row,
     return SegmentedHitIndex(m, r, items, count, x);
 }
 
-// 「按键图标样式」的两段文案与控件矩形：绘制 / 命中 / 点击必须共用（画与热区同源）。
-// 只有两段：文字 / 图标+文字 —— 纯图标（键面只剩一个裸图形，没有文字兜底）已按实机反馈去掉。
-// 段下标与 g_keyIconStyle 不再相等，收在下面两个小函数里，别在调用点各写一遍映射。
-#define KEYICON_SEG_COUNT 2
-static int KeyIconStyleOfSeg(int seg) { return (seg == 1) ? 2 : 0; }
-static int KeyIconSegOfStyle(int style) { return (style == 2) ? 1 : 0; }
-
-static void KeyIconSegItems(const wchar_t* out[KEYICON_SEG_COUNT]) {
-    out[0] = T(L"文字", L"Text");
-    out[1] = T(L"图标+文字", L"Icon+Text");
-}
-
-static RECT KeyIconSegRect(const SettingsMetrics& m, const wchar_t* items[KEYICON_SEG_COUNT]) {
-    RECT row = SettingsRowRect(m, 1);
-    int w = SegmentedWidth(m, items, KEYICON_SEG_COUNT);
-    int x = row.right - (int)(20 * m.dpi) - w;
-    int y = SettingsComboY(m, row);
-    RECT r = {x, y, x + w, y + m.comboH};
-    return r;
-}
+// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」，不再提供「仅文字」）。
+// 原来的 KEYICON_SEG_COUNT / KeyIconStyleOfSeg / KeyIconSegOfStyle / KeyIconSegItems /
+// KeyIconSegRect 随之全部删除；g_keyIconStyle 固定为 2，见 LoadConfig 与 DrawKeyLabel。
 
 static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
     int w = (int)(150 * m.dpi), h = (int)(32 * m.dpi);
@@ -3758,12 +3739,12 @@ static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     // 常规 Tab 行序（自动收起行仅在自动呼出开启时存在）：
     //   g_af 开：0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
     //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=界面语言
-    // 布局 Tab 行序：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=小键盘按钮
+    // 布局 Tab（「按键图标样式」行已删）：0=键盘布局 1=Fn 网页布局 2=小键盘按钮
     int rowIndex;
     if (hit == S_HIT_AUTO) rowIndex = 0;
     else if (hit == S_HIT_AUTOHIDE) rowIndex = 1;
-    else if (hit == S_HIT_FNWEB) rowIndex = 2;
-    else if (hit == S_HIT_NPBTN) rowIndex = 3;
+    else if (hit == S_HIT_FNWEB) rowIndex = 1;
+    else if (hit == S_HIT_NPBTN) rowIndex = 2;
     else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
     else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
     else rowIndex = g_af ? 5 : 4;
@@ -4193,7 +4174,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               g_sHov == S_HIT_LANG_DROP, gsegR.left);
         DrawSegmented(dc, m, gsegR, gseg, gsegn, g_lang);
     } else if (g_sTab == 3) {
-        // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=小键盘按钮
+        // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮（「按键图标样式」行已删）
         // （原第 5 行「Fn + Tab 切换小键盘」已下线：全尺寸下显隐数字区只留标题栏那一个入口）
         RECT r = SettingsRowRect(m, 0);
         const wchar_t* lseg[3];
@@ -4205,34 +4186,23 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               g_sHov == S_HIT_LAYOUT_DROP, lsegR.left);
         DrawSegmented(dc, m, lsegR, lseg, lsegn, g_layoutMode);
 
-        // 按键图标样式：分段控件二选一，改完立即重绘主键盘
-        r = SettingsRowRect(m, 1);
-        const wchar_t* seg[KEYICON_SEG_COUNT];
-        KeyIconSegItems(seg);
-        RECT segR = KeyIconSegRect(m, seg);
-        DrawSettingRowContent(dc, m, r, HKICON_CARET, NULL,
-                              T(L"按键图标样式", L"Key Icon Style"),
-                              T(L"键面显示为文字，或图标与文字并存", L"Draw key faces as text, or icon plus text"),
-                              FALSE, segR.left);
-        DrawSegmented(dc, m, segR, seg, KEYICON_SEG_COUNT, KeyIconSegOfStyle(g_keyIconStyle));
-
         // Fn 网页布局：全尺寸与小键盘布局下不存在（见 SettingsRowHidden）
-        if (!SettingsRowHidden(3, 2)) {
-        r = SettingsRowRect(m, 2);
+        if (!SettingsRowHidden(3, 1)) {
+        r = SettingsRowRect(m, 1);
         DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
                               T(L"Fn 网页布局", L"Fn Web Layout"),
-                              SettingsRowDescText(3, 2),
+                              SettingsRowDescText(3, 1),
                               g_sHov == S_HIT_FNWEB, SettingsSwitchTextRight(m, r),
-                              SettingsRowDescTwoLines(m, 3, 2));
+                              SettingsRowDescTwoLines(m, 3, 1));
         DrawSettingSwitch(dc, m, r, g_fnWebLayout, S_HIT_FNWEB);
         }
 
-        r = SettingsRowRect(m, 3);
+        r = SettingsRowRect(m, 2);
         DrawSettingRowContent(dc, m, r, HKICON_NUMPAD, NULL,
                               T(L"小键盘按钮", L"Numpad Button"),
-                              SettingsRowDescText(3, 3),
+                              SettingsRowDescText(3, 2),
                               g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r),
-                              SettingsRowDescTwoLines(m, 3, 3));
+                              SettingsRowDescTwoLines(m, 3, 2));
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
     } else if (g_sTab == 1) {
         RECT r = SettingsRowRect(m, 0);
@@ -4432,7 +4402,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
           RECT sr = RowSegRect(m, r, it, n);
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LANG_DROP; }
     } else if (g_sTab == 3) {
-        // 布局 Tab：0=键盘布局 1=按键图标样式 2=Fn 网页布局 3=小键盘按钮
+        // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮（「按键图标样式」行已删）
         // （原第 5 行「Fn + Tab 切换小键盘」已下线：全尺寸下显隐数字区只留标题栏那一个入口）
         RECT r;
         // 下拉列表优先命中
@@ -4441,20 +4411,12 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
           RECT sr = RowSegRect(m, r, it, n);
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LAYOUT_DROP; }
 
-        // 按键图标样式：整条分段控件一个命中码，段下标在点击时按 x 算
-        {
-            const wchar_t* seg[KEYICON_SEG_COUNT];
-            KeyIconSegItems(seg);
-            RECT sr = KeyIconSegRect(m, seg);
-            if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_KEYICON;
-        }
-
-        if (!SettingsRowHidden(3, 2)) {                  // 全尺寸 / 小键盘下不存在
-            r = SettingsRowRect(m, 2);
+        if (!SettingsRowHidden(3, 1)) {                  // 全尺寸 / 小键盘下不存在
+            r = SettingsRowRect(m, 1);
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FNWEB;
         }
 
-        r = SettingsRowRect(m, 3);
+        r = SettingsRowRect(m, 2);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_NPBTN;
     } else if (g_sTab == 1) {
         RECT r;
@@ -4642,11 +4604,9 @@ static void LoadConfig() {
     g_npHidden = IniGetInt(L"Keyboard", L"NpHidden", 0) != 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
-    g_keyIconStyle = IniGetInt(L"Keyboard", L"KeyIconStyle", 2);
-    // 0=文字 2=图标+文字（默认）。
-    // 旧配置里的 1（纯图标）已取消 —— 迁移到 2，别让它落回「文字」丢掉用户的选择。
-    if (g_keyIconStyle == 1) g_keyIconStyle = 2;
-    if (g_keyIconStyle != 2) g_keyIconStyle = 0;
+    // 键面固定「图标+文字」：不再提供「仅文字」模式（实机反馈），设置页也没有对应行了。
+    // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
+    g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
     g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
     g_lang = IniGetInt(L"General", L"Language", 0);
@@ -4971,21 +4931,6 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_hlSliderDrag = hit;
         SetCapture(hWnd);
         UpdateHueSlider(hWnd, x);
-        return;
-    }
-    if (hit == S_HIT_KEYICON) {
-        // 分段控件：按 x 定位具体段；改完存盘并立即重绘主键盘（三窗口联动的关键一步）
-        SettingsMetrics km = GetSettingsMetrics(hWnd);
-        const wchar_t* seg[KEYICON_SEG_COUNT];
-        KeyIconSegItems(seg);
-        RECT sr = KeyIconSegRect(km, seg);
-        int idx = SegmentedHitIndex(km, sr, seg, KEYICON_SEG_COUNT, x);
-        if (idx >= 0) {
-            g_keyIconStyle = KeyIconStyleOfSeg(idx);
-            IniSetInt(L"Keyboard", L"KeyIconStyle", g_keyIconStyle);
-            if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
-        }
-        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
         return;
     }
     if (hit == S_HIT_CLOSE) { SendMessageW(hWnd, WM_CLOSE, 0, 0); return; }

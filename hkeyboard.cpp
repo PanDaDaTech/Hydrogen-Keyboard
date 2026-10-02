@@ -5218,47 +5218,80 @@ static void ClosePromptAnimated(HWND hWnd) {
 //
 // 原来两边各算一遍，尺寸改一处就漏一处（老坑：按钮画在右边、热区还在左边）。
 // 全部 DIP，乘 dpi 后给像素。
+//
+// 结构照搬设置页的「标题 + 卡片 + 行」语法（见用户实机图）：
+//   标题行   图标块 + 「关闭轻键」            （落在 pageBg 淡紫底上，不进卡片）
+//   卡片     C_KEY 白底 + 16 圆角，两行内容：
+//              关闭按钮   [✕] 标题 + 描述   右对齐分段控件
+//              记住我的选择 [✓] 标题 + 描述  右对齐开关
+//   按钮区   分隔线 + 确定 / 取消            （也在淡紫底上）
+// 这样对话框就是设置页「常规」Tab 的一个特写：卡片、图标块、分段、开关全是同一套令牌，
+// 不再是「卡片里摆一堆孤立控件」的另一套语法。
 struct PromptLayout {
     int pad;        // 左右内边距（也等于上下留白）
     int closeW, closeH, closeX, closeY;   // 右上关闭钮
-    int iconTile;   // 标题图标块边长
-    int subY;       // 副标题盒顶
-    int subH;       // 副标题行高
-    int segH;       // 分段控件高（与设置页 comboH 同为 40 DIP）
-    int segY;       // 分段轨道盒顶
+    int headIcon;   // 标题图标块边长（与设置页 headIcon 同为 38）
+    int titleY;     // 标题行盒顶
+    int titleH;     // 标题行高
+
+    int cardX, cardY, cardW, cardH, cardR;   // 白色卡片
+    int rowPadY;    // 行上下内边距（与设置页 rowPadY 同为 12）
+    int tile;       // 行图标块边长（设置页 tileSize = 30）
+    int tileGap;    // 图标块↔文字块间距（设置页 tileGap = 18）
+    int rowH;       // 单行高（12 + 30 + 12）
+    int titleH2;    // 行内标题行高
+    int descH;      // 行内描述行高
+
+    int segRowY;    // 「关闭按钮」行盒顶
+    int segH;       // 分段控件高（设置页 comboH = 40）
     int segX;       // 分段轨道左缘
     int segW;       // 分段轨道宽（按两项文字量出来）
-    int remY;       // 「记住我的选择」盒顶
-    int rowH;       // 开关行高（触摸命中区）
+
+    int remRowY;    // 「记住我的选择」行盒顶
     int swW, swH, swX;
-    int lineY;      // 按钮区分隔线
+
+    int lineY;      // 卡片与按钮区之间的分隔线
     int btnW, btnH, okX, cancelX, btnY;
 };
 
-// 纵向推进链（单位 DIP；窗口高 253 = 上下各 20 + 内容 213）：
-//   20 标题图标块(26) → 46 +4 → 50 副标题(20) → 70 +12 → 82 分段控件(40)
-//   → 122 +14 → 136 记住(38) → 174 +10 → 184 分隔线(1) → 185 +12
-//   → 197 按钮(30) → 227 +20 底留白 = 247
+// 纵向推进链（单位 DIP；窗口高 263 = 上下各 20 + 内容 223）：
+//   20 标题行(38) → 58 +18 → 76 卡片顶
+//   卡片内：12 + 54(行) = 66 每行，两行 + 1px 分隔线 = 109，圆角 16
+//   → 76 + 109 = 185 卡片底 → +16 → 201 分隔线 → +12 → 213 按钮(30)
+//   → 243 +20 底留白 = 263
 // ⚠ 改任何一个间距都要重算这条链，并同步 OpenClosePrompt 里的窗口高。
 static PromptLayout PromptComputeLayout(int W, double dpi) {
     PromptLayout L;
     L.pad      = (int)(20 * dpi);
-    L.iconTile = (int)(26 * dpi);
 
-    L.closeW = (int)(26 * dpi);
-    L.closeH = (int)(24 * dpi);
+    L.closeW = (int)(28 * dpi);
+    L.closeH = (int)(28 * dpi);
     L.closeX = W - L.pad - L.closeW;
-    L.closeY = L.pad;
+    L.closeY = (int)(5 * dpi);
 
-    L.subY = L.pad + L.iconTile + (int)(4 * dpi);
-    L.subH = (int)(20 * dpi);
+    L.headIcon = (int)(38 * dpi);
+    L.titleY   = L.pad;
+    L.titleH   = L.headIcon;
 
-    // 两个关闭方式用**分段控件**（与设置页所有选择行同一套）：
-    // 轨道 btnRegularBg + 选中段 cardBg + 文字。原方案的「整行淡紫铺底 + 勾选方块」
-    // 在只有两项时视觉过重 —— 勾选块和整行底色同时表达选中，一件事说了两遍。
-    L.segH = (int)(40 * dpi);
-    L.segY = L.subY + L.subH + (int)(12 * dpi);
-    L.segX = L.pad;
+    L.rowPadY  = (int)(12 * dpi);
+    L.tile     = (int)(30 * dpi);
+    L.tileGap  = (int)(18 * dpi);
+    L.rowH     = L.rowPadY * 2 + L.tile;
+    L.titleH2  = (int)(18 * dpi);
+    L.descH    = (int)(16 * dpi);
+
+    L.cardX = L.pad;
+    L.cardY = L.titleY + L.titleH + (int)(18 * dpi);
+    L.cardR = (int)(16 * dpi);
+    L.cardW = W - L.pad * 2;
+    L.cardH = L.rowH * 2 + 1;   // 两行 + 1px 行间分隔线
+
+    // 卡片内两行
+    L.segRowY = L.cardY + L.rowPadY;
+    L.remRowY = L.segRowY + L.rowH + 1;
+
+    L.segH = (int)(40 * dpi);   // 与设置页 comboH 一致
+    L.segX = W - L.pad - (int)(20 * dpi);   // 行内右对齐，与设置页 RowSegRect 同
     {
         // 段宽按文字量（SegmentedItemW 与设置页分段共用同一份算法）
         static const wchar_t* items[2];
@@ -5267,17 +5300,14 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
         for (int i = 0; i < 2; i++) w += SegmentedItemWAtDpi(items[i], dpi);
         L.segW = w;
     }
+    L.swW = (int)(46 * dpi);   // 与设置页 switchW 一致
+    L.swH = (int)(26 * dpi);
+    L.swX = W - L.pad - (int)(20 * dpi) - L.swW;
 
-    L.rowH = (int)(38 * dpi);
-    L.remY = L.segY + L.segH + (int)(14 * dpi);
-    L.swW = (int)(38 * dpi);
-    L.swH = (int)(20 * dpi);
-    L.swX = W - L.pad - L.swW;
-
-    L.lineY = L.remY + L.rowH + (int)(10 * dpi);
+    L.lineY = L.cardY + L.cardH + (int)(16 * dpi);
     L.btnW  = (int)(84 * dpi);
     L.btnH  = (int)(30 * dpi);
-    L.btnY  = L.lineY + 1 + (int)(12 * dpi);
+    L.btnY  = L.lineY + (int)(12 * dpi);
     L.cancelX = W - L.pad - L.btnW;
     L.okX     = L.cancelX - (int)(10 * dpi) - L.btnW;
     return L;
@@ -5290,20 +5320,21 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     (void)H;
     PromptLayout L = PromptComputeLayout(W, dpi);
 
-    // 窗口底：floatPanelBg（纯白），与 pageBg 拉开层级 —— 浮层感靠明度差，
-    // 不用描边也不用阴影（与设置页卡片同一套语法）。
-    DrawRoundRect(dc, 0, 0, W, H, C_FLOAT, C_FLOAT, (int)(14 * dpi));
+    // 窗口底：**pageBg**（淡紫），与设置页页面底同一层 ——
+    // 白卡片浮在它上面构成层级。原来的纯白底把卡片「吸」进去了，看着像一张大表格。
+    DrawRoundRect(dc, 0, 0, W, H, C_BG, C_BG, (int)(14 * dpi));
 
-    // 标题：图标块 + 文字（与设置页页头同一套配方）
-    DrawRoundRect(dc, L.pad, L.pad, L.iconTile, L.iconTile, C_REGULAR, C_REGULAR, (int)(7 * dpi));
+    // 标题行：图标块 + 「关闭轻键」（落在 pageBg 上，不进卡片 —— 与设置页页头同一语法）
+    DrawRoundRect(dc, L.pad, L.titleY, L.headIcon, L.headIcon,
+                  C_REGULAR, C_REGULAR, (int)(9 * dpi));
     {
-        int isz = (int)(12 * dpi);
-        DrawHkIcon(dc, (float)(L.pad + (L.iconTile - isz) / 2),
-                   (float)(L.pad + (L.iconTile - isz) / 2), (float)isz,
+        int isz = (int)(16 * dpi);
+        DrawHkIcon(dc, (float)(L.pad + (L.headIcon - isz) / 2),
+                   (float)(L.titleY + (L.headIcon - isz) / 2), (float)isz,
                    HkIcon(HKICON_CLOSE), C_BTN_CONTENT, C_BTN_CONTENT);
     }
-    DrawTextL(dc, L.pad + L.iconTile + (int)(9 * dpi), L.pad,
-              W - L.closeX + (int)(10 * dpi), L.iconTile,
+    DrawTextL(dc, L.pad + L.headIcon + (int)(12 * dpi), L.titleY,
+              L.closeX - (L.pad + L.headIcon) - (int)(12 * dpi), L.titleH,
               T(L"关闭轻键", L"Close HKeyboard"), g_sfCtrl, C_WHITE);
 
     // 右上关闭钮：平时不铺底，悬停才给一层 btn_regular_bg_hover（与设置页一致）
@@ -5318,40 +5349,72 @@ static void PromptDraw(HDC dc, HWND hWnd) {
                    HkIcon(HKICON_CLOSE), C_DIM, C_DIM);
     }
 
-    // 副标题：原来是「请选择关闭方式：」，两个选项自解释，说明是冗余 ——
-    // 换成更短的「选择关闭方式」，用 btnContent 色（比 textMuted 醒目一档）。
-    DrawTextL(dc, L.pad, L.subY, W - L.pad * 2, L.subH,
-              T(L"选择关闭方式", L"How to close"), g_sfBase, C_BTN_CONTENT);
+    // 卡片：cardBg 白底 + 16 圆角，无描边无阴影（与设置页 DrawSettingsCard 同一配方）
+    DrawRoundRect(dc, L.cardX, L.cardY, L.cardW, L.cardH, C_KEY, C_KEY, L.cardR);
+    // 行间分隔线（左右各缩进 20 —— 与设置页一致）
+    Fill(dc, L.cardX + (int)(20 * dpi), L.segRowY + L.rowH,
+         L.cardW - (int)(40 * dpi), 1, C_LINE_DIV);
 
-    // 两个关闭方式：**分段控件**，与设置页所有选择行同一套配方
-    //（轨道 btnRegularBg + 选中段 cardBg + btnContent 文字）。
-    // 原方案「整行淡紫铺底 + 勾选方块」在两项时过重 —— 勾选块与整行底色同时
-    // 表达选中，一件事说了两遍。分段控件只靠「选中段变白」表意，更安静。
+    // 两行内容的文字块左缘（tile 右 + tileGap）
+    int tx = L.cardX + (int)(20 * dpi) + L.tile + L.tileGap;
+    int txMax = L.segX - (int)(12 * dpi);
+
+    // ---- 行 1：关闭按钮 ----
+    {
+        int ry = L.segRowY + (L.rowH - L.tile) / 2;
+        DrawRoundRect(dc, L.cardX + (int)(20 * dpi), ry, L.tile, L.tile,
+                      C_REGULAR, C_REGULAR, (int)(8 * dpi));
+        int isz = (int)(15 * dpi);
+        DrawHkIcon(dc, (float)(L.cardX + (int)(20 * dpi) + (L.tile - isz) / 2),
+                   (float)(ry + (L.tile - isz) / 2), (float)isz,
+                   HkIcon(HKICON_CLOSE), C_BTN_CONTENT, C_BTN_CONTENT);
+        int ty = L.segRowY + (L.rowH - (L.titleH2 + L.descH)) / 2;
+        DrawTextL(dc, tx, ty, txMax - tx, L.titleH2,
+                  T(L"关闭按钮", L"Close button"), g_sfCtrl, C_WHITE);
+        DrawTextL(dc, tx, ty + L.titleH2, txMax - tx, L.descH,
+                  T(L"选择关闭窗口时执行的操作", L"Action when closing the window"),
+                  g_sfBase, C_DIM);
+    }
+    // 行 1 右侧的分段控件（与设置页 DrawSegmented 同一配方）
     {
         const wchar_t* items[2];
         CloseSegItems(items);
-        int pad = (int)(3 * dpi);
-        DrawRoundRect(dc, L.segX, L.segY, L.segW, L.segH,
+        int sy = L.segRowY + (L.rowH - L.segH) / 2;
+        int pad3 = (int)(3 * dpi);
+        DrawRoundRect(dc, L.segX, sy, L.segW, L.segH,
                       C_REGULAR, C_REGULAR, (int)(10 * dpi));
-        int x = L.segX + pad;
-        int ih = L.segH - pad * 2;
+        int x = L.segX + pad3;
+        int ih = L.segH - pad3 * 2;
         for (int i = 0; i < 2; i++) {
             int w = SegmentedItemWAtDpi(items[i], dpi);
             if (i == g_pChoice) {
-                DrawRoundRect(dc, x, L.segY + pad, w, ih, C_KEY, C_KEY, (int)(8 * dpi));
+                DrawRoundRect(dc, x, sy + pad3, w, ih, C_KEY, C_KEY, (int)(8 * dpi));
             }
-            DrawTextC(dc, x, L.segY + pad, w, ih, items[i], g_sfCtrl,
+            DrawTextC(dc, x, sy + pad3, w, ih, items[i], g_sfCtrl,
                       (i == g_pChoice) ? C_BTN_CONTENT : C_DIM);
             x += w;
         }
     }
 
-    // 记住我的选择
-    DrawSwitch(dc, L.swX, L.remY + (L.rowH - L.swH) / 2, L.swW, L.swH, g_pRemember);
-    DrawTextL(dc, L.pad, L.remY, L.swX - (int)(12 * dpi) - L.pad, L.rowH,
-              T(L"记住我的选择", L"Remember my choice"), g_sfCtrl, C_WHITE);
+    // ---- 行 2：记住我的选择 ----
+    {
+        int ry = L.remRowY + (L.rowH - L.tile) / 2;
+        DrawRoundRect(dc, L.cardX + (int)(20 * dpi), ry, L.tile, L.tile,
+                      C_REGULAR, C_REGULAR, (int)(8 * dpi));
+        int isz = (int)(15 * dpi);
+        DrawHkIcon(dc, (float)(L.cardX + (int)(20 * dpi) + (L.tile - isz) / 2),
+                   (float)(ry + (L.tile - isz) / 2), (float)isz,
+                   HkIcon(HKICON_CHECK), C_BTN_CONTENT, C_BTN_CONTENT);
+        int ty = L.remRowY + (L.rowH - (L.titleH2 + L.descH)) / 2;
+        DrawTextL(dc, tx, ty, L.swX - (int)(12 * dpi) - tx, L.titleH2,
+                  T(L"记住我的选择", L"Remember my choice"), g_sfCtrl, C_WHITE);
+        DrawTextL(dc, tx, ty + L.titleH2, L.swX - (int)(12 * dpi) - tx, L.descH,
+                  T(L"记住关闭按钮的操作，下次直接执行", L"Run the chosen action next time"),
+                  g_sfBase, C_DIM);
+    }
+    DrawSwitch(dc, L.swX, L.remRowY + (L.rowH - L.swH) / 2, L.swW, L.swH, g_pRemember);
 
-    // 按钮区分隔线：把「操作区」与「内容区」分开
+    // 卡片与按钮区之间的分隔线
     Fill(dc, L.pad, L.lineY, W - L.pad * 2, 1, C_LINE_DIV);
 
     DrawRoundRect(dc, L.okX, L.btnY, L.btnW, L.btnH,
@@ -5375,7 +5438,8 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
         y >= L.closeY && y < L.closeY + L.closeH) return P_HIT_CLOSE;
 
     // 分段控件：命中按段宽算，与绘制读同一套段宽算法（SegmentedItemWAtDpi）
-    if (y >= L.segY && y < L.segY + L.segH && x >= L.segX && x < L.segX + L.segW) {
+    if (y >= L.segRowY && y < L.segRowY + L.rowH &&
+        x >= L.segX && x < L.segX + L.segW) {
         const wchar_t* items[2];
         CloseSegItems(items);
         int cx = L.segX + (int)(3 * dpi);
@@ -5386,8 +5450,9 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
         }
     }
 
-    if (x >= L.pad && x < W - L.pad && y >= L.remY && y < L.remY + L.rowH)
-        return P_HIT_REMEMBER;
+    // 「记住我的选择」：整行都是热区（与设置页的开关行一致，点行内空白也能切）
+    if (x >= L.cardX && x < L.cardX + L.cardW &&
+        y >= L.remRowY && y < L.remRowY + L.rowH) return P_HIT_REMEMBER;
 
     if (x >= L.okX && x < L.okX + L.btnW && y >= L.btnY && y < L.btnY + L.btnH) return P_HIT_OK;
     if (x >= L.cancelX && x < L.cancelX + L.btnW && y >= L.btnY && y < L.btnY + L.btnH) return P_HIT_CANCEL;
@@ -5515,11 +5580,11 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    // 340x247：与 PromptComputeLayout 的推进链对齐 ——
-    // 20 + 26(标题块) + 4 + 20(副标题) + 12 + 40(分段控件) + 14 + 38(记住)
-    // + 10 + 1(分隔线) + 12 + 30(按钮) + 20 = 247。上下留白各 20 DIP。
+    // 340x263：与 PromptComputeLayout 的推进链对齐 ——
+    // 20 + 38(标题行) + 18 + 109(卡片：两行 54 + 分隔线 1) + 16 + 1(分隔线)
+    // + 12 + 30(按钮) + 20 = 263。上下留白各 20 DIP。
     // ⚠ 改这个数必须同步 PromptComputeLayout 里的推进链。
-    int w = (int)(340 * dpi), h = (int)(247 * dpi);
+    int w = (int)(340 * dpi), h = (int)(263 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;

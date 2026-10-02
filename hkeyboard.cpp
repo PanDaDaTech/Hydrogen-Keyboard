@@ -1423,6 +1423,22 @@ static void RecreateFontsAndLayout() {
     const double kFontGrowCapH = 90.0;   // 字号随键高增长的上限（DIP）
     double keyHDip = (double)g_keyHeight / dpiScale;
     if (keyHDip > kFontGrowCapH) keyHDip = kFontGrowCapH;
+
+    // ⚠ 还要受**键宽**约束：窗口只往窄拖时键高不变、键变窄，只按键高缩放会让标签相对键帽
+    // 越来越大（实机反馈「还是太大」）。取「1u 标准键宽」与键高中较小者做基准。
+    // 字母键就是 1u：默认 980 宽时键宽 ~68 DIP > 48，比的是键高（观感与改动前一致）；
+    // 拖窄到 500 宽时键宽 ~33 DIP，字号随之收到 33/48，标签不再顶满键帽。
+    {
+        int refW = 0;
+        for (int i = 0; i < g_nk; i++) {
+            if (g_keys[i].type != K_LETTER) continue;
+            if (refW == 0 || g_keys[i].w < refW) refW = g_keys[i].w;
+        }
+        if (refW > 0) {
+            double keyWDip = (double)refW / dpiScale;
+            if (keyWDip < keyHDip) keyHDip = keyWDip;
+        }
+    }
     double finalFontScale = dpiScale * (keyHDip / kFontRefKeyH);
     if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
@@ -3865,7 +3881,7 @@ static const wchar_t* CloseActionName() {
 // 下面全部是 DIP，实机再乘 dpi。
 static int AboutPadY(const SettingsMetrics& m) { return (int)(16 * m.dpi); }      // .card-pad 上下
 static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
-static int AboutGap(const SettingsMetrics& m) { return (int)(16 * m.dpi); }       // 卡与章节之间的间距
+static int AboutGap(const SettingsMetrics& m) { return (int)(10 * m.dpi); }       // 卡与卡之间的间距
 static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高
 
 // 页内一行：上 12 + 内容 36 + 下 12；**最后一行只给下 2** —— 制作工具的 form_card 是
@@ -3937,7 +3953,7 @@ struct AboutLayout {
 
 static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     AboutLayout a = {};
-    int padY = AboutPadY(m), gap = AboutGap(m), secH = AboutSectionH(m);
+    int padY = AboutPadY(m), gap = AboutGap(m);
     int y;
 
     // 身份标识 56 DIP（= 制作工具的 ABOUT_TILE）：卡高 = 上下 16 + 标识 56 = 88，
@@ -3956,10 +3972,6 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     a.card2.top = y;           a.card2.bottom = y + AboutLinksCardH(m);
 
     y = a.card2.bottom + gap;
-    a.sec2.left = m.contentX; a.sec2.right = m.contentX + m.contentW;
-    a.sec2.top = y;           a.sec2.bottom = y + secH;
-
-    y += secH + gap;
     a.card3.left = m.contentX; a.card3.right = m.contentX + m.contentW;
     a.card3.top = y;           a.card3.bottom = y + AboutLicenceCardH(m);
     return a;
@@ -4057,7 +4069,7 @@ static void DrawAboutLicenceRow(HDC dc, const SettingsMetrics& m, const RECT& ro
     DrawTextC(dc, btn.left, btn.top, bw, bh, T(L"查看", L"View"), g_sfCtrl, C_BTN_CONTENT);
 
     DrawTextL(dc, lx, row.top, labelW, row.bottom - row.top,
-              T(L"许可协议", L"Licence"), g_sfCtrl, C_WHITE);
+              T(L"开源许可", L"Licence"), g_sfCtrl, C_WHITE);
     int vx = lx + labelW + (int)(18 * m.dpi);
     DrawTextL(dc, vx, row.top, btn.left - (int)(12 * m.dpi) - vx, row.bottom - row.top,
               L"MIT", g_sfCtrl, C_HOT);
@@ -4328,7 +4340,6 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                          T(L"源码、版本发布与使用说明", L"Source, releases and documentation"),
                          g_sHov == S_HIT_URL);
 
-        DrawAboutSection(dc, m, al.sec2, T(L"开源许可", L"Licence"));
         DrawRoundRect(dc, al.card3.left, al.card3.top,
                       al.card3.right - al.card3.left, al.card3.bottom - al.card3.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));

@@ -3429,19 +3429,30 @@ static void DrawSettingsCard(HDC dc, const SettingsMetrics& m) {
 static int SettingsRowTileX(const SettingsMetrics& m) { return m.contentX + (int)(20 * m.dpi); }
 static int SettingsRowTextX(const SettingsMetrics& m) { return SettingsRowTileX(m) + m.tileSize + m.tileGap; }
 
-// 行的「头部」高度 = 12 + 40 + 12 DIP。图标 tile、文字块、行内控件（开关 / 分段 / 下拉）
-// 全都只在这段里居中，**行因为描述折行而变高时不跟着变**。
-// 布局页的「Fn 网页布局」「小键盘按钮」两行：换文案后描述折成两行，整行高 80 DIP；
-// 控件若按整行居中，就会比 tile 与文字块低 (80-64)/2 = 8 DIP（实机实测 8.3 DIP）。
-// 主题页的色相行是可展开行（210 DIP），同理。
-static int SettingsRowHeadH(const SettingsMetrics& m, const RECT& row) {
-    int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
-    int rowH = row.bottom - row.top;
-    return headH > rowH ? rowH : headH;
+// 行的「头部」高度：图标 tile、文字块、行内控件（开关 / 分段 / 下拉）**共用同一段居中**。
+//
+// ⚠ 这里必须用**整行高**，不能写死 `rowPadY*2 + 40`（= 64 DIP）。
+//   布局页「Fn 网页布局」「小键盘按钮」两行的描述会折成两行，整行高 80 DIP。
+//   写死 64 时，多出的 16 DIP 全被推到行底，而头部又贴在行顶 ——
+//   实机量到 tile 中心 23.61 / 文字块心 32.82 / 行心 40.59：
+//   标题距行顶只剩 5.18，描述第二行下方空 20.73，**整块内容浮在上半部**
+//   （原图见 §十二 的 rows_annot.png，蓝框行心横线压在描述第一行中间）。
+//   改成整行居中后三者都落在行心 40.59，顶底各 12.95 对称。
+//
+//   原文写的理由是「控件若按整行居中，就会比 tile 与文字块低 8 DIP」——
+//   那是**控件按整行、tile 按 64 头部**两种基准混用才有的偏差。
+//   三者统一读同一个 SettingsRowHeadH 之后差恒为 0（实测开关中心 22.46 /
+//   tile 23.61，差 1.15，本来就在容差内）。别再为了这个 8 DIP 拆成两套基准。
+//
+// 不折行的行 headH == rowH（64 ≈ 63.33），行为与原来完全一致。
+// 主题页色相行是可展开行（210 DIP），同样按整行居中。
+// 整行高就是居中基准 —— 没有任何行外状态要读，所以不收 SettingsMetrics 参数。
+static int SettingsRowHeadH(const RECT& row) {
+    return row.bottom - row.top;   // tile / 文字块 / 控件三者共用整行居中
 }
 
 static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {
-    return row.top + (SettingsRowHeadH(m, row) - m.comboH) / 2;
+    return row.top + (SettingsRowHeadH(row) - m.comboH) / 2;
 }
 
 // 与 SettingsComboY 等价：头部高 = rowPadY*2 + comboH，在头部里居中后的偏移正好是 rowPadY。
@@ -3472,9 +3483,9 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
                                   BOOL hover, int ctrlLeft, BOOL descWrap = FALSE) {
     if (hover) DrawSettingsRowHover(dc, m, row);
 
-    // 图标 tile 与文字块都按行的「头部」居中（见 SettingsRowHeadH）：行因为描述折行
-    // 变高时头部不变，二者仍中心对中心。展开行（主题色相）也走同一条规则，不跟着整行跑。
-    int headH = SettingsRowHeadH(m, row);
+    // 图标 tile 与文字块都按**整行**居中（见 SettingsRowHeadH）：行因为描述折行
+    // 变高时，tile / 文字 / 控件三者一起下移，仍中心对中心。展开行（主题色相）同理。
+    int headH = SettingsRowHeadH(row);
     int ty = row.top + (headH - m.tileSize) / 2;
     DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
 
@@ -3736,9 +3747,11 @@ static void BeginSwitchAnimation(HWND hWnd, int hit, BOOL from, BOOL to) {
 
 static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL on, int hit) {
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
-    // 开关与「开/关」文字跟 tile / 文字块用同一条基准（行的头部），
-    // 不按整行居中 —— 否则描述折行的那一行里，开关会比标题低 8 DIP。
-    int headH = SettingsRowHeadH(m, row);
+    // 开关与「开/关」文字跟 tile / 文字块用同一条基准（整行居中，见 SettingsRowHeadH）。
+    // 原来这里刻意按 64 DIP 的「头部」居中、理由是「否则会比标题低 8 DIP」——
+    // 那是控件与 tile 用了两套基准才有的偏差。三者统一后差为 0，而折行行
+    // 不再出现「内容全浮在上半部、行底空 20 DIP」的问题（见 SettingsRowHeadH 注释）。
+    int headH = SettingsRowHeadH(row);
     int y = row.top + (headH - m.switchH) / 2;
     DrawTextC(dc, x - (int)(42 * m.dpi), row.top, (int)(34 * m.dpi), headH,
               on ? T(L"开", L"On") : T(L"关", L"Off"), g_sfCtrl, C_WHITE);

@@ -2098,10 +2098,9 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     }
 
     // 只画图形（没有文字 / 箭头键 / 降到底仍放不下）
-    // 尺寸自适应：**本来有名字**的键（Win / Menu …）退到这一档时沿用 inline 档，不再放大 ——
-    // 同排的字都在，单独一个放大的徽标会显得大一号（实机图：Win 徽标明显大于 Fn/Alt 的字）。
-    // 只有本来就没名字的键（方向键）才用更大的独占尺寸，并且仍受键盒约束。
-    iconOnly = (text && text[0]) ? iconInline : (k->h * 42 / 100);   // 上面已声明
+    // 只有**方向键**用更大的独占尺寸（键面本来就是那个箭头，撑满键帽更好看）；
+    // 其余没名字的键（Win / Menu 徽标）沿用 inline 档 —— 同排的字都在，放大的徽标会大一号。
+    iconOnly = (k->type == K_ARROW) ? (k->h * 42 / 100) : iconInline;
     if (iconOnly > k->w - 2 * edge) iconOnly = k->w - 2 * edge;
     if (iconOnly < 6) iconOnly = 6;
     int gx = k->x + (k->w - iconOnly) / 2;
@@ -2202,10 +2201,10 @@ static const wchar_t* KeyText(const KeyDef* k) {
         case 0x10: case 0xA0: case 0xA1: return L"Shift";
         case 0x11: return L"Ctrl";
         case 0x12: return L"Alt";
-        // Win 键：键面是矢量四格徽标 + 这个名字（见 DrawKeyGlyph）。
-        // 原来这里返回空串（只有徽标、没有名字），「图标+文字」档下就少了一半信息。
-        case 0x5B: return L"Win";
-        case 0x5D: return L"Menu";       // 三条杠是它的图形；文字模式下要给出名字（原来返回空串）
+        // Win / Menu：键面只留图形，不再带名字（实机反馈：这两个键的文字描述去掉）。
+        // 键面本身就是公认图形（四格徽标 / 三条杠），名字是冗余信息，去掉后与方向键一样干净。
+        case 0x5B: return L"";
+        case 0x5D: return L"";
         // 独立小键盘是 4 列网格，纯空白的一格看着像画错了（参考图那里写着「空格」）；
         // 默认布局 / 全尺寸的空格键很宽，沿用屏幕键盘的惯例不写字。
         case 0x20: return (g_layoutMode == 1) ? T(L"\x7A7A\x683C", L"Space") : L"";
@@ -3341,11 +3340,12 @@ static BOOL SettingsRowDescWraps(int tab, int index) {
 static const wchar_t* SettingsRowDescText(int tab, int index) {
     if (tab != 3) return NULL;
     if (index == 2)
-        return T(L"按 Fn 切换：常用符号与网址后缀直接铺在键面上，不用按 Shift",
-                 L"Press Fn: common symbols and web suffixes are laid out on the keys, no Shift needed");
+        return T(L"按 Fn 切换布局，显示常用符号和常用网站前后缀",
+                 L"Press Fn to switch layout: common symbols and website prefixes/suffixes on the keys");
     if (index == 3)
-        return T(L"在标题栏显示；默认布局切小键盘，全尺寸显隐数字区",
-                 L"Show it in the title bar; toggles the numpad section");
+        return T(L"在标题栏显示圆角按钮：在默认布局上切换小键盘布局，全尺寸布局下则显示/隐藏数字区",
+                 L"Pill button in the title bar: switches to the numpad layout in the default layout, "
+                 L"shows/hides the numpad section in the full-size layout");
     return NULL;
 }
 

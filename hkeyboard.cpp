@@ -1385,7 +1385,7 @@ static HFONT MakeFont(double size) {
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
     g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
-    g_sfSec  = MakeFont(20 * dpi);     // 关于页产品名（章节标题已下线，这一档只剩它在用）
+    g_sfSec  = MakeFont(17 * dpi);     // 关于页产品名（章节标题已下线，这一档只剩它在用）
     g_sfRow  = MakeFont(12.5 * dpi);   // 行主文本
     g_sfCtrl = MakeFont(11 * dpi);     // 控件标签：Tab / 开关「开·关」/ 分段 / 按钮 / 弹窗
     g_sfBase = MakeFont(10 * dpi);     // 行描述
@@ -3850,10 +3850,14 @@ static const wchar_t* CloseActionName() {
              g_closeToTray ? L"Hide to tray" : L"Exit program");
 }
 // ===== 关于页几何（与制作工具 PanDa PE 的 about 页同一套语法）=====
-// 卡片内边距上下 10 / 左右 20、堆叠间距 6、身份卡「56×56 主色方块 + 产品名 + 版本」、
+// 卡片内边距上下 14 / 左右 20、堆叠间距 6、身份卡「56 DIP 标识网格 + 产品名 + 版本」、
 // 行「标题 + 说明 + 右侧 34 DIP 圆钮」、许可行「标签 + MIT + 查看按钮」。
 // 下面全部是 DIP，实机再乘 dpi。
-static int AboutPadY(const SettingsMetrics& m) { return (int)(10 * m.dpi); }      // .card-pad 上下
+//
+// ⚠ 上下内边距是 **14 不是 10**：制作工具的许可卡高 78 DIP、许可行 46，反推出 padY = 16；
+//   本窗口许可行同样是 46，把 padY 提到 14 后三张卡的留白节奏与它一致。
+//   改 10 时身份卡只有 76 高，文字块上下各剩 12.7 DIP，描述贴着卡底，看着像「掉下去」。
+static int AboutPadY(const SettingsMetrics& m) { return (int)(14 * m.dpi); }      // .card-pad 上下
 static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
 static int AboutGap(const SettingsMetrics& m) { return (int)(6 * m.dpi); }        // 卡与卡之间的间距
 
@@ -3927,8 +3931,8 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     int padY = AboutPadY(m), gap = AboutGap(m);
     int y;
 
-    // 身份标识按 56 DIP 的绘制网格算：卡高 = 上下 10 + 56 = 76。
-    // 「标题 + 版本号」的文字块（32 + 6 + 18 = 56）按卡纵心居中，与标识同轴。
+    // 身份标识按 56 DIP 的绘制网格算：卡高 = 上下 14 + 56 = 84。
+    // 「标题 + 版本号」的文字块按卡纵心居中，与标识同轴。
     a.mark = (int)(56 * m.dpi);
     a.card1.left = m.contentX;
     a.card1.top = m.contentY;
@@ -4269,33 +4273,41 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         //   它那枚是熊猫头，与色块同色系但形状完全不同；KeyboardMark 本身就是完整剪影，
         //   套色块后只会在 56 DIP 的位置里塞进一条 49×34 的扁带，中间还多一圈冗余底色。
         int my = al.card1.top + (al.card1.bottom - al.card1.top - al.mark) / 2;
+        // ⚠ 文字起点用 **15 DIP**（原 18），因为 al.mark 是 56 DIP 的**绘制网格**，
+        //   而 KeyboardMark 的着色只占网格的 88%（实测墨迹 49.52 DIP，网格内左留白
+        //   2.48）。按网格量间距会多算 6.5 DIP：原来视觉间距 22.00，改后 18.98，
+        //   与制作工具实测的 18.98 一致（那边 tile 满格，网格=墨迹，不存在这个偏差）。
+        //   ⚠ 别再套一层圆角方块去「填满」网格 —— 那会让 49×34 的扁带缩在色块里。
         DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
-        // 产品名用 g_sfSec（20pt ≈ 26.7 DIP）而不是页面标题那一档：制作工具的名称 20 /
-        // 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），卡里的名字会和页面
-        // 大标题打架。文字块 = 名 32 + 间隙 3 + 版本 18 = 53，按卡纵心居中
-        // （卡高 76 = 方块 56 + 上下各 10），再按墨迹下移 1.5 DIP：20pt 标题的墨迹在
-        // 32 DIP 的盒里天然偏上，只居中盒子不居中墨迹，视觉上就是「没对齐」。
+        // 产品名用 g_sfSec（17pt ≈ 22.7 DIP）而不是页面标题那一档：制作工具的名称 20 /
+        // 页标题 26（0.77），本窗口页标题是 18pt，若卡里的名字也用 18pt 就和页面大标题
+        // 同号，两行字重一样、互相打架。17pt 保住层级差（0.94），又比 20pt 少占 5 DIP
+        // 高度 —— 这一项是「描述别掉下去」的关键，见下。
         //
-        // ⚠ 盒顶间隙只有 **3 DIP**，别看着「挤」就调回 6。制作工具那边量到 9.14 DIP 的
-        //   墨迹间隙，看着比这个大，但它的产品名「PanDa PE」**全是拉丁字母** ——
-        //   墨迹只有 cap height（20 DIP 字号下 ≈ 15.4 DIP），上下都留白；
-        //   而本行含「轻键」两个**汉字**，墨迹高 29.36 DIP、几乎撑满 32 DIP 的盒。
-        //   墨迹间隙 = 盒顶间隙 + 标题盒内下留白 + 描述盒内上留白
-        //            = 3 + (32−29.36) + (18−12.09)/2 = 8.6 DIP ≈ 制作工具的 9.14。
-        //   用 6 会算成 11.6 DIP（实测 11.52），肉眼就是「标题和版本号离得太开」。
-        int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(53 * m.dpi)) / 2
-                 + (int)(1.5 * m.dpi + 0.5);
+        // ⚠ 文字块高度是 **49 DIP**（标题盒 28 + 间隙 3 + 描述盒 18），不是 53。
+        //   「标题↔描述中心距」= 墨迹间隙 + 两个墨迹高的一半，而汉字墨迹比拉丁高得多：
+        //   20pt 下「HKeyboard 轻键」墨迹 29.36 DIP，制作工具的「PanDa PE」只有 15.43
+        //   （纯拉丁 cap height）。中心距因此被撑到 29.36 对 22.57，描述被推下去。
+        //   标题压到 17pt 后墨迹降到 24.18，中心距收到 27.05，块才排得进 84 高的卡。
+        //   ⚠ 别想着「把盒顶间隙调成 0 补回来」：汉字墨迹几乎撑满标题盒，间隙归零后
+        //   标题与描述的字面会贴到一起。间隙 3 是下限。
+        //
+        // ⚠ 文字块整体再上移 0.9 DIP（不是原来的下移 1.5）。17pt 的墨迹在 28 DIP 的盒里
+        //   偏上得更少，盒子居中即可对上；负值是让块心与制作工具一致（那边块心偏下
+        //   1.7 DIP，卡内相对位置 +3.4%）。
+        int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(15 * m.dpi);
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(49 * m.dpi)) / 2
+                 - (int)(0.9 * m.dpi + 0.5);
         int tw = al.card1.right - AboutPadX(m) - tx;
-        DrawTextL(dc, tx, ty, tw, (int)(32 * m.dpi),
+        DrawTextL(dc, tx, ty, tw, (int)(28 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfSec, C_WHITE);
         wchar_t meta[96];
         // 版本串 = 内部版本号 + 构建日期（北京时间），例如 "v2.0_20261002"
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs_%ls (%ls)", L"Lightweight screen keyboard · v%hs_%ls (%ls)"),
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
-        DrawTextL(dc, tx, ty + (int)(35 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(31 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,

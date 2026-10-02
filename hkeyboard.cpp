@@ -4153,16 +4153,16 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         int csegn = CloseSegItems(cseg);
         RECT csegR = RowSegRect(m, r1, cseg, csegn);
         DrawSettingRowContent(dc, m, r1, HKICON_CLOSE, NULL,
-                              T(L"关闭按钮", L"Close Button"),
+                             T(L"选择关闭方式", L"Close Action"),
                               T(L"选择关闭窗口时执行的操作", L"Choose what happens when the window is closed"),
                               g_sHov == S_HIT_CLOSE_DROP, csegR.left);
         DrawSegmented(dc, m, csegR, cseg, csegn, g_closeToTray ? 1 : 0);
 
         RECT r2 = SettingsRowRect(m, closeRow + 1);
         DrawSettingRowContent(dc, m, r2, HKICON_CHECK, NULL,
-                              T(L"记住我的选择", L"Remember My Choice"),
-                              T(L"记住关闭按钮的操作，下次直接执行", L"Remember the action and skip asking next time"),
-                              g_sHov == S_HIT_REMEMBER, SettingsSwitchTextRight(m, r2));
+                             T(L"记住我的选择", L"Remember My Choice"),
+                             T(L"记住选择关闭方式，下次直接执行", L"Remember the action and skip asking next time"),
+                             g_sHov == S_HIT_REMEMBER, SettingsSwitchTextRight(m, r2));
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
         RECT r;
@@ -5220,10 +5220,10 @@ static void ClosePromptAnimated(HWND hWnd) {
 // 全部 DIP，乘 dpi 后给像素。
 //
 // 结构照搬设置页的「标题 + 卡片 + 行」语法（见用户实机图）：
-//   标题行   图标块 + 「关闭轻键」            （落在 pageBg 淡紫底上，不进卡片）
-//   卡片     C_KEY 白底 + 16 圆角，两行内容：
-//              关闭按钮   [✕] 标题 + 描述   右对齐分段控件
-//              记住我的选择 [✓] 标题 + 描述  右对齐开关
+//   标题行   图标块 + 「是否关闭轻键」         （落在 pageBg 淡紫底上，不进卡片）
+//   卡片     C_KEY 白底 + 16 圆角，两行内容（**均无描述**，按用户要求）：
+//              选择关闭方式 [✕] 标题   右对齐分段控件
+//              记住我的选择 [✓] 标题   右对齐开关
 //   按钮区   分隔线 + 确定 / 取消            （也在淡紫底上）
 // 这样对话框就是设置页「常规」Tab 的一个特写：卡片、图标块、分段、开关全是同一套令牌，
 // 不再是「卡片里摆一堆孤立控件」的另一套语法。
@@ -5240,7 +5240,6 @@ struct PromptLayout {
     int tileGap;    // 图标块↔文字块间距（设置页 tileGap = 18）
     int rowH;       // 单行高（12 + 30 + 12）
     int titleH2;    // 行内标题行高
-    int descH;      // 行内描述行高
 
     int segRowY;    // 「关闭按钮」行盒顶
     int segH;       // 分段控件高（设置页 comboH = 40）
@@ -5254,11 +5253,13 @@ struct PromptLayout {
     int btnW, btnH, okX, cancelX, btnY;
 };
 
-// 纵向推进链（单位 DIP；窗口高 263 = 上下各 20 + 内容 223）：
+// 纵向推进链（单位 DIP；窗口高 287 = 上下各 20 + 内容 247）：
 //   20 标题行(38) → 58 +18 → 76 卡片顶
-//   卡片内：12 + 54(行) = 66 每行，两行 + 1px 分隔线 = 109，圆角 16
-//   → 76 + 109 = 185 卡片底 → +16 → 201 分隔线 → +12 → 213 按钮(30)
-//   → 243 +20 底留白 = 263
+//   卡片内：12(上留白) + 54(行) + 1(行间分隔线) + 54(行) + 12(下留白) = 133，圆角 16
+//   → 76 + 133 = 209 卡片底 → +16 → 225 分隔线 → +12 → 237 按钮(30)
+//   → 267 +20 底留白 = 287
+// ⚠ 卡片高**必须含上下 rowPadY**。原来漏成 rowH*2+1 = 109，让行 2 底超出
+//   卡片底 12 DIP（卡片内上留白 24.6 / 下留白 0.6，肉眼是「下面顶到边了」）。
 // ⚠ 改任何一个间距都要重算这条链，并同步 OpenClosePrompt 里的窗口高。
 static PromptLayout PromptComputeLayout(int W, double dpi) {
     PromptLayout L;
@@ -5278,13 +5279,15 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
     L.tileGap  = (int)(18 * dpi);
     L.rowH     = L.rowPadY * 2 + L.tile;
     L.titleH2  = (int)(18 * dpi);
-    L.descH    = (int)(16 * dpi);
 
     L.cardX = L.pad;
     L.cardY = L.titleY + L.titleH + (int)(18 * dpi);
     L.cardR = (int)(16 * dpi);
     L.cardW = W - L.pad * 2;
-    L.cardH = L.rowH * 2 + 1;   // 两行 + 1px 行间分隔线
+    // ⚠ 必须含上下 rowPadY：`rowPadY*2 + rowH*2 + 1`。
+    //   原来漏成`rowH*2 + 1`，行 2 底超出卡片底 12 DIP ——
+    //   卡片内上留白 24.6 / 下留白 0.6，肉眼就是「下面顶到边了」（用户实测发现）。
+    L.cardH = L.rowPadY * 2 + L.rowH * 2 + 1;
 
     // 卡片内两行
     L.segRowY = L.cardY + L.rowPadY;
@@ -5327,18 +5330,20 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     // 白卡片浮在它上面构成层级。原来的纯白底把卡片「吸」进去了，看着像一张大表格。
     DrawRoundRect(dc, 0, 0, W, H, C_BG, C_BG, (int)(14 * dpi));
 
-    // 标题行：图标块 + 「关闭轻键」（落在 pageBg 上，不进卡片 —— 与设置页页头同一语法）
+    // 标题行：图标块 + 「是否关闭轻键」（落在 pageBg 上，不进卡片 —— 与设置页页头同一语法）
+    //图标用 DIALOGINFO（ⓘ圆圈信息），语义上是「询问」而不是「关闭」——
+    //   HKICON_CLOSE 已经被右上角那个 ✕ 用了，两处同图标会让人以为是同一个按钮。
     DrawRoundRect(dc, L.pad, L.titleY, L.headIcon, L.headIcon,
                   C_REGULAR, C_REGULAR, (int)(9 * dpi));
     {
-        int isz = (int)(16 * dpi);
+        int isz = (int)(17 * dpi);
         DrawHkIcon(dc, (float)(L.pad + (L.headIcon - isz) / 2),
                    (float)(L.titleY + (L.headIcon - isz) / 2), (float)isz,
-                   HkIcon(HKICON_CLOSE), C_BTN_CONTENT, C_BTN_CONTENT);
+                   HkIcon(HKICON_DIALOGINFO), C_BTN_CONTENT, C_BTN_CONTENT);
     }
     DrawTextL(dc, L.pad + L.headIcon + (int)(12 * dpi), L.titleY,
               L.closeX - (L.pad + L.headIcon) - (int)(12 * dpi), L.titleH,
-              T(L"关闭轻键", L"Close HKeyboard"), g_sfCtrl, C_WHITE);
+              T(L"是否关闭轻键", L"Close HKeyboard?"), g_sfCtrl, C_WHITE);
 
     // 右上关闭钮：平时不铺底，悬停才给一层 btn_regular_bg_hover（与设置页一致）
     if (g_pHov == P_HIT_CLOSE) {
@@ -5362,7 +5367,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int tx = L.cardX + (int)(20 * dpi) + L.tile + L.tileGap;
     int txMax = L.segX - (int)(12 * dpi);
 
-    // ---- 行 1：关闭按钮 ----
+    // ---- 行 1：选择关闭方式（描述已按要求去掉，标题在行盒内垂直居中）----
     {
         int ry = L.segRowY + (L.rowH - L.tile) / 2;
         DrawRoundRect(dc, L.cardX + (int)(20 * dpi), ry, L.tile, L.tile,
@@ -5371,12 +5376,11 @@ static void PromptDraw(HDC dc, HWND hWnd) {
         DrawHkIcon(dc, (float)(L.cardX + (int)(20 * dpi) + (L.tile - isz) / 2),
                    (float)(ry + (L.tile - isz) / 2), (float)isz,
                    HkIcon(HKICON_CLOSE), C_BTN_CONTENT, C_BTN_CONTENT);
-        int ty = L.segRowY + (L.rowH - (L.titleH2 + L.descH)) / 2;
+        // ⚠ 没有描述了，标题必须按**整个行盒**居中（不是 titleH2 居中后再偏上），
+        //   否则字会偏行盒中心 3 DIP —— 与右侧分段控件/开关不在一条基线上。
+        int ty = L.segRowY + (L.rowH - L.titleH2) / 2;
         DrawTextL(dc, tx, ty, txMax - tx, L.titleH2,
-                  T(L"关闭按钮", L"Close button"), g_sfCtrl, C_WHITE);
-        DrawTextL(dc, tx, ty + L.titleH2, txMax - tx, L.descH,
-                  T(L"选择关闭窗口时执行的操作", L"Action when closing the window"),
-                  g_sfBase, C_DIM);
+                  T(L"选择关闭方式", L"Close action"), g_sfCtrl, C_WHITE);
     }
     // 行 1 右侧的分段控件（与设置页 DrawSegmented 同一配方）
     {
@@ -5399,7 +5403,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
         }
     }
 
-    // ---- 行 2：记住我的选择 ----
+    // ---- 行 2：记住我的选择（描述已按要求去掉）----
     {
         int ry = L.remRowY + (L.rowH - L.tile) / 2;
         DrawRoundRect(dc, L.cardX + (int)(20 * dpi), ry, L.tile, L.tile,
@@ -5408,12 +5412,10 @@ static void PromptDraw(HDC dc, HWND hWnd) {
         DrawHkIcon(dc, (float)(L.cardX + (int)(20 * dpi) + (L.tile - isz) / 2),
                    (float)(ry + (L.tile - isz) / 2), (float)isz,
                    HkIcon(HKICON_CHECK), C_BTN_CONTENT, C_BTN_CONTENT);
-        int ty = L.remRowY + (L.rowH - (L.titleH2 + L.descH)) / 2;
+        // ⚠ 同行 1：按整个行盒居中，别按 titleH2 居中
+        int ty = L.remRowY + (L.rowH - L.titleH2) / 2;
         DrawTextL(dc, tx, ty, L.swX - (int)(12 * dpi) - tx, L.titleH2,
                   T(L"记住我的选择", L"Remember my choice"), g_sfCtrl, C_WHITE);
-        DrawTextL(dc, tx, ty + L.titleH2, L.swX - (int)(12 * dpi) - tx, L.descH,
-                  T(L"记住关闭按钮的操作，下次直接执行", L"Run the chosen action next time"),
-                  g_sfBase, C_DIM);
     }
     DrawSwitch(dc, L.swX, L.remRowY + (L.rowH - L.swH) / 2, L.swW, L.swH, g_pRemember);
 
@@ -5583,22 +5585,22 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    // 540x263：与 PromptComputeLayout 的推进链对齐 ——
-    // 20 + 38(标题行) + 18 + 109(卡片：两行 54 + 分隔线 1) + 16 + 1(分隔线)
-    // + 12 + 30(按钮) + 20 = 263。上下留白各 20 DIP。
+    // 460x287：与 PromptComputeLayout 的推进链对齐 ——
+    // 20 + 38(标题行) + 18 + 133(卡片：上下留白 24 + 两行 108 + 分隔线 1)
+    // + 16 + 1(分隔线) + 12 + 30(按钮) + 20 = 287。上下留白各 20 DIP。
     //
-    // ⚠ 宽度必须按**实机字宽**（MiSans 11pt/10pt）反推，不能拿渲染器估的数：
-    //   行1 描述「选择关闭窗口时执行的操作」= 156 DIP，文字块左缘 tx=88，
-    //   加分段控件 segW=197 + 间距 12 + 右留白 40 -> 至少需 493 DIP。
-    //   480 会差 13 DIP，描述被裁掉最后 2 字（实机已复现）。
-    //   540留 47 DIP 余量；设置页是 705 DIP，这里取其 77%。
+    // ⚠ 宽度按**实机字宽**（MiSans 11pt）反推。描述去掉后约束变成了分段控件：
+    //   行1 标题「选择关闭方式」= 90 DIP，但右侧分段控件 segW=197 DIP 才是瓶颈 ——
+    //   tx(88) + 间距(12) + segW(197) + 右留白(40) = 337 DIP 起步。
+    //   取 460 留 33 DIP 余量；设置页是 705 DIP，这里取其 65%。
+    //   （曾经按「带描述」的口径定过 540，去掉描述后收窄，否则右边空一大片。）
     // ⚠ 改这个数必须同步 PromptComputeLayout 里的推进链。
-    int w = (int)(540 * dpi), h = (int)(263 * dpi);
+    int w = (int)(460 * dpi), h = (int)(287 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;
     int y = work.top + ((work.bottom - work.top) - h) / 2;
-    g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"关闭轻键", L"Close HKeyboard"), WS_POPUP,
+    g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"是否关闭轻键", L"Close HKeyboard?"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
         // 先置为全透明，再显示并渐显（避免闪现一帧不透明内容）

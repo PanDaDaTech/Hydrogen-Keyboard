@@ -152,7 +152,7 @@ struct HkbTokens {
     DWORD metaDivider;       // 次强分隔线
     DWORD text;              // 主文字
     DWORD textMuted;         // 弱化文字
-    DWORD titleActive;       // 章节标题（title-active：比主色深一档、比正文淡）
+    DWORD titleActive;       // title-active：比主色深一档、比正文淡（关于页章节标题已下线，暂留）
 };
 
 // oklch(L, C, h) → sRGB，与 panda-core 的 Tokens::with_hue 结果一致
@@ -502,7 +502,7 @@ HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：
 HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
-static HFONT g_sfSec = 0;                                                          // 章节标题（关于页「开源许可」）
+static HFONT g_sfSec = 0;                                                          // 14 档大字号（关于页产品名）
 static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
 static HANDLE g_fontReg = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -1382,9 +1382,8 @@ static HFONT MakeFont(double size) {
 // 单字重下层级完全由「字号 + 颜色」承担，相邻档至少差 1pt。
 // 基准对齐 Windows 设置页：本窗口只有 700 DIP 宽（系统设置约 1024），字号不能照抄它的绝对值，
 // 但也不该按 1024 的宽窗口取值 —— 这一档比首版整体下移一档，阶梯形状不变。
-// 14 这一档是为关于页的章节标题（「社区交流 / 开源许可」）加的：制作工具的同一处是
-// 18 DIP（页标题 26），比例 0.69；本窗口页标题 18，按同一比例落在 12.4 —— 但那与行主文本
-// 同号，层级就没了。取 14：站得住「比行标题大一档」，又实实在在小于页面标题的 18。
+// 14 这一档现在只由关于页的产品名用（制作工具同一处是 18 DIP、页标题 26，比例 0.69；
+// 本窗口页标题 18，按同一比例落在 12.4 —— 但那与行主文本同号，层级就没了）。
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
     g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
@@ -3477,7 +3476,6 @@ static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {
 }
 
 // 与 SettingsComboY 等价：头部高 = rowPadY*2 + comboH，在头部里居中后的偏移正好是 rowPadY。
-// 色相行历史上单独走过一个「与标题对齐」的分支，保留这个名字表达意图。
 static int SettingsComboYTop(const SettingsMetrics& m, const RECT& row) {
     return row.top + m.rowPadY;
 }
@@ -3715,9 +3713,8 @@ static int RowSegIndexTop(const SettingsMetrics& m, const RECT& row,
     return SegmentedHitIndex(m, r, items, count, x);
 }
 
-// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」，不再提供「仅文字」）。
-// 原来的 KEYICON_SEG_COUNT / KeyIconStyleOfSeg / KeyIconSegOfStyle / KeyIconSegItems /
-// KeyIconSegRect 随之全部删除；g_keyIconStyle 固定为 2，见 LoadConfig 与 DrawKeyLabel。
+// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」），相关分段控件的辅助函数
+// 一并删除；g_keyIconStyle 固定为 2，见 LoadConfig 与 DrawKeyLabel。
 
 static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
     int w = (int)(150 * m.dpi), h = (int)(32 * m.dpi);
@@ -3890,7 +3887,6 @@ static const wchar_t* CloseActionName() {
 static int AboutPadY(const SettingsMetrics& m) { return (int)(10 * m.dpi); }      // .card-pad 上下
 static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
 static int AboutGap(const SettingsMetrics& m) { return (int)(6 * m.dpi); }        // 卡与卡之间的间距
-static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高
 
 // 页内一行：上 12 + 内容 36 + 下 12；末行只给下 2（制作工具 form_card 的
 // `.field{padding:12px 0}` + `:last-child{padding-bottom:2px}`）。
@@ -3953,7 +3949,6 @@ static RECT AboutLicenceBtnRect(const SettingsMetrics& m, int rowTop) {
 struct AboutLayout {
     RECT card1;   // 身份卡
     RECT card2;   // 链接卡（一行：项目地址）
-    RECT sec2;    // 「开源许可」章节标题行
     RECT card3;   // 许可卡（一行）
     int  mark;    // 身份标识方块边长（正方，= 制作工具的 ABOUT_TILE）
     int  glyph;   // 方块内键盘标识的绘制边长（= 制作工具的 ABOUT_GLYPH）
@@ -4015,17 +4010,6 @@ static void SettingsFitHeight(HWND hWnd) {
     if (rc.bottom - rc.top == want) return;
     SetWindowPos(hWnd, NULL, 0, 0, rc.right - rc.left, want,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-// 章节标题：4×16 主色圆角条 + 14 DIP 标题（制作工具 widgets::section 的同款语法：
-// 条 4×16 / 圆角 2 / 间距 10 / 文字取 title-active）。主色实心条是整页唯一一处「不描边」的
-// 强调块，分组由它说清楚，不再靠卡片之间空一行来表达。
-static void DrawAboutSection(HDC dc, const SettingsMetrics& m, const RECT& r, const wchar_t* label) {
-    int barW = (int)(4 * m.dpi), barH = (int)(16 * m.dpi);
-    int by = r.top + ((r.bottom - r.top) - barH) / 2;
-    DrawRoundRect(dc, r.left, by, barW, barH, C_HOT, C_HOT, (int)(2 * m.dpi));
-    int lx = r.left + barW + (int)(10 * m.dpi);
-    DrawTextL(dc, lx, r.top, r.right - lx, r.bottom - r.top, label, g_sfSec, C_TITLE);
 }
 
 // 链接行：左「标题 + 说明」，右一枚 34 DIP 圆钮，圆钮里的图标 = 去哪里。

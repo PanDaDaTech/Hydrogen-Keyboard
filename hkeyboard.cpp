@@ -400,7 +400,11 @@ struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift; 
 // C++ 函数前置声明
 static void ShowKB(BOOL show, BOOL isManual = FALSE);
 static void ToggleKB();
-static void UserHideKeyboard(BOOL permanent);   // 手动收起；permanent=TRUE 时不再自动弹出（Issue #2）
+static void UserHideKeyboard();        // 临时收起（自动呼出仍然有效）
+static void HideToTray();              // 永久隐藏到托盘（单击托盘图标恢复）
+// 关闭对话框的两项复用设置页的分段控件（定义在文件后半段，故此处前置声明）
+static int  SegmentedItemWAtDpi(const wchar_t* item, double dpi);
+static int  CloseSegItems(const wchar_t** out);
 static void HandleCloseAction(HWND hWnd);
 static void ExitApplicationAnimated();
 static void OpenClosePrompt();
@@ -2582,7 +2586,7 @@ static void DoKeyAction(const KeyDef* k) {
         SendKey(0x20, g_sh, g_ct, g_al, g_winKey);
         g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
-    case K_HIDE: UserHideKeyboard(FALSE); break;   // 收起键：临时挡路，遇到输入框仍会回来
+    case K_HIDE: UserHideKeyboard(); break;   // 收起键：临时挡路，遇到输入框仍会回来
     default: break;
     }
 }
@@ -2591,14 +2595,15 @@ static void DoKeyAction(const KeyDef* k) {
 #define HDR_MIN   1003
 #define HDR_CLOSE 1004
 #define HDR_NUM   1005   // 123 按钮：切换小键盘
+#define HDR_HIDE  1006   // ⏑ 按钮：永久隐藏到托盘（单击托盘图标恢复）
 
 // 标题栏几何：绘制与命中必须取自同一份数据。
 // 这里历史上抄过两份（DrawHeader / HitHeader 各写一遍），改宽度就会出「按钮画在左、
 // 热区在右」的 bug；今后任何改动只改这里。
 struct HeaderMetrics {
     int btnY, btnH;
-    int wMenu, wMin, wNum, wClose;
-    int xMenu, xMin, xNum, xClose;
+    int wMenu, wMin, wHide, wNum, wClose;
+    int xMenu, xMin, xHide, xNum, xClose;
     int xTitle, wTitle;
     BOOL numBtnVisible;
 };
@@ -2637,17 +2642,20 @@ static HeaderMetrics GetHeaderMetrics() {
     hm.wMenu  = (int)(78 * dpi * fr);
     hm.wClose = (int)(32 * dpi);
     hm.wMin   = (int)(32 * dpi);
+    hm.wHide  = (int)(32 * dpi);
     hm.wNum   = (int)(96 * dpi * fr);
 
     hm.xClose = g_ww - rMargin - hm.wClose;
     hm.xMin   = hm.xClose - gap - hm.wMin;
+    // ⏑ 夹在最小化与「小键盘」之间：两个「收起」按钮相邻，手感才连贯
+    hm.xHide  = hm.xMin - gap - hm.wHide;
     // 全尺寸布局下也常驻：它是数字区唯一的界面开关（也给「窄屏自动收起」留了恢复入口）。
     hm.numBtnVisible = g_showNumBtn;
-    hm.xNum   = hm.numBtnVisible ? (hm.xMin - gap - hm.wNum) : hm.xMin;
+    hm.xNum   = hm.numBtnVisible ? (hm.xHide - gap - hm.wNum) : hm.xHide;
     hm.xMenu  = (int)(6 * dpi);
 
     hm.xTitle = hm.xMenu + hm.wMenu + gap;
-    hm.wTitle = (hm.numBtnVisible ? hm.xNum : hm.xMin) - hm.xTitle - gap;
+    hm.wTitle = (hm.numBtnVisible ? hm.xNum : hm.xHide) - hm.xTitle - gap;
     return hm;
 }
 
@@ -2658,6 +2666,7 @@ static int HitHeader(int x, int y) {
 
     if (x >= hm.xClose && x < hm.xClose + hm.wClose) return HDR_CLOSE;
     if (x >= hm.xMin && x < hm.xMin + hm.wMin) return HDR_MIN;
+    if (x >= hm.xHide && x < hm.xHide + hm.wHide) return HDR_HIDE;
     if (hm.numBtnVisible && x >= hm.xNum && x < hm.xNum + hm.wNum) return HDR_NUM;
     if (x >= hm.xMenu && x < hm.xMenu + hm.wMenu) return HDR_DOCK;
     return -1;
@@ -2684,6 +2693,7 @@ static int HeaderIconBox(int id, double dpi) {
     case HKICON_GEAR:     box = 14.0 * 24.0 / 22.4; break;   // 可见 ≈ 14 DIP
     case HKICON_NUMPAD:   box = 14.0 * 24.0 / 17.6; break;   // 可见 ≈ 14 DIP
     case HKICON_MINIMIZE: box = 12.5 * 12.0 / 8.0;  break;   // 横线长 ≈ 12.5 DIP
+    case HKICON_CHEVRONDOWN: box = 13.0 * 24.0 / 12.0; break; // 箭头宽 ≈ 13 DIP（24 网格，可见 6..18）
     case HKICON_CLOSE:    box = 10.5 * 12.0 / 6.0;  break;   // 叉宽 ≈ 10.5 DIP
     default:              box = 17.0; break;
     }
@@ -2752,9 +2762,10 @@ static void DrawHeader(HDC dc) {
                        T(L"\x5C0F\x952E\x76D8", L"Numpad"), NumBtnActive());
     }
 
-    // 最小化 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
-    // 外框按各自图标的可见尺寸反解（见 HeaderIconBox），两者观感才一样大。
+    // 最小化 / ⏑隐藏 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
+    // 外框按各自图标的可见尺寸反解（见 HeaderIconBox），三者观感才一样大。
     int szMin  = HeaderIconBox(HKICON_MINIMIZE, dpiScale);
+    int szHide = HeaderIconBox(HKICON_CHEVRONDOWN, dpiScale);
     int szCls  = HeaderIconBox(HKICON_CLOSE, dpiScale);
     int hoverR = (int)(6 * dpiScale);
     if (g_hdrHov == HDR_MIN) {
@@ -2764,6 +2775,13 @@ static void DrawHeader(HDC dc) {
     DrawHkIcon(dc, (float)(hm.xMin + (hm.wMin - szMin) / 2),
                (float)(hm.btnY + (hm.btnH - szMin) / 2), (float)szMin,
                HkIcon(HKICON_MINIMIZE), C_DIM, C_DIM);
+    if (g_hdrHov == HDR_HIDE) {
+        DrawRoundRect(dc, hm.xHide, hm.btnY, hm.wHide, hm.btnH,
+                      C_REGULAR_HOV, C_REGULAR_HOV, hoverR);
+    }
+    DrawHkIcon(dc, (float)(hm.xHide + (hm.wHide - szHide) / 2),
+               (float)(hm.btnY + (hm.btnH - szHide) / 2), (float)szHide,
+               HkIcon(HKICON_CHEVRONDOWN), C_DIM, C_DIM);
     if (g_hdrHov == HDR_CLOSE) {
         DrawRoundRect(dc, hm.xClose, hm.btnY, hm.wClose, hm.btnH,
                       C_REGULAR_HOV, C_REGULAR_HOV, hoverR);
@@ -3069,20 +3087,14 @@ static void ShowKB(BOOL show, BOOL isManual) {
 
 static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
-// 主动收起键盘。**两种语义，必须分开**（Issue #2）：
+// 临时收起（「收起」键 K_HIDE 与标题栏 HDR_MIN 共用）：
+//   自动收起开启时，若焦点在输入框里记下该控件，同一输入框内不再自动回弹
+//   （焦点换到别的框后恢复自动呼出）。
 //
-//   「收起」键（K_HIDE）= **临时**挡路。收起后遇到输入框仍会自动回来 ——
-//       键盘压在小程序上时用得上，翻到输入框它就自动让位。
-//
-//   标题栏「最小化」= 用户明确表示「我不想看到它」。必须置 g_manualHide，
-//       否则 UpdateAutoVisibility 的 `if (!g_manualHide && !g_vis) ShowKB(TRUE)`
-//       会在下一个轮询周期（约 300ms 的 WM_FOCUS_EVENT）把它弹回来 ——
-//       实机表现就是「最小化后在所有页面自动弹出，必须完全退出程序才停」
-//       （Issue #2，HuangsOffice 报于第一个发行版）。
-//
-// 「关闭 → 隐藏到系统托盘」本来就走 g_manualHide = TRUE（见 HandleCloseAction
-// 与 PromptOnClick），所以只有最小化这条路漏了。
-static void UserHideKeyboard(BOOL permanent) {
+// ⚠ 这里**故意不置 g_manualHide** —— 自动呼出是这个键盘的核心功能，
+// 最小化只是「暂时不要」，不能等同于「我不想看到它」。
+// 「明确不想看到」的语义由标题栏的 ⏑ 按钮（HideToTray）承担，见其定义。
+static void UserHideKeyboard() {
     if (g_afAutoHide) {
         HWND input = GetFocusedInputControl();
         if (input) {
@@ -3090,8 +3102,15 @@ static void UserHideKeyboard(BOOL permanent) {
             g_hiddenInputToken = g_detectedInputToken;
         }
     }
-    // 永久收起：置位后只有手动重新显示（ShowKB(TRUE, TRUE)）才会再出现。
-    if (permanent) g_manualHide = TRUE;
+    ShowKB(FALSE, TRUE);
+}
+
+// 永久隐藏到托盘：置 g_manualHide，UpdateAutoVisibility 的
+// `if (!g_manualHide && !g_vis) ShowKB(TRUE)` 就再也弹不回来。
+// 恢复入口 = 单击托盘图标（走 ToggleKB → ShowKB(TRUE, TRUE)，
+// isManual 分支会清 g_manualHide）。
+static void HideToTray() {
+    g_manualHide = TRUE;
     ShowKB(FALSE, TRUE);
 }
 
@@ -3606,6 +3625,13 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
 // 10px（em 26px 时）。主题页「主界面透明度」那一行的分段控件有 6 段，多出来的宽度把
 // 左侧文本列挤到只剩 142px，而标题「主界面透明度」需要 174px —— 于是被裁成「主界面透」。
 // 段宽只喂给绘制与命中两条路径（三处共用本函数），且恒大于容纳宽度，不会造成段内文字被裁。
+static int SegmentedItemWAtDpi(const wchar_t* item, double dpi) {
+    HDC dc = GetDC(0);
+    int adv = MeasureTextAdvW(dc, item, g_sfCtrl);
+    if (adv <= 0) adv = MeasureTextW(dc, item, g_sfCtrl);   // GDI+ 未就绪时的回退
+    ReleaseDC(0, dc);
+    return adv + (int)(28 * dpi);
+}
 static int SegmentedItemW(HDC dc, const wchar_t* item, double dpi) {
     int adv = MeasureTextAdvW(dc, item, g_sfCtrl);
     if (adv <= 0) adv = MeasureTextW(dc, item, g_sfCtrl);   // GDI+ 未就绪时的回退
@@ -5198,24 +5224,22 @@ struct PromptLayout {
     int iconTile;   // 标题图标块边长
     int subY;       // 副标题盒顶
     int subH;       // 副标题行高
-    int rowH;       // 选项行高（= 触摸命中区高度）
-    int rowGap;     // 两个选项行之间的间隙
-    int optY;       // 选项 1 盒顶
-    int optX0;      // 选项行左缘
-    int optX1;      // 选项行右缘
-    int markX;      // 勾选方块中心
-    int textX;      // 选项文字左缘
+    int segH;       // 分段控件高（与设置页 comboH 同为 40 DIP）
+    int segY;       // 分段轨道盒顶
+    int segX;       // 分段轨道左缘
+    int segW;       // 分段轨道宽（按两项文字量出来）
     int remY;       // 「记住我的选择」盒顶
+    int rowH;       // 开关行高（触摸命中区）
     int swW, swH, swX;
     int lineY;      // 按钮区分隔线
     int btnW, btnH, okX, cancelX, btnY;
 };
 
-// 纵向推进链（单位 DIP；窗口高 287 = 上下各 20 + 内容 267）：
-//   20 标题图标块(26) → 46 +4 → 50 副标题(20) → 70 +10 → 80 选项1(38)
-//   → 118 +6 → 124 选项2(38) → 162 +14 → 176 记住(38) → 214 +10
-//   → 224 分隔线(1) → 225 +12 → 237 按钮(30) → 267 +20 底留白 = 287
-// ⚠ 改任何一个间距都要重算这条链，并同步 OpenClosePrompt 里的窗口高（287）。
+// 纵向推进链（单位 DIP；窗口高 253 = 上下各 20 + 内容 213）：
+//   20 标题图标块(26) → 46 +4 → 50 副标题(20) → 70 +12 → 82 分段控件(40)
+//   → 122 +14 → 136 记住(38) → 174 +10 → 184 分隔线(1) → 185 +12
+//   → 197 按钮(30) → 227 +20 底留白 = 247
+// ⚠ 改任何一个间距都要重算这条链，并同步 OpenClosePrompt 里的窗口高。
 static PromptLayout PromptComputeLayout(int W, double dpi) {
     PromptLayout L;
     L.pad      = (int)(20 * dpi);
@@ -5229,15 +5253,23 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
     L.subY = L.pad + L.iconTile + (int)(4 * dpi);
     L.subH = (int)(20 * dpi);
 
-    L.rowH   = (int)(38 * dpi);   // ← 关键：24 → 38。触摸目标从 24 DIP 抬到 38 DIP
-    L.rowGap = (int)(6 * dpi);
-    L.optY   = L.subY + L.subH + (int)(10 * dpi);
-    L.optX0  = L.pad;
-    L.optX1  = W - L.pad;
-    L.markX  = L.optX0 + (int)(18 * dpi);
-    L.textX  = L.optX0 + (int)(32 * dpi);
+    // 两个关闭方式用**分段控件**（与设置页所有选择行同一套）：
+    // 轨道 btnRegularBg + 选中段 cardBg + 文字。原方案的「整行淡紫铺底 + 勾选方块」
+    // 在只有两项时视觉过重 —— 勾选块和整行底色同时表达选中，一件事说了两遍。
+    L.segH = (int)(40 * dpi);
+    L.segY = L.subY + L.subH + (int)(12 * dpi);
+    L.segX = L.pad;
+    {
+        // 段宽按文字量（SegmentedItemW 与设置页分段共用同一份算法）
+        static const wchar_t* items[2];
+        CloseSegItems(items);
+        int w = (int)(6 * dpi);
+        for (int i = 0; i < 2; i++) w += SegmentedItemWAtDpi(items[i], dpi);
+        L.segW = w;
+    }
 
-    L.remY = L.optY + L.rowH * 2 + L.rowGap + (int)(14 * dpi);
+    L.rowH = (int)(38 * dpi);
+    L.remY = L.segY + L.segH + (int)(14 * dpi);
     L.swW = (int)(38 * dpi);
     L.swH = (int)(20 * dpi);
     L.swX = W - L.pad - L.swW;
@@ -5291,39 +5323,27 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     DrawTextL(dc, L.pad, L.subY, W - L.pad * 2, L.subH,
               T(L"选择关闭方式", L"How to close"), g_sfBase, C_BTN_CONTENT);
 
-    // 两个选项行：整行可点，命中区就是 rowH（38 DIP）
-    int oy = L.optY;
-    for (int i = 0; i < 2; i++) {
-        BOOL sel = (g_pChoice == i);
-        int boxY = oy, boxH = L.rowH;
-        if (sel) {
-            // 选中：整行铺 btnRegularBg（淡紫），不画描边 —— 与设置页分段选中态同一语法
-            DrawRoundRect(dc, L.optX0, boxY, L.optX1 - L.optX0, boxH,
-                          C_REGULAR, C_REGULAR, (int)(8 * dpi));
-            // 勾选方块：primary 圆角方块 + 对勾（on_primary 色）
-            // 对勾画法与设置页色板选中标记完全一致（CreatePen + 折线）。
-            int ms = (int)(8 * dpi);
-            int my = boxY + boxH / 2;
-            DrawRoundRect(dc, L.markX - ms, my - ms, ms * 2, ms * 2, C_HOT, C_HOT, (int)(3 * dpi));
-            HPEN pen = CreatePen(PS_SOLID, 2, C_ON_PRIMARY);
-            HPEN old = (HPEN)SelectObject(dc, pen);
-            MoveToEx(dc, L.markX - (int)(5 * dpi), my, NULL);
-            LineTo(dc, L.markX - (int)(1 * dpi), my + (int)(4 * dpi));
-            LineTo(dc, L.markX + (int)(6 * dpi), my - (int)(5 * dpi));
-            SelectObject(dc, old); DeleteObject(pen);
-        } else {
-            // 未选中：cardBg（白）+ keyOutline 描边
-            DrawRoundRect(dc, L.optX0, boxY, L.optX1 - L.optX0, boxH,
-                          C_KEY, C_KEY_BORDER, (int)(8 * dpi));
-            int ms = (int)(4 * dpi);
-            DrawRoundRect(dc, L.markX - ms, boxY + (boxH - ms * 2) / 2,
-                          ms * 2, ms * 2, C_DARK, C_DARK, (int)(2 * dpi));
+    // 两个关闭方式：**分段控件**，与设置页所有选择行同一套配方
+    //（轨道 btnRegularBg + 选中段 cardBg + btnContent 文字）。
+    // 原方案「整行淡紫铺底 + 勾选方块」在两项时过重 —— 勾选块与整行底色同时
+    // 表达选中，一件事说了两遍。分段控件只靠「选中段变白」表意，更安静。
+    {
+        const wchar_t* items[2];
+        CloseSegItems(items);
+        int pad = (int)(3 * dpi);
+        DrawRoundRect(dc, L.segX, L.segY, L.segW, L.segH,
+                      C_REGULAR, C_REGULAR, (int)(10 * dpi));
+        int x = L.segX + pad;
+        int ih = L.segH - pad * 2;
+        for (int i = 0; i < 2; i++) {
+            int w = SegmentedItemWAtDpi(items[i], dpi);
+            if (i == g_pChoice) {
+                DrawRoundRect(dc, x, L.segY + pad, w, ih, C_KEY, C_KEY, (int)(8 * dpi));
+            }
+            DrawTextC(dc, x, L.segY + pad, w, ih, items[i], g_sfCtrl,
+                      (i == g_pChoice) ? C_BTN_CONTENT : C_DIM);
+            x += w;
         }
-        DrawTextL(dc, L.textX, boxY, L.optX1 - L.textX - (int)(10 * dpi), boxH,
-                  i == 0 ? T(L"直接退出程序", L"Exit program directly")
-                         : T(L"隐藏到系统托盘", L"Hide to system tray"),
-                  g_sfCtrl, C_WHITE);
-        oy += L.rowH + L.rowGap;
     }
 
     // 记住我的选择
@@ -5354,12 +5374,16 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
     if (x >= L.closeX && x < L.closeX + L.closeW &&
         y >= L.closeY && y < L.closeY + L.closeH) return P_HIT_CLOSE;
 
-    // 两个选项行：整行宽都是热区，高度 = rowH（38 DIP，触摸友好）
-    int oy = L.optY;
-    for (int i = 0; i < 2; i++) {
-        if (x >= L.optX0 && x < L.optX1 && y >= oy && y < oy + L.rowH)
-            return i == 0 ? P_HIT_DIRECT : P_HIT_TRAY;
-        oy += L.rowH + L.rowGap;
+    // 分段控件：命中按段宽算，与绘制读同一套段宽算法（SegmentedItemWAtDpi）
+    if (y >= L.segY && y < L.segY + L.segH && x >= L.segX && x < L.segX + L.segW) {
+        const wchar_t* items[2];
+        CloseSegItems(items);
+        int cx = L.segX + (int)(3 * dpi);
+        for (int i = 0; i < 2; i++) {
+            int w = SegmentedItemWAtDpi(items[i], dpi);
+            if (x >= cx && x < cx + w) return i == 0 ? P_HIT_DIRECT : P_HIT_TRAY;
+            cx += w;
+        }
     }
 
     if (x >= L.pad && x < W - L.pad && y >= L.remY && y < L.remY + L.rowH)
@@ -5491,11 +5515,11 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    // 340x287：与 PromptComputeLayout 的推进链对齐 ——
-    // 20 + 26(标题块) + 4 + 20(副标题) + 10 + 38+6+38(两选项) + 14 + 38(记住)
-    // + 10 + 1(分隔线) + 12 + 30(按钮) + 20 = 287。上下留白各 20 DIP。
+    // 340x247：与 PromptComputeLayout 的推进链对齐 ——
+    // 20 + 26(标题块) + 4 + 20(副标题) + 12 + 40(分段控件) + 14 + 38(记住)
+    // + 10 + 1(分隔线) + 12 + 30(按钮) + 20 = 247。上下留白各 20 DIP。
     // ⚠ 改这个数必须同步 PromptComputeLayout 里的推进链。
-    int w = (int)(340 * dpi), h = (int)(287 * dpi);
+    int w = (int)(340 * dpi), h = (int)(247 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;
@@ -5847,8 +5871,10 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
-        // 最小化 = 永久收起，不再自动弹出（Issue #2）
-        case HDR_MIN: UserHideKeyboard(TRUE); break;
+        // 最小化 = 临时收起，自动呼出仍然有效
+        case HDR_MIN: UserHideKeyboard(); break;
+        // ⏑ = 永久隐藏到托盘，只有单击托盘图标才回来
+        case HDR_HIDE: HideToTray(); break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         case HDR_NUM:   // 「小键盘」按钮：语义统一为「小键盘开着吗」
             if (g_layoutMode == 2) {

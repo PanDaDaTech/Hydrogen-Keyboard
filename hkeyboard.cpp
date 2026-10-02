@@ -1424,21 +1424,9 @@ static void RecreateFontsAndLayout() {
     double keyHDip = (double)g_keyHeight / dpiScale;
     if (keyHDip > kFontGrowCapH) keyHDip = kFontGrowCapH;
 
-    // ⚠ 还要受**键宽**约束：窗口只往窄拖时键高不变、键变窄，只按键高缩放会让标签相对键帽
-    // 越来越大（实机反馈「还是太大」）。取「1u 标准键宽」与键高中较小者做基准。
-    // 字母键就是 1u：默认 980 宽时键宽 ~68 DIP > 48，比的是键高（观感与改动前一致）；
-    // 拖窄到 500 宽时键宽 ~33 DIP，字号随之收到 33/48，标签不再顶满键帽。
-    {
-        int refW = 0;
-        for (int i = 0; i < g_nk; i++) {
-            if (g_keys[i].type != K_LETTER) continue;
-            if (refW == 0 || g_keys[i].w < refW) refW = g_keys[i].w;
-        }
-        if (refW > 0) {
-            double keyWDip = (double)refW / dpiScale;
-            if (keyWDip < keyHDip) keyHDip = keyWDip;
-        }
-    }
+    // ⚠ 基准只能取键高，**不要再掺键宽**：试过 min(键高, 1u 键宽)，窗口拖窄时整盘字都跟着缩，
+    // 实机反馈「反而字体太小」，而且修饰键的标签被挤到整字截断（Esc→Es、Del→D）。
+    // 键宽不够是**逐键**问题，交给 FitKeyFont 的降档阶梯处理，不要动全局基准。
     double finalFontScale = dpiScale * (keyHDip / kFontRefKeyH);
     if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
@@ -2618,11 +2606,22 @@ struct HeaderMetrics {
     BOOL numBtnVisible;
 };
 
+// 页头胶囊与其中文字共用 g_f12，而 g_f12 = 12pt × 键高/48 —— 所以胶囊尺寸必须按同一个比例
+// 缩放，否则字号一大文字就撑出主色底（实机图：「小键盘」三个字溢出胶囊）。只放大不缩小：
+// 窄窗口下字号本来就不缩（基准是键高），胶囊也不该缩。上限与字号封顶（90 DIP）一致。
+static double HeaderFontRatio() {
+    double r = ((double)g_keyHeight / GetSystemDpiScale()) / 48.0;
+    if (r < 1.0) r = 1.0;
+    if (r > 90.0 / 48.0) r = 90.0 / 48.0;
+    return r;
+}
+
 static HeaderMetrics GetHeaderMetrics() {
     double dpiScale = GetSystemDpiScale();
     double dpi = dpiScale;
     HeaderMetrics hm = {};
-    hm.btnH = (int)(HDR_BTN_H_DIP * dpi);
+    double fr = HeaderFontRatio();
+    hm.btnH = (int)(HDR_BTN_H_DIP * dpi * fr);
     // 按钮上留白固定 10 DIP（原来是 (header-btnH)/2 居中，页头 36 时只剩 4 DIP，贴顶）；
     // 页头被压得很矮时退回居中，免得按钮溢出页头。
     hm.btnY = (int)(HDR_BTN_TOP_DIP * dpi);
@@ -2636,14 +2635,12 @@ static HeaderMetrics GetHeaderMetrics() {
 
     // 「设置」和「小键盘」两个按钮都是「图标 + 文字」，宽度按内容给足，
     // 两者共用 DrawHeaderPill 绘制（形状、配色、留白一致）。
-    // 宽度必须按「图标外框 + 间距 + 文字实际宽 + 左右各 ~8 DIP 内边距」给：
-    // 旧值 68 / 84 是贴着文字算的 —— 实测小键盘胶囊实底 147px 里内容就占 143px，
-    // 文字右缘距胶囊边 0px（实机反馈「按钮太挤」）。中文「设置」= 2em、「小键盘」= 3em，
-    // 12pt 档下 1em ≈ 16 DIP，所以 78 / 96 刚好各留 9 / 8 DIP。
-    hm.wMenu  = (int)(78 * dpi);
+    // 基值 78 / 96 是「12pt 档、1em ≈ 16 DIP」下量出来的（中文 设置 = 2em、小键盘 = 3em），
+    // 再乘 fr 跟上字号 —— 字号来自键高，所以窗口拉高时胶囊同步变大，不会越看越小。
+    hm.wMenu  = (int)(78 * dpi * fr);
     hm.wClose = (int)(32 * dpi);
     hm.wMin   = (int)(32 * dpi);
-    hm.wNum   = (int)(96 * dpi);
+    hm.wNum   = (int)(96 * dpi * fr);
 
     hm.xClose = g_ww - rMargin - hm.wClose;
     hm.xMin   = hm.xClose - gap - hm.wMin;
@@ -2716,8 +2713,8 @@ static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL h
     DrawRoundRect(dc, x, hm.btnY, w, hm.btnH, bg, bg, hm.btnH / 2);
 
     double dpi  = GetSystemDpiScale();
-    int iconSz  = HeaderIconBox(iconId, dpi);
-    int gap     = (int)(7 * dpi);
+    int iconSz  = (int)(HeaderIconBox(iconId, dpi) * HeaderFontRatio());   // 与胶囊和文字同比例
+    int gap     = (int)(7 * dpi * HeaderFontRatio());
     int tw     = MeasureTextW(dc, label, g_f12);       // 容纳宽度 → 绘制矩形用它（见 MeasureTextW）
     int adv    = MeasureTextAdvW(dc, label, g_f12);    // 布局宽度 → 排版必须用它
     if (adv <= 0) adv = tw;
@@ -5840,13 +5837,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO mmi = (LPMINMAXINFO)l;
-        // 允许自由缩小（小键盘布局等），仅挡住过小尺寸。
-        // 全尺寸布局必须单独给下限：键帽 44px 的触摸安全线反解出 1090 宽（含数字区）/
-        // 870 宽（数字区收起后）。写死 300 的话窗口一窄，整块数字区就被推出窗口看不见了。
+        // 下限按「1u 键不低于触摸安全线、标签不被挤到截断」反解（三种布局各一套）：
+        //   全尺寸  870 × 300 —— 键帽 44px 的触摸安全线，数字区收起后的宽度
+        //   默认    480 × 240 —— 13 键一行、每键 ≥30 DIP；5 行 + 页头 ≈ 240
+        //   小键盘  330 × 260 —— 4 列数字键
+        // 上限不设：交给系统（= 屏幕工作区）。硬编码上限在竖屏 / 多屏下会变成「能拖但拖不出去」。
         // 注意「退格标签放不下」不是靠这里兜的 —— 标签判据本身就是实测文字宽（见 KeyText）。
         double dpiScale = GetSystemDpiScale();
-        mmi->ptMinTrackSize.x = (int)((g_layoutMode == 2 ? 870 : 300) * dpiScale);
-        mmi->ptMinTrackSize.y = (int)((g_layoutMode == 2 ? 300 : 150) * dpiScale);
+        int minW, minH;
+        if (g_layoutMode == 2)      { minW = 870; minH = 300; }
+        else if (g_layoutMode == 1) { minW = 330; minH = 260; }
+        else                        { minW = 480; minH = 240; }
+        mmi->ptMinTrackSize.x = (int)(minW * dpiScale);
+        mmi->ptMinTrackSize.y = (int)(minH * dpiScale);
         return 0;
     }
     case WM_DPICHANGED: {

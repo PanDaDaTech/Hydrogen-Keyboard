@@ -4334,8 +4334,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         // 卡里的名字会和页面大标题打架。
         // 文字块 = 名 32 + 间隙 6 + 版本 18 = 56，按卡纵心居中（卡高 76 = 标识 56 + 上下各 10）。
         // ⚠ 名盒 / 偏移 / 块高必须随字号一起长，否则墨迹被盒切（em 26.7 DIP 放不进 26 的盒）。
+        //
+        // ⚠ 还要按**墨迹**再下移 1.5 DIP：盒子居中是对称的，但 20pt 标题的墨迹在 32 DIP
+        //   的盒里天然偏上（上升部 > 下降部）。实机量过（175% 抓图，身份卡白底 215..346）：
+        //   图标墨迹上留白 23 / 下留白 23（正居中），文字块却是 18 / 21 —— 整体偏上 3px。
+        //   只居中盒子、不居中墨迹，视觉上就是"没对齐"。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(56 * m.dpi)) / 2;
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(56 * m.dpi)) / 2
+                 + (int)(1.5 * m.dpi + 0.5);
         int tw = al.card1.right - AboutPadX(m) - tx;
         DrawTextL(dc, tx, ty, tw, (int)(32 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfSec, C_WHITE);

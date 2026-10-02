@@ -3457,8 +3457,11 @@ static int SettingsRowHeadH(const SettingsMetrics& m, const RECT& row) {
     int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
     // 色相可展开行：标题区固定 64 DIP，展开区坐标是相对 row.top 的硬编码（见上方说明）。
     if (g_sTab == 1) return headH;
-    int rowH = row.bottom - row.top;
-    return headH > rowH ? rowH : headH;   // 折叠行 / 高度异常时兜底
+    // ⚠⚠ 折叠行返回**整行高 rowH**，不要写成 `headH > rowH ? headH : rowH` 之类的
+    //   「取小值兜底」—— 那个写法在 headH(111px) < rowH(141px) 时会取 111，
+    //   等于又按 64 DIP 头部居中，把 a8f61c8 修的 bug 原样带回来（实测距行顶 5.18）。
+    //   不折行的行 headH == rowH（64 == 63.33），两者等价，所以直接返回 rowH 无副作用。
+    return row.bottom - row.top;
 }
 
 static int SettingsComboY(const SettingsMetrics& m, const RECT& row) {

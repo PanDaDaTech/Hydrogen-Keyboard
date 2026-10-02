@@ -5291,7 +5291,6 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
     L.remRowY = L.segRowY + L.rowH + 1;
 
     L.segH = (int)(40 * dpi);   // 与设置页 comboH 一致
-    L.segX = W - L.pad - (int)(20 * dpi);   // 行内右对齐，与设置页 RowSegRect 同
     {
         // 段宽按文字量（SegmentedItemW 与设置页分段共用同一份算法）
         static const wchar_t* items[2];
@@ -5300,6 +5299,10 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
         for (int i = 0; i < 2; i++) w += SegmentedItemWAtDpi(items[i], dpi);
         L.segW = w;
     }
+    // ⚠ 右对齐必须减掉 segW **自身宽度**（设置页 RowSegRect 就是
+    //   x = row.right - 20*dpi - w）。只减到「右边界」会让分段控件
+    //   整体向右溢出 segW 像素，末段被窗口裁掉。
+    L.segX = W - L.pad - (int)(20 * dpi) - L.segW;
     L.swW = (int)(46 * dpi);   // 与设置页 switchW 一致
     L.swH = (int)(26 * dpi);
     L.swX = W - L.pad - (int)(20 * dpi) - L.swW;

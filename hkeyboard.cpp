@@ -3403,10 +3403,10 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     // 文字块：标题 18 + 间距 6 + 描述 16 = 40。间距不能省 —— 标题的下缘和描述的上缘
     // 会顶在一起（实机反馈「文本和描述的间距对吗」）；文字蒙版本身还上下各留了 4px。
     if (contentDip < 40) contentDip = 40;
-    // 只有描述**真的**会折成两行时才多留 16 DIP。原来这里是「可能折行就留」，
+    // 描述真会折成两行时内容高 40 → 58（多 18 DIP）。原来这里是「可能折行就留」，
     // 于是中文单行的「小键盘按钮」行高 80 DIP、内容只占 52，描述下方空 30 DIP。
-    if (SettingsRowDescTwoLines(m, g_sTab, index) && contentDip < 56)
-        contentDip = 56;                    // 标题 18 + 间距 6 + 描述两行 32
+    if (SettingsRowDescTwoLines(m, g_sTab, index) && contentDip < 58)
+        contentDip = 58;                    // 标题 20 + 间距 6 + 描述两行 32（与 DrawSettingRowContent 的块高一致）
     return (int)((12 + contentDip + 12) * m.dpi);
 }
 
@@ -3526,30 +3526,24 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
         if (hard > tw) tw = hard;
     }
 
-    // 文字块必须与 tile「中心对中心」。tile 30 DIP、文字块 42 DIP，**共用同一个 top 是不行的**：
-    // 那样 tile 中心会比文字块中心高 6 DIP（上一版就是这样，实机上看着图标偏低）。
-    // 文字块内两行盒的中心分别落在 块顶+10dpi（标题盒 20）与 块顶+26dpi+8dpi（描述盒 16）处，
-    // 于是块中心 = 块顶 + 22dpi。让块中心对齐 tile 中心，反解出块顶。
-    // 这个 22dpi 与描述折不折行**无关**：折行时用「盒顶上移 8 DIP、盒高 32 DIP」的画法，
-    // 让描述第一行仍落在 块顶+34dpi（见下），块中心因此不变。
-    // （文字自身还有「行盒中心 vs 墨迹中心」的补偿，已在 DrawTextGp 里统一做掉，
-    //   所以这里直接按盒中心算即可，不需要再叠一次偏移。）
-    // 折行 / 不折行的**块高不同**（50 vs 42），块心必须各算各的。
-    // 原来固定用单行的 22 DIP：折行行（「小键盘按钮」这种长描述）的块心因此偏低 3 DIP，
-    // 字一长上下间距就不匀（实机反馈「文本一长上下间距又不对了」）。
-    int blockBottom = descWrap ? ((int)(18 * m.dpi) + (int)(32 * m.dpi))
+    // 文字块与 tile「中心对中心」。tile 30 DIP，文字块 42 DIP（标题盒 20 + 间隙 6 +
+    // 描述盒 16），**共用同一个 top 不行** —— 那样 tile 中心会比文字块中心高 6 DIP。
+    // 块内两个盒的中心分别落在 块顶+10（标题）与 块顶+26+8（描述）处，块心 = 块顶+22。
+    // 折行时描述占 32 DIP（两行），块心 = 块顶+29；两种块高各算各的，别共用 22。
+    // （「行盒中心 vs 墨迹中心」的补偿已在 DrawTextGp 里统一做掉，这里按盒中心算即可。）
+    int blockBottom = descWrap ? ((int)(26 * m.dpi) + (int)(32 * m.dpi))
                                : ((int)(26 * m.dpi) + (int)(16 * m.dpi));
     int textMid = blockBottom / 2;
     int tyText = ty + m.tileSize / 2 - textMid;
 
     DrawTextL(dc, tx, tyText, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0]) {
+        // 折行与不折行**同一个描述盒顶 26 DIP**，标题↔描述的间距因此恒定。
+        // 原来折行把盒顶上移到 18 DIP，想让描述第一行对齐不折行的位置，但 18 已在
+        // 标题盒（高 20）的底缘之下，标题下缘与描述上缘直接压在一起：实机量到标题↔描述
+        // 1.7 DIP、描述两行之间 4.6 DIP，节奏反了（肉眼就是「标题粘住描述」）。
         if (descWrap)
-            // 盒顶从 26 上移到 18 DIP、盒高保持 32 DIP：单行时描述墨迹中心仍是 块顶+34dpi，
-            // 与不折行的行完全同高；真折成两行时第二行自然往下走（GDI+ 侧开了 NoClip 不裁）。
-            // 原先直接用「盒顶 26 + 高 32」，单行也会被居中到 块顶+42dpi —— 于是同一页里
-            // 「小键盘按钮」行的标题↔描述间距比上面几行大 8 DIP（实机肉眼可见，实测 +14px）。
-            DrawTextL(dc, tx, tyText + (int)(18 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
+            DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
         else
             DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(16 * m.dpi), desc, g_sfBase, C_DIM);
     }
@@ -3890,7 +3884,7 @@ static const wchar_t* CloseActionName() {
              g_closeToTray ? L"Hide to tray" : L"Exit program");
 }
 // ===== 关于页几何（与制作工具 PanDa PE 的 about 页同一套语法）=====
-// 卡片内边距 16 / 20、堆叠间距 16、章节标题「4×16 主色圆角条 + 标签」、
+// 卡片内边距上下 10 / 左右 20、堆叠间距 6、身份卡「56×56 主色方块 + 产品名 + 版本」、
 // 行「标题 + 说明 + 右侧 34 DIP 圆钮」、许可行「标签 + MIT + 查看按钮」。
 // 下面全部是 DIP，实机再乘 dpi。
 static int AboutPadY(const SettingsMetrics& m) { return (int)(10 * m.dpi); }      // .card-pad 上下
@@ -3898,12 +3892,11 @@ static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }    
 static int AboutGap(const SettingsMetrics& m) { return (int)(6 * m.dpi); }        // 卡与卡之间的间距
 static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高
 
-// 页内一行：上 12 + 内容 36 + 下 12；**最后一行只给下 2** —— 制作工具的 form_card 是
-// `.field{padding:12px 0}` 配 `:last-child{padding-bottom:2px}`。末行多出来的 10 DIP 会变成
-// 卡片底部的死白（一行字下面空 24 DIP，肉眼就是「卡片下半边空着」）。
-// 内容 36 = 标题盒 15 + 说明盒顶偏移 23 + 说明盒 13：偏移取 23 而不是 20，
-// 是因为本窗口的行标题（g_sfCtrl = 11pt ≈ 14.7 DIP）墨迹比制作工具的 14px 略高，
-// 偏移 20 时两行墨迹只隔 4.6 DIP（制作工具 8.6），肉眼就是「标题和说明糊在一起」。
+// 页内一行：上 12 + 内容 36 + 下 12；末行只给下 2（制作工具 form_card 的
+// `.field{padding:12px 0}` + `:last-child{padding-bottom:2px}`）。
+// 内容 36 = 标题盒 15 + 说明盒顶偏移 23 + 说明盒 13。偏移取 23 而非 20：本窗口行标题
+// （g_sfCtrl ≈ 14.7 DIP）墨迹比制作工具的 14px 高，偏移 20 时两行墨迹只隔 4.6 DIP
+// （制作工具 8.6），肉眼是「标题和说明糊在一起」。
 static int AboutRowH(const SettingsMetrics& m, BOOL last) {
     return m.rowPadY + (int)(36 * m.dpi) + (last ? (int)(2 * m.dpi) : m.rowPadY);
 }
@@ -3916,15 +3909,13 @@ static RECT AboutRowRect(const SettingsMetrics& m, const RECT& card, int index) 
     return r;
 }
 
-// 链接卡现在只有「项目地址」一行，而 AboutRowRect 的第 0 行用的是**非末行**高度
-// （12 + 36 + 12，上下对称）。卡片高度必须跟它一致 —— 原来是 padY*2 + 末行高（12 + 36 + 2，
-// 底部只给 2 是制作工具 form_card 的 :last-child 规则），于是高亮块上边距 10、下边距 0，
-// 贴着卡片底边，「高亮不出对齐」。单行卡片按非末行算，上下各 10 DIP。
+// 链接卡只有「项目地址」一行，按**非末行**高度算（12 + 36 + 12，上下各 10 DIP）。
+// 原来按末行算（底部只给 2），高亮块下边距 0、贴着卡片底边。
 static int AboutLinksCardH(const SettingsMetrics& m) {
     return AboutPadY(m) * 2 + AboutRowH(m, FALSE);
 }
 
-// 许可行：上 12 + 按钮 32 + 下 2；卡高 = 上下 16 + 行。
+// 许可行：上 12 + 按钮 32 + 下 2；卡高 = 上下 10 + 行。
 static int AboutLicenceRowH(const SettingsMetrics& m) {
     return m.rowPadY + (int)(32 * m.dpi) + (int)(2 * m.dpi);
 }
@@ -3964,7 +3955,8 @@ struct AboutLayout {
     RECT card2;   // 链接卡（一行：项目地址）
     RECT sec2;    // 「开源许可」章节标题行
     RECT card3;   // 许可卡（一行）
-    int  mark;    // 矢量键盘标识边长
+    int  mark;    // 身份标识方块边长（正方，= 制作工具的 ABOUT_TILE）
+    int  glyph;   // 方块内键盘标识的绘制边长（= 制作工具的 ABOUT_GLYPH）
 };
 
 static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
@@ -3972,17 +3964,15 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     int padY = AboutPadY(m), gap = AboutGap(m);
     int y;
 
-    // 身份标识 56 DIP（= 制作工具的 ABOUT_TILE）：卡高 = 上下 16 + 标识 56 = 88，
-    // 标识正好落在内边距上；「标题 + 说明」的文字块（26 + 6 + 18 = 50）按卡纵心居中，
-    // 与标识同高同轴 —— 见 SettingsDraw 里为什么不能再拿行盒中心去对齐。
+    // 身份标识是 56×56 的**正方块**（制作工具的 ABOUT_TILE）：卡高 = 上下 10 + 方块 56 = 76。
+    // 「标题 + 版本号」的文字块（32 + 6 + 18 = 56）按卡纵心居中，与方块同轴。
     a.mark = (int)(56 * m.dpi);
+    a.glyph = (int)(32 * m.dpi);
     a.card1.left = m.contentX;
     a.card1.top = m.contentY;
     a.card1.right = m.contentX + m.contentW;
     a.card1.bottom = a.card1.top + padY * 2 + a.mark;
 
-    // 身份卡之后直接接链接卡（原来中间还有一节「社区交流」标题，已按实机反馈去掉）；
-    // 「开源许可」保留章节标题，节奏仍是「卡 → 间距 16 → 章节 → 间距 16 → 卡」。
     y = a.card1.bottom + gap;
     a.card2.left = m.contentX; a.card2.right = m.contentX + m.contentW;
     a.card2.top = y;           a.card2.bottom = y + AboutLinksCardH(m);
@@ -4038,17 +4028,17 @@ static void DrawAboutSection(HDC dc, const SettingsMetrics& m, const RECT& r, co
     DrawTextL(dc, lx, r.top, r.right - lx, r.bottom - r.top, label, g_sfSec, C_TITLE);
 }
 
-// 链接行：左「标题 + 说明」，右一枚 34 DIP 主色淡底圆钮，圆钮里的图标 = 去哪里。
+// 链接行：左「标题 + 说明」，右一枚 34 DIP 圆钮，圆钮里的图标 = 去哪里。
 //
-// ⚠ 这里刻意不再用「行首图标 tile + 通用外链箭头」那一套（那是旧样式，照的是制作工具改版前
-//   的关于页）：行首 tile 和右侧箭头说的是同一件事（「这是个链接」，说两遍），说明位又放网址，
-//   整行读下来是「地址 + 打开」—— 得先认字才知道点去哪儿。改版后的形态是
-//   「标题 + 一句说明 + 目的地自己的图标」：圆圈里的 GitHub 标一眼就够，说明句用来讲清用途。
+// ⚠ 高亮**只作用在圆钮上，不铺整行**（实测制作工具：链接卡整卡纯白 (255,255,255)，
+//   三行的行背景在 hover 下都不变色，只有圆钮底色从 btn_regular_bg 变到
+//   btn_regular_bg_hover）。原来这里调 DrawSettingsRowHover 把整行铺成 C_REGULAR_HOV，
+//   实测高亮块 547×60 DIP 横跨整张卡，比圆钮大一个量级；更糟的是圆钮也用同一个
+//   C_REGULAR_HOV —— 两者同色，圆钮在 hover 态直接「消失」在行底里。
+//
 //   命中区仍是整行（触摸场景下按钮不能只有 34×34 DIP）。
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
-    if (hover) DrawSettingsRowHover(dc, m, row);
-
     int btn = (int)(34 * m.dpi);
     int bx = row.right - AboutPadX(m) - btn;
     int by = row.top + ((row.bottom - row.top) - btn) / 2;   // 圆钮在行内居中
@@ -4308,37 +4298,31 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         }
     } else {
         // 关于 tab：身份卡 → 链接卡（项目地址）→ 「开源许可」→ 许可卡，版权行在最下方居中。
-        // 语法整体照制作工具（PanDa PE）改版后的关于页：章节标题带主色条、行是「标题 + 说明
-        // + 目的地图标圆钮」、许可是独立一行；卡片内边距 16/20、堆叠间距 16，见 GetAboutLayout。
+        // 语法整体照制作工具（PanDa PE）的关于页：身份卡是「方块 + 产品名 + 版本」，
+        // 链接行是「标题 + 说明 + 目的地图标圆钮」，许可是独立一行。见 GetAboutLayout。
         AboutLayout al = GetAboutLayout(m);
         DrawRoundRect(dc, al.card1.left, al.card1.top,
                       al.card1.right - al.card1.left, al.card1.bottom - al.card1.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
-        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图。
-        //
-        // 纵向**居中于卡片本身**，而不是居中于「标题 + 描述」的行盒：
-        //   卡高 88 = 上下内边距 16 + 标识 56，标识盒正好落在内边距上；
-        //   文字块（标题盒 26 + 间隙 6 + 描述盒 18 = 50）也按卡纵心居中，两者同轴。
-        //
-        //   ⚠ 不要拿行盒中心去对齐。行盒中心比文字**墨迹**中心高约 2 DIP（标题带降部、
-        //     墨迹向上溢出，描述墨迹只占 18 DIP 行盒里的 13 DIP），照行盒中心摆图标会低 3 DIP：
-        //     实测图标上留白 50px、下留白 38px，肉眼就是「图标陷在卡片下半边」。
-        //   直接由卡高算，改字号或改卡高都自洽。
-        int my = al.card1.top + ((al.card1.bottom - al.card1.top) - al.mark) / 2;
-        DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
-                   HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
+        // 身份标识 = 56×56 主色圆角方块（radius 8）+ 居中的 32 DIP 键盘标识，
+        // 即制作工具的 brand_tile（primary 底 + ABOUT_GLYPH 居中）。
+        // ⚠ 别把 KeyboardMark 直接当方块用：DrawHkIcon 的 size 是**网格边长**，而该图形
+        //   着色外框只有 21.2×14.8（占 24 网格的 88%×62%），传 56 实测只画出 49×34 DIP
+        //   的扁块 —— 56×56 的位置里只占一条扁带（实机量到 49.1×34.3）。
+        int my = al.card1.top + (al.card1.bottom - al.card1.top - al.mark) / 2;
+        DrawRoundRect(dc, al.card1.left + AboutPadX(m), my, al.mark, al.mark,
+                      C_HOT, C_HOT, (int)(8 * m.dpi));
+        int gx = al.card1.left + AboutPadX(m) + (al.mark - al.glyph) / 2;
+        int gy = my + (al.mark - al.glyph) / 2;
+        DrawHkIcon(dc, (float)gx, (float)gy, (float)al.glyph,
+                   HkIcon(HKICON_KEYBOARDMARK), C_ON_PRIMARY, C_ON_PRIMARY);
 
-        // 产品名用 g_sfSec（20pt ≈ 26.7 DIP）而不是页面标题那一档：
-        // 制作工具的关于页是 名称 20 / 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），
-        // 卡里的名字会和页面大标题打架。
-        // 文字块 = 名 32 + 间隙 6 + 版本 18 = 56，按卡纵心居中（卡高 76 = 标识 56 + 上下各 10）。
-        // ⚠ 名盒 / 偏移 / 块高必须随字号一起长，否则墨迹被盒切（em 26.7 DIP 放不进 26 的盒）。
-        //
-        // ⚠ 还要按**墨迹**再下移 1.5 DIP：盒子居中是对称的，但 20pt 标题的墨迹在 32 DIP
-        //   的盒里天然偏上（上升部 > 下降部）。实机量过（175% 抓图，身份卡白底 215..346）：
-        //   图标墨迹上留白 23 / 下留白 23（正居中），文字块却是 18 / 21 —— 整体偏上 3px。
-        //   只居中盒子、不居中墨迹，视觉上就是"没对齐"。
+        // 产品名用 g_sfSec（20pt ≈ 26.7 DIP）而不是页面标题那一档：制作工具的名称 20 /
+        // 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），卡里的名字会和页面
+        // 大标题打架。文字块 = 名 32 + 间隙 6 + 版本 18 = 56，按卡纵心居中
+        // （卡高 76 = 方块 56 + 上下各 10），再按墨迹下移 1.5 DIP：20pt 标题的墨迹在
+        // 32 DIP 的盒里天然偏上，只居中盒子不居中墨迹，视觉上就是「没对齐」。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
         int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(56 * m.dpi)) / 2
                  + (int)(1.5 * m.dpi + 0.5);

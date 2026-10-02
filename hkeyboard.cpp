@@ -502,7 +502,7 @@ HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：
 HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
-static HFONT g_sfSec = 0;                                                          // 章节标题（关于页「社区交流 / 开源许可」）
+static HFONT g_sfSec = 0;                                                          // 章节标题（关于页「开源许可」）
 static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 GDI+ 视角（GDI 注册的字 GDI+ 看不见）
 static HANDLE g_fontReg = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
@@ -3183,7 +3183,6 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_SHIFTSYM       19
 #define S_HIT_THEME_DROP     20
 #define S_HIT_URL            30
-#define S_HIT_FEEDBACK       31
 #define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
 #define S_HIT_CLOSE_DROP     70
 #define S_HIT_LANG_DROP      50
@@ -3887,8 +3886,10 @@ static RECT AboutRowRect(const SettingsMetrics& m, const RECT& card, int index) 
     return r;
 }
 
-static int AboutCommunityCardH(const SettingsMetrics& m) {
-    return AboutPadY(m) * 2 + AboutRowH(m, FALSE) + 1 + AboutRowH(m, TRUE);
+// 链接卡现在只有「项目地址」一行（「问题反馈」已按实机反馈去掉）；末行只给下 2 DIP，
+// 与 AboutRowH 的 last 规则一致
+static int AboutLinksCardH(const SettingsMetrics& m) {
+    return AboutPadY(m) * 2 + AboutRowH(m, TRUE);
 }
 
 // 许可行：上 12 + 按钮 32 + 下 2；卡高 = 上下 16 + 行。
@@ -3928,8 +3929,7 @@ static RECT AboutLicenceBtnRect(const SettingsMetrics& m, int rowTop) {
 // 关于 tab 的卡与章节：绘制与命中必须取自同一份几何，避免两边各算一遍
 struct AboutLayout {
     RECT card1;   // 身份卡
-    RECT sec1;    // 「社区交流」章节标题行
-    RECT card2;   // 社区交流卡（两行链接）
+    RECT card2;   // 链接卡（一行：项目地址）
     RECT sec2;    // 「开源许可」章节标题行
     RECT card3;   // 许可卡（一行）
     int  mark;    // 矢量键盘标识边长
@@ -3949,15 +3949,11 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     a.card1.right = m.contentX + m.contentW;
     a.card1.bottom = a.card1.top + padY * 2 + a.mark;
 
-    // 卡片之间是「间距 16 → 章节 16 → 间距 16」的节奏（制作工具同款），
-    // 章节因此永远贴在自己那张卡的上方，而不是落在两张卡的正中。
+    // 身份卡之后直接接链接卡（原来中间还有一节「社区交流」标题，已按实机反馈去掉）；
+    // 「开源许可」保留章节标题，节奏仍是「卡 → 间距 16 → 章节 → 间距 16 → 卡」。
     y = a.card1.bottom + gap;
-    a.sec1.left = m.contentX; a.sec1.right = m.contentX + m.contentW;
-    a.sec1.top = y;           a.sec1.bottom = y + secH;
-
-    y += secH + gap;
     a.card2.left = m.contentX; a.card2.right = m.contentX + m.contentW;
-    a.card2.top = y;           a.card2.bottom = y + AboutCommunityCardH(m);
+    a.card2.top = y;           a.card2.bottom = y + AboutLinksCardH(m);
 
     y = a.card2.bottom + gap;
     a.sec2.left = m.contentX; a.sec2.right = m.contentX + m.contentW;
@@ -4287,7 +4283,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                       showHint ? L"RRGGBB" : shown, g_sfBase, showHint ? C_DIM : C_WHITE);
         }
     } else {
-        // 关于 tab：身份卡 → 「社区交流」→ 链接卡 → 「开源许可」→ 许可卡，版权行在最下方居中。
+        // 关于 tab：身份卡 → 链接卡（项目地址）→ 「开源许可」→ 许可卡，版权行在最下方居中。
         // 语法整体照制作工具（PanDa PE）改版后的关于页：章节标题带主色条、行是「标题 + 说明
         // + 目的地图标圆钮」、许可是独立一行；卡片内边距 16/20、堆叠间距 16，见 GetAboutLayout。
         AboutLayout al = GetAboutLayout(m);
@@ -4323,22 +4319,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
         DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
-        DrawAboutSection(dc, m, al.sec1, T(L"社区交流", L"Community"));
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
-        // 两行之间的 1px 分隔线：左右两端内缩到卡片内边距上（与制作工具的 form_card 一致）
-        Fill(dc, al.card2.left + AboutPadX(m), AboutRowRect(m, al.card2, 1).top - 1,
-             (al.card2.right - al.card2.left) - AboutPadX(m) * 2, 1, C_LINE_DIV);
         // 说明句代替网址：图标已经说明「去哪儿」，说明句用来讲清「去那儿干什么」。
         DrawAboutLinkRow(dc, m, AboutRowRect(m, al.card2, 0), HKICON_GITHUB,
                          T(L"项目地址", L"Project URL"),
                          T(L"源码、版本发布与使用说明", L"Source, releases and documentation"),
                          g_sHov == S_HIT_URL);
-        DrawAboutLinkRow(dc, m, AboutRowRect(m, al.card2, 1), HKICON_GITHUB,
-                         T(L"问题反馈", L"Feedback"),
-                         T(L"遇到 bug 或有建议，到 GitHub 提一个 issue", L"Report bugs or ideas on GitHub Issues"),
-                         g_sHov == S_HIT_FEEDBACK);
 
         DrawAboutSection(dc, m, al.sec2, T(L"开源许可", L"Licence"));
         DrawRoundRect(dc, al.card3.left, al.card3.top,
@@ -4457,8 +4445,6 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         AboutLayout al = GetAboutLayout(m);
         RECT r0 = AboutRowRect(m, al.card2, 0);
         if (x >= r0.left && x < r0.right && y >= r0.top && y < r0.bottom) return S_HIT_URL;
-        RECT r1 = AboutRowRect(m, al.card2, 1);
-        if (x >= r1.left && x < r1.right && y >= r1.top && y < r1.bottom) return S_HIT_FEEDBACK;
         RECT rb = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3).top);
         if (x >= rb.left && x < rb.right && y >= rb.top && y < rb.bottom) return S_HIT_LICENSE;
     }
@@ -4848,9 +4834,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
     case S_HIT_URL:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard", NULL, NULL, SW_SHOWNORMAL);
         break;
-    case S_HIT_FEEDBACK:
-        ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/issues", NULL, NULL, SW_SHOWNORMAL);
-        break;
     case S_HIT_LICENSE:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/blob/main/LICENSE", NULL, NULL, SW_SHOWNORMAL);
         break;
@@ -5028,7 +5011,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ScreenToClient(hWnd, &pt);
         if (g_sTab == 2) {
             int hv = SettingsHitTest(hWnd, pt.x, pt.y);
-            if (hv == S_HIT_URL || hv == S_HIT_FEEDBACK || hv == S_HIT_LICENSE) {
+            if (hv == S_HIT_URL || hv == S_HIT_LICENSE) {
                 SetCursor(LoadCursor(NULL, IDC_HAND));
                 return TRUE;
             }

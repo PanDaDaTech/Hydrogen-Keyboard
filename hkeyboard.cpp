@@ -3882,7 +3882,7 @@ static const wchar_t* CloseActionName() {
 // 卡片内边距 16 / 20、堆叠间距 16、章节标题「4×16 主色圆角条 + 标签」、
 // 行「标题 + 说明 + 右侧 34 DIP 圆钮」、许可行「标签 + MIT + 查看按钮」。
 // 下面全部是 DIP，实机再乘 dpi。
-static int AboutPadY(const SettingsMetrics& m) { return (int)(16 * m.dpi); }      // .card-pad 上下
+static int AboutPadY(const SettingsMetrics& m) { return (int)(10 * m.dpi); }      // .card-pad 上下
 static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
 static int AboutGap(const SettingsMetrics& m) { return (int)(6 * m.dpi); }        // 卡与卡之间的间距
 static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高

@@ -2045,13 +2045,13 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     if (g_keyIconStyle == 0) return FALSE;
     if (!KeyHasGlyph(k)) return FALSE;
 
-    double dpi = GetSystemDpiScale();
-    // 尺寸按「1u 键（默认布局 57 DIP 宽）也要放得下『图标 + Win』」反推：
-    // 图标 15 DIP + 间距 4 DIP + 两侧各 6 DIP 边距 = 31 DIP，留给文字 26 DIP ≈ 2 个字。
-    int iconInline = (int)(15 * dpi);
-    int iconOnly   = (int)(20 * dpi);
-    int gap        = (int)(4 * dpi);
-    int edge       = (int)(6 * dpi);    // 「图标+文字」整组两侧的呼吸边距
+    // 尺寸一律**按键高**取值（原来写死 15/20 DIP）：窗口缩小、键帽变矮时，固定尺寸的图标
+    // 会挤掉同排文字，[图标 + 文字] 放不下就只能退成纯图标 —— 即缩小窗口后的图标显示异常。
+    // 用键高做基准，DPI 与窗口缩放天然同步（48 DIP 键 ≈ 原来的 15/20 DIP）。
+    int iconInline = k->h * 31 / 100;
+    int iconOnly   = k->h * 42 / 100;
+    int gap        = k->h * 8 / 100;
+    int edge       = k->h * 12 / 100;   // 「图标+文字」整组两侧的呼吸边距
 
     // 方向键：键面标签本身就是那个箭头，画成「图标 + ←」等于同一个信息写两遍，只画图形。
     BOOL hasText = (k->type != K_ARROW) && text && text[0];

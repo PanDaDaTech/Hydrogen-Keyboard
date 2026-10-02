@@ -1338,6 +1338,10 @@ static void SetFullNumpadHidden(HWND hWnd, BOOL hidden) {
 }
 
 // 注册内嵌字体（MiSans Medium 精简子集，界面唯一字面）到当前进程；失败则回退系统字体
+// ⚠ 子集是按「源码全部 UI 字符」生成的（tools/subset_font.py，从 build/font-backup 的
+//   全量字体子集化）。**新增任何 UI 文案后必须重跑 `python tools/subset_font.py`**，
+//   或先跑 `--check` 校验 —— 否则新文案里表外的字会回退系统宋体，
+//   同一行 MiSans 与宋体混排（v2.0 关于页「社区交流」的「社/流」即此，实机确认）。
 static void LoadEmbeddedFonts() {
     HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(IDR_FONT), MAKEINTRESOURCEW(10));  // RT_RCDATA
     if (!hr) return;

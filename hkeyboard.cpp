@@ -400,7 +400,7 @@ struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift; 
 // C++ 函数前置声明
 static void ShowKB(BOOL show, BOOL isManual = FALSE);
 static void ToggleKB();
-static void UserHideKeyboard();   // 手动收起（自动收起开启时同输入框内不回弹）
+static void UserHideKeyboard(BOOL permanent);   // 手动收起；permanent=TRUE 时不再自动弹出（Issue #2）
 static void HandleCloseAction(HWND hWnd);
 static void ExitApplicationAnimated();
 static void OpenClosePrompt();
@@ -2582,7 +2582,7 @@ static void DoKeyAction(const KeyDef* k) {
         SendKey(0x20, g_sh, g_ct, g_al, g_winKey);
         g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
-    case K_HIDE: UserHideKeyboard(); break;
+    case K_HIDE: UserHideKeyboard(FALSE); break;   // 收起键：临时挡路，遇到输入框仍会回来
     default: break;
     }
 }
@@ -3069,10 +3069,20 @@ static void ShowKB(BOOL show, BOOL isManual) {
 
 static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
-// 用户主动收起（键盘“收起”键 / 标题栏最小化按钮）：
-// 自动收起开启时，若当前焦点在输入框中，记录该输入控件，
-// UpdateAutoVisibility 在同一输入框内不再自动回弹（焦点换框后恢复自动呼出）。
-static void UserHideKeyboard() {
+// 主动收起键盘。**两种语义，必须分开**（Issue #2）：
+//
+//   「收起」键（K_HIDE）= **临时**挡路。收起后遇到输入框仍会自动回来 ——
+//       键盘压在小程序上时用得上，翻到输入框它就自动让位。
+//
+//   标题栏「最小化」= 用户明确表示「我不想看到它」。必须置 g_manualHide，
+//       否则 UpdateAutoVisibility 的 `if (!g_manualHide && !g_vis) ShowKB(TRUE)`
+//       会在下一个轮询周期（约 300ms 的 WM_FOCUS_EVENT）把它弹回来 ——
+//       实机表现就是「最小化后在所有页面自动弹出，必须完全退出程序才停」
+//       （Issue #2，HuangsOffice 报于第一个发行版）。
+//
+// 「关闭 → 隐藏到系统托盘」本来就走 g_manualHide = TRUE（见 HandleCloseAction
+// 与 PromptOnClick），所以只有最小化这条路漏了。
+static void UserHideKeyboard(BOOL permanent) {
     if (g_afAutoHide) {
         HWND input = GetFocusedInputControl();
         if (input) {
@@ -3080,6 +3090,8 @@ static void UserHideKeyboard() {
             g_hiddenInputToken = g_detectedInputToken;
         }
     }
+    // 永久收起：置位后只有手动重新显示（ShowKB(TRUE, TRUE)）才会再出现。
+    if (permanent) g_manualHide = TRUE;
     ShowKB(FALSE, TRUE);
 }
 
@@ -5721,7 +5733,8 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (hh >= 0) {
         switch (hh) {
         case HDR_DOCK: OpenSettings(); break;
-        case HDR_MIN: UserHideKeyboard(); break;   // 手动收起（自动收起开启时同输入框内不回弹）
+        // 最小化 = 永久收起，不再自动弹出（Issue #2）
+        case HDR_MIN: UserHideKeyboard(TRUE); break;
         case HDR_CLOSE: HandleCloseAction(hWnd); break;
         case HDR_NUM:   // 「小键盘」按钮：语义统一为「小键盘开着吗」
             if (g_layoutMode == 2) {

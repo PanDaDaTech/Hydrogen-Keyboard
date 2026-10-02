@@ -3919,8 +3919,7 @@ struct AboutLayout {
     RECT card1;   // 身份卡
     RECT card2;   // 链接卡（一行：项目地址）
     RECT card3;   // 许可卡（一行）
-    int  mark;    // 身份标识方块边长（正方，= 制作工具的 ABOUT_TILE）
-    int  glyph;   // 方块内键盘标识的绘制边长（= 制作工具的 ABOUT_GLYPH）
+    int  mark;    // 身份标识绘制边长（56 DIP 网格）
 };
 
 static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
@@ -3928,10 +3927,9 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     int padY = AboutPadY(m), gap = AboutGap(m);
     int y;
 
-    // 身份标识是 56×56 的**正方块**（制作工具的 ABOUT_TILE）：卡高 = 上下 10 + 方块 56 = 76。
-    // 「标题 + 版本号」的文字块（32 + 6 + 18 = 56）按卡纵心居中，与方块同轴。
+    // 身份标识按 56 DIP 的绘制网格算：卡高 = 上下 10 + 56 = 76。
+    // 「标题 + 版本号」的文字块（32 + 6 + 18 = 56）按卡纵心居中，与标识同轴。
     a.mark = (int)(56 * m.dpi);
-    a.glyph = (int)(32 * m.dpi);
     a.card1.left = m.contentX;
     a.card1.top = m.contentY;
     a.card1.right = m.contentX + m.contentW;
@@ -4258,18 +4256,21 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                       al.card1.right - al.card1.left, al.card1.bottom - al.card1.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
-        // 身份标识 = 56×56 主色圆角方块（radius 8）+ 居中的 32 DIP 键盘标识，
-        // 即制作工具的 brand_tile（primary 底 + ABOUT_GLYPH 居中）。
-        // ⚠ 别把 KeyboardMark 直接当方块用：DrawHkIcon 的 size 是**网格边长**，而该图形
-        //   着色外框只有 21.2×14.8（占 24 网格的 88%×62%），传 56 实测只画出 49×34 DIP
-        //   的扁块 —— 56×56 的位置里只占一条扁带（实机量到 49.1×34.3）。
+        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图。
+        // 纵向**居中于卡片本身**，而不是居中于「标题 + 描述」的行盒：
+        //   卡高 76 = 上下内边距 10 + 标识 56，标识盒正好落在内边距上；
+        //   文字块（标题盒 32 + 间隙 6 + 描述盒 18 = 56）也按卡纵心居中，两者同轴。
+        //   直接由卡高算，改字号或改卡高都自洽。
+        //
+        // ⚠ hole 色必须与 fg 不同（这里传 C_ON_PRIMARY = primaryFg 浅色下的深色正文色）：
+        //   键块是**独立子路径**，靠 hole 色「挖」出来才看得见键盘。同色 ⇒ 挖空失效，
+        //   56×56 的位置里只剩一个实心方块，键块全部消失（实机踩过）。
+        // ⚠ 也**别再往外套一层圆角方块**。制作工具的 brand_tile 是「色块 + 另一枚图形」，
+        //   它那枚是熊猫头，与色块同色系但形状完全不同；KeyboardMark 本身就是完整剪影，
+        //   套色块后只会在 56 DIP 的位置里塞进一条 49×34 的扁带，中间还多一圈冗余底色。
         int my = al.card1.top + (al.card1.bottom - al.card1.top - al.mark) / 2;
-        DrawRoundRect(dc, al.card1.left + AboutPadX(m), my, al.mark, al.mark,
-                      C_HOT, C_HOT, (int)(8 * m.dpi));
-        int gx = al.card1.left + AboutPadX(m) + (al.mark - al.glyph) / 2;
-        int gy = my + (al.mark - al.glyph) / 2;
-        DrawHkIcon(dc, (float)gx, (float)gy, (float)al.glyph,
-                   HkIcon(HKICON_KEYBOARDMARK), C_ON_PRIMARY, C_ON_PRIMARY);
+        DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
+                   HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
         // 产品名用 g_sfSec（20pt ≈ 26.7 DIP）而不是页面标题那一档：制作工具的名称 20 /
         // 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），卡里的名字会和页面

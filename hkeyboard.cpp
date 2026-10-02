@@ -2098,6 +2098,12 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     }
 
     // 只画图形（没有文字 / 箭头键 / 降到底仍放不下）
+    // 尺寸自适应：**本来有名字**的键（Win / Menu …）退到这一档时沿用 inline 档，不再放大 ——
+    // 同排的字都在，单独一个放大的徽标会显得大一号（实机图：Win 徽标明显大于 Fn/Alt 的字）。
+    // 只有本来就没名字的键（方向键）才用更大的独占尺寸，并且仍受键盒约束。
+    int iconOnly = (text && text[0]) ? iconInline : (k->h * 42 / 100);
+    if (iconOnly > k->w - 2 * edge) iconOnly = k->w - 2 * edge;
+    if (iconOnly < 6) iconOnly = 6;
     int gx = k->x + (k->w - iconOnly) / 2;
     if (k->align == KA_LEFT)       gx = k->x + edge;
     else if (k->align == KA_RIGHT) gx = k->x + k->w - edge - iconOnly;
@@ -3878,7 +3884,7 @@ static const wchar_t* CloseActionName() {
 // 下面全部是 DIP，实机再乘 dpi。
 static int AboutPadY(const SettingsMetrics& m) { return (int)(16 * m.dpi); }      // .card-pad 上下
 static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
-static int AboutGap(const SettingsMetrics& m) { return (int)(10 * m.dpi); }       // 卡与卡之间的间距
+static int AboutGap(const SettingsMetrics& m) { return (int)(6 * m.dpi); }        // 卡与卡之间的间距
 static int AboutSectionH(const SettingsMetrics& m) { return (int)(16 * m.dpi); }  // 章节行高 = 主色条高
 
 // 页内一行：上 12 + 内容 36 + 下 12；**最后一行只给下 2** —— 制作工具的 form_card 是

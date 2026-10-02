@@ -1388,7 +1388,7 @@ static HFONT MakeFont(double size) {
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
     g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
-    g_sfSec  = MakeFont(14 * dpi);     // 章节标题
+    g_sfSec  = MakeFont(16 * dpi);     // 关于页产品名（章节标题已下线，这一档只剩它在用）
     g_sfRow  = MakeFont(12.5 * dpi);   // 行主文本
     g_sfCtrl = MakeFont(11 * dpi);     // 控件标签：Tab / 开关「开·关」/ 分段 / 按钮 / 弹窗
     g_sfBase = MakeFont(10 * dpi);     // 行描述
@@ -4322,19 +4322,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
-        // 产品名用 g_sfSec（14pt ≈ 18.7 DIP）而不是页面标题那一档：
+        // 产品名用 g_sfSec（16pt ≈ 21.3 DIP）而不是页面标题那一档：
         // 制作工具的关于页是 名称 20 / 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），
-        // 卡里的名字会和页面大标题打架。文字块 = 名 22 + 间隙 6 + 版本 18 = 46，按卡纵心居中。
+        // 卡里的名字会和页面大标题打架。
+        // 文字块 = 名 26 + 间隙 6 + 版本 18 = 50，按卡纵心居中（卡高 76 = 上下各 13）。
+        // ⚠ 名 22 / 偏移 28 / 块 46 是 14pt 时的值，字号提上去后盒子必须一起长，
+        //   否则 16pt 的墨迹（em ≈ 21.3 DIP）在 22 DIP 的盒里上下被切。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(46 * m.dpi)) / 2;
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(50 * m.dpi)) / 2;
         int tw = al.card1.right - AboutPadX(m) - tx;
-        DrawTextL(dc, tx, ty, tw, (int)(22 * m.dpi),
+        DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfSec, C_WHITE);
         wchar_t meta[96];
         // 版本串 = 内部版本号 + 构建日期（北京时间），例如 "v2.0_20261002"
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs_%ls (%ls)", L"Lightweight screen keyboard · v%hs_%ls (%ls)"),
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
-        DrawTextL(dc, tx, ty + (int)(28 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(32 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,

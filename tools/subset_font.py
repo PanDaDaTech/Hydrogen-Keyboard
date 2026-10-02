@@ -73,6 +73,12 @@ def collect():
     chars -= set("\r\n\t\0")
     return chars
 
+def _family_name(font):
+    for r in font["name"].names:
+        if r.nameID == 1 and r.platformID == 3:
+            return r.toUnicode()
+    return None
+
 def allowed_missing(full_cmap):
     """两类字符允许不在子集里（全量字体也没有，历来靠系统回退）：
     1. PUA 私有区 U+E000-U+F8FF（_pua.txt 里的 Segoe 图标码位）；
@@ -104,6 +110,19 @@ def main():
                 print("   U+%04X %s" % (ord(c), c))
             return 1
         print("[OK] 子集覆盖源码全部 UI 字符（cmap %d 条）" % len(cmap))
+        os2 = font["OS/2"]
+        if os2.usWeightClass != 500 or not (os2.fsSelection & 0x40):
+            print("[ERR] OS/2 元数据异常：usWeightClass=%d fsSelection=0x%04X"
+                  "（应为 500 / 含 0x40 REGULAR，否则 GDI 回退宋体，重跑重建）"
+                  % (os2.usWeightClass, os2.fsSelection))
+            return 1
+        fam = _family_name(font)
+        if fam != "MiSans":
+            print("[ERR] name ID1(family) = %r（应为 'MiSans'，否则 GDI+ FontFamilyNotFound，"
+                  "重跑重建）" % fam)
+            return 1
+        print("[OK] OS/2 元数据正常（usWeightClass=500, fsSelection=0x%04X）；family=%r"
+              % (os2.fsSelection, fam))
         return 0
 
     # 重建：只保留收集到的字符（含缺的），从全量字体子集化
@@ -116,6 +135,30 @@ def main():
     ss = subset.Subsetter(options)
     ss.populate(unicodes=[ord(c) for c in chars])
     ss.subset(font)
+
+    # —— 关键修正：小米原版 MiSans 的 OS/2 元数据是「非标准」的，必须重写，否则全局宋体 ——
+    #   原版 usWeightClass=380（标准应是 100~900 整百）、fsSelection=0x0100（无 REGULAR 位，
+    #   也无 BOLD/ITALIC 位）。GDI 的 CreateFontW(FW_NORMAL=400, "MiSans") 与 GDI+ 的
+    #   FontStyleRegular 都按字重/style 匹配，匹配不到「380 / 既非 Regular 也非 Bold」的
+    #   字体会静默回退系统默认字体（宋体）→ 整个界面全局宋体。
+    #   能正常显示的那版旧子集正是把这两项修成 500 / 0x0140（见 git 历史 173608 B 那版）。
+    os2 = font["OS/2"]
+    os2.usWeightClass = 500                                       # Medium（原版错标成 380）
+    os2.fsSelection = (os2.fsSelection & ~0x21) | 0x40            # 清 BOLD(0x20)+ITALIC(0x01)，置 REGULAR(0x40)
+
+    # —— 关键修正 2：name 表 —— 程序按族名「MiSans」找字体（CreateFontW L"MiSans" /
+    #    GDI+ FontFamily(L"MiSans", collection)），而原版 family name(ID1) 是「MiSans Medium」、
+    #    subfamily(ID2) 是「Regular」。GDI+ 严格按 ID1 匹配 → FontFamilyNotFound(14)，
+    #    DrawTextGp 失败回退 GDI/系统字体 → 全局宋体（这是比 OS/2 更致命的一处）。
+    #    旧子集把 ID1/ID2 改成「MiSans」/「Medium」，并只保留 Windows(3) 平台记录。
+    nametbl = font["name"]
+    nametbl.names = [r for r in nametbl.names if r.platformID == 3]
+    for r in nametbl.names:
+        if r.nameID == 1:
+            r.string = "MiSans"
+        elif r.nameID == 2:
+            r.string = "Medium"
+
     font.save(str(TTF_OUT))
     print("[OK] 已重建 %s: %d 字符, %d 字节" % (TTF_OUT.relative_to(ROOT),
                                                len(chars), TTF_OUT.stat().st_size))
@@ -124,7 +167,16 @@ def main():
     miss2 = [c for c in chars if ord(c) not in cmap2 and ord(c) >= 0x80 and not is_ok(c)]
     if miss2:
         print("[ERR] 重建后仍有缺失: %s" % " ".join(miss2)); return 1
-    print("[OK] 重建后自检通过（cmap %d 条）" % len(cmap2))
+    f3 = TTFont(str(TTF_OUT))
+    os2b = f3["OS/2"]
+    if os2b.usWeightClass != 500 or not (os2b.fsSelection & 0x40):
+        print("[ERR] 重建后 OS/2 元数据异常: usWeightClass=%d fsSelection=0x%04X"
+              % (os2b.usWeightClass, os2b.fsSelection)); return 1
+    fam = _family_name(f3)
+    if fam != "MiSans":
+        print("[ERR] 重建后 name ID1(family) = %r（应为 MiSans）" % fam); return 1
+    print("[OK] 重建后自检通过（cmap %d 条 / usWeightClass=%d / fsSelection=0x%04X / family=%r）"
+          % (len(cmap2), os2b.usWeightClass, os2b.fsSelection, fam))
     return 0
 
 if __name__ == "__main__":

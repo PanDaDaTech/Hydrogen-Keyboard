@@ -3874,10 +3874,13 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
     //   标题「HKeyboard 轻键」带降部、墨迹比行盒高约 1.4 DIP 且向上溢出，描述墨迹只占行盒
     //   18 里的 ≈11 DIP。用 82 实测留白是「上 14.25 / 下 20.0」，肉眼能看出整体偏上。
     //   78 → 卡高 136px，实测墨迹留白「上 26 / 下 25 px」（差 1px）；76 时是 26 / 22 px。
-    //   78 也容得下图标盒 44（图标盒顶 +20 → 盒底 64 < 78）。
+    //   78 也容得下图标盒 mark 44（图标盒按卡纵心居中 → 盒顶 +17、盒底 +61 < 78）。
     a.card1.bottom = a.card1.top + (int)(78 * m.dpi);
     a.card2.left = m.contentX;
-    a.card2.top = a.card1.bottom + (int)(12 * m.dpi);
+    // 卡间距 12 → 16 DIP。原来的 12 比「卡内内容到卡边」的留白（链接行 tile 上下各
+    // rowPadY = 12、卡 1 文字上下各 14）还小，于是两张卡看起来是贴在一起的、分组感不清。
+    // 改后整页竖直节奏是 14（tab→卡1）/ 16（卡1→卡2）/ 18（卡2→版权），逐级放大。
+    a.card2.top = a.card1.bottom + (int)(16 * m.dpi);
     a.card2.right = m.contentX + m.contentW;
     a.card2.bottom = a.card2.top + AboutLinkRowHeight(m) * 2;
     return a;
@@ -4171,14 +4174,18 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
         // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图、不加 tile。
-        // 纵向与「标题 + 描述」这个文字块同高 —— 与链接行（DrawAboutLinkRow 的
-        //「文字块与 tile 中心对中心」）同一条规则。这里：
-        //   文字块 = 标题盒 26 + 间隙 6 + 描述盒 18 = 50，块中心距块顶 25；
-        //   块顶 = card1.top + 16，图标盒 = mark 44 → 纯按行盒算是 +16 + 25 - 22 = +19。
-        //   再下移 1 DIP：实测标题 "HKeyboard 轻键" 带降部、墨迹比行盒中心高约 1.6 DIP，
-        //   描述墨迹比行盒中心高 0.7 DIP，取整后 +20 与墨迹块同高（实测残差 0.15 DIP）。
-        // 改动前是 +16：实测图标纵心比文字块纵心高 7.86 DIP，肉眼就是「图标飘在上面」。
-        int my = al.card1.top + (int)(20 * m.dpi);
+        //
+        // 纵向**居中于卡片本身**，而不是居中于「标题 + 描述」的行盒：
+        //   card1 的高度（78 DIP）本来就是按「卡内墨迹上下留白相等」定的（见 GetAboutLayout），
+        //   所以卡纵心 ≈ 文字墨迹的视觉纵心 —— 实机实测卡纵心 +38.6 DIP、文字墨迹纵心 +39.1 DIP。
+        //   图标按卡纵心居中，就同时满足「图标居中于卡片」与「图标与文字同高」。
+        //
+        //   ⚠ 不要再拿行盒中心去对齐。行盒是 +16..+66、中心 +41 DIP，但标题墨迹向上溢出行盒
+        //     （带降部）、描述墨迹只占 18 DIP 行盒里的 13 DIP，墨迹中心其实在 +39。照行盒中心
+        //     对齐会写成 +20（= 41 − 22 + 1 的对齐量），实测图标比文字墨迹低 2.9 DIP（5px）：
+        //     图标上留白 50px、下留白 38px，肉眼就是「图标陷在卡片下半边、上下间距不匀」。
+        //   更早的 +16 是另一个极端（图标偏高 7.9 DIP）。现在直接由卡高算，改字号或改卡高都自洽。
+        int my = al.card1.top + ((al.card1.bottom - al.card1.top) - al.mark) / 2;
         DrawHkIcon(dc, (float)(al.card1.left + (int)(20 * m.dpi)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 

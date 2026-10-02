@@ -3233,7 +3233,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_REMEMBER       95
 #define S_HIT_OPACITY_DROP   96
 
-static int  g_sTab = 0;        // 0=常规 1=主题 2=关于
+static int  g_sTab = 0;        // 0=常规 1=布局 2=主题 3=关于（见 k_settingsTabHits 的映射）
 static int  g_sHov = -1;       // 悬停元素，-1=无
 static BOOL g_sTracking = FALSE;
 static BOOL g_settingsClosing = FALSE;

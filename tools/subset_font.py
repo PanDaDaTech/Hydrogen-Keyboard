@@ -37,31 +37,69 @@ PUA_TXT = ROOT / "build" / "_pua.txt"
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'",
            "0": "\0", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
 
+def _escaped(text, i, out):
+    """处理 text[i] == '\\' 的转义序列，把结果字符加入 out，返回新的 i。"""
+    n = len(text)
+    if i + 1 >= n:
+        return i + 1
+    c = text[i + 1]
+    if c == "u" and i + 6 <= n:                       # \uXXXX
+        try:
+            out.add(chr(int(text[i + 2:i + 6], 16))); return i + 6
+        except ValueError:
+            pass
+    if c == "x":                                      # \xNN...
+        j = i + 2
+        while j < n and text[j] in "0123456789abcdefABCDEF" and j - i < 5:
+            j += 1
+        try:
+            out.add(chr(int(text[i + 2:j], 16))); return j
+        except ValueError:
+            pass
+    out.add(ESCAPES.get(c, c))
+    return i + 2
+
 def source_chars(text):
-    """提取 C 源码里所有字符串字面量的字符（含 \\uXXXX / \\xNN 转义）。"""
+    """提取 C 源码里所有字符串 / 字符字面量的字符。
+
+    ⚠ 必须用状态机扫描，不能用正则 —— 两个真实的坑（都踩过）：
+      1. 注释里有孤立双引号：`// ... `{ } | : "`（副符号格）...`（L396），
+         正则把之后 518 行吞成一个假字符串；
+      2. 字符字面量包着双引号：键位表里的 `L'"'`（L2109 附近），
+         正则把它当字符串起点，从这里起连锁错位 —— 「遇到 bug...」的「遇」
+         就是这么从字符集里丢掉的（U+9047 不进子集 → 实机单个字回退宋体）。
+    状态机处理 // 行注释、块注释、"字符串"、'字符字面量'（内容也收：键面符号）。
+    """
     out = set()
-    for m in re.finditer(r'(?:L)?"((?:[^"\\]|\\.)*)"', text):
-        s = m.group(1)
-        i = 0
-        while i < len(s):
-            c = s[i]
-            if c == "\\" and i + 1 < len(s):
-                n = s[i + 1]
-                if n == "u" and i + 6 <= len(s):       # \uXXXX
-                    try:
-                        out.add(chr(int(s[i + 2:i + 6], 16))); i += 6; continue
-                    except ValueError:
-                        pass
-                if n == "x":                            # \xNN...
-                    j = i + 2
-                    while j < len(s) and s[j] in "0123456789abcdefABCDEF" and j - i < 5:
-                        j += 1
-                    try:
-                        out.add(chr(int(s[i + 2:j], 16))); i = j; continue
-                    except ValueError:
-                        pass
-                out.add(ESCAPES.get(n, n)); i += 2; continue
-            out.add(c); i += 1
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":      # 行注释
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":    # 块注释
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        elif c == '"':                                          # 字符串
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i = _escaped(text, i, out)
+                else:
+                    out.add(text[i]); i += 1
+            i += 1
+        elif c == "'":                                          # 字符字面量（含 L'"' 这类）
+            i += 1
+            while i < n and text[i] != "'":
+                if text[i] == "\\":
+                    i = _escaped(text, i, out)
+                else:
+                    out.add(text[i]); i += 1
+            i += 1
+        else:
+            i += 1
     return out
 
 def collect():

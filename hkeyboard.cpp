@@ -1388,7 +1388,7 @@ static HFONT MakeFont(double size) {
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
     g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
-    g_sfSec  = MakeFont(16 * dpi);     // 关于页产品名（章节标题已下线，这一档只剩它在用）
+    g_sfSec  = MakeFont(20 * dpi);     // 关于页产品名（章节标题已下线，这一档只剩它在用）
     g_sfRow  = MakeFont(12.5 * dpi);   // 行主文本
     g_sfCtrl = MakeFont(11 * dpi);     // 控件标签：Tab / 开关「开·关」/ 分段 / 按钮 / 弹窗
     g_sfBase = MakeFont(10 * dpi);     // 行描述
@@ -2016,9 +2016,13 @@ static BOOL KeyHasGlyph(const KeyDef* k) {
 static void DrawKeyGlyph(HDC dc, int x, int y, int size, const KeyDef* k, DWORD color) {
     if (!k || size <= 0) return;
     if (k->vk == 0x5B) {
-        // Win11 风格四格徽标：四块圆角方块 + 中间一条缝
-        int sq = (int)(size * 0.44 + 0.5);
-        int gp = (int)(size * 0.12 + 0.5);
+        // Win11 风格四格徽标：四块圆角方块 + 中间一条缝。
+        // ⚠ 外框要比 size 收一圈：Menu 的三条杠在 24 网格里只占 2..22（≈83%），
+        //    而这里原来铺满整个 size —— 同样 size 下 Win 明显比 Menu 满一圈
+        //    （实机反馈「Menu 键和 Win 键的图标大小需一致」）。按 0.78 缩后再居中。
+        int box = (int)(size * 0.78 + 0.5);
+        int sq = (int)(box * 0.44 + 0.5);
+        int gp = (int)(box * 0.12 + 0.5);
         if (sq < 2) sq = 2;
         if (gp < 1) gp = 1;
         int total = sq * 2 + gp;
@@ -2190,9 +2194,12 @@ static const wchar_t* KeyText(const KeyDef* k) {
         //   g_bkspTextW = 字体重建时量一次的「Backspace」在 g_f12 档下的容纳宽。
         // 字体还没建完时（极早的一次绘制）退回几何判据 —— 实测「放得下」⇔ 键宽 ≥ 1.83 × 键高。
         case 0x08: {
+            // 默认布局的退格键只有 1.75u，文字被挤到只剩「Bksp」——实机反馈直接不要文字，
+            // 只留 ⌫ 图形（图形本身已经说清楚）。全尺寸 / 小键盘里键够宽，保留 Backspace。
+            if (g_layoutMode == 0) return L"";
             int avail = k->w - (int)(6 * GetSystemDpiScale());
-            if (g_bkspTextW > 0) return (avail >= g_bkspTextW) ? L"Backspace" : L"Bksp";
-            return (k->w >= (int)(1.9 * k->h)) ? L"Backspace" : L"Bksp";
+            if (g_bkspTextW > 0) return (avail >= g_bkspTextW) ? L"Backspace" : L"";
+            return (k->w >= (int)(1.9 * k->h)) ? L"Backspace" : L"";
         }
         case 0x09: return L"Tab";
         case 0x0D: return L"Enter";
@@ -3527,7 +3534,12 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     // 让描述第一行仍落在 块顶+34dpi（见下），块中心因此不变。
     // （文字自身还有「行盒中心 vs 墨迹中心」的补偿，已在 DrawTextGp 里统一做掉，
     //   所以这里直接按盒中心算即可，不需要再叠一次偏移。）
-    int textMid = ((int)(20 * m.dpi) / 2 + (int)(26 * m.dpi) + (int)(16 * m.dpi) / 2) / 2;
+    // 折行 / 不折行的**块高不同**（50 vs 42），块心必须各算各的。
+    // 原来固定用单行的 22 DIP：折行行（「小键盘按钮」这种长描述）的块心因此偏低 3 DIP，
+    // 字一长上下间距就不匀（实机反馈「文本一长上下间距又不对了」）。
+    int blockBottom = descWrap ? ((int)(18 * m.dpi) + (int)(32 * m.dpi))
+                               : ((int)(26 * m.dpi) + (int)(16 * m.dpi));
+    int textMid = blockBottom / 2;
     int tyText = ty + m.tileSize / 2 - textMid;
 
     DrawTextL(dc, tx, tyText, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
@@ -4317,22 +4329,21 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
-        // 产品名用 g_sfSec（16pt ≈ 21.3 DIP）而不是页面标题那一档：
+        // 产品名用 g_sfSec（20pt ≈ 26.7 DIP）而不是页面标题那一档：
         // 制作工具的关于页是 名称 20 / 页标题 26（0.77），本窗口若两者同号（都 18pt = 24 DIP），
         // 卡里的名字会和页面大标题打架。
-        // 文字块 = 名 26 + 间隙 6 + 版本 18 = 50，按卡纵心居中（卡高 76 = 上下各 13）。
-        // ⚠ 名 22 / 偏移 28 / 块 46 是 14pt 时的值，字号提上去后盒子必须一起长，
-        //   否则 16pt 的墨迹（em ≈ 21.3 DIP）在 22 DIP 的盒里上下被切。
+        // 文字块 = 名 32 + 间隙 6 + 版本 18 = 56，按卡纵心居中（卡高 76 = 标识 56 + 上下各 10）。
+        // ⚠ 名盒 / 偏移 / 块高必须随字号一起长，否则墨迹被盒切（em 26.7 DIP 放不进 26 的盒）。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(18 * m.dpi);
-        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(50 * m.dpi)) / 2;
+        int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(56 * m.dpi)) / 2;
         int tw = al.card1.right - AboutPadX(m) - tx;
-        DrawTextL(dc, tx, ty, tw, (int)(26 * m.dpi),
+        DrawTextL(dc, tx, ty, tw, (int)(32 * m.dpi),
                   T(L"HKeyboard 轻键", L"HKeyboard"), g_sfSec, C_WHITE);
         wchar_t meta[96];
         // 版本串 = 内部版本号 + 构建日期（北京时间），例如 "v2.0_20261002"
         swprintf(meta, 96, T(L"轻量屏幕键盘 · v%hs_%ls (%ls)", L"Lightweight screen keyboard · v%hs_%ls (%ls)"),
                  VER_FILEVERSION_STR, HK_BUILD_DATE, ArchName());
-        DrawTextL(dc, tx, ty + (int)(32 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
+        DrawTextL(dc, tx, ty + (int)(38 * m.dpi), tw, (int)(18 * m.dpi), meta, g_sfMeta, C_DIM);
 
         DrawRoundRect(dc, al.card2.left, al.card2.top,
                       al.card2.right - al.card2.left, al.card2.bottom - al.card2.top,

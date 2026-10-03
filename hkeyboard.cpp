@@ -6570,6 +6570,17 @@ static void Clip_Clear() {
     if (Clip_OpenRetry()) { EmptyClipboard(); CloseClipboard(); }
 }
 
+// 读剪贴板里的 Unicode 文本。
+//
+// ⚠⚠ 返回值语义必须分清三件事，混为一谈会直接导致误判：
+//    FALSE  ->  剪贴板**根本没有文本**（打不开、或没有 CF_UNICODETEXT）
+//    TRUE + out[0] != 0  ->  有文本，且非空
+//    TRUE + out[0] == 0  ->  **有文本，但内容是空的**
+//                          这第三种情况在「空输入框」上完全正常 ——
+//                          `Ctrl+C` 从空字段复制，本来就复制不到东西。
+//                          早期把 FALSE 一律当成"读不到"，于是把
+//                          **空输入框误判成不可测**，恰好把最可靠的
+//                          对照组给跳过了。
 static BOOL Clip_ReadText(wchar_t* out, int cap) {
     if (!out || cap < 8) return FALSE;
     out[0] = 0;
@@ -6588,6 +6599,18 @@ static BOOL Clip_ReadText(wchar_t* out, int cap) {
     }
     CloseClipboard();
     return ok;
+}
+
+// 剪贴板里**是否存在任何 Unicode 文本**（哪怕内容是空的字符串）。
+// ⚠ 与 `Clip_ReadText` 的区别：这个函数只回答"有没有"，
+//   用来区分「空输入框（正常）」和「剪贴板压根没被写过（异常）」。
+//   在空字段上按 Ctrl+C，剪贴板可能是空的字符串，也可能压根没变化；
+//   两者的区别靠"打开剪贴板后有没有 CF_UNICODETEXT"来判断。
+static BOOL Clip_HasUnicode(void) {
+    if (!Clip_OpenRetry()) return FALSE;
+    BOOL has = (GetClipboardData(CF_UNICODETEXT) != NULL);
+    CloseClipboard();
+    return has;
 }
 
 static BOOL CALLBACK CbEnumImeUi(HWND w, LPARAM p) {
@@ -6951,19 +6974,38 @@ static BOOL FindLaunchableApp(const wchar_t* selfDir,
         }
     }
 
-    // ③ 兜底：系统自带原版记事本（对照组）
+    // ③ 兜底：找一个**真正已知良好**的对照组
+    //
+    // ⚠⚠⚠ 为什么要多备几个、且事后还要复查真实窗口类？
+    //   实测（本机演练）：`%SystemRoot%\system32\notepad.exe` 启动出来的
+    //   窗口**类名是 `Notepad4`、焦点在 `Scintilla`** ——
+    //   因为有人把系统记事本**替换成了 Notepad4**（常见手法）。
+    //   那个窗口恰恰是 issue #3 的故障环境！把它当"已知能打中文"的基准，
+    //   结论必然错。⇒ 光看"我启动的是 notepad.exe"**不能**断定它是对照组，
+    //   必须回看真实窗口类（见调用处的 RECLASSIFIED 逻辑）。
+    //
+    //   兜底顺序刻意如此：先试系统记事本（Win10 一定有），
+    //   它若已被替换成 Notepad4，WordPad 就是下一个候选
+    //   （Win7/8/10 自带、Win11 已移除、控件是标准 RichEdit）。
     {
         wchar_t sys[MAX_PATH] = {0};
         GetSystemDirectoryW(sys, MAX_PATH);
         if (sys[0]) {
-            wchar_t p[MAX_PATH] = {0};
-            _snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%ls\\notepad.exe", sys);
-            if (HkFileExists(p)) {
-                wcscpy_s(outPath, pathCap, p);
-                wcscpy_s(outLabel, labelCap, L"notepad.exe  [CONTROL - known good, cannot repro #3]");
-                outArgs[0] = 0;
-                *outIsControl = TRUE;
-                return TRUE;
+            static const struct { const wchar_t* file; const wchar_t* label; } kCtl[] = {
+                { L"notepad.exe",  L"notepad.exe  [CONTROL - known good, cannot repro #3]" },
+                { L"write.exe",    L"write.exe    [CONTROL - RichEdit, known good]" },
+                { L"wordpad.exe",  L"wordpad.exe  [CONTROL - RichEdit, known good]" },
+            };
+            for (int i = 0; i < (int)(sizeof(kCtl) / sizeof(kCtl[0])); i++) {
+                wchar_t p[MAX_PATH] = {0};
+                _snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%ls\\%ls", sys, kCtl[i].file);
+                if (HkFileExists(p)) {
+                    wcscpy_s(outPath, pathCap, p);
+                    wcscpy_s(outLabel, labelCap, kCtl[i].label);
+                    outArgs[0] = 0;
+                    *outIsControl = TRUE;
+                    return TRUE;
+                }
             }
         }
     }
@@ -7429,6 +7471,31 @@ static void RunImeProbe() {
                 t->launched  = TRUE;
                 t->usable    = TRUE;
                 t->r1 = t->r2 = PR_SKIP;
+                // ⚠⚠⚠ **不能只信"我们启动的是 notepad.exe"就当对照组。**
+                //   实测（本机演练）：系统 notepad.exe 启动出来的窗口
+                //   类名是 `Notepad4`、标题 `未命名 - Notepad4`、焦点在
+                //   `Scintilla` —— 因为**有人把 notepad.exe 换成了 Notepad4**
+                //   （一种常见的"替换版记事本"手法）。
+                //   它是 Scintilla 控件，正是 issue #3 的故障环境，
+                //   **恰恰是理想的被测对象，绝不能当对照组**。
+                //   把故障对象当基准 ⇒ 结论必然错。
+                //   ⇒ 一律以**实际窗口类名**为准。
+                {
+                    wchar_t rcls[80] = {0};
+                    GetClassNameW(found, rcls, 80);
+                    wchar_t resc[200]; FillEscaped(resc, 200, rcls);
+                    if (isCtrl && ContainsCI(rcls, L"Notepad4")) {
+                        ProbeFmt(&L,"         RECLASSIFIED: the window is really Notepad4\n");
+                        ProbeFmt(&L, "         (class='%ls'), NOT the system notepad -\n", resc);
+                        ProbeFmt(&L, "         system notepad.exe has been REPLACED on this\n");
+                        ProbeFmt(&L, "         machine. Treating it as a TEST TARGET instead of\n");
+                        ProbeFmt(&L, "         a control, because that is what it actually is.\n");
+                        t->isControl = FALSE;
+                        wcscpy_s(t->label, 80, L"Notepad4 (hijacked notepad.exe)");
+                    } else if (isCtrl) {
+                        wcscpy_s(t->label, 80, L"notepad.exe  [CONTROL - known good]");
+                    }
+                }
                 ProbeFmt(&L, "         added as target #%d%s\n", nTgt,
                          isCtrl ? "  [CONTROL]" : "");
             } else if (!found) {
@@ -7527,14 +7594,19 @@ static void RunImeProbe() {
                 wchar_t probe[256] = {0};
                 BOOL pOk = GrabTargetText(probe, 256);
                 wchar_t pesc2[512]; FillEscaped(pesc2, 512, probe);
-                if (!pOk) {
-                    ProbeFmt(&L, "!! SKIP this target - could not read the field before\n");
-                    ProbeFmt(&L, "!! starting (Ctrl+A/Ctrl+C produced nothing). The probe\n");
-                    ProbeFmt(&L, "!! cannot prove the caret is in an editable field.\n");
+                // ⚠ 分清两种「没有内容」：
+                //   · 剪贴板被写过、但内容是空的 ⇒ **光标在空输入框里，可测**
+                //   · 剪贴板压根没被写过（目标不响应 Ctrl+C）
+                //     ⇒ 判不了，不可测
+                // 早期把两者都当"读不到"，结果把**空输入框误判成不可测** ——
+                // 而"空字段"恰恰是正常且最理想的状态。
+                if (!pOk && !Clip_HasUnicode()) {
+                    ProbeFmt(&L, "!! SKIP this target - the clipboard was never written, so\n");
+                    ProbeFmt(&L, "!! Ctrl+A/Ctrl+C did not reach any editable field.\n");
                     t->usable = FALSE;
                     continue;
                 }
-                if (wcslen(probe) > 0) {
+                if (pOk && wcslen(probe) > 0) {
                     ProbeFmt(&L, "!! SKIP this target - the field is NOT empty, so the caret is\n");
                     ProbeFmt(&L, "!! probably not in an input box (a self-drawn control would\n");
                     ProbeFmt(&L, "!! select the whole page instead). readback='%ls'\n", pesc2);
@@ -7542,7 +7614,7 @@ static void RunImeProbe() {
                     t->usable = FALSE;
                     continue;
                 }
-                ProbeFmt(&L, "pre-check OK: field reads back empty => caret is in an editable field\n");
+                ProbeFmt(&L, "pre-check OK: field reads back EMPTY => caret IS in an editable field\n");
             }
         }
 

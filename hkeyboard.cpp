@@ -141,8 +141,16 @@ int g_keyHeight = 46;
 #define TIMER_WINDOW_ANIM 8828
 #define TIMER_SETTINGS_ANIM 8827
 #define TIMER_WIN_FADE 8831
+// -envtest 专用：驱动"注入→退出"两个阶段（说明见 EnvTestInject）
+#define TIMER_ENVTEST   8833
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
+// -envtest 的运行标志与前向声明。
+// ⚠ 前向声明是必需的：WM_TIMER 的处理在主 WndProc 里（文件靠前），
+//   而 EnvTestInject 定义在 WinMain 附近（文件靠后）。
+BOOL g_envTest = FALSE;
+int  g_envTestStage = 0;
+static void EnvTestInject();
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
 
 #ifndef WM_DPICHANGED
@@ -6374,6 +6382,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (w == TIMER_WINDOW_ANIM) {
             TickWindowMotion(&g_mainMotion, hWnd);
             return 0;
+        } else if (w == TIMER_ENVTEST) {
+            // -envtest：两阶段 —— 先注入，再退出。说明见 EnvTestInject。
+            if (g_envTestStage == 0) {
+                g_envTestStage = 1;
+                SetTimer(hWnd, TIMER_ENVTEST, 3000, NULL);
+                EnvTestInject();
+            } else {
+                KillTimer(hWnd, TIMER_ENVTEST);
+                DestroyWindow(hWnd);
+            }
+            return 0;
         } else if (w == TIMER_REPEAT) {
             SetTimer(hWnd, TIMER_REPEAT, 40, NULL);
             if (g_pk >= 0 && g_pk == g_repeatKeyIdx) {
@@ -6606,6 +6625,34 @@ static void RunSendTest() {
     }
 }
 
+// ---- -envtest：在 HKeyboard 的**完整环境**里只做纯注入 ----
+//
+// 背景：`-sendtest` 已证明，在**什么都不装**的裸进程里，四种纯注入
+// 方式**全部成功**（记事本四段都是「你好」）。⇒ 注入代码本身没问题，
+// 问题出在 HKeyboard 的**运行环境**或**调用方式**上。
+//
+// 这个入口把问题一分为二：让 HKeyboard **正常启动** —— 窗口、低层键盘
+// 钩子、两个 WinEvent 钩子、焦点定时器、托盘图标全都装好，和平时一模一样 ——
+// 但**只用纯注入**打字，既不经过 SendKey，也不需要用户点击按键。
+//
+//   · 若记事本里出现「你好」 ⇒ 环境无辜，问题在 SendKey 的代码路径，
+//                              或者「用户点击按键」这个动作本身
+//   · 若出现 nihao          ⇒ 环境里有东西在干扰注入，
+//                              再逐个摘掉（钩子 / 窗口 / 定时器）即可定位
+//
+// ⚠ 用定时器触发，**不在 WinMain 里 Sleep**。真实按键也是"短暂阻塞 UI 线程
+//   后立即返回"，用定时器才与它等价；直接 Sleep 会把消息循环堵很久，
+//   那是另一种（不真实的）状态，测出来的东西不可信。
+static void EnvTestInject() {
+    static const BYTE kL[5] = { 'N', 'I', 'H', 'A', 'O' };
+    for (int i = 0; i < 5; i++) {
+        SendTestKey(kL[i], 1);      // 方式2 = 当前版本 SendKey 的做法
+        Sleep(30);
+    }
+    Sleep(200);
+    SendTestKey(VK_SPACE, 1);       // 上屏
+}
+
 // 高精度计时器分辨率（动态加载 winmm，避免新增链接依赖）
 // SetTimer 默认受 ~15.6ms 系统计时粒度限制，动画会一顿一顿；
 // 进程级调到 1ms 让窗口滑动定时器按请求间隔触发。
@@ -6678,6 +6725,12 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         return 0;
     }
 
+    // -envtest：在**完整环境**里只做纯注入（说明见 EnvTestInject）。
+    // 与 -sendtest 的区别：那个什么都不装，这个全装（窗口/钩子/定时器）。
+    // ⚠ 不能在这里 return —— 要让它正常启动到消息循环，
+    //   再由 TIMER_ENVTEST 驱动注入，这样环境才是"真在跑的 HKeyboard"。
+    g_envTest = HasArg(cmd, "-envtest") ? TRUE : FALSE;
+
     BOOL isTouch = IsTouchDevice();
 
     if (tOnly && !isTouch) return 0;
@@ -6741,6 +6794,13 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     } else {
         g_vis = FALSE;
         ShowWindow(hWnd, SW_HIDE);
+    }
+
+    // -envtest：3 秒后开始注入（给用户切回记事本、放进光标的时间）。
+    // 此刻窗口、低层键盘钩子、两个 WinEvent 钩子、焦点定时器、托盘
+    // 全都已装好 —— 与真实使用状态完全一致，只差"用户点击按键"那一下。
+    if (g_envTest) {
+        SetTimer(hWnd, TIMER_ENVTEST, 3000, NULL);
     }
 
     MSG msg;

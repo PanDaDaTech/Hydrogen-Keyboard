@@ -3338,7 +3338,15 @@ static BOOL SettingsRowHidden(int tab, int index) {
         if (index == closeRow + 3) return onlyDefault;   // Shift 符号
         return FALSE;
     }
-    if (tab == 3) return onlyDefault && index == 1;      // Fn 网页布局（= index 1，不是 2）
+    // Fn 网页布局两条件任一成立就藏：
+    //  a) 非默认布局 —— 小键盘 / 全尺寸布局压根没有 Fn 层
+    //  b) 开了功能键行 —— 此时底排走 kDefRow4NoFn，**Fn 键被移除**、空出的 1u 并进空格
+    //     （5.5 → 6.5u，见 BuildDefaultKeys）。键都没了，留着这行开关纯属摆设。
+    //
+    // ⚠ 只藏 UI 行，**不改 g_fnWebLayout 的持久化值**：用户关掉功能键行后，
+    //   原来的网页布局设置立刻原样恢复，不用重新开一次。这是「隐藏入口」不是「禁用功能」。
+    //   （反过来若在这里顺手把 g_fnWebLayout 置 FALSE，就成了静默改用户配置。）
+    if (tab == 3) return (onlyDefault || g_showFKeys) && index == 1;
     return FALSE;
 }
 

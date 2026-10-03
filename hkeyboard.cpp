@@ -2252,10 +2252,72 @@ static BOOL IsActive(const KeyDef* k) {
 // ========== IME-Compatible Input Injection ==========
 // ⚠ 必须用 SendInput（keybd_event 已废弃且拦不到高权限窗口），扫描码走
 //   MapVirtualKeyW(MAPVK_VK_TO_VSC) —— 部分 IME 依赖正确扫描码。
-static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
-    INPUT inputs[12] = {};
-    int count = 0;
+//
+// ⚠⚠ **注入必须分段，down/up 之间要让出消息循环**（Win10 微软拼音不收，issue #3）
+//
+//   现象：Win10 + 微软拼音打不出中文，但**微信拼音正常**、**Win11 正常**、
+//   **Win7 正常**，而且**同一台机器上资源管理器搜索框里能打中文、
+//   Edge 地址栏和记事本里不能**。
+//   这组对照说明注入通路本身是通的（英文/数字全部正常），微软拼音的状态机
+//   只是不接受这种「一个 SendInput 里down+up 全部灌完、零延时」的节奏。
+//
+//   原理：微软拼音的 TSF 前端要在 WM_KEYDOWN 之后**跑一轮自己的消息循环**
+//   才开始组字；down 与 up 在同一个 SendInput 里同批到达时，它还没来得及
+//   进入组字状态就收到了 KEYUP，于是整串被丢掉 —— 不上屏、不出候选窗。
+//   微信拼音的实现更宽容，Win11 / Win7 的 IME 容错更高，所以都不复现。
+//   Chromium（Edge）与纯文本控件对按键节奏最敏感，资源管理器的搜索框反而宽容，
+//   于是出现「换个窗口就能用」的迷惑现象。
+//
+//   佐证：本文件原有的 ToggleImeLang / SendWinToggle **都**是「分两次发送 +
+//   Sleep(50)」并在注释里写明了「避免过快 down+up 被 IME 忽略」，
+//   偏偏 SendKey 这条最常走的路径漏了 —— 现在按同样的思路补上。
+//
+//   ⚠ 延时不能省，也不能给太大：太大则长按连发（TIMER_REPEAT 40ms 一个 tick）
+//   会因为 Sleep 累积而拖慢。1ms 是「足够让出消息循环」与「不拖慢连发」的折中。
+#define KEY_INJECT_GAP_MS 1
 
+// gapMs = 0 表示「不分段、一次性 SendInput 灌完」，即v2.0 修复前的行为。
+// 只给**连续大量注入**的场景用（Fn 层的网址后缀键TypeDomainText、长按连发）：
+// 那里本来就不会触发中文组字，逐键 1ms 的延时只会累积成几十毫秒的卡顿。
+// ⚠ 绝不要给「用户敲单个键」用 —— 那正是 issue #3 的场景，需要让出消息循环。
+static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs) {
+    if (gapMs == 0) {
+        // 快速路径：还原成一次性批量注入（与修复前逐字一致）
+        INPUT inputs[12] = {};
+        int count = 0;
+        UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        BOOL isExt = (vk == VK_RCONTROL || vk == VK_RMENU ||
+                      vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN ||
+                      vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT ||
+                      vk == VK_INSERT || vk == VK_DELETE || vk == VK_LWIN || vk == VK_RWIN ||
+                      vk == VK_NUMLOCK);
+        DWORD ext = isExt ? KEYEVENTF_EXTENDEDKEY : 0;
+        if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD;
+                  i.ki.wVk = VK_CONTROL; i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); }
+        if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY; }
+        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); }
+        if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
+                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY; }
+        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext; }
+        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_KEYUP; }
+        if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
+                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY; }
+        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP; }
+        if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY; }
+        if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_CONTROL;
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP; }
+        SendInput(count, inputs, sizeof(INPUT));
+        return;
+    }
+    // 正常路径：下面那个 SendKey 的分段实现
+    SendKey(vk, sh, ct, al, win);
+}
+
+static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
     UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 
     // 判断扩展键（右 Ctrl/Alt、方向键、Win 等；右 Shift 不带 E0 扩展标志）
@@ -2268,78 +2330,97 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
 
     DWORD extFlag = isExtended ? KEYEVENTF_EXTENDEDKEY : 0;
 
-    // 按下修饰键
-    if (ct) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_CONTROL;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
-        count++;
-    }
-    if (al) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_MENU;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
-        inputs[count].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-        count++;
-    }
-    if (sh) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_SHIFT;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
-        count++;
-    }
-    if (win) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_LWIN;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
-        inputs[count].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-        count++;
-    }
-
-    // 目标键 down + up（以 VK 形式发送，TSF/IME 可正确拦截 WM_KEYDOWN）
-    inputs[count].type = INPUT_KEYBOARD;
-    inputs[count].ki.wVk = vk;
-    inputs[count].ki.wScan = (WORD)sc;
-    inputs[count].ki.dwFlags = extFlag;
-    count++;
-
-    inputs[count].type = INPUT_KEYBOARD;
-    inputs[count].ki.wVk = vk;
-    inputs[count].ki.wScan = (WORD)sc;
-    inputs[count].ki.dwFlags = extFlag | KEYEVENTF_KEYUP;
-    count++;
-
-    // 释放修饰键
-    if (win) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_LWIN;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
-        count++;
-    }
-    if (sh) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_SHIFT;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
-        count++;
-    }
-    if (al) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_MENU;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
-        count++;
-    }
-    if (ct) {
-        inputs[count].type = INPUT_KEYBOARD;
-        inputs[count].ki.wVk = VK_CONTROL;
-        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
-        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
-        count++;
+    // ---- 第 1 段：修饰键按下（一次 SendInput，顺序 ct → al → sh → win）----
+    {
+        INPUT mods[4] = {};
+        int mc = 0;
+        if (ct) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_CONTROL;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+            mc++;
+        }
+        if (al) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_MENU;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+            mc++;
+        }
+        if (sh) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_SHIFT;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+            mc++;
+        }
+        if (win) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_LWIN;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+            mc++;
+        }
+        if (mc > 0) SendInput(mc, mods, sizeof(INPUT));
+        if (mc > 0) Sleep(KEY_INJECT_GAP_MS);
     }
 
-    SendInput(count, inputs, sizeof(INPUT));
+    // ---- 第 2 段：目标键 down（以 VK 形式发送，TSF/IME 可正确拦截 WM_KEYDOWN）----
+    {
+        INPUT down = {};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wVk = vk;
+        down.ki.wScan = (WORD)sc;
+        down.ki.dwFlags = extFlag;
+        SendInput(1, &down, sizeof(INPUT));
+    }
+
+    // 关键延时：给 IME 的 TSF 前端跑一轮消息循环、进入组字状态
+    Sleep(KEY_INJECT_GAP_MS);
+
+    // ---- 第 3 段：目标键 up ----
+    {
+        INPUT up = {};
+        up.type = INPUT_KEYBOARD;
+        up.ki.wVk = vk;
+        up.ki.wScan = (WORD)sc;
+        up.ki.dwFlags = extFlag | KEYEVENTF_KEYUP;
+        SendInput(1, &up, sizeof(INPUT));
+    }
+
+    // ---- 第 4 段：修饰键抬起（逆序win → sh → al → ct，与按下相反）----
+    {
+        INPUT mods[4] = {};
+        int mc = 0;
+        if (win) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_LWIN;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+            mc++;
+        }
+        if (sh) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_SHIFT;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP;
+            mc++;
+        }
+        if (al) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_MENU;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+            mc++;
+        }
+        if (ct) {
+            mods[mc].type = INPUT_KEYBOARD;
+            mods[mc].ki.wVk = VK_CONTROL;
+            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP;
+            mc++;
+        }
+        if (mc > 0) SendInput(mc, mods, sizeof(INPUT));
+    }
 }
 
 // 输入法中英文切换：由左右 Shift 的第 2 次点击触发（用右 Shift 扫描码，与真实右 Shift 一致）。
@@ -2461,7 +2542,9 @@ static void TypeDomainText(const wchar_t* s) {
         } else {
             continue;
         }
-        SendKey((BYTE)vk, sh, FALSE, FALSE);
+        // 网址后缀是「一次性把整串打完」，不会进中文组字 —— 走 gap=0 的快速路径，
+        // 否则每个字符 2 次 Sleep(1)，20 字符的域名就是 40ms 的卡顿。
+        SendKeyGap((BYTE)vk, sh, FALSE, FALSE, FALSE, 0);
     }
 }
 

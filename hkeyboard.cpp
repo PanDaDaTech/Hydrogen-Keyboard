@@ -10,6 +10,7 @@
 #include <oleacc.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>   // ProbeFmt 的变参格式化（诊断输出用）
 #include <string.h>
 #include <math.h>
 #include "resource.h"
@@ -6446,64 +6447,97 @@ static void InitTimePeriodApi() {
 //   「收到了但中途 return」。**所以这里在任何分支之前就写一份启动痕迹**，
 //   把命令行原文、exe 路径、是否命中 -imeprobe 都记下来，
 //   以后再出「结果文件是空的」能立刻看出卡在哪一步。
-static void WriteStartupTrace(const char* cmd) {
+// 诊断输出用的裸写文件工具。
+// ⚠ 为什么不早fopen：`fprintf` 在 VMware 共享文件夹路径上只落下BOM（3 字节）就
+//   再无内容 —— CRT 缓冲写往共享路径不可靠。改成 CreateFileW + WriteFile +
+//   FILE_FLAG_WRITE_THROUGH，每段写完立刻FlushFileBuffers，把错误码一并记下来自证。
+struct ProbeLog {
+    HANDLE h;
+    DWORD  err;      //最近一次写/开失败时的 GetLastError
+    BOOL   bad;      // 置TRUE 表示已发生错误
+};
+
+static ProbeLog ProbeOpen(BOOL append) {
+    ProbeLog L;
+    L.h = INVALID_HANDLE_VALUE;
+    L.err = 0;
+    L.bad = FALSE;
+
     wchar_t dir[MAX_PATH];
-    if (!GetModuleFileNameW(NULL, dir, MAX_PATH)) return;
+    if (!GetModuleFileNameW(NULL, dir, MAX_PATH)) return L;
     wchar_t* cut = wcsrchr(dir, L'\\');
-    if (!cut) return;
+    if (!cut) return L;
     *cut = 0;
 
     wchar_t path[MAX_PATH] = {0};
     wcscpy_s(path, MAX_PATH, dir);
     wcscat_s(path, L"\\hkeyboard_imeprobe.txt");
 
-    FILE* fp = NULL;
-    _wfopen_s(&fp, path, L"w, ccs=UTF-8");
-    if (!fp) {
+    DWORD creation = append ? FILE_APPEND_DATA : (DWORD)GENERIC_WRITE;
+    L.h = CreateFileW(path, creation, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                      NULL);
+    if (L.h == INVALID_HANDLE_VALUE) {
+        L.err = GetLastError();
+        L.bad = TRUE;
+        // 退回 %TEMP%
         if (GetTempPathW(MAX_PATH, dir)) {
             wcscpy_s(path, MAX_PATH, dir);
             wcscat_s(path, L"hkeyboard_imeprobe.txt");
-            _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+            L.h = CreateFileW(path, creation, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                              NULL);
+            if (L.h == INVALID_HANDLE_VALUE) { L.err = GetLastError(); L.bad = TRUE; }
+            else { SetFilePointer(L.h, 0, NULL, FILE_END); L.bad = FALSE; L.err = 0; }
         }
+    } else {
+        SetFilePointer(L.h, 0, NULL, append ? FILE_END : FILE_BEGIN);
     }
-    if (!fp) return;
+    return L;
+}
 
-    fprintf(fp, "=== startup trace ===\n");
-    fprintf(fp, "cmdline = '%s'\n", (cmd && *cmd) ? cmd : "(empty)");
-    fprintf(fp, "hasArg  = %d\n", (strstr(cmd, "-imeprobe") != NULL) ? 1 : 0);
-    fprintf(fp, "time= %lu\n", GetTickCount());
-    fclose(fp);
+static void ProbeWrite(ProbeLog* L, const char* s) {
+    if (!L || L->h == INVALID_HANDLE_VALUE || !s) return;
+    DWORD n = 0;
+    if (!WriteFile(L->h, s, (DWORD)strlen(s), &n, NULL)) {
+        L->err = GetLastError();
+        L->bad = TRUE;
+    }
+    FlushFileBuffers(L->h);
+}
+
+static void ProbeFmt(ProbeLog* L, const char* fmt, ...) {
+    if (!L || L->h == INVALID_HANDLE_VALUE) return;
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (n > 0) ProbeWrite(L, buf);
+}
+
+static void ProbeClose(ProbeLog* L) {
+    if (L && L->h != INVALID_HANDLE_VALUE) { CloseHandle(L->h); L->h = INVALID_HANDLE_VALUE; }
+}
+
+static void WriteStartupTrace(const char* cmd) {
+    ProbeLog L = ProbeOpen(FALSE);
+
+    ProbeFmt(&L, "=== startup trace ===\n");
+    ProbeFmt(&L, "cmdline = '%s'\n", (cmd && *cmd) ? cmd : "(empty)");
+    ProbeFmt(&L, "hasArg  = %d\n", (strstr(cmd, "-imeprobe") != NULL) ? 1 : 0);
+    ProbeFmt(&L, "tick    = %lu\n", GetTickCount());
+    ProbeFmt(&L, "pid     = %lu\n", GetCurrentProcessId());
+
+    if (L.bad) ProbeFmt(&L, "!! write error %lu occurred\n", L.err);
+
+    ProbeClose(&L);
 }
 
 static void RunImeProbe() {
     static const char* kNames[] = { "?", "SendKey(gap=1ms)", "SendKeyGap(gap=0)" };
 
-    // ⚠ 结果写到**exe 同目录**，不写 %TEMP%：
-    //   测试时 exe 放在 VMware 共享文件夹里，写在 exe 旁边宿主机能直接读到，
-    //   省掉「去虚机里翻 %TEMP% 再拷回来」这一步。%TEMP% 在虚机里位置太偏。
-    //   写不出来时（只读目录 / 无权限）退回 %TEMP%，两条路径都试。
-    wchar_t dir[MAX_PATH];
-    wchar_t path[MAX_PATH] = {0};
-    if (GetModuleFileNameW(NULL, dir, MAX_PATH)) {
-        wchar_t* cut = wcsrchr(dir, L'\\');
-        if (cut) {
-            *cut = 0;
-            wcscpy_s(path, MAX_PATH, dir);
-            wcscat_s(path, L"\\hkeyboard_imeprobe.txt");
-        }
-    }
-    FILE* fp = NULL;
-    // ⚠ 用追加模式（"a"）而不是覆盖（"w"）：WriteStartupTrace 已经写了启动痕迹，
-    //   这里追加内容，两者才能同时留在一个文件里供对账。
-    if (path[0]) _wfopen_s(&fp, path, L"a, ccs=UTF-8");
-    if (!fp) {
-        if (GetTempPathW(MAX_PATH, dir)) {
-            wcscpy_s(path, MAX_PATH, dir);
-            wcscat_s(path, L"hkeyboard_imeprobe.txt");
-            _wfopen_s(&fp, path, L"a, ccs=UTF-8");
-        }
-    }
-    if (!fp) return;
+    ProbeLog L = ProbeOpen(TRUE);   // 追加：WriteStartupTrace 已写了第一段
 
     HWND fg = GetForegroundWindow();
     char cls[128] = {0};
@@ -6512,30 +6546,83 @@ static void RunImeProbe() {
     wchar_t exepath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exepath, MAX_PATH);
 
-    fprintf(fp, "\n=== self-probe ===\n");
-    fprintf(fp, "exe=%ls\n", exepath);
-    fprintf(fp, "pid=%lu foreground=0x%llx class=%s\n",
-            GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)fg, cls);
+    ProbeFmt(&L, "\n=== self-probe ===\n");
+    ProbeFmt(&L, "exe=%ls\n", exepath);
+    ProbeFmt(&L, "pid=%lu foreground=0x%llx class=%s\n",
+             GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)fg, cls);
 
     DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
     HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
-    fprintf(fp, "foregroundTid=%lu keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
-            tidFg, (unsigned long long)(ULONG_PTR)hkl);
+    ProbeFmt(&L, "foregroundTid=%lu keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
+             tidFg, (unsigned long long)(ULONG_PTR)hkl);
+
+    //⚠ 自己拉起记事本并置前，不再要求用户手工准备 ——
+    //   手工准备既易错（用户已经点了记事本却仍没识别到），也让测试不可复现。
+    ProbeFmt(&L, "\n-- launching notepad ourselves --\n");
+    HWND np = NULL;
+    {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        WCHAR dir[MAX_PATH];
+        if (GetSystemDirectoryW(dir, MAX_PATH)) {
+            wcscat_s(dir, L"\\notepad.exe");
+            CreateProcessW(dir, NULL, NULL, NULL, FALSE,
+                           0, NULL, NULL, &si, &pi);
+            if (pi.hProcess) {
+                WaitForInputIdle(pi.hProcess, 8000);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
+        Sleep(1200);
+        //枚举顶层窗口找 Notepad（比 FindWindow 稳，能同时匹配新版记事本类名）
+        for (HWND w = GetTopWindow(NULL); w; w = GetNextWindow(w, GW_HWNDNEXT)) {
+            if (!IsWindowVisible(w)) continue;
+            wchar_t cn[128] = {0};
+            GetClassNameW(w, cn, 128);
+            if (wcsstr(cn, L"Notepad")) { np = w; break; }
+        }
+        ProbeFmt(&L, "notepadHwnd=0x%llx\n", (unsigned long long)(ULONG_PTR)np);
+
+        if (np) {
+            ShowWindow(np, SW_RESTORE);
+            BringWindowToTop(np);
+            SetForegroundWindow(np);
+            SetActiveWindow(np);
+            Sleep(700);
+            // 置前可能被拒，前台不是它就再试一次
+            if (GetForegroundWindow() != np) {
+                SetForegroundWindow(np);
+                SetActiveWindow(np);
+                Sleep(500);
+            }
+            fg = GetForegroundWindow();
+            cls[0] = 0;
+            GetClassNameA(fg, cls, 128);
+            ProbeFmt(&L, "afterForce foreground=0x%llx class=%s  %s\n",
+                     (unsigned long long)(ULONG_PTR)fg, cls,
+                     (fg == np) ? "(OK, ours is foreground)" : "(FAILED to come to front)");
+        } else {
+            ProbeFmt(&L, "!! could not find a notepad window\n");
+        }
+    }
 
     // 只在目标窗口类像文本编辑器时才测，避免往命令行 / 资源管理器里灌字符。
-    // ⚠ 不做限制也可以，但要在文件里写明 class 是什么 —— 万一用户停在命令行，
-    //   SKIP 本身也是有用的信息。
     BOOL looksLikeEditor = (strstr(cls, "Edit") || strstr(cls, "Notepad") ||
                             strstr(cls, "Chrome") || strstr(cls, "Edge") ||
                             cls[0] == 0);
-    fprintf(fp, "looksLikeEditor=%d\n", looksLikeEditor);
+    ProbeFmt(&L, "looksLikeEditor=%d\n", looksLikeEditor);
     if (!looksLikeEditor) {
-        fprintf(fp, "SKIP: foreground class is not a known text control\n");
-        fprintf(fp, "hint: focus Notepad (and click into the text area) first, then rerun\n");
-        fclose(fp);
+        ProbeFmt(&L, "SKIP: foreground class is not a known text control\n");
+        ProbeFmt(&L, "hint: this build launches notepad by itself; if we got here,\n");
+        ProbeFmt(&L, "      SetForegroundWindow was blocked. Switch to Notepad manually\n");
+        ProbeFmt(&L, "      and run again.\n");
+        ProbeClose(&L);
         return;
     }
-    fprintf(fp, "\n");
+    ProbeFmt(&L, "\n");
 
     for (int round = 1; round <= 2; round++) {
         // 清空目标：Ctrl+A 然后 Delete（用 gap=0 快速路径，不干扰本轮测量对象）
@@ -6571,25 +6658,35 @@ static void RunImeProbe() {
                             (LPARAM)(ULONG_PTR)buf,
                             SMTO_ABORTIFHUNG, 1500, NULL);
 
-        // 把不可打印字符替成 '.'，免得控制台里出现乱码
-        wchar_t shown[256];
-        for (int i = 0; i < 255; i++) {
+        //把不可打印字符替成 '.'，免得控制台里出现乱码；
+        // 非 ASCII（组字结果）转成 U+XXXX 形式，便于区分「组字了」与「原样字母」。
+        wchar_t shown[1024];
+        int si2 = 0;
+        for (int i = 0; i < 255 && si2 < 1000; i++) {
             wchar_t c = buf[i];
-            if (c == 0) { shown[i] = 0; break; }
-            shown[i] = (c < 0x20) ? L'.' : c;
+            if (c == 0) break;
+            if (c < 0x20) { shown[si2++] = L'.'; }
+            else if (c < 0x80) { shown[si2++] = c; }
+            else {
+                si2 += _snwprintf_s(shown + si2, 1024 - si2, _TRUNCATE,
+                                    L"<U+%04X>", (unsigned)c);
+            }
         }
+        shown[si2] = 0;
 
-        fprintf(fp, "[%s]\n", kNames[round]);
-        fprintf(fp, "  target=0x%llx class=%ls text='%ls'\n",
-                (unsigned long long)(ULONG_PTR)target, tcls, shown);
+        ProbeFmt(&L, "[%s]\n", kNames[round]);
+        ProbeFmt(&L, "  target=0x%llx class=%ls text='%ls'\n",
+                 (unsigned long long)(ULONG_PTR)target, tcls, shown);
 
-        if (wcscmp(buf, L"\x4f60\x597d") == 0)    fprintf(fp, "  => IME OK (composed)\n");
-        else if (wcsncmp(buf, L"nihao", 5) == 0) fprintf(fp, "  => IME NOT composing\n");
-        else if (buf[0] == 0)                    fprintf(fp, "  => nothing received\n");
-        else                                     fprintf(fp, "  => other\n");
-        fflush(fp);
+        if (wcscmp(buf, L"\x4f60\x597d") == 0)          ProbeFmt(&L, "  => IME OK (composed)\n");
+        else if (wcsncmp(buf, L"nihao", 5) == 0)       ProbeFmt(&L, "  => IME NOT composing\n");
+        else if (buf[0] == 0)                          ProbeFmt(&L, "  => nothing received\n");
+        else                                           ProbeFmt(&L, "  => other\n");
     }
-    fclose(fp);
+
+    if (L.bad) ProbeFmt(&L, "!! write error %lu occurred\n", L.err);
+    ProbeFmt(&L, "=== end ===\n");
+    ProbeClose(&L);
 }
 
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {

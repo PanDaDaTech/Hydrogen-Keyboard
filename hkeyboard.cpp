@@ -6428,6 +6428,99 @@ static void InitTimePeriodApi() {
     }
 }
 
+// ========== IME 自测（-imeprobe，仅诊断用） ==========
+// 用途：在**本进程内**走与真实按键完全相同的注入路径，然后读回前台控件文本，
+// 用来区分「注入写法不对」与「本进程环境影响 IME 组字」。
+//
+// 背景（Win10 22H2 19045.2006 实测）：一个独立 PowerShell 探针裸调 SendInput
+// 在同一台机器、同一个记事本、微软拼音中文状态下**能打出「你好」**，
+// 证明「SendInput + wVk + wScan 一次性注入」这个写法本身没问题。
+// 若本自测却打出「nihao」，差异只可能来自本进程 —— 主UI 线程的 STA COM 初始化
+// （IsStartMenuOpen 的CoInitializeEx / EnsureAccessibilityCom）、
+// WH_KEYBOARD_LL 低层钩子、50ms TIMER_FOCUS、WS_EX_NOACTIVATE 这几项。
+//
+// 结果写 %TEMP%\hkeyboard_imeprobe.txt，不弹任何 UI。
+static void RunImeProbe() {
+    static const char* kNames[] = { "?", "SendKey(gap=1ms)", "SendKeyGap(gap=0)" };
+
+    wchar_t path[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, path)) return;
+    wcscat_s(path, L"hkeyboard_imeprobe.txt");
+
+    FILE* fp = NULL;
+    _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+    if (!fp) return;
+
+    HWND fg = GetForegroundWindow();
+    char cls[128] = {0};
+    GetClassNameA(fg, cls, 128);
+
+    fprintf(fp, "=== hkeyboard IME self-probe ===\n");
+    fprintf(fp, "pid=%lu foreground=0x%llx class=%s\n",
+            GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)fg, cls);
+
+    // 只在目标窗口类像文本编辑器时才测，避免往命令行 / 资源管理器里灌字符
+    BOOL looksLikeEditor = (strstr(cls, "Edit") || strstr(cls, "Notepad") ||
+                            strstr(cls, "Chrome") || strstr(cls, "Edge"));
+    if (!looksLikeEditor) {
+        fprintf(fp, "SKIP: foreground class is not a known text control\n");
+        fclose(fp);
+        return;
+    }
+    fprintf(fp, "testing on class=%s\n\n", cls);
+
+    for (int round = 1; round <= 2; round++) {
+        // 清空目标：Ctrl+A 然后 Delete（用 gap=0 快速路径，不干扰本轮测量对象）
+        SendKeyGap(VK_CONTROL, FALSE, TRUE, FALSE, FALSE, 0);
+        SendKeyGap((BYTE)'A', FALSE, FALSE, FALSE, FALSE, 0);
+        SendKeyGap(VK_DELETE, FALSE, FALSE, FALSE, FALSE, 0);
+        Sleep(200);
+
+        const char* p = "nihao";
+        for (const char* s = p; *s; s++) {
+            BYTE vk = (BYTE)toupper((unsigned char)*s);
+            if (round == 1) SendKey(vk, FALSE, FALSE, FALSE, FALSE);
+            else           SendKeyGap(vk, FALSE, FALSE, FALSE, FALSE, 0);
+        }
+        if (round == 1) SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
+        else           SendKeyGap(VK_SPACE, FALSE, FALSE, FALSE, FALSE, 0);
+
+        Sleep(700);
+
+        // 读回前台线程焦点控件文本
+        DWORD tid = GetWindowThreadProcessId(fg, NULL);
+        GUITHREADINFO gi = {sizeof(gi)};
+        HWND target = fg;
+        if (GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) target = gi.hwndFocus;
+
+        wchar_t tcls[64] = {0};
+        GetClassNameW(target, tcls, 64);
+
+        wchar_t buf[256] = {0};
+        SendMessageTimeoutW(target, WM_GETTEXT, 256, (LPWSTR)buf,
+                            SMTO_ABORTIFHUNG, 1500, NULL);
+
+        // 把不可打印字符替成 '.'，免得控制台里出现乱码
+        wchar_t shown[256];
+        for (int i = 0; i < 255; i++) {
+            wchar_t c = buf[i];
+            if (c == 0) { shown[i] = 0; break; }
+            shown[i] = (c < 0x20) ? L'.' : c;
+        }
+
+        fprintf(fp, "[%s]\n", kNames[round]);
+        fprintf(fp, "  target=0x%llx class=%ls text='%ls'\n",
+                (unsigned long long)(ULONG_PTR)target, tcls, shown);
+
+        if (wcscmp(buf, L"\x4f60\x597d") == 0)    fprintf(fp, "  => IME OK (composed)\n");
+        else if (wcsncmp(buf, L"nihao", 5) == 0) fprintf(fp, "  => IME NOT composing\n");
+        else if (buf[0] == 0)                    fprintf(fp, "  => nothing received\n");
+        else                                     fprintf(fp, "  => other\n");
+        fflush(fp);
+    }
+    fclose(fp);
+}
+
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_hInst = hI;
 
@@ -6459,6 +6552,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     BOOL fLight  = (strstr(cmd, "-light") != NULL);
     BOOL fWall   = (strstr(cmd, "-wallpaper") != NULL);
     BOOL fHelp   = (HasArg(cmd, "-h") || HasArg(cmd, "-help") || HasArg(cmd, "-?"));
+    BOOL fImeProbe = HasArg(cmd, "-imeprobe");   // 仅诊断：进程内IME 自测，见RunImeProbe
 
     // 主题参数解析
     if (fDark) g_themeMode = 1;
@@ -6470,6 +6564,13 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // -h / -help / -?：仅显示命令行参数帮助，不打开主界面
     if (fHelp) {
         ShowHelpDialog(NULL);
+        return 0;
+    }
+
+    // -imeprobe：仅诊断。**在建任何窗口/钩子/定时器之前**先在进程内打一次字，
+    // 结果写 %TEMP%\hkeyboard_imeprobe.txt 后退出，用于判断 IME 问题是否来自本进程环境。
+    if (fImeProbe) {
+        RunImeProbe();
         return 0;
     }
 

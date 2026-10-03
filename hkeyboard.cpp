@@ -6644,6 +6644,26 @@ static void RunSendTest() {
 //   后立即返回"，用定时器才与它等价；直接 Sleep 会把消息循环堵很久，
 //   那是另一种（不真实的）状态，测出来的东西不可信。
 static void EnvTestInject() {
+    // 落一份构建戳，方便确认这次实验跑的是哪一版。
+    // （-sendtest 已有同样的机制，实测确实用上了：能确认用户手上的 exe 是哪次构建）
+    {
+        wchar_t self[MAX_PATH] = {0};
+        GetModuleFileNameW(NULL, self, MAX_PATH);
+        wchar_t* slash = wcsrchr(self, L'\\');
+        if (slash) *(slash + 1) = 0;
+        wchar_t note[MAX_PATH * 2] = {0};
+        _snwprintf_s(note, MAX_PATH * 2, _TRUNCATE, L"%lsenvtest_readme.txt", self);
+        FILE* f = NULL;
+        if (_wfopen_s(&f, note, L"w, ccs=UTF-8") == 0 && f) {
+            fwprintf(f, L"HKeyboard -envtest   构建=%ls\n\n", BuildStampText());
+            fwprintf(f, L"结果请到记事本里看（3 秒后自动注入 nihao，再过 3 秒退出）：\n");
+            fwprintf(f, L"  出现「你好」 = 环境无辜，问题在 SendKey 或「点击按键」这个动作\n");
+            fwprintf(f, L"  出现 nihao   = 环境在干扰注入，需逐个摘掉：\n");
+            fwprintf(f, L"                 WH_KEYBOARD_LL 钩子 -> 窗口 -> WinEvent 钩子 -> 定时器\n");
+            fclose(f);
+        }
+    }
+
     static const BYTE kL[5] = { 'N', 'I', 'H', 'A', 'O' };
     for (int i = 0; i < 5; i++) {
         SendTestKey(kL[i], 1);      // 方式2 = 当前版本 SendKey 的做法

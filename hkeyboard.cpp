@@ -6496,8 +6496,11 @@ static void RunImeProbe() {
         wchar_t tcls[64] = {0};
         GetClassNameW(target, tcls, 64);
 
+        // WM_GETTEXT 的 lParam 是缓冲区地址，类型是 LPARAM(整型)，
+        // 直接传 wchar_t* 编译不过（C2664），必须先转成指针值再强转成 LPARAM。
         wchar_t buf[256] = {0};
-        SendMessageTimeoutW(target, WM_GETTEXT, 256, (LPWSTR)buf,
+        SendMessageTimeoutW(target, WM_GETTEXT, (WPARAM)256,
+                            (LPARAM)(ULONG_PTR)buf,
                             SMTO_ABORTIFHUNG, 1500, NULL);
 
         // 把不可打印字符替成 '.'，免得控制台里出现乱码

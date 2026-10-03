@@ -6761,6 +6761,153 @@ static BOOL ForceForeground(HWND target) {
     return ok;
 }
 
+// ========== 目标应用的定位与启动 ==========
+//
+// ⚠⚠⚠ 上一轮日志给出了一个决定性事实（19:59那次实跑）：
+//
+//     visible top-level windows with a title: 8
+//     [00] HKeyboard                [04] Windows.UI.Core.CoreWindow   设置
+//     [01] ConsoleWindowClass cmd   [05] ApplicationFrameWindow       设置
+//     [02] ConsoleWindowClass cmd   [06] Microsoft Text Input Application
+//     [03] CabinetWClass sharedtest2[07] Progman
+//
+//     ⇒ **虚机上既没有 Edge，也没有 Notepad4。**
+//   用户「切换输入法状态」解决不了这件事 —— 缺的是目标应用本身。
+//
+//⚠ 而且上一轮那句「没装」是**我下早了的结论**：我只枚举了**正在运行**的窗口，
+//   没启动过的应用当然不在列表里。**Win10 预装 Edge**，它只是没运行。
+//   ⇒ 这就是为什么「枚举窗口」必须配一个「按路径启动」，
+//   只做前者会把「没运行」误报成「没安装」。
+
+// 判断文件是否存在且不是目录。走 GetFileAttributesW 而不是 FindFirstFile ——
+// 后者要缓冲区、还要处理通配符，诊断代码越简单越不容易出错。
+static BOOL HkFileExists(const wchar_t* p) {
+    if (!p || !*p) return FALSE;
+    DWORD a = GetFileAttributesW(p);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// 探针就躺在共享文件夹里 —— 用户把 Notepad4.exe 直接丢进这个目录即可，
+// 这是**最可靠也最省事**的投放方式（不用装、不用改PATH、不用注册表）。
+static void HkDirOfSelf(wchar_t* out, int cap) {
+    wchar_t self[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    for (int i = lstrlenW(self) - 1; i >= 0; i--) {
+        if (self[i] == L'\\' || self[i] == L'/') { self[i] = 0; break; }
+    }
+    wcscpy_s(out, cap, self);
+}
+
+// 启动目标并等它的消息队列建起来。
+// ⚠ 不用 ShellExecuteW：它对「路径不存在」只返回个32 位的错误码，
+//   说不清是文件没了还是权限不对，排查时还得再查一遍注册表。
+//   CreateProcessW 的 GetLastError 至少能直接区分 ERROR_FILE_NOT_FOUND。
+static BOOL HkLaunchApp(const wchar_t* exePath, const wchar_t* args) {
+    if (!HkFileExists(exePath)) return FALSE;
+    wchar_t cmd[MAX_PATH * 2 + 16] = {0};
+    if (args && *args)
+        _snwprintf_s(cmd, MAX_PATH * 2 + 16, _TRUNCATE, L"\"%ls\" %ls", exePath, args);
+    else
+        _snwprintf_s(cmd, MAX_PATH * 2 + 16, _TRUNCATE, L"\"%ls\"", exePath);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(exePath, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+        return FALSE;
+    WaitForInputIdle(pi.hProcess, 8000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return TRUE;
+}
+
+// 找一个能启动的目标应用。
+// ⚠ 同时返回启动参数：Edge 是单实例应用，不带参数直接跑可能把请求转发给
+//   现有进程然后立刻退出（那样CreateProcess 返回的句柄马上失效），
+//   `--profile-directory=Default` 能确保落到真正的默认配置上。
+//
+// ⚠ `GetEnvironmentVariableW` 而不是 `ExpandEnvironmentStrings`：
+//   WOW64 下 32 位进程的 %ProgramFiles% 与 64 位不同，而 x86 构建就是
+//   32 位进程。这里把ProgramFiles / ProgramFiles(x86) / LocalAppData
+//   都试一遍，覆盖两种位数下的实际安装位置。
+//
+// 优先级（**失败应用在前，已知成功的原版记事本在最后**）：
+//   ① exe 同目录下的便携版 —— 用户把 Notepad4.exe 直接丢进 sharedtest2，
+//      不用安装、不用改 PATH、不碰注册表，是最可靠的投放方式
+//   ② Edge / Chrome / Firefox —— Win10 预装 Edge，只是通常没在运行
+//   ③ 系统自带原版记事本 —— **它是已知能打中文的对照组**，
+//      拿它兜底能验证「探针本身没问题」，但它复现不了 issue #3，
+//      所以日志里会明确标成 CONTROL，读结果时不能当成 bug 复现。
+static BOOL FindLaunchableApp(const wchar_t* selfDir,
+                              wchar_t* outPath, int pathCap,
+                              wchar_t* outLabel, int labelCap,
+                              wchar_t* outArgs, int argsCap,
+                              BOOL* outIsControl) {
+    static const struct { const wchar_t* name; const wchar_t* rel; const wchar_t* args; } kKnown[] = {
+        { L"Microsoft Edge",    L"Microsoft\\Edge\\Application\\msedge.exe",
+          L"--profile-directory=Default" },
+        { L"Google Chrome",     L"Google\\Chrome\\Application\\chrome.exe",
+          L"--profile-directory=Default" },
+        { L"Mozilla Firefox",   L"Mozilla Firefox\\firefox.exe", NULL },
+    };
+    wchar_t roots[3][MAX_PATH] = {0};
+    GetEnvironmentVariableW(L"ProgramFiles",      roots[0], MAX_PATH);
+    GetEnvironmentVariableW(L"ProgramFiles(x86)", roots[1], MAX_PATH);
+    GetEnvironmentVariableW(L"LocalAppData",     roots[2], MAX_PATH);
+
+    // ① 便携版：与探针同目录
+    static const wchar_t* kPortable[] = {
+        L"Notepad4.exe", L"Notepad4_x64.exe", L"n4.exe", L"Notepad4\\Notepad4.exe",
+    };
+    for (int i = 0; i < (int)(sizeof(kPortable) / sizeof(kPortable[0])); i++) {
+        wchar_t p[MAX_PATH] = {0};
+        _snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%ls\\%ls", selfDir, kPortable[i]);
+        if (HkFileExists(p)) {
+            wcscpy_s(outPath, pathCap, p);
+            wcscpy_s(outLabel, labelCap, kPortable[i]);
+            outArgs[0] = 0;
+            *outIsControl = FALSE;
+            return TRUE;
+        }
+    }
+
+    // ② 已知浏览器安装位置
+    for (int k = 0; k < (int)(sizeof(kKnown) / sizeof(kKnown[0])); k++) {
+        for (int r = 0; r < 3; r++) {
+            if (!roots[r][0]) continue;
+            wchar_t p[MAX_PATH] = {0};
+            _snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%ls\\%ls", roots[r], kKnown[k].rel);
+            if (HkFileExists(p)) {
+                wcscpy_s(outPath, pathCap, p);
+                wcscpy_s(outLabel, labelCap, kKnown[k].name);
+                if (kKnown[k].args) wcscpy_s(outArgs, argsCap, kKnown[k].args);
+                else outArgs[0] = 0;
+                *outIsControl = FALSE;
+                return TRUE;
+            }
+        }
+    }
+
+    // ③ 兜底：系统自带原版记事本（对照组）
+    {
+        wchar_t sys[MAX_PATH] = {0};
+        GetSystemDirectoryW(sys, MAX_PATH);
+        if (sys[0]) {
+            wchar_t p[MAX_PATH] = {0};
+            _snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%ls\\notepad.exe", sys);
+            if (HkFileExists(p)) {
+                wcscpy_s(outPath, pathCap, p);
+                wcscpy_s(outLabel, labelCap, L"notepad.exe  [CONTROL - known good, cannot repro #3]");
+                outArgs[0] = 0;
+                *outIsControl = TRUE;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
 // 把当前前台窗口的完整指纹写进日志，并**明确报告焦点是否落在输入控件上**。
 // ⚠ 上一轮就是因为没做这个自证，才把「焦点在网页上」误读成「Edge 通过」。
 static HWND LogForegroundFingerprint(ProbeLog* L, const char* tag) {
@@ -6955,12 +7102,26 @@ static void RunImeProbe() {
 
     ProbeFmt(&L, "\n*** TARGET SELECTION ***\n");
 
-    // 先把虚机上所有可见窗口列出来。即使匹配失败，这份清单也回答了
-    // 「虚机上到底有什么 / 那个失败的应用装了没有」—— 这是排障第一手信息。
+    // 候选目标类名，按用户报告的失败应用排序。
+    // ⚠ 原版记事本故意排最后：它是已知能打中文的对照组，
+    //   拿它当兜底能验证「探针本身没问题」，但它**复现不了 issue #3**。
+    static const wchar_t* kWantCls[] = {
+        L"Notepad4", L"Scintilla",          // 用户报告失败的 Scintilla 编辑器
+        L"Chrome_WidgetWin",               // Edge / Chrome 自绘窗口
+        L"MozillaWindow",                  // Firefox
+        L"OpusApp",                        // Win11 自带新记事本
+        L"Notepad",                        // ⚠ 已知成功的对照组，放最后
+    };
+
+    // ---- 步骤 1：看看已经有什么在跑 ----
     //
     // ⚠ 放静态区而不是栈上：这个结构约 9.4 KB，
-    //   而 -imeprobe 是在 WinMain 里跑的，栈上再叠一个探针局部变量没必要。
+    //   而 -imeprobe 是在 WinMain 里跑的，栈上再叠一个没必要。
     static TargetScan sc;
+    HWND target = NULL;
+    wchar_t how[80] = {0};
+    BOOL   isControl = FALSE;
+
     ZeroMemory(&sc, sizeof(sc));
     sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
     EnumWindows(CbEnumTargets, (LPARAM)&sc);
@@ -6973,54 +7134,120 @@ static void RunImeProbe() {
                  i, (unsigned long long)(ULONG_PTR)sc.hits[i].hwnd, cesc, tesc);
     }
 
-    // 候选目标：按用户报告的失败应用排序，**原版记事本故意排在最后**
-    // （它是已知能打中文的对照组，只有在前面的都找不到时才用它兜底）。
-    static const wchar_t* kWantCls[] = {
-        L"Notepad4", L"Scintilla",          // 用户报告失败的 Scintilla 编辑器
-        L"Chrome_WidgetWin",               // Edge / Chrome 自绘窗口
-        L"MozillaWindow",                  // Firefox
-        L"OpusApp",                        // Win11 自带新记事本
-        L"Notepad",                        // ⚠ 已知成功的对照组，放最后
-    };
-
-    HWND target = NULL;
-    wchar_t how[64] = {0};
+    // 在已运行的窗口里按优先级找一个
     for (int wi = 0; wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !target; wi++) {
         for (int i = 0; i < sc.n; i++) {
             if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
                 target = sc.hits[i].hwnd;
-                wcscpy_s(how, 64, kWantCls[wi]);
+                wcscpy_s(how, 80, kWantCls[wi]);
+                isControl = (wcscmp(kWantCls[wi], L"Notepad") == 0);
                 break;
             }
         }
     }
-    // 类名没命中就退到标题匹配（Edge 的地址栏窗口标题里通常有 "Edge"）
+    // 类名没中就退到标题匹配（Edge 窗口标题里通常带 "Edge"）
     if (!target) {
         static const wchar_t* kWantTitle[] = { L"Edge", L"Chrome", L"Notepad4", L"Firefox" };
         for (int wi = 0; wi < 4 && !target; wi++) {
             for (int i = 0; i < sc.n; i++) {
                 if (ContainsCI(sc.hits[i].title, kWantTitle[wi])) {
                     target = sc.hits[i].hwnd;
-                    wcscpy_s(how, 64, kWantTitle[wi]);
+                    wcscpy_s(how, 80, kWantTitle[wi]);
                     break;
                 }
             }
         }
     }
 
-    if (!target) {
-        ProbeFmt(&L, "\n!! NO TARGET MATCHED. Install/open the failing app first,\n");
-        ProbeFmt(&L, "!! then run again. The window list above tells you what\n");
-        ProbeFmt(&L, "!! is actually running on this machine.\n");
-        ProbeFmt(&L, "!! NOT falling back to the foreground window - typing into\n");
-        ProbeFmt(&L, "!! whatever happens to be in front produces a bogus sample.\n");
-        ProbeClose(&L);
-        return;
+    if (target) {
+        ProbeFmt(&L, "\nstep 1: matched a RUNNING window by '%ls'\n", how);
+    } else {
+        // ---- 步骤 2：没有在跑的，那就自己启动一个 ----
+        //
+        // ⚠⚠ 上一轮就是漏了这一步，只枚举不启动，于是把「没运行」
+        //   误报成「没安装」—— 而 Win10 是预装 Edge 的，它只是没运行。
+        //   这是排障里极容易犯的一个错：**用「当前列表里没有」推断「不存在」**。
+        ProbeFmt(&L, "\nstep 1: no matching window is RUNNING.\n");
+        ProbeFmt(&L, "step 2: looking for an installed app to launch ...\n");
+
+        wchar_t selfDir[MAX_PATH] = {0};
+        HkDirOfSelf(selfDir, MAX_PATH);
+        wchar_t appPath[MAX_PATH] = {0};
+        wchar_t appLabel[80] = {0};
+        wchar_t appArgs[MAX_PATH] = {0};
+        BOOL ctrl = FALSE;
+
+        if (!FindLaunchableApp(selfDir, appPath, MAX_PATH, appLabel, 80,
+                               appArgs, MAX_PATH, &ctrl)) {
+            ProbeFmt(&L, "!! could not find ANY known app (no portable Notepad4\n");
+            ProbeFmt(&L, "!! next to the exe, no Edge/Chrome/Firefox installed).\n");
+            ProbeFmt(&L, "!! Not falling back to the foreground window - typing into\n");
+            ProbeFmt(&L, "!! whatever is in front produces a bogus sample.\n");
+            ProbeClose(&L);
+            return;
+        }
+        {
+            wchar_t pesc[1024]; FillEscaped(pesc, 1024, appPath);
+            ProbeFmt(&L, "step 2: will launch '%ls'\n", appLabel);
+            ProbeFmt(&L, "         at        '%ls'\n", pesc);
+        }
+
+        if (!HkLaunchApp(appPath, appArgs[0] ? appArgs : NULL)) {
+            ProbeFmt(&L, "!! CreateProcess failed, GetLastError=%lu\n", GetLastError());
+            ProbeFmt(&L, "!! Cannot test anything. Send this log back as-is.\n");
+            ProbeClose(&L);
+            return;
+        }
+
+        // ⚠⚠ **必须轮询等窗口出现，不能只靠 WaitForInputIdle**：
+        //   Chromium 启动后还要再建自己的窗口，可能要好几秒；
+        //   而 Edge 这类单实例应用若已在运行，CreateProcess 会**立刻返回**
+        //   （请求被转发给现有进程），新窗口可能过一会儿才出现。
+        //   固定等一次然后就枚举，很容易「窗口还没出来」→ 误判成没装。
+        ProbeFmt(&L, "step 2: launched, waiting for its window to appear ...\n");
+        for (int attempt = 0; attempt < 40 && !target; attempt++) {
+            PumpMs(500);
+            ZeroMemory(&sc, sizeof(sc));
+            sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
+            EnumWindows(CbEnumTargets, (LPARAM)&sc);
+            for (int wi = 0;
+                 wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !target; wi++) {
+                for (int i = 0; i < sc.n; i++) {
+                    if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
+                        target = sc.hits[i].hwnd;
+                        isControl = ctrl && (wcscmp(kWantCls[wi], L"Notepad") == 0);
+                        break;
+                    }
+                }
+            }
+            if (target) {
+                ProbeFmt(&L, "         window appeared after %d x 500ms\n", attempt + 1);
+                break;
+            }
+        }
+
+        if (!target) {
+            ProbeFmt(&L, "!! launched '%ls' but NO usable window showed up in 20s.\n", appLabel);
+            ProbeFmt(&L, "!! Windows that are up right now:\n");
+            for (int i = 0; i < sc.n; i++) {
+                wchar_t tesc[512]; FillEscaped(tesc, 512, sc.hits[i].title);
+                wchar_t cesc[256]; FillEscaped(cesc, 256, sc.hits[i].cls);
+                ProbeFmt(&L, "  [%02d] class='%ls' title='%ls'\n", i, cesc, tesc);
+            }
+            ProbeClose(&L);
+            return;
+        }
+        wcscpy_s(how, 80, appLabel);
     }
 
-    ProbeFmt(&L, "\nchosen target: hwnd=0x%llx matched by '%ls'\n",
-             (unsigned long long)(ULONG_PTR)target, how);
+    ProbeFmt(&L, "\nchosen target: hwnd=0x%llx via '%ls'%s\n",
+             (unsigned long long)(ULONG_PTR)target, how,
+             isControl ? "   <-- CONTROL, this one is known to WORK" : "");
 
+    // ---- 步骤 3：强制置前，并复核 ----
+    //
+    // ⚠ 置前失败时**必须如实停下**：这时打出去的字符全落到别人家，
+    //   产出的样本看起来像 bug 复现，实际上是打错窗口。
     BOOL fgOk = ForceForeground(target);
     ProbeFmt(&L, "ForceForeground -> %s (GetForegroundWindow=0x%llx)\n",
              fgOk ? "OK" : "REFUSED by the foreground lock",
@@ -7029,8 +7256,6 @@ static void RunImeProbe() {
         ProbeFmt(&L, "\n!! could NOT bring the target to the foreground. Every key\n");
         ProbeFmt(&L, "!! would land in whatever is in front instead, so the result\n");
         ProbeFmt(&L, "!! would be meaningless. NOT running the rounds.\n");
-        ProbeFmt(&L, "!! Close whatever steals focus, or click the target once,\n");
-        ProbeFmt(&L, "!! then run this again.\n");
         ProbeClose(&L);
         return;
     }
@@ -7038,7 +7263,7 @@ static void RunImeProbe() {
     LogForegroundFingerprint(&L, "initial");
 
     // ⚠⚠ 最后一层自证：置前成功**不等于焦点落在输入框上**。
-    //   Chromium/Scintilla 置前后焦点可能还在标签栏、菜单或文档空白处，
+    //   Chromium 置前后焦点可能还在标签栏、菜单或文档空白处，
     //   这时打出去的字对方根本不接。而 cmd.exe / PowerShell 这类控制台
     //   压根没有可编辑控件，`keyboardLayout` 也会读出 0。
     //   ⇒ 这两种情况一律中止，绝不产出一个会被误读成 bug 的 FAIL。
@@ -7052,8 +7277,7 @@ static void RunImeProbe() {
             ProbeFmt(&L, "\n!! ABORT: the foreground thread has NO keyboard layout "
                          "(GetKeyboardLayout returned NULL).\n");
             ProbeFmt(&L, "!! That means the focus is not on an editable control at all\n");
-            ProbeFmt(&L, "!! (a console window, or the desktop). Click INTO the text\n");
-            ProbeFmt(&L, "!! field of the app you want to test, then run again.\n");
+            ProbeFmt(&L, "!! (a console window, or the desktop).\n");
             ProbeClose(&L);
             return;
         }
@@ -7061,8 +7285,6 @@ static void RunImeProbe() {
             strstr(cls, "CASCADIA") != NULL) {
             ProbeFmt(&L, "\n!! ABORT: the foreground window is a console ('%s').\n", cls);
             ProbeFmt(&L, "!! Keys typed here go to the shell, never to an IME.\n");
-            ProbeFmt(&L, "!! Open the failing app, click into its text field, and\n");
-            ProbeFmt(&L, "!! make sure it is in front when this probe runs.\n");
             ProbeClose(&L);
             return;
         }

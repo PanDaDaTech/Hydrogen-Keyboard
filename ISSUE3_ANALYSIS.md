@@ -78,8 +78,47 @@ SendWinToggle()   // Win 键开关开始菜单 —— 工作正常
 
 ### 状态
 
-已修（`SendKey` 8 处 + `SendKeyGap` 8 处），**待用户实机验证**。
-故意不动 `SendWinToggle` / `ToggleImeLang`（已正确，且不涉 IME 组字）。
+**待用户实机验证**（2026-10-03 23:08 那版）。
+
+### ⚠ 补 SCANCODES 后暴露的旧错误（左/右 Shift）
+
+用户实测：补 SCANCODES 后，**Win10 记事本里按 Shift 切不了中英文**。
+
+**这不是 SCANCODES 引入的新 bug，而是它暴露了原先被掩盖的错误：**
+
+```
+MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC)  ->  0x2A（**左** Shift）
+补上 SCANCODES 后，系统按扫描码反查 VK：0x2A -> VK_LSHIFT
+而微软拼音的切换键默认绑定在**右 Shift** ⇒ 发出去的是左 Shift，IME 不认
+```
+
+不设 SCANCODES 时，系统只认 `wVk = VK_SHIFT`（通用 Shift，左右皆可触发），
+**把左/右这个错误掩盖了**。补上扫描码后原错显形。
+
+同文件 `ToggleImeLang` 一直用 `VK_RSHIFT` / 0x36（正确的），
+两者本来就不一致，只是没人同时读过这两处。
+
+已修：`SendKey` 第 1/4 段 + `SendKeyGap` 两处，Shift 一律用
+`VK_RSHIFT` + **硬编码 `wScan = 0x36`**，且不带 `KEYEVENTF_EXTENDEDKEY`
+（右 Shift 不是扩展键）。按下与抬起必须成对。
+
+顺带修掉：`SendKeyGap` 有一处**连 `dwFlags` 都没设**（默认 0），
+是全局唯一一处漏设标志位的地方。
+
+### `KEYEVENTF_SCANCODE` 的准确语义（Microsoft Learn）
+
+> **KEYEVENTF_SCANCODE (0x0008)**: If specified, **wScan identifies the key
+> and wVk is ignored.**
+
+⇒ 同时设 `wVk`/`wScan` 是**有定义的**（`wVk` 被忽略），不是未定义行为。
+
+同页另一句，点明了**该用扫描码的真正理由**：
+
+> The virtual key value of a key can change depending on the current keyboard
+> layout or what other keys were pressed, **but the scan code will always be
+> the same.**
+
+⇒ 理由是「**VK 随布局变，扫描码恒定**」。
 
 ### 若仍失败的下一步
 
@@ -153,6 +192,15 @@ SendWinToggle()   // Win 键开关开始菜单 —— 工作正常
 
 7. **同一个文件里"能工作的路径"是最快的线索来源** —— SCANCODES 这个根因
    就是靠对比 `ToggleImeLang`（正常）与 `SendKey`（异常）发现的。
+
+8. **当一个"修复"暴露出新症状，先怀疑它暴露了旧问题，别急着回退** ——
+   补 SCANCODES 后 Shift 切换失效，看起来像新引入的回归，实际是原先
+   `wVk = VK_SHIFT`（通用 Shift，左右皆可触发）把左/右这个错误掩盖了。
+   回退只会让旧错误继续隐身。
+
+9. **相邻代码的"不一致"是最值钱的线索** —— 同一功能的另一处实现
+   （`ToggleImeLang` vs `SendKey`）用了不同的 VK。通读单个函数永远看不出来，
+   只有横向对比才暴露。修 bug 时主动找"同一功能的另一处实现"做对照。
 
 ---
 

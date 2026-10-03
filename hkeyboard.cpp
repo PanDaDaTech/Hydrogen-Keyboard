@@ -6637,23 +6637,134 @@ static BOOL GrabTargetText(wchar_t* out, int cap) {
 }
 
 // ========== 自测目标：用户手动聚焦，探针只管注入 ==========
-// ⚠⚠⚠ **为什么不再由 exe 自动拉起应用**（这是一个被用户一句话点破的设计错误）：
+// ⚠⚠⚠ **这一段改了三次，每次都错在同一个地方**，值得完整记下来：
 //
-//   上一版让 exe 自己 CreateProcess 拉起目标再测。问题在于**虚机上能拉起来的
-//   应用，恰好就是那个已知能打中文的应用** —— 系统自带的原版 Win32 记事本。
-//   用户实际失败的是 Win11 上的 Notepad4（Scintilla）和 Edge 地址栏
-//   （Chromium 自绘），虚机上这两个要么根本没有、要么焦点压根落不到输入框。
+//   v1（第 14 轮）：exe 用 `CreateProcessW` 自动拉起 notepad / msedge / Notepad4。
+//      问题：**虚机上能拉起的恰好就是那个已知能成功的应用**（系统自带 Win32 记事本），
+//      而用户失败的是 Notepad4（Scintilla）和 Edge 地址栏（Chromium 自绘）——
+//      虚机上这两个要么没装、要么焦点压根落不到输入框。
+//      ⇒ 测的是「已知成功的对照组 + 两个坏测量」，没有任何一个复现 issue #3。
 //
-//   于是「三个目标」实际测的是：**已知成功的对照组 + 两个坏测量**，
-//   没有任何一个目标复现了 issue #3。上一轮那份「Edge 也 OK」的结论
-//   完全是假阳性（读的是窗口标题里的「用户配置」四个字）。
+//   v2（第 15 轮）：干脆**不拉起**，改成「用户手动点进失败应用的输入框」。
+//      这个设计**结构上就是自相矛盾的**，实测日志证明：
+//          [initial] foreground=0x90440 class=ConsoleWindowClass
+//          [initial] title='C:\Windows\system32\cmd.exe'
+//          [initial] keyboardLayout=0x0
+//          [initial] focus=0x0 class=''
+//      用户是**在 cmd.exe 里敲 `go.ps1` 启动探针的**，而 `Start-Process -Wait`
+//      会让 cmd 保持前台 —— 哪怕事先点进了 Edge，跑脚本那一刻前台也变回 cmd。
+//      于是两轮全部打进 cmd.exe，`readback=''`，报出两个
+//      `FAIL (target received NOTHING)` —— **纯假失败样本**。
+//      ⇒ 「让用户自己准备目标」这个方案的前提（前台能被保持）根本不成立。
 //
-//   现在改成：**目标由用户手动准备，探针只负责注入与取证**。
-//   这与真实使用场景完全一致 —— 用户本来就是先点进输入框、再用屏幕键盘打字。
+//   v3（本次）：**exe 自己枚举窗口、按标题/类名匹配目标、强制切前台、再自证**。
+//      三件事必须同时做，缺一件就又是坏样本：
+//        ① 枚举**所有**可见顶层窗口并打印出来 —— 即使匹配失败，
+//           这份清单也能告诉用户「虚机上到底有什么」，这是排障的第一手信息；
+//        ② 匹配不到就**明确报 NOT FOUND 并列出候选**，绝不静默拿当前前台凑数；
+//        ③ 切前台之后**必须复核** `GetForegroundWindow()` 真的等于目标，
+//           不等就中止并说明原因（`SetForegroundWindow` 会被前台锁拒绝）。
+
+// ---------- 目标窗口枚举与强制置前 ----------
+
+struct TargetHit {
+    HWND   hwnd;
+    DWORD  pid;
+    wchar_t cls[96];
+    wchar_t title[192];
+};
+
+// 枚举时用来在回调与调用方之间传状态的块。
+// ⚠ 容量与计数必须是**前两个**字段，回调里靠 offsetof 取，
+//   靠 `p + 偏移` 硬算极易与结构错位（本次就先踩了一次）。
+struct TargetScan {
+    int        cap;
+    int        n;
+    TargetHit  hits[32];
+};
+
+static BOOL CALLBACK CbEnumTargets(HWND w, LPARAM p) {
+    TargetScan* s = (TargetScan*)p;
+    if (!s || s->n >= s->cap) return FALSE;
+    if (!IsWindowVisible(w)) return TRUE;
+    wchar_t title[192] = {0};
+    GetWindowTextW(w, title, 192);
+    if (title[0] == 0) return TRUE;          // 无标题的辅助窗口跳过
+    TargetHit* h = &s->hits[s->n];
+    h->hwnd = w;
+    h->pid  = GetWindowThreadProcessId(w, NULL);
+    GetClassNameW(w, h->cls, 96);
+    wcscpy_s(h->title, 192, title);
+    s->n++;
+    return TRUE;
+}
+
+// 窗口标题/类名里是否含有 needle（大小写不敏感的子串匹配）。
+// ⚠ 不用 `StrStrI` 之类的 Shell API —— 那是 shell32 的导出，
+//   x86构建目标是 WinXP(SUBSYSTEM 5.01)，少一个依赖就多一个加载风险。
+//   自己写循环，零依赖。
+static BOOL ContainsCI(const wchar_t* hay, const wchar_t* needle) {
+    if (!hay || !needle || !*needle) return FALSE;
+    size_t nl = wcslen(needle);
+    for (const wchar_t* p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl) {
+            wchar_t a = p[i], b = needle[i];
+            if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+            if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return TRUE;
+    }
+    return FALSE;
+}
+
+// 强制把目标窗口切到前台。
+// ⚠ `SetForegroundWindow` 会**被前台锁拒绝** —— 调用者不是当前前台窗口时，
+//   系统只在前台进程刚失去焦点、或调用者是前台进程、或用户刚敲过键时才放行。
+//   所以必须：先 `AttachThreadInput` 把两个输入队列缝在一起（这能拿到
+//   绕过前台锁的资格），置前后再缝回去；失败则如实返回 FALSE，
+//   **绝不能假装成功** —— 上一轮就是这里没做复核，把字符打进了 cmd.exe。
+static BOOL ForceForeground(HWND target) {
+    if (!target) return FALSE;
+    HWND fg = GetForegroundWindow();
+    if (fg == target) return TRUE;
+
+    DWORD tidFg    = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    DWORD tidSelf  = GetCurrentThreadId();
+    DWORD tidTgt   = GetWindowThreadProcessId(target, NULL);
+    DWORD tidOther = (tidFg && tidFg != tidSelf) ? tidFg : 0;
+
+    BOOL a1 = FALSE, a2 = FALSE;
+    if (tidOther && tidOther != tidSelf && tidOther != tidTgt) {
+        a1 = (AttachThreadInput(tidSelf, tidOther, TRUE) != 0);
+        // 目标窗口若不是前台窗口自己的线程，也要缝，否则置前不生效
+        if (tidTgt && tidTgt != tidSelf && tidTgt != tidOther)
+            a2 = (AttachThreadInput(tidSelf, tidTgt, TRUE) != 0);
+    } else if (tidTgt && tidTgt != tidSelf) {
+        a2 = (AttachThreadInput(tidSelf, tidTgt, TRUE) != 0);
+    }
+
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    else ShowWindow(target, SW_SHOW);
+    BringWindowToTop(target);
+    BOOL ok = SetForegroundWindow(target) != 0;
+    SetActiveWindow(target);
+    PumpMs(120);
+
+    // ⚠ 必须复核：置前可能悄悄失败（前台锁），此时字符就会打回原前台窗口。
+    ok = (GetForegroundWindow() == target);
+
+    if (a2) AttachThreadInput(tidSelf, tidTgt, FALSE);
+    if (a1) AttachThreadInput(tidSelf, tidOther, FALSE);
+    return ok;
+}
 
 // 把当前前台窗口的完整指纹写进日志，并**明确报告焦点是否落在输入控件上**。
 // ⚠ 上一轮就是因为没做这个自证，才把「焦点在网页上」误读成「Edge 通过」。
 static HWND LogForegroundFingerprint(ProbeLog* L, const char* tag) {
+
     HWND fg = GetForegroundWindow();
     char cls[128] = {0};
     if (fg) GetClassNameA(fg, cls, 128);
@@ -6842,20 +6953,126 @@ static void RunImeProbe() {
         ProbeFmt(&L, "apartment AFTER pump=%s (%d)  0=STA 1=MTA\n", nm, t);
     }
 
-    ProbeFmt(&L, "\n*** TARGET = whatever window is in the foreground NOW. ***\n");
-    ProbeFmt(&L, "*** Switch to the app that fails, click into its text field,  ***\n");
-    ProbeFmt(&L, "*** then come back and run this probe. Do NOT touch anything   ***\n");
-    ProbeFmt(&L, "*** for 20 seconds - it types 'nihao'+Space on its own.        ***\n");
+    ProbeFmt(&L, "\n*** TARGET SELECTION ***\n");
+
+    // 先把虚机上所有可见窗口列出来。即使匹配失败，这份清单也回答了
+    // 「虚机上到底有什么 / 那个失败的应用装了没有」—— 这是排障第一手信息。
+    //
+    // ⚠ 放静态区而不是栈上：这个结构约 9.4 KB，
+    //   而 -imeprobe 是在 WinMain 里跑的，栈上再叠一个探针局部变量没必要。
+    static TargetScan sc;
+    ZeroMemory(&sc, sizeof(sc));
+    sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
+    EnumWindows(CbEnumTargets, (LPARAM)&sc);
+
+    ProbeFmt(&L, "visible top-level windows with a title: %d\n", sc.n);
+    for (int i = 0; i < sc.n; i++) {
+        wchar_t tesc[512]; FillEscaped(tesc, 512, sc.hits[i].title);
+        wchar_t cesc[256]; FillEscaped(cesc, 256, sc.hits[i].cls);
+        ProbeFmt(&L, "  [%02d] hwnd=0x%llx class='%ls' title='%ls'\n",
+                 i, (unsigned long long)(ULONG_PTR)sc.hits[i].hwnd, cesc, tesc);
+    }
+
+    // 候选目标：按用户报告的失败应用排序，**原版记事本故意排在最后**
+    // （它是已知能打中文的对照组，只有在前面的都找不到时才用它兜底）。
+    static const wchar_t* kWantCls[] = {
+        L"Notepad4", L"Scintilla",          // 用户报告失败的 Scintilla 编辑器
+        L"Chrome_WidgetWin",               // Edge / Chrome 自绘窗口
+        L"MozillaWindow",                  // Firefox
+        L"OpusApp",                        // Win11 自带新记事本
+        L"Notepad",                        // ⚠ 已知成功的对照组，放最后
+    };
+
+    HWND target = NULL;
+    wchar_t how[64] = {0};
+    for (int wi = 0; wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !target; wi++) {
+        for (int i = 0; i < sc.n; i++) {
+            if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
+                target = sc.hits[i].hwnd;
+                wcscpy_s(how, 64, kWantCls[wi]);
+                break;
+            }
+        }
+    }
+    // 类名没命中就退到标题匹配（Edge 的地址栏窗口标题里通常有 "Edge"）
+    if (!target) {
+        static const wchar_t* kWantTitle[] = { L"Edge", L"Chrome", L"Notepad4", L"Firefox" };
+        for (int wi = 0; wi < 4 && !target; wi++) {
+            for (int i = 0; i < sc.n; i++) {
+                if (ContainsCI(sc.hits[i].title, kWantTitle[wi])) {
+                    target = sc.hits[i].hwnd;
+                    wcscpy_s(how, 64, kWantTitle[wi]);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!target) {
+        ProbeFmt(&L, "\n!! NO TARGET MATCHED. Install/open the failing app first,\n");
+        ProbeFmt(&L, "!! then run again. The window list above tells you what\n");
+        ProbeFmt(&L, "!! is actually running on this machine.\n");
+        ProbeFmt(&L, "!! NOT falling back to the foreground window - typing into\n");
+        ProbeFmt(&L, "!! whatever happens to be in front produces a bogus sample.\n");
+        ProbeClose(&L);
+        return;
+    }
+
+    ProbeFmt(&L, "\nchosen target: hwnd=0x%llx matched by '%ls'\n",
+             (unsigned long long)(ULONG_PTR)target, how);
+
+    BOOL fgOk = ForceForeground(target);
+    ProbeFmt(&L, "ForceForeground -> %s (GetForegroundWindow=0x%llx)\n",
+             fgOk ? "OK" : "REFUSED by the foreground lock",
+             (unsigned long long)(ULONG_PTR)GetForegroundWindow());
+    if (!fgOk) {
+        ProbeFmt(&L, "\n!! could NOT bring the target to the foreground. Every key\n");
+        ProbeFmt(&L, "!! would land in whatever is in front instead, so the result\n");
+        ProbeFmt(&L, "!! would be meaningless. NOT running the rounds.\n");
+        ProbeFmt(&L, "!! Close whatever steals focus, or click the target once,\n");
+        ProbeFmt(&L, "!! then run this again.\n");
+        ProbeClose(&L);
+        return;
+    }
 
     LogForegroundFingerprint(&L, "initial");
 
-    HWND fg = GetForegroundWindow();
-    if (!fg) {
-        ProbeFmt(&L, "\n!! no foreground window at all - cannot test\n");
-    } else {
-        RunOneInjectionRound(&L, 1, FALSE);   // 直接 SendInput
-        RunOneInjectionRound(&L, 2, TRUE);    // 走完整点键路径
+    // ⚠⚠ 最后一层自证：置前成功**不等于焦点落在输入框上**。
+    //   Chromium/Scintilla 置前后焦点可能还在标签栏、菜单或文档空白处，
+    //   这时打出去的字对方根本不接。而 cmd.exe / PowerShell 这类控制台
+    //   压根没有可编辑控件，`keyboardLayout` 也会读出 0。
+    //   ⇒ 这两种情况一律中止，绝不产出一个会被误读成 bug 的 FAIL。
+    {
+        HWND fg = GetForegroundWindow();
+        char cls[128] = {0};
+        if (fg) GetClassNameA(fg, cls, 128);
+        DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+        HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
+        if (hkl == NULL) {
+            ProbeFmt(&L, "\n!! ABORT: the foreground thread has NO keyboard layout "
+                         "(GetKeyboardLayout returned NULL).\n");
+            ProbeFmt(&L, "!! That means the focus is not on an editable control at all\n");
+            ProbeFmt(&L, "!! (a console window, or the desktop). Click INTO the text\n");
+            ProbeFmt(&L, "!! field of the app you want to test, then run again.\n");
+            ProbeClose(&L);
+            return;
+        }
+        if (strcmp(cls, "ConsoleWindowClass") == 0 ||
+            strstr(cls, "CASCADIA") != NULL) {
+            ProbeFmt(&L, "\n!! ABORT: the foreground window is a console ('%s').\n", cls);
+            ProbeFmt(&L, "!! Keys typed here go to the shell, never to an IME.\n");
+            ProbeFmt(&L, "!! Open the failing app, click into its text field, and\n");
+            ProbeFmt(&L, "!! make sure it is in front when this probe runs.\n");
+            ProbeClose(&L);
+            return;
+        }
     }
+
+    ProbeFmt(&L, "\n*** Do NOT touch anything for ~20 seconds. ***\n");
+    ProbeFmt(&L, "*** It types 'nihao'+Space into the target, twice.         ***\n");
+
+    RunOneInjectionRound(&L, 1, FALSE);   // 直接 SendInput
+    RunOneInjectionRound(&L, 2, TRUE);    // 走完整点键路径
 
     if (L.bad) ProbeFmt(&L, "\n!! write error %lu occurred\n", L.err);
     ProbeFmt(&L, "=== end ===\n");

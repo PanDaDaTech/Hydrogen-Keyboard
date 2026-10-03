@@ -7504,6 +7504,46 @@ static void RunImeProbe() {
                 t->usable = FALSE;
                 continue;
             }
+
+            // ⚠⚠⚠ **可测性基准检查**（本轮新增，最关键的一道闸门）。
+            //   上面那两道只能证明「焦点在某个有键盘布局的窗口上」，
+            //   但**证明不了光标在输入框里**。Chromium / Firefox / Scintilla
+            //   都是自绘控件，置前后焦点可能落在标签栏、菜单、页面空白处。
+            //   那样打出来的字没人接，`Ctrl+A` 还会选中**整页**，
+            //   于是读回一堆页面上原有的中文 —— 极易被误读成"打进去了"。
+            //
+            //   探法：在真正注入**之前**先做一次「Ctrl+A → Ctrl+C」，
+            //   用读回内容判断这个输入框**本来是空的还是非空的**。
+            //   读回为空 ⇒ 光标确实在空输入框里，**可测**，继续。
+            //   读回非空 ⇒ 焦点不在输入框（或字段里已有内容），
+            //   **跳过这个目标**并如实说明 —— 绝不硬打一轮然后
+            //   把页面上原有的中文当成结论。
+            //
+            //   ⚠ 这一条会让「浏览器」在多数情况下被跳过，这是**正确的**：
+            //   探针没法替用户把光标点进地址栏，那本来就不是它能做的事。
+            //   真实用户是手动点进去的 —— 那种场景请让用户先把光标放好，
+            //   再让探针接管注入（见 README）。
+            {
+                wchar_t probe[256] = {0};
+                BOOL pOk = GrabTargetText(probe, 256);
+                wchar_t pesc2[512]; FillEscaped(pesc2, 512, probe);
+                if (!pOk) {
+                    ProbeFmt(&L, "!! SKIP this target - could not read the field before\n");
+                    ProbeFmt(&L, "!! starting (Ctrl+A/Ctrl+C produced nothing). The probe\n");
+                    ProbeFmt(&L, "!! cannot prove the caret is in an editable field.\n");
+                    t->usable = FALSE;
+                    continue;
+                }
+                if (wcslen(probe) > 0) {
+                    ProbeFmt(&L, "!! SKIP this target - the field is NOT empty, so the caret is\n");
+                    ProbeFmt(&L, "!! probably not in an input box (a self-drawn control would\n");
+                    ProbeFmt(&L, "!! select the whole page instead). readback='%ls'\n", pesc2);
+                    ProbeFmt(&L, "!! Put the caret in an EMPTY text field first, then re-run.\n");
+                    t->usable = FALSE;
+                    continue;
+                }
+                ProbeFmt(&L, "pre-check OK: field reads back empty => caret is in an editable field\n");
+            }
         }
 
         ProbeFmt(&L, "*** do NOT touch anything for ~20 seconds ***\n");
@@ -7527,7 +7567,7 @@ static void RunImeProbe() {
         if (!t->usable) {
             ProbeFmt(&L, "%-22s %-8s %-8s %-7s %-7s %s\n",
                      "SKIPPED", "-", "-", "-", "-",
-                     "could not be focused; not testable");
+                     "not testable - see the reason above");
             continue;
         }
         const char* s1 = VerdictTag(t->r1);
@@ -7600,6 +7640,31 @@ static void RunImeProbe() {
         } else {
             ProbeFmt(&L, "No control target was available, so there is nothing to\n");
             ProbeFmt(&L, "compare against. See the window list above.\n");
+        }
+
+        // ---- 无论上面结论是什么，都把"怎样才能真正测到"说清楚 ----
+        //⚠ 探针的**能力边界**必须写出来，否则用户会以为"没复现"就等于没问题。
+        //   探针能把按键注入到**当前焦点所在**的控件，但它**没法替用户把光标
+        //   点进自绘控件的输入框**（Chromium 地址栏 / Scintilla 那种）。
+        //   真实用户是手动点进去的 —— 所以要复现 issue #3，必须先手动就位。
+        {
+            int nSkipped = 0;
+            for (int i = 0; i < nTgt; i++) if (!tgts[i].usable) nSkipped++;
+            ProbeFmt(&L, "\n---- HOW TO GET A REAL REPRODUCTION ----\n");
+            if (nSkipped > 0)
+                ProbeFmt(&L, "%d target(s) were skipped as untestable (reasons above).\n", nSkipped);
+            ProbeFmt(&L, "The probe injects keys into whatever has the CARET. It cannot\n");
+            ProbeFmt(&L, "click the caret into a self-drawn control (Chromium address\n");
+            ProbeFmt(&L, "bar, Scintilla) - that is a user action, and pretending\n");
+            ProbeFmt(&L, "otherwise only produces fake samples.\n");
+            ProbeFmt(&L, "\nSo, to test the app that actually fails:\n");
+            ProbeFmt(&L, "  1. Open it and click into its text field yourself.\n");
+            ProbeFmt(&L, "  2. Make sure the field is EMPTY (the probe verifies this).\n");
+            ProbeFmt(&L, "  3. Leave the caret there - do not click anything else.\n");
+            ProbeFmt(&L, "  4. Then start the probe from the tray or this script.\n");
+            ProbeFmt(&L, "\nNotepad4 is the easiest case: just leave it open with an empty\n");
+            ProbeFmt(&L, "document and click in the text area. A stray click anywhere\n");
+            ProbeFmt(&L, "else is enough to make the whole run worthless.\n");
         }
     }
 

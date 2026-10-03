@@ -339,19 +339,56 @@ jobs:
           }
           Get-Item -LiteralPath 'dist/release/HKeyboard_X86_X64_Arm64.7z' | Select-Object Name, Length
 
+      - name: Generate checksum files (MD5 / SHA256)
+        shell: pwsh
+        run: |
+          # 校验文件放在dist/release/，命名与 Release 上的附件同名。
+          # 格式用 Get-FileHash 默认的"<hash> *<相对路径>"（二进制模式，
+          # 与 certutil / md5sum / sha256sum -b 的输出兼容，可直接校验）。
+          $targets = @(
+              'dist/x86/HKeyboard_x86.exe',
+              'dist/x64/HKeyboard_x64.exe',
+              'dist/arm64/HKeyboard_arm64.exe',
+              'dist/release/HKeyboard_X86_X64_Arm64.7z'
+          )
+
+          $md5Lines   = @()
+          $sha256Lines = @()
+          foreach ($f in $targets) {
+              if (-not (Test-Path -LiteralPath $f)) {
+                  throw "Cannot checksum missing file: $f"
+              }
+              # 校验文件里只写文件名（不含 dist\... 路径），用户下载后同目录即可校验
+              $name = Split-Path -Leaf $f
+              $md5Lines+= "$((Get-FileHash -LiteralPath $f -Algorithm MD5).Hash.ToLower()) *$name"
+              $sha256Lines += "$((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLower()) *$name"
+          }
+
+          $md5Path   = 'dist/release/HKeyboard_X86_X64_Arm64.md5.txt'
+          $sha256Path = 'dist/release/HKeyboard_X86_X64_Arm64.sha256.txt'
+          Set-Content -LiteralPath $md5Path   -Value $md5Lines   -Encoding ascii
+          Set-Content -LiteralPath $sha256Path -Value $sha256Lines -Encoding ascii
+
+          Write-Host "---- $md5Path ----"
+          Get-Content -LiteralPath $md5Path
+          Write-Host "---- $sha256Path ----"
+          Get-Content -LiteralPath $sha256Path
+
       - name: Verify release files
         shell: pwsh
         run: |
           $required = @(
-            'dist/x86/HKeyboard_x86.exe',
-            'dist/x64/HKeyboard_x64.exe',
-            'dist/arm64/HKeyboard_arm64.exe',
-            'dist/release/HKeyboard_X86_X64_Arm64.7z'
+              'dist/x86/HKeyboard_x86.exe',
+              'dist/x64/HKeyboard_x64.exe',
+              'dist/arm64/HKeyboard_arm64.exe',
+              'dist/release/HKeyboard_X86_X64_Arm64.7z',
+              'dist/release/HKeyboard_X86_X64_Arm64.md5.txt',
+              'dist/release/HKeyboard_X86_X64_Arm64.sha256.txt'
           )
           foreach ($file in $required) {
-            if (-not (Test-Path -LiteralPath $file)) {
-              throw "Missing release file: $file"
-            }
+              if (-not (Test-Path -LiteralPath $file)) {
+                  throw "Missing release file: $file"
+              }
           }
 
       - name: Upload workflow artifacts
@@ -364,6 +401,8 @@ jobs:
             dist/x64/HKeyboard_x64.exe
             dist/arm64/HKeyboard_arm64.exe
             dist/release/HKeyboard_X86_X64_Arm64.7z
+            dist/release/HKeyboard_X86_X64_Arm64.md5.txt
+            dist/release/HKeyboard_X86_X64_Arm64.sha256.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -380,3 +419,5 @@ jobs:
             dist/x64/HKeyboard_x64.exe
             dist/arm64/HKeyboard_arm64.exe
             dist/release/HKeyboard_X86_X64_Arm64.7z
+            dist/release/HKeyboard_X86_X64_Arm64.md5.txt
+            dist/release/HKeyboard_X86_X64_Arm64.sha256.txt

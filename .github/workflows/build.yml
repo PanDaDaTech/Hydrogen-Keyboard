@@ -214,6 +214,29 @@ jobs:
         if %errorlevel% neq 0 exit /b %errorlevel%
         echo [arm64] Build succeeded.
 
+    - name: Generate checksum files (MD5 / SHA256)
+      shell: pwsh
+      run: |
+        $targets = @(
+            'dist/x86/HKeyboard_x86.exe',
+            'dist/x64/HKeyboard_x64.exe',
+            'dist/arm64/HKeyboard_arm64.exe'
+        )
+        $md5Lines    = @()
+        $sha256Lines = @()
+        foreach ($f in $targets) {
+            if (-not (Test-Path -LiteralPath $f)) {
+                throw "Cannot checksum missing file: $f"
+            }
+            $name = Split-Path -Leaf $f
+            $md5Lines    += "$((Get-FileHash -LiteralPath $f -Algorithm MD5).Hash.ToLower()) *$name"
+            $sha256Lines += "$((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLower()) *$name"
+        }
+        New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+        Set-Content -LiteralPath 'dist/release/HKeyboard_X86_X64_Arm64.md5.txt'   -Value $md5Lines    -Encoding ascii
+        Set-Content -LiteralPath 'dist/release/HKeyboard_X86_X64_Arm64.sha256.txt' -Value $sha256Lines -Encoding ascii
+        Get-Content -LiteralPath 'dist/release/HKeyboard_X86_X64_Arm64.sha256.txt'
+
     - name: Upload x86 artifact
       uses: actions/upload-artifact@v4
       with:
@@ -232,6 +255,12 @@ jobs:
         name: HKeyboard_arm64
         path: dist/arm64/HKeyboard_arm64.exe
 
+    - name: Upload checksums artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: HKeyboard_checksums
+        path: dist/release/HKeyboard_X86_X64_Arm64.*.txt
+
     - name: Create Release (on tag)
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
@@ -240,6 +269,8 @@ jobs:
           dist/x86/HKeyboard_x86.exe
           dist/x64/HKeyboard_x64.exe
           dist/arm64/HKeyboard_arm64.exe
+          dist/release/HKeyboard_X86_X64_Arm64.md5.txt
+          dist/release/HKeyboard_X86_X64_Arm64.sha256.txt
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

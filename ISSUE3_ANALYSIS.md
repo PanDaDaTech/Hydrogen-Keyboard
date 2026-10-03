@@ -3,6 +3,59 @@
 > 这份文档记录**已排除的假设**和**关键证据**，避免后人重走弯路。
 > 每条结论都有实测或代码依据，不是推测。
 
+## ✅ 最终结论（2026-10-04 已修复并实机验证）
+
+**根因：微软拼音（Win10）在「鼠标左键按下期间」拒绝处理注入的键盘事件。**
+
+`OnLDown` 是在 `WM_LBUTTONDOWN` 的处理过程中调用的，此刻鼠标左键必然处于
+按下状态 —— 于是紧接着注入的按键不被 IME 组字，直接落成英文字母。
+`-sendtest` / `-envtest` 之所以一直"通过"，是因为它们用 **`SendInput`
+注入的鼠标**点击，而**注入的鼠标按下不会被系统记为"按下"**，
+`GetAsyncKeyState(VK_LBUTTON)` 仍是 0。
+
+### 证据（diag.txt，三类场景对比注入那一刻的系统状态）
+
+| 场景 | tag | LBTN | 其余状态 |
+|---|---|---|---|
+| 用户**真实**鼠标点击按键 | `[before]/[after]` | **1** | fg=Notepad、focus/caret/hkl 全同 |
+| **注入**鼠标点击（envtest 阶段2） | `[before]/[after]` | **0** | 同上 |
+| 定时器注入（envtest 阶段1） | `[env-bef]/[env-aft]` | **0** | 同上 |
+
+**唯一差异就是 LBTN。** 最有说服力的一点：同样是 `[before]/[after]` 两组，
+一组 LBTN=1、一组 LBTN=0。
+
+### 修复
+`DoKeyAction` 开头统一调用 `WaitForLeftButtonUp()`：若左键按下就**泵消息
+等它抬起**（上限 250ms）。空格同样受益（它负责把候选框里的中文上屏）。
+
+三个易踩的点：
+1. **必须 `PeekMessage` 泵消息，不能死 `Sleep`** —— `OnLDown` 在
+   `WM_LBUTTONDOWN` 处理中，`WM_LBUTTONUP` 还得靠消息循环派发，
+   死等必然一路耗到超时。
+2. **防重入**（`g_inWaitLButton`）—— 泵消息会派发 `WM_LBUTTONUP` → `OnLUp`。
+3. **`WM_QUIT` 要投回去** —— `PeekMessage` 取走它而 `DispatchMessage`
+   不处理，不补这一下程序再也收不到退出信号。
+
+长按连发用 `g_inRepeat` 跳过等待（连发时用户一直按着鼠标，等只会每次
+耗满超时；且连发是重复同一字符，不走组字）。
+
+### 这条规则解释全部现象
+| 现象 | 解释 |
+|---|---|
+| 手动点击必失败 | 注入时鼠标必然按下 |
+| `-sendtest` / `-envtest` 必成功 | 无真实鼠标按下 |
+| 物理键盘不受影响 | 不涉及注入 |
+| 点标题栏无影响 | 不触发按键注入 |
+| Win11 / Win7 / 第三方输入法正常 | 对鼠标状态不敏感 |
+
+### 诊断工具保留在 `#ifdef HK_DIAG` 下
+`-sendtest` / `-envtest` / `-noscapture` / `-norepaint` / `-diag`
+（含 `RunSendTest`、`EnvTestInject`、`DiagSnap` 等）全部保留在源码里，
+但**正式版一律不定义 `HK_DIAG`，这些代码不参与编译**。
+需要排查时编译命令加 `/DHK_DIAG`。
+
+---
+
 ## 现象（issue #3 原文）
 
 - Win10（19045.7725）+ 微软拼音，**用 HKeyboard 打不出中文**

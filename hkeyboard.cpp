@@ -6847,6 +6847,13 @@ static BOOL HkLaunchApp(const wchar_t* exePath, const wchar_t* args) {
 //   32 位进程。这里把ProgramFiles / ProgramFiles(x86) / LocalAppData
 //   都试一遍，覆盖两种位数下的实际安装位置。
 //
+// ⚠⚠ **对照组（系统记事本）和被测目标是两次独立的决策**。
+//   round 18 实测踩过的坑：这个函数原本只能返回一个应用，优先级是
+//   便携版 → 浏览器 → 记事本。Win10 预装 Edge，于是 Edge 永远先被选中，
+//   `return TRUE` 直接结束 —— 记事本那条分支**根本走不到**。
+//   结果那一轮「RUNNING 1 TARGET(S)」且无对照，跑完什么也没证明。
+//   ⇒ 加 `wantControl` 开关：真目标找不到时再单独要一次记事本。
+//
 // 优先级（**失败应用在前，已知成功的原版记事本在最后**）：
 //   ① exe 同目录下的便携版 —— 用户把 Notepad4.exe 直接丢进 sharedtest2，
 //      不用安装、不用改 PATH、不碰注册表，是最可靠的投放方式
@@ -6854,17 +6861,33 @@ static BOOL HkLaunchApp(const wchar_t* exePath, const wchar_t* args) {
 //   ③ 系统自带原版记事本 —— **它是已知能打中文的对照组**，
 //      拿它兜底能验证「探针本身没问题」，但它复现不了 issue #3，
 //      所以日志里会明确标成 CONTROL，读结果时不能当成 bug 复现。
+//
+// `wantControl=TRUE` 时**只考虑 ③**，其余一律忽略 ——
+// 这样调用方可以把「补一个基准」和「找一个真目标」分开调用。
 static BOOL FindLaunchableApp(const wchar_t* selfDir,
                               wchar_t* outPath, int pathCap,
                               wchar_t* outLabel, int labelCap,
                               wchar_t* outArgs, int argsCap,
-                              BOOL* outIsControl) {
+                              BOOL* outIsControl,
+                              BOOL wantControl) {
+    // ⚠⚠ 浏览器必须**明确打开一个页面**，不能只靠启动。
+    //   Chromium 裸启动会开"无标题"新标签页 —— 那是 `chrome://newtab`，
+    //   页面上**没有任何可编辑控件**，焦点落在顶层窗口上。
+    //   实测（round 18）就是这样：Edge 被拉起来了，置前成功，
+    //   但两轮 readback 全空、imeUI 从未出现，样本完全无效。
+    //   ⇒ 必须让它打开真实页面。
+    //
+    //   选 `search.microsoft.com` 而不是 data: URL 的原因：
+    //     - data: URL 在 Chromium 属"不可信来源"，新窗口可能被拒
+    //     - 搜索页一定有**地址栏（omnibox，标准 Edit 子窗口）**+ 搜索框
+    //     - 断网也能打开 —— 不会因为没网就退化成一个空白页
     static const struct { const wchar_t* name; const wchar_t* rel; const wchar_t* args; } kKnown[] = {
         { L"Microsoft Edge",    L"Microsoft\\Edge\\Application\\msedge.exe",
-          L"--profile-directory=Default" },
+          L"--profile-directory=Default https://www.bing.com/" },
         { L"Google Chrome",     L"Google\\Chrome\\Application\\chrome.exe",
-          L"--profile-directory=Default" },
-        { L"Mozilla Firefox",   L"Mozilla Firefox\\firefox.exe", NULL },
+          L"--profile-directory=Default https://www.bing.com/" },
+        { L"Mozilla Firefox",   L"Mozilla Firefox\\firefox.exe",
+          L"https://www.bing.com/" },
     };
     wchar_t roots[3][MAX_PATH] = {0};
     GetEnvironmentVariableW(L"ProgramFiles",      roots[0], MAX_PATH);
@@ -6876,6 +6899,7 @@ static BOOL FindLaunchableApp(const wchar_t* selfDir,
         L"Notepad4.exe", L"Notepad4_x64.exe", L"n4.exe", L"Notepad4\\Notepad4.exe",
     };
     for (int i = 0; i < (int)(sizeof(kPortable) / sizeof(kPortable[0])); i++) {
+        if (wantControl) break;                 // 只要对照组，别的一概不考虑
         wchar_t p[MAX_PATH] = {0};
         _snwprintf_s(p, MAX_PATH, _TRUNCATE, L"%ls\\%ls", selfDir, kPortable[i]);
         if (HkFileExists(p)) {
@@ -6889,6 +6913,7 @@ static BOOL FindLaunchableApp(const wchar_t* selfDir,
 
     // ② 已知浏览器安装位置
     for (int k = 0; k < (int)(sizeof(kKnown) / sizeof(kKnown[0])); k++) {
+        if (wantControl) break;                 // 只要对照组
         for (int r = 0; r < 3; r++) {
             if (!roots[r][0]) continue;
             wchar_t p[MAX_PATH] = {0};
@@ -7144,14 +7169,17 @@ static void RunImeProbe() {
     }
 
     ProbeFmt(&L, "\n-- env fingerprint --\n");
-    ProbeFmt(&L, "kbHook=%llu winHook=%llu fgHook=%llu\n",
-             (unsigned long long)(ULONG_PTR)g_kbHook,
-             (unsigned long long)(ULONG_PTR)g_winHook,
-             (unsigned long long)(ULONG_PTR)g_fgHook);
     ProbeFmt(&L, "g_hWnd=0x%llx visible=%d exStyle=0x%llx\n",
              (unsigned long long)(ULONG_PTR)g_hWnd,
              g_hWnd ? IsWindowVisible(g_hWnd) : 0,
              (unsigned long long)(ULONG_PTR)GetWindowLongW(g_hWnd, GWL_EXSTYLE));
+    // ⚠ visible=0 在探针模式下是**预期**的：探针把自己的窗口藏起来了，
+    //   免得和用户自己那个 HKeyboard 实例混淆（见 WinMain 里的说明）。
+    //   真正要看的证据在下面两行 —— 钩子与定时器是否照常装好了。
+    ProbeFmt(&L, "hooks: kb=%llu win=%llu fg=%llu   (all three must be non-zero)\n",
+             (unsigned long long)(ULONG_PTR)g_kbHook,
+             (unsigned long long)(ULONG_PTR)g_winHook,
+             (unsigned long long)(ULONG_PTR)g_fgHook);
 
     // ⚠ 泵消息**之前**打一次 COM 状态：此时尚未初始化，必然是 -1(CURRENT)，
     //   这本身不是异常，只是给后面的复查做对照。
@@ -7256,71 +7284,114 @@ static void RunImeProbe() {
     // ⚠⚠ 第 16 轮就是漏了「启动」这一步，只枚举不启动，
     //   于是把「没运行」误报成「没安装」——
     //   **用「当前列表里没有」推断「不存在」，是排障里最容易犯的错**。
-    if (nTgt < 2) {
-        ProbeFmt(&L, "step 3: looking for an installed app to launch ...\n");
+    //
+    // ⚠⚠ 另一个更隐蔽的坑（round 18 实测）：门槛只数「总数 ≥2」，
+    //   **并不保证对照组存在**。那一轮启动了 Edge 就收工，
+    //   结果 RUNNING 1 TARGET(S)、无对照，结论段只能写「无从比较」——
+    //   跑了一轮什么都没证明。
+    //   ⇒ 门槛改成：必须**有对照组**（系统记事本）才算够。
+    //      浏览器再怎么说也只是被测对象，替不了基准。
+    {
+        BOOL haveCtrl = FALSE;
+        for (int k = 0; k < nTgt; k++)
+            if (tgts[k].isControl) haveCtrl = TRUE;
+        if (!haveCtrl)
+            ProbeFmt(&L, "         (no control target yet - the control is mandatory)\n");
+        // ⚠ 循环补齐，最多两轮：
+        //   第 1 轮要一个**真目标**（便携版 Notepad4 / 浏览器）——
+        //       那是可能复现 issue #3 的对象。
+        //   第 2 轮若仍**缺对照组**，单独要系统记事本。
+        //   浏览器替不了基准：它本身就是被测对象，拿它当"已知能打中文"的
+        //   参照是循环论证。round 18 就是这么白跑一轮的。
         wchar_t selfDir[MAX_PATH] = {0};
         HkDirOfSelf(selfDir, MAX_PATH);
-        wchar_t appPath[MAX_PATH] = {0};
-        wchar_t appLabel[80] = {0};
-        wchar_t appArgs[MAX_PATH] = {0};
-        BOOL ctrl = FALSE;
 
-        if (FindLaunchableApp(selfDir, appPath, MAX_PATH, appLabel, 80,
-                              appArgs, MAX_PATH, &ctrl)) {
+        for (int round = 0; round < 2 && nTgt < kMaxTargets; round++) {
+            BOOL wantCtrl = (round == 1);
+            if (wantCtrl) {
+                BOOL already = FALSE;
+                for (int k = 0; k < nTgt; k++)
+                    if (tgts[k].isControl) already = TRUE;
+                if (already) break;              // 有了就别再要
+            }
+
+            wchar_t appPath[MAX_PATH] = {0};
+            wchar_t appLabel[80] = {0};
+            wchar_t appArgs[MAX_PATH] = {0};
+            BOOL isCtrl = FALSE;
+
+            if (!FindLaunchableApp(selfDir, appPath, MAX_PATH, appLabel, 80,
+                                   appArgs, MAX_PATH, &isCtrl, wantCtrl)) {
+                ProbeFmt(&L, "         no %s app found.\n",
+                         wantCtrl ? "control" : "testable");
+                if (!wantCtrl)
+                    ProbeFmt(&L, "!!   (no portable Notepad4 next to the exe, and no\n");
+                if (!wantCtrl)
+                    ProbeFmt(&L, "!!    Edge/Chrome/Firefox installed)\n");
+                continue;
+            }
             {
                 wchar_t pesc[1024]; FillEscaped(pesc, 1024, appPath);
-                ProbeFmt(&L, "         will launch '%ls'\n", appLabel);
+                ProbeFmt(&L, "         will launch '%ls'%s\n", appLabel,
+                         wantCtrl ? "  (asking for the CONTROL)" : "");
                 ProbeFmt(&L, "         at        '%ls'\n", pesc);
             }
-            if (HkLaunchApp(appPath, appArgs[0] ? appArgs : NULL)) {
-                // ⚠⚠ **必须轮询等窗口出现，不能只靠 WaitForInputIdle**：
-                //   Chromium 建自己的窗口要好几秒；Edge 这类单实例应用
-                //   若已在运行，CreateProcess 会**立刻返回**（请求转发给
-                //   现有进程），新窗口可能过一会儿才出现。
-                //   固定等一次就枚举，很容易「窗口还没出来」→ 误判成没装。
-                HWND found = NULL;
-                wchar_t foundCls[80] = {0};
-                for (int attempt = 0; attempt < 40 && !found; attempt++) {
-                    PumpMs(500);
-                    ZeroMemory(&sc, sizeof(sc));
-                    sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
-                    EnumWindows(CbEnumTargets, (LPARAM)&sc);
-                    for (int wi = 0;
-                         wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !found; wi++) {
-                        for (int i = 0; i < sc.n; i++) {
-                            if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
-                                // 别把已经收进清单的那个再收一遍
-                                BOOL dup = FALSE;
-                                for (int k = 0; k < nTgt; k++)
-                                    if (tgts[k].hwnd == sc.hits[i].hwnd) dup = TRUE;
-                                if (dup) continue;
-                                found = sc.hits[i].hwnd;
-                                wcscpy_s(foundCls, 80, kWantCls[wi]);
-                                break;
-                            }
-                        }
-                    }
-                    if (found)
-                        ProbeFmt(&L, "         window appeared after %d x 500ms\n", attempt + 1);
-                }
-                if (found && nTgt < kMaxTargets) {
-                    Tgt* t = &tgts[nTgt++];
-                    t->hwnd = found;
-                    wcscpy_s(t->label, 80, appLabel);
-                    t->isControl = ctrl;
-                    t->launched  = TRUE;
-                    t->usable    = TRUE;
-                    t->r1 = t->r2 = PR_SKIP;
-                    ProbeFmt(&L, "         added as target #%d\n", nTgt);
-                } else if (!found) {
-                    ProbeFmt(&L, "!! launched but NO usable window showed up in 20s.\n");
-                }
-            } else {
+            if (!HkLaunchApp(appPath, appArgs[0] ? appArgs : NULL)) {
                 ProbeFmt(&L, "!! CreateProcess failed, GetLastError=%lu\n", GetLastError());
+                continue;
             }
-        } else {
-            ProbeFmt(&L, "!! no known app found (no portable Notepad4 next to the exe,\n");
-            ProbeFmt(&L, "!! no Edge/Chrome/Firefox installed, no system notepad).\n");
+
+            // ⚠⚠ **必须轮询等窗口出现，不能只靠 WaitForInputIdle**：
+            //   Chromium 建自己的窗口要好几秒；Edge 这类单实例应用
+            //   若已在运行，CreateProcess 会**立刻返回**（请求转发给
+            //   现有进程），新窗口可能过一会儿才出现。
+            //   固定等一次就枚举，很容易「窗口还没出来」→ 误判成没装。
+            HWND found = NULL;
+            for (int attempt = 0; attempt < 40 && !found; attempt++) {
+                PumpMs(500);
+                ZeroMemory(&sc, sizeof(sc));
+                sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
+                EnumWindows(CbEnumTargets, (LPARAM)&sc);
+                for (int wi = 0;
+                     wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !found; wi++) {
+                    for (int i = 0; i < sc.n; i++) {
+                        if (!ContainsCI(sc.hits[i].cls, kWantCls[wi])) continue;
+                        // 已经被收进清单的不要重复收
+                        BOOL dup = FALSE;
+                        for (int k = 0; k < nTgt; k++)
+                            if (tgts[k].hwnd == sc.hits[i].hwnd) dup = TRUE;
+                        if (dup) continue;
+                        found = sc.hits[i].hwnd;
+                        break;
+                    }
+                }
+                if (found)
+                    ProbeFmt(&L, "         window appeared after %d x 500ms\n", attempt + 1);
+            }
+            if (found && nTgt < kMaxTargets) {
+                Tgt* t = &tgts[nTgt++];
+                t->hwnd = found;
+                wcscpy_s(t->label, 80, appLabel);
+                t->isControl = isCtrl;
+                t->launched  = TRUE;
+                t->usable    = TRUE;
+                t->r1 = t->r2 = PR_SKIP;
+                ProbeFmt(&L, "         added as target #%d%s\n", nTgt,
+                         isCtrl ? "  [CONTROL]" : "");
+            } else if (!found) {
+                ProbeFmt(&L, "!! launched but NO usable window showed up in 20s.\n");
+            }
+        }
+
+        // 最后再报一次对照组的账，让"没对照"这件事无法被忽略
+        {
+            BOOL haveCtrl = FALSE;
+            for (int k = 0; k < nTgt; k++)
+                if (tgts[k].isControl) haveCtrl = TRUE;
+            if (!haveCtrl)
+                ProbeFmt(&L, "\n!! WARNING: still no CONTROL target. Any PASS you see\n");
+            if (!haveCtrl)
+                ProbeFmt(&L, "!! cannot be trusted - there is nothing to compare against.\n");
         }
     }
 
@@ -7574,13 +7645,24 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         g_ww, g_wh, 0, 0, hI, 0);
     if (!hWnd) return 1;
 
-    AddTray();   // 无论是否触屏/隐藏模式，始终创建托盘图标，以便从托盘恢复
-
-    if (!fHide) {
-        ShowKB(TRUE, TRUE);
-    } else {
+    // ⚠ 探针模式**绝不显示自己的窗口**，也不建托盘图标。
+    //   原因：虚机上用户往往已经开着另一个 HKeyboard 实例在用，而探针是
+    //   **绕过单实例互斥体**跑的 —— 于是屏幕上会同时存在两个类名都叫
+    //   'HKeyboard' 的窗口。用户看到的"键盘自己退了 / 自己冒出来"，
+    //   其实是探针这个多余的窗口在闪。
+    //   被测的始终是别的应用（Edge / 记事本 / Notepad4），探针自己的窗口
+    //   可见与否不影响结论，所以直接藏掉最干净。
+    if (fImeProbe) {
         g_vis = FALSE;
         ShowWindow(hWnd, SW_HIDE);
+    } else {
+        AddTray();   // 无论是否触屏/隐藏模式，始终创建托盘图标，以便从托盘恢复
+        if (!fHide) {
+            ShowKB(TRUE, TRUE);
+        } else {
+            g_vis = FALSE;
+            ShowWindow(hWnd, SW_HIDE);
+        }
     }
 
     MSG msg;
@@ -7591,8 +7673,17 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     //   「STA COM 初始化」这个头号嫌疑真的发生，下面手动泵一小段消息循环。
     if (fImeProbe) {
         RunImeProbe();
-        if (IsWindow(hWnd)) DestroyWindow(hWnd);
-        return 0;
+        // ⚠⚠ 跑完就**安静地**退出，不要 DestroyWindow。
+        //   虚机上用户可能正开着另一个 HKeyboard 实例在用（探针绕过互斥体跑的），
+        //   两个进程的窗口同属类名 'HKeyboard'。用户看到的"键盘自己退了"其实
+        //   是探针这个窗口：它先弹出来、跑完又销毁，视觉上像键盘闪了一下。
+        //   探针窗口全程不需要显示（真正被测的是别的应用），所以这里
+        //   先隐藏再退出，最大限度不打扰用户。
+        //   顺带也让"键盘退出了"这个现象与探针彻底解耦，不再误导判断。
+        if (IsWindow(hWnd)) {
+            ShowWindow(hWnd, SW_HIDE);
+        }
+        // 仍在消息循环里正常收尾：清理钩子、GDI+、字体资源，与普通退出同路径。
     }
 
     while (GetMessage(&msg, 0, 0, 0)) {

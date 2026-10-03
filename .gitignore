@@ -1,5 +1,19 @@
-.workbuddy/
+# 构建输出与依赖（build_cpp.bat 生成）
 build/
 dist/
 deps/
+
+# 本地共享测试目录：与虚机交换构建产物用，里面是 exe 和测试脚本
 sharedtest/
+sharedtest2/
+
+# 本地工具缓存
+.workbuddy/
+.commandcode/
+
+# 编辑器 / IDE
+.vs/
+*.user
+
+# ⚠ 不要用 *.exe 通配 —— bin/upx.exe 是随仓库发布的，会被误伤。
+#   构建产物都在 dist/ 下，上面的规则已经覆盖。

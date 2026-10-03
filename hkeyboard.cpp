@@ -481,6 +481,10 @@ BOOL        g_af = TRUE;
 BOOL        g_afAutoHide = TRUE;       // 自动呼出开启时，收起键盘后同一输入框内不自动回弹（ini: General/AutoHide）
 static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收起（自动收起开启时不回弹）
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
+// 长按连发中。TRUE 时 DoKeyAction 跳过 KEY_LETTER_GAP_MS ——
+// 连发 tick 本来就 40ms，叠加 30ms 会变成 70ms/字符，长按明显发"粘"；
+// 且连发重复的是同一个字母，本就不会组字。
+static BOOL g_inKeyRepeat = FALSE;
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=默认 1=小键盘 2=全尺寸（完整）
@@ -2272,9 +2276,38 @@ static BOOL IsActive(const KeyDef* k) {
 //   Sleep(50)」并在注释里写明了「避免过快 down+up 被 IME 忽略」，
 //   偏偏 SendKey 这条最常走的路径漏了 —— 现在按同样的思路补上。
 //
-//   ⚠ 延时不能省，也不能给太大：太大则长按连发（TIMER_REPEAT 40ms 一个 tick）
-//   会因为 Sleep 累积而拖慢。1ms 是「足够让出消息循环」与「不拖慢连发」的折中。
+// ⚠⚠⚠ **2026-10 修正：原先的「1ms 折中」判断是错的。**
+//
+//   原注释写「1ms 是足够让出消息循环与不拖慢连发的折中」。**错在把两件事
+//   混成了一件**：
+//
+//     KEY_INJECT_GAP_MS  = **单键内部** down↔up 之间的间隔
+//     KEY_LETTER_GAP_MS  = **相邻两个字母**之间的间隔
+//
+//   只有前者被实现了，后者一直是**零延时** —— 而决定「组字能否累积成
+//   拼音串」的恰恰是后者：n-i-h-a-o 必须一个一个来，中间留出时间让
+//   TSF 前端更新候选窗。真键盘是物理按键，天然有 50~100ms 的按键间隔；
+//   注入时字母间隔≈0，候选窗来不及更新，整串被丢掉。
+//
+//   另一个认知修正：`Sleep(1)` 在 Windows 上并不会只睡 1ms —— 默认计时器
+//   分辨率 15.6ms，1ms 的 Sleep 实际会挂起到下一个时间片，**≈15ms**。
+//   所以把常量写成 1 和写成 12，效果差别不大但语义完全不同；真正缺的是
+//   字母间隔那个量级的东西。
 #define KEY_INJECT_GAP_MS 1
+
+// ⚠⚠ **相邻字母之间的组字间隔**（issue #3 的关键量，2026-10 新增）。
+//
+//   真键盘典型按键间隔 50~100ms。30ms 取的是偏保守的下限：
+//   既要让微软拼音的候选窗有机会更新，又不能让连续输入明显变钝。
+//
+//   代价：连续敲 5 个字母要多花 4 × 30 = 120ms —— 可以接受。
+//   代价：长按连发（TIMER_REPEAT，350ms 一个 tick）会累加，但 350 > 30，
+//   影响有限。
+//   ⚠ 只给**字母**加。功能键 / 导航键 / 修饰组合不需要组字，保持原节奏。
+//
+//   若实测仍打不出中文，依次试 45 / 60（真键盘下限附近）；
+//   若发现输入明显变钝，降到 15 或 20。
+#define KEY_LETTER_GAP_MS 30
 
 // gapMs = 0 表示「不分段、一次性 SendInput 灌完」，即v2.0 修复前的行为。
 // 只给**连续大量注入**的场景用（Fn 层的网址后缀键TypeDomainText、长按连发）：
@@ -2561,6 +2594,17 @@ static void DoKeyAction(const KeyDef* k) {
             if (g_sh) g_sh = FALSE;
             ClearWinLock();   // 普通键也退出 Win 锁定/切换状态
         }
+        // ⚠⚠ **相邻字母之间的组字间隔**（issue #3，2026-10 新增）。
+        //   上面 SendKey 内部的 KEY_INJECT_GAP_MS 只管**单键内部**的
+        //   down↔up；这里补的是**字母与字母之间**的间隔 —— 决定 n-i-h-a-o
+        //   能否累积成拼音串的那个量。真键盘物理按键天然有 50~100ms，
+        //   之前这里零延时，微软拼音的候选窗来不及更新，整串被丢掉。
+        //
+        //   ⚠ 只在没有修饰键、且非长按连发时加。
+        //     Ctrl/Alt/Win 组合键走快捷键通路，不组字，延时纯属白等；
+        //     长按连发 tick 自带 40ms，叠加会变 70ms/字符，手感发粘。
+        if (!(g_ct || g_al || g_winKey) && !g_inKeyRepeat)
+            Sleep(KEY_LETTER_GAP_MS);
         break;
     case K_NORMAL:
         if (g_fnLayer && !g_fnWebLayout) {
@@ -6307,7 +6351,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             SetTimer(hWnd, TIMER_REPEAT, 40, NULL);
             if (g_pk >= 0 && g_pk == g_repeatKeyIdx) {
                 const KeyDef* k = &g_keys[g_pk];
+                // ⚠ 长按连发**跳过字母组字间隔**（issue #3 的 KEY_LETTER_GAP_MS）。
+                //   tick 已经是 40ms，再叠加30ms 变成 70ms/字符，比真键盘
+                //   （约 30ms/字符）慢一倍以上，长按会明显"粘"。
+                //   而且长按重复的是**同一个字母**，本就不会组字成拼音串，
+                //   这个间隔对它毫无意义。
+                g_inKeyRepeat = TRUE;
                 DoKeyAction(k);
+                g_inKeyRepeat = FALSE;
             } else {
                 KillTimer(hWnd, TIMER_REPEAT);
             }

@@ -6622,19 +6622,19 @@ static void FillEscaped(wchar_t* dst, int cap, const wchar_t* src) {
     dst[si] = 0;
 }
 
-// ⚠ 关于 `ProbeFmt` 里的 `%ls`（曾经的伪 bug，已排查清楚，留此备注免得再犯）：
+// ⚠ 关于 `ProbeFmt` 里的 `%ls`（曾经误判为 bug，查实后留注名免得再犯）：
 //   `ProbeFmt` 底下是 `_vsnprintf_s`（**窄字符版**）。曾以为窄版里 `%ls` 会把
-//   `wchar_t*` 当 `char*` 逐字节读 —— **这是错的**。MSVC 明确规定：
+//   `wchar_t*` 当成 `char*` 逐字节读——**这是错的**。MSVC 明确规定：
 //   `%ls` / `%lc` / `%ws` / `%wc` **恒等于 wchar_t**，`%hs` / `%hc` 恒等于 char，
-//   与函数本身的宽窄无关。所以窄版 printf 里的 `%ls` 是合法的宽转窄转换符。
-//   （虚机日志里 `title='C:\Windows\system32\cmd.exe'` 一直显示正常，
-//     本就是这一点的实证 —— 既有那些 `%ls` 从来没打乱码过。）
+//   与函数本身的宽窄无关。所以窄版 printf 里的 `%ls` 是合法的宽转窄。
+//   （实证就在手边：虚机日志里 `title='C:\Windows\system32\cmd.exe'`一直显示正常，
+//     本就是这一点的实证——既有那些 `%ls` 从来没打乱码过。）
 //
 //   **真正要当心的是另一件事**：宽转窄走**区域设置代码页**（ANSI code page），
-//   非 ASCII 字符会被吃掉或变成 `?`。这正是 `FillEscaped` 存在的理由 ——
+//   非ASCII 字符会被吃掉或变成 `?`。这正是 `FillEscaped` 存在的理由——
 //   先把非 ASCII 统一转成 `<U+XXXX>`，剩下的纯 ASCII 转换才是无损的。
 //   ⇒ 打宽字符串到日志的**唯一正确姿势**：`FillEscaped` + `%ls`，两步缺一不可。
-//   绝不要为了「保险」再自己转一层窄串—— 那只会把已经转好的 `<U+XXXX>`
+//   绝不要为了「保险」再自己转一层窄串——那只会把已经转好的 `<U+XXXX>`
 //   又按代码页走一遍，纯属多余，且一旦代码页不是 ASCII 就可能出问题。
 
 // 用 Ctrl+A / Ctrl+C 把目标控件的真实文本取回到 out。
@@ -6953,15 +6953,15 @@ static HWND LogForegroundFingerprint(ProbeLog* L, const char* tag) {
         wcscmp(fcls, L"TMemo") == 0 || wcscmp(fcls, L"SysEdit32") == 0 ||
         wcscmp(fcls, L"Scintilla") == 0;
 
-    ProbeFmt(&L, "\n  [%s] foreground=0x%llx class=%s\n", tag,
+    ProbeFmt(L, "\n  [%s] foreground=0x%llx class=%s\n", tag,
              (unsigned long long)(ULONG_PTR)fg, cls);
-    ProbeFmt(&L, "  [%s] title='%ls'\n", tag, titleEsc);
-    ProbeFmt(&L, "  [%s] keyboardLayout=0x%llx (0x08040804 = zh-CN)\n", tag,
+    ProbeFmt(L, "  [%s] title='%ls'\n", tag, titleEsc);
+    ProbeFmt(L, "  [%s] keyboardLayout=0x%llx (0x08040804 = zh-CN)\n", tag,
              (unsigned long long)(ULONG_PTR)hkl);
-    ProbeFmt(&L, "  [%s] focus=0x%llx class='%ls' %s\n", tag,
+    ProbeFmt(L, "  [%s] focus=0x%llx class='%ls' %s\n", tag,
              (unsigned long long)(ULONG_PTR)focus, fcls,
              looksEditable ? "(looks like a text control)" : "(SELF-DRAWN or top-level; normal for Chromium/Scintilla)");
-    ProbeFmt(&L, "  [%s] imeUI(candidate window) visible=%d\n", tag,
+    ProbeFmt(L, "  [%s] imeUI(candidate window) visible=%d\n", tag,
              ProbeImeUiWindow() ? 1 : 0);
     return fg;
 }
@@ -7046,7 +7046,7 @@ static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseCli
     // 这是「键到底有没有送到 IME」与「IME 收到但没组字」的唯一分界点。
     BOOL imeUi = ProbeImeUiWindow();
     rec.imeUiComposing = imeUi;
-    ProbeFmt(&L, "  [round %d] after 5 letters: imeUI visible=%d  %s\n", round,
+    ProbeFmt(L, "  [round %d] after 5 letters: imeUI visible=%d  %s\n", round,
              imeUi ? 1 : 0,
              imeUi ? "<- IME IS composing (keys reached the IME)"
                    : "<- NO candidate window: IME never started composing");
@@ -7081,11 +7081,11 @@ static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseCli
             ? "FAIL (raw ASCII came through - IME did NOT compose at all)"
             : "FAIL (some CJK, but not ending in the expected 2 chars)";
     }
-    ProbeFmt(&L, "  [round %d] %s\n", round,
+    ProbeFmt(L, "  [round %d] %s\n", round,
              viaMouseClick ? "via simulated MOUSE CLICK on the on-screen key"
                            : "via direct SendKey        ");
-    ProbeFmt(&L, "  [round %d] readback='%ls'\n", round, esc);
-    ProbeFmt(&L, "  [round %d] VERDICT: %s\n", round, verdict);
+    ProbeFmt(L, "  [round %d] readback='%ls'\n", round, esc);
+    ProbeFmt(L, "  [round %d] VERDICT: %s\n", round, verdict);
     // 额外线索：期望只有「你好」两个字，实际多出来的部分单独报出来，
     // 免得它混在 PASS 里被忽略（例如多出一个被 Ctrl+A 修饰键漏出去的「啊」）。
     if (rec.result == PR_PASS) {
@@ -7094,11 +7094,11 @@ static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseCli
             wchar_t extra[64] = {0};
             wcsncpy_s(extra, 64, got, ls - lt);
             wchar_t eesc[256]; FillEscaped(eesc, 256, extra);
-            ProbeFmt(&L, "  [round %d] NOTE: %d extra char(s) before the expected text: '%ls'\n",
+            ProbeFmt(L, "  [round %d] NOTE: %d extra char(s) before the expected text: '%ls'\n",
                      round, (int)(ls - lt), eesc);
         }
     }
-    ProbeFmt(&L, "  [round %d] imeUI after commit=%d\n\n", round, ProbeImeUiWindow() ? 1 : 0);
+    ProbeFmt(L, "  [round %d] imeUI after commit=%d\n\n", round, ProbeImeUiWindow() ? 1 : 0);
 
     Clip_Restore(&bak);
 
@@ -7109,7 +7109,7 @@ static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseCli
 }
 
 // 把单轮判定结果压成表格里的一个短标签。
-// ⚠ 必须是**纯 ASCII 窄串**才能用 %s 打。
+// ⚠ 返回值必须是**纯 ASCII 窄串**，才能用 %s 打。
 static const char* VerdictTag(ProbeResult r) {
     switch (r) {
         case PR_PASS:         return "PASS";
@@ -7392,10 +7392,10 @@ static void RunImeProbe() {
 
     // ---- 步骤 5：对比表 ----
     //
-    // 这一步才是本轮存在的意义：**单看一个目标得不出结论，对比才行。**
+    // 这一步才是本轮存在的意义：**单看一个目标得不出结论，对比才行**。
     ProbeFmt(&L, "\n================ SUMMARY (compare the rows!) ================\n");
     // 列名全是纯 ASCII 窄串，直接 %s。
-    // 数据行的目标名是宽串 => FillEscaped 转纯 ASCII + `%ls`（见 FillEscaped 上方备注）。
+    // 数据行的目标名是宽串 => FillEscaped 转纯ASCII + `%ls`（见上方备注）。
     ProbeFmt(&L, "%-22s %-8s %-8s %-7s %-7s %s\n",
              "target", "r1", "r2", "imeUI1", "imeUI2", "note");
     for (int i = 0; i < nTgt; i++) {

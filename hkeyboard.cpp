@@ -2295,21 +2295,21 @@ static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs
         if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD;
                   i.ki.wVk = VK_CONTROL; i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); }
         if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY; }
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
         if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); }
         if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
-                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY; }
-        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext; }
-        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_KEYUP; }
+                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
+        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_SCANCODE; }
+        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP; }
         if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
-                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY; }
+                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
         if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP; }
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE; }
         if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY; }
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
         if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_CONTROL;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP; }
+                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE; }
         SendInput(count, inputs, sizeof(INPUT));
         return;
     }
@@ -2338,39 +2338,62 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_CONTROL;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_SCANCODE;
             mc++;
         }
         if (al) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_MENU;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE;
             mc++;
         }
         if (sh) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_SHIFT;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+            mods[mc].ki.dwFlags = KEYEVENTF_SCANCODE;
             mc++;
         }
         if (win) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_LWIN;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE;
             mc++;
         }
         if (mc > 0) SendInput(mc, mods, sizeof(INPUT));
         if (mc > 0) Sleep(KEY_INJECT_GAP_MS);
     }
 
-    // ---- 第 2 段：目标键 down（以 VK 形式发送，TSF/IME 可正确拦截 WM_KEYDOWN）----
+    // ---- 第 2 段：目标键 down ----
+    //
+    // ⚠⚠⚠ **必须带 KEYEVENTF_SCANCODE**，否则 `wScan` 是死字段（issue #3 根因）
+    //
+    //   Win32 语义：**不设 KEYEVENTF_SCANCODE 时，系统只认 `wVk`，
+    //   `wScan` 会被完全忽略**。而我们下面把 `wScan` 填了却没设这个标志，
+    //   于是它从来没生效过 —— 文件顶部注释「扫描码走 MapVirtualKeyW，
+    //   部分 IME 依赖正确扫描码」说的事情，实际上**一件都没发生**。
+    //
+    //   佐证：本文件里**能正常工作**的 `ToggleImeLang` / `SendWinToggle`
+    //   都老老实实设了 `dwFlags = KEYEVENTF_SCANCODE`：
+    //       in.ki.dwFlags = KEYEVENTF_SCANCODE;              // ToggleImeLang
+    //       in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+    //   偏偏最常走的 SendKey 这条漏了。
+    //
+    //   为什么这会让微软拼音丢字：TSF 前端从 `WM_KEYDOWN` 的 `lParam`
+    //   （bit 16~23 = 扫描码、bit 24 = 扩展键标志）判断按了哪个物理键。
+    //   只给 `wVk` 时系统要自己反推扫描码，在非美式布局 / IME 激活态下
+    //   反推结果可能与真键盘不同 ⇒ IME 认不出这串按键 ⇒ 不组字、不上屏。
+    //
+    //   设定 SCANCODES 后 `wVk` 会被忽略，所以**保持同时赋值无害**，
+    //   且能让意图在代码里保持清晰。
     {
         INPUT down = {};
         down.type = INPUT_KEYBOARD;
         down.ki.wVk = vk;
         down.ki.wScan = (WORD)sc;
-        down.ki.dwFlags = extFlag;
+        down.ki.dwFlags = extFlag | KEYEVENTF_SCANCODE;
         SendInput(1, &down, sizeof(INPUT));
     }
 
@@ -2383,7 +2406,7 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
         up.type = INPUT_KEYBOARD;
         up.ki.wVk = vk;
         up.ki.wScan = (WORD)sc;
-        up.ki.dwFlags = extFlag | KEYEVENTF_KEYUP;
+        up.ki.dwFlags = extFlag | KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
         SendInput(1, &up, sizeof(INPUT));
     }
 
@@ -2395,28 +2418,28 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_LWIN;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE;
             mc++;
         }
         if (sh) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_SHIFT;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP;
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE;
             mc++;
         }
         if (al) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_MENU;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE;
             mc++;
         }
         if (ct) {
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_CONTROL;
             mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP;
+            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE;
             mc++;
         }
         if (mc > 0) SendInput(mc, mods, sizeof(INPUT));

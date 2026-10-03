@@ -3322,6 +3322,14 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
 //   常规 Tab：功能键行、Shift 符号     布局 Tab：Fn 网页布局
 // 这些行**高度给 0**、绘制与命中也一并跳过：SettingsRowRect 是按行高累加出来的，
 // 高度归零后后面的行自动上移，绘制 / 命中 / 点击读的仍是同一份几何，不会出现「画一行点一行」。
+//
+// ⚠⚠ 布局 Tab 的 index 是**按绘制顺序从 0 数**的，别把注释当行号：
+//   0 = 键盘布局   1 = Fn 网页布局   2 = 小键盘按钮
+//   这里原来写的是 `index == 2`（注释却写着「Fn 网页布局」），于是小键盘 / 全尺寸布局下
+//   **藏错了行**：Fn 网页布局照画（小键盘按钮被挤到它下面），而真正该藏的
+//   「小键盘按钮」高度归 0 却仍被绘制 —— 绘制处拿到的 row 高度为 0，
+//   SettingsRowHeadH 返回 0，文字块整体上移约 44 DIP，直接压在 Fn 行的描述上
+//   （实机截图：三行文字糊成一团，卡片底部还露出去）。
 static BOOL SettingsRowHidden(int tab, int index) {
     BOOL onlyDefault = (g_layoutMode != 0);
     if (tab == 0) {
@@ -3330,7 +3338,7 @@ static BOOL SettingsRowHidden(int tab, int index) {
         if (index == closeRow + 3) return onlyDefault;   // Shift 符号
         return FALSE;
     }
-    if (tab == 3) return onlyDefault && index == 2;      // Fn 网页布局
+    if (tab == 3) return onlyDefault && index == 1;      // Fn 网页布局（= index 1，不是 2）
     return FALSE;
 }
 
@@ -3521,6 +3529,13 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
                                   int iconId, const wchar_t* glyph,
                                   const wchar_t* title, const wchar_t* desc,
                                   BOOL hover, int ctrlLeft, BOOL descWrap = FALSE) {
+    // ⚠ 隐藏行（SettingsRowHidden 命中）的高度是 0，**不能进来**。
+    //   行高 0 时 SettingsRowHeadH 返回 0，tile / 文字块 / 控件全部算出负偏移，
+    //   直接糊在上一行上（实机截图：布局页三行文字叠成一团）。
+    //   绘制处虽已逐处判 SettingsRowHidden，这里再兜一道 —— 将来新增行忘了加判断，
+    //   最坏也只是「这一行不画」，不会再退化成满屏错位。
+    if (row.bottom <= row.top) return;
+
     if (hover) DrawSettingsRowHover(dc, m, row);
 
     // 图标 tile 与文字块都按**折叠行整行**居中（见 SettingsRowHeadH）：行因为描述折行

@@ -7414,7 +7414,12 @@ static void RunImeProbe() {
             strcpy_s(note, sizeof(note), "CONTROL: Chinese is known to work here");
         else if (t->r1 == PR_PASS)
             strcpy_s(note, sizeof(note), "repro NOT reproduced on this target");
-        ProbeFmt(&L, "%-22s %-8s %-8s %-7d %-7d %s\n",
+        // ⚠⚠ `nameEsc` 是 **wchar_t\***，这里必须写 `%ls`。
+        //   写成 `%s` 的话，MSVC 会（静态分析能看出来，但默认不拦）
+        //   把它当 `char*` 逐字节读 —— 宽字符串的低字节恰好是'NUL'，
+        //   于是只打出**第一个字符**就停。实测表现为目标名变成 "C" / "M"。
+        //   ⇒凡是传宽串的地方，`%s` / `%ls` 必须和实参类型对上，一个字都不能错。
+        ProbeFmt(&L, "%-22ls %-8s %-8s %-7d %-7d %s\n",
                  nameEsc, s1, s2, t->ime1 ? 1 : 0, t->ime2 ? 1 : 0, note);
     }
     ProbeFmt(&L, "\n(legend: F-EMPTY = target got nothing; F-ASCII = raw letters came\n");

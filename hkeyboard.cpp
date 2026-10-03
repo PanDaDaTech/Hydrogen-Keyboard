@@ -2296,16 +2296,18 @@ static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs
                   i.ki.wVk = VK_CONTROL; i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); }
         if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
-        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); }
+        // ⚠ Shift 一律用**右 Shift**（0x36），与 SendKey / ToggleImeLang 一致。
+        //   微软拼音的切换键默认绑在右 Shift 上；发左 Shift（0x2A）它不认。
+        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_RSHIFT;
+                  i.ki.wScan = 0x36; i.ki.dwFlags = KEYEVENTF_SCANCODE; }
         if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
                    i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
         { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_SCANCODE; }
         { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP; }
         if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
                    i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
-        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE; }
+        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_RSHIFT;
+                  i.ki.wScan = 0x36; i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE; }
         if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_SCANCODE; }
         if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_CONTROL;
@@ -2349,9 +2351,18 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
             mc++;
         }
         if (sh) {
+            // ⚠⚠ **必须用右 Shift（VK_RSHIFT / 扫描码 0x36），不能用 VK_SHIFT。**
+            //   实测（2026-10-03 Win10）：用 VK_SHIFT（→扫描码 0x2A =左 Shift）
+            //   时，**按 Shift 切不了中英文**。
+            //   原因：微软拼音的切换键默认绑定在**右 Shift** 上。
+            //   补上 KEYEVENTF_SCANCODE 后系统按扫描码反查 VK，
+            //   0x2A 反查出来是 VK_LSHIFT，IME 自然不认。
+            //   ⇒与 ToggleImeLang 保持一致（它用 VK_RSHIFT / 0x36）。
+            //   另：右 Shift 本身**不是**扩展键（不带 0xE0），
+            //   所以这里不能加 KEYEVENTF_EXTENDEDKEY。
             mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_SHIFT;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+            mods[mc].ki.wVk = VK_RSHIFT;
+            mods[mc].ki.wScan = 0x36;              // 右 Shift 标准扫描码
             mods[mc].ki.dwFlags = KEYEVENTF_SCANCODE;
             mc++;
         }
@@ -2422,9 +2433,12 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
             mc++;
         }
         if (sh) {
+            // 与第 1 段的按下**必须成对**：同样是右 Shift / 扫描码 0x36。
+            // 若按下发左 Shift、抬起发右 Shift（或反过来），
+            // 系统会认为有另一个 Shift 被按下/释放，状态会错乱。
             mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_SHIFT;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+            mods[mc].ki.wVk = VK_RSHIFT;
+            mods[mc].ki.wScan = 0x36;              // 右 Shift 标准扫描码
             mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE;
             mc++;
         }

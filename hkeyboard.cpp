@@ -2699,8 +2699,69 @@ static void DiagSnap(const wchar_t* tag) {
     fclose(f);
 }
 
+// ⚠⚠⚠ **注入前必须等鼠标左键抬起** —— issue #3 的真正根因（2026-10-04 定位）
+//
+// 实测依据（diag.txt 记录的"注入前后系统状态"）：
+//     用户**真实**鼠标点击  -> LBTN=1  -> 微软拼音不组字（出英文）
+//     **注入**鼠标点击      -> LBTN=0  -> 正常组字
+//     定时器触发注入        -> LBTN=0  -> 正常组字
+//   三者其余状态**完全相同**：同一个前台窗口(Notepad)、同一个 focus/caret、
+//   同一个键盘布局(0x08040804 = zh-CN)。唯一差异就是 LBTN。
+//
+//   最有说服力的一点：同样是 `[before]/[after]` 两组，一组 LBTN=1、
+//   一组 LBTN=0 —— 说明 **SendInput 注入的鼠标按下不会被系统记为"按下"**，
+//   所以自动化测试永远测不出这个问题。
+//
+// ⇒ 结论：**微软拼音（Win10）在"鼠标左键按下期间"拒绝处理注入的键盘事件。**
+//   这一条同时解释了全部现象：手动点击必然失败、自动化注入必然成功、
+//   物理键盘不受影响、Win11/Win7/第三方输入法对鼠标状态不敏感。
+//
+// ⚠ 实现上必须用 PeekMessage 泵消息，**不能死 Sleep**：
+//   `OnLDown` 是在 WM_LBUTTONDOWN 的处理过程中调用的，此刻左键必然按下；
+//   而 WM_LBUTTONUP 还得靠消息循环派发才能到达 —— 死等的话它永远收不到，
+//   必然一路等到超时。泵消息同时保证界面不卡。
+//
+// ⚠ 加防重入：泵消息会派发 WM_LBUTTONUP -> OnLUp，若用户此刻又点了别的键，
+//   会重入 WndProc -> DoKeyAction -> 本函数。没有这个标志会递归下去。
+static BOOL g_inWaitLButton = FALSE;
+// 长按连发中：跳过左键等待。
+// ⚠ 连发时用户**一直按着**鼠标，等下去只会每次都耗满 250ms 超时，
+//   把连发拖成每 250ms 一次。而连发本身是"重复同一个字符"
+//   （退格/删除/空格/方向键），不走组字 —— 真正需要组字的是**第一次**
+//   注入，那一次在 OnLDown 里、用户刚按下，等待很短就能过。
+static BOOL g_inRepeat = FALSE;
+
+static void WaitForLeftButtonUp() {
+    if (g_inWaitLButton) return;                              // 防重入
+    if (g_inRepeat) return;                                   // 连发中不等
+    if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;     // 没按下，直接走
+
+    g_inWaitLButton = TRUE;
+    DWORD start = GetTickCount();
+    while ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
+           GetTickCount() - start < 250) {                    // 250ms 上限，别卡死
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            // ⚠ WM_QUIT 必须自己再投回去：PeekMessage 会把它取走，
+            //   而 DispatchMessage 不处理它 —— 取走后没人管，程序就再
+            //   也收不到退出信号了。
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage((int)msg.wParam);
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(1);
+    }
+    g_inWaitLButton = FALSE;
+}
+
 static void DoKeyAction(const KeyDef* k) {
     if (!k) return;
+    // ⚠ 所有按键都在此统一等待 —— 空格尤其重要：它负责把候选框里的中文上屏，
+    //   若在左键按下期间注入，中文同样上不去（这正是 issue #3 的主诉之一）。
+    WaitForLeftButtonUp();
     switch (k->type) {
     case K_LETTER:
         DiagSnap(L"[before]");
@@ -6478,7 +6539,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             SetTimer(hWnd, TIMER_REPEAT, 40, NULL);
             if (g_pk >= 0 && g_pk == g_repeatKeyIdx) {
                 const KeyDef* k = &g_keys[g_pk];
+                // ⚠ 标记为"连发中"，让 WaitForLeftButtonUp 直接返回 ——
+                //   连发时用户一直按着鼠标，等下去每次都要耗满 250ms 超时。
+                g_inRepeat = TRUE;
                 DoKeyAction(k);
+                g_inRepeat = FALSE;
             } else {
                 KillTimer(hWnd, TIMER_REPEAT);
             }

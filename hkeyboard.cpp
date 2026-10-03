@@ -46,6 +46,27 @@ static const wchar_t* ArchName() {
 #endif
 }
 
+// ==========================================================================
+// 诊断开关
+// --------------------------------------------------------------------------
+// 定义 HK_DIAG 时才会编译下面那些**排查专用**的代码：
+//   -sendtest    注入方式对照实验（裸进程，4 种注入方式）
+//   -envtest     在完整环境里只做纯注入，二分定位环境干扰
+//   -noscapture  跳过 OnLDown 里的 SetCapture
+//   -norepaint   跳过点击后的重绘
+//   -diag        记录每次按键注入前后的系统状态到 diag.txt
+//
+// ⚠ **正式发布版一律不定义这个宏** —— 上面这些参数与代码一行都不会
+//   编进 exe，命令行只保留正式参数（-show / -hide / -dark / -help ...）。
+//   需要排查时在编译命令里加 /DHK_DIAG 单独构建一份诊断版即可。
+//
+// 保留它们的原因：issue #3（Win10 微软拼音打不出中文）就是靠这一整套
+// 逐层二分才定位到的 —— 先 -sendtest 排除注入代码，再 -envtest 排除运行
+// 环境，最后 -diag 记录"注入那一刻的系统状态"才抓到真正的差异
+// （鼠标左键按下期间微软拼音拒绝处理注入的按键）。丢了下次还得重写。
+// 排查方法见仓库根目录的 ISSUE3_ANALYSIS.md。
+// ==========================================================================
+
 // 关于页显示的版本串 = "<VER_FILEVERSION_STR>_<构建日期>"，如 "2.0_20261002"。
 //
 // ⚠ 只有日期、不带时分 —— 这是**正式版**该有的样子：用户只需要知道
@@ -83,7 +104,9 @@ static const wchar_t* BuildDateBeijing() {
     return buf;
 }
 
-// 精确构建时刻（"20261003.2314"），**只给诊断路径用**，不进正式 UI。
+#ifdef HK_DIAG
+
+// 精确构建时刻（"20261003.2314"），**只给诊断路径用**，不进正式 exe。
 // 存在的理由：同一天会为排查构建很多次，只看到 "20261003" 无法分辨
 // 手里那个 exe 是哪一次构建的产物 —— 排查时这会白白浪费好几轮。
 static const wchar_t* BuildStampText() {
@@ -113,6 +136,8 @@ static const wchar_t* BuildStampText() {
     return buf;
 }
 
+#endif  // HK_DIAG  —— 正式版里 BuildStampText 整个不存在，也不留空壳
+
 // 日期取值入口。换构建环境（本地编译、或想钉死某个日期）时用
 // -DHK_BUILD_DATE=L"20261002" 覆盖即可，不必改上面的换算。
 // 摆在函数定义之后：#define 的宏体会引用 BuildDateBeijing()，虽然宏只在调用点展开，
@@ -141,10 +166,13 @@ int g_keyHeight = 46;
 #define TIMER_WINDOW_ANIM 8828
 #define TIMER_SETTINGS_ANIM 8827
 #define TIMER_WIN_FADE 8831
-// -envtest 专用：驱动"注入→退出"两个阶段（说明见 EnvTestInject）
-#define TIMER_ENVTEST   8833
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
+#define WM_SHOW_KEYBOARD (WM_APP + 102)
+
+#ifdef HK_DIAG
+// -envtest 专用：驱动"注入→退出"两个阶段（说明见 EnvTestInject）
+#define TIMER_ENVTEST   8833
 // -envtest 的运行标志与前向声明。
 // ⚠ 前向声明是必需的：WM_TIMER 的处理在主 WndProc 里（文件靠前），
 //   而 EnvTestInject 定义在 WinMain 附近（文件靠后）。
@@ -167,13 +195,9 @@ static void EnvTestInject();
 //
 //   -noscapture  跳过 OnLDown 里的 SetCapture（会改变系统鼠标捕获状态）
 //   -norepaint   跳过点击相关的 InvalidateRect（会触发一次全键盘重绘）
-//
-// ⚠ 两个都不能长期缺省 —— SetCapture 是为了在开始菜单弹出等情况下仍能收到
-//   鼠标抬起消息（否则按键高亮会卡住），重绘是为了高亮反馈。这里只是临时
-//   用来定位，找到元凶后再想不牺牲功能的办法。
 BOOL g_noSetCapture = FALSE;
 BOOL g_noClickRepaint = FALSE;
-#define WM_SHOW_KEYBOARD (WM_APP + 102)
+#endif  // HK_DIAG
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -2649,6 +2673,7 @@ static void TypeDomainText(const wchar_t* s) {
     }
 }
 
+#ifdef HK_DIAG
 // ---- -diag：最小诊断，记录"注入前后"的关键系统状态 ----
 //
 // 用途：issue #3 已经缩小到「用户**手动点击**按键 → 注入的按键不被微软拼音
@@ -2698,6 +2723,7 @@ static void DiagSnap(const wchar_t* tag) {
              (int)lbtn, (void*)hkl);
     fclose(f);
 }
+#endif  // HK_DIAG
 
 // ⚠⚠⚠ **注入前必须等鼠标左键抬起** —— issue #3 的真正根因（2026-10-04 定位）
 //
@@ -2764,7 +2790,9 @@ static void DoKeyAction(const KeyDef* k) {
     WaitForLeftButtonUp();
     switch (k->type) {
     case K_LETTER:
+#ifdef HK_DIAG
         DiagSnap(L"[before]");
+#endif
         if (g_ct || g_al || g_winKey) {
             SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
@@ -2774,7 +2802,9 @@ static void DoKeyAction(const KeyDef* k) {
             if (g_sh) g_sh = FALSE;
             ClearWinLock();   // 普通键也退出 Win 锁定/切换状态
         }
+#ifdef HK_DIAG
         DiagSnap(L"[after ]");
+#endif
         break;
     case K_NORMAL:
         if (g_fnLayer && !g_fnWebLayout) {
@@ -6297,12 +6327,12 @@ static void OnLDown(HWND hWnd, int x, int y) {
     int ki = HitKey(x, y);
     if (ki < 0) return;
     g_pk = ki;
-    // ⚠ 排查开关 -noscapture：跳过鼠标捕获，用来验证 SetCapture 是否是
-    //   破坏微软拼音组字的元凶（见 g_noSetCapture 处的说明）。
-    //   跳过会带来副作用：鼠标在按键抬起前移出窗口时收不到 WM_LBUTTONUP，
-    //   按键高亮可能卡住 —— 定位阶段可以接受。
+    // ⚠ 正式版里这两句恒为真（`#ifdef` 整块不编译），保持原行为不变；
+    //   诊断版可以用 -noscapture / -norepaint 临时跳过它们做二分。
+#ifdef HK_DIAG
     if (!g_noSetCapture)
-        SetCapture(hWnd);   // 捕获鼠标，防止开始菜单等出现时抢走鼠标抬起消息导致键一直高亮
+#endif
+    SetCapture(hWnd);   // 捕获鼠标，防止开始菜单等出现时抢走鼠标抬起消息导致键一直高亮
     const KeyDef* k = &g_keys[ki];
     DoKeyAction(k);
 
@@ -6310,9 +6340,10 @@ static void OnLDown(HWND hWnd, int x, int y) {
         g_repeatKeyIdx = ki;
         SetTimer(hWnd, TIMER_REPEAT, 350, NULL);
     }
-    // ⚠ 排查开关 -norepaint：跳过点击后的全键盘重绘
+#ifdef HK_DIAG
     if (!g_noClickRepaint)
-        InvalidateRect(hWnd, 0, TRUE);
+#endif
+    InvalidateRect(hWnd, 0, TRUE);
 }
 
 static void OnLUp(HWND hWnd, int x, int y) {
@@ -6524,6 +6555,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (w == TIMER_WINDOW_ANIM) {
             TickWindowMotion(&g_mainMotion, hWnd);
             return 0;
+#ifdef HK_DIAG
         } else if (w == TIMER_ENVTEST) {
             // -envtest：两阶段 —— 先注入，再退出。说明见 EnvTestInject。
             if (g_envTestStage == 0) {
@@ -6535,6 +6567,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 DestroyWindow(hWnd);
             }
             return 0;
+#endif  // HK_DIAG
         } else if (w == TIMER_REPEAT) {
             SetTimer(hWnd, TIMER_REPEAT, 40, NULL);
             if (g_pk >= 0 && g_pk == g_repeatKeyIdx) {
@@ -6646,6 +6679,7 @@ static BOOL HasArg(const char* cmd, const char* arg) {
     return FALSE;
 }
 
+#ifdef HK_DIAG
 // ========== 注入方式对照实验（-sendtest）==========
 //
 // ⚠⚠⚠ 为什么需要这个入口（2026-10 加）：
@@ -6943,6 +6977,7 @@ static void ClickOwnKey(BYTE vk) {
     SendInput(1, &mi, sizeof(INPUT));
     Sleep(120);
 }
+#endif  // HK_DIAG —— 以上全部诊断代码在正式版里不参与编译
 
 // 高精度计时器分辨率（动态加载 winmm，避免新增链接依赖）
 // SetTimer 默认受 ~15.6ms 系统计时粒度限制，动画会一顿一顿；
@@ -7007,6 +7042,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         return 0;
     }
 
+#ifdef HK_DIAG
+    // ---- 以下全是排查参数，正式版不编译（见文件顶部"诊断开关"说明）----
+
     // -sendtest：注入方式对照实验（说明见 RunSendTest 上方的大段注释）。
     // ⚠⚠ 必须在 `CreateMutexW` **之前**返回。否则若托盘里已有实例在跑，
     //   就会被单实例逻辑转发消息后静默退出，实验根本跑不起来 ——
@@ -7022,8 +7060,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     //   再由 TIMER_ENVTEST 驱动注入，这样环境才是"真在跑的 HKeyboard"。
     g_envTest = HasArg(cmd, "-envtest") ? TRUE : FALSE;
 
-    // 排查开关：二分「点击按键」时哪个动作破坏了 IME 组字。
-    // 说明见 g_noSetCapture 的定义处。**定位完就该删掉**，别留在正式版里。
+    // 排查开关：二分「点击按键」时哪个动作破坏了 IME 组字（见其定义处说明）
     g_noSetCapture    = HasArg(cmd, "-noscapture") ? TRUE : FALSE;
     g_noClickRepaint  = HasArg(cmd, "-norepaint")  ? TRUE : FALSE;
     // -diag：记录每次字母键注入前后的系统状态到 diag.txt（见 DiagSnap）
@@ -7031,6 +7068,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
     // 少了这个没法比较（见 DiagSnap 的说明）。
     if (g_envTest) g_diag = TRUE;
+#endif  // HK_DIAG
 
     BOOL isTouch = IsTouchDevice();
 
@@ -7097,12 +7135,14 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         ShowWindow(hWnd, SW_HIDE);
     }
 
+#ifdef HK_DIAG
     // -envtest：3 秒后开始注入（给用户切回记事本、放进光标的时间）。
     // 此刻窗口、低层键盘钩子、两个 WinEvent 钩子、焦点定时器、托盘
     // 全都已装好 —— 与真实使用状态完全一致，只差"用户点击按键"那一下。
     if (g_envTest) {
         SetTimer(hWnd, TIMER_ENVTEST, 3000, NULL);
     }
+#endif  // HK_DIAG
 
     MSG msg;
     while (GetMessage(&msg, 0, 0, 0)) {

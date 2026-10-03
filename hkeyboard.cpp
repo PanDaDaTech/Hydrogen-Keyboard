@@ -6498,37 +6498,144 @@ static void ClickKeyByVk(BYTE vk) {
     Sleep(40);
 }
 
+// 读回目标控件的 IME 状态：是否中文态、是否在组字、组字串内容。
+// ⚠ 为什么必须读这个：光看 WM_GETTEXT 只能知道「最后留下了什么」，
+//   区分不出「IME 根本没收到键」与「IME 收到了但没组字」。
+//   ImmGetCompositionString 直接问 IME「你缓冲区里现在有什么」，
+//   是唯一能区分这两种情况的手段。
+// ⚠ ImmGetContext 需要的是**焦点控件**的 HIMC，而它同时也是「这个控件
+//   能不能承载 IME 上下文」的判据 —— 返回 NULL 说明目标压根不是输入控件，
+//   键打进去也不会组字。这种情况必须与「注入被吞」区分开。
+static void ProbeImeState(ProbeLog* L, HWND target, const char* tag) {
+    typedef HANDLE (WINAPI *PGetCtx)(HWND);
+    typedef BOOL   (WINAPI *POpen)(HANDLE);
+    typedef LONG   (WINAPI *PCompW)(HANDLE, DWORD, LPWSTR, int);
+    typedef BOOL   (WINAPI *PState)(HANDLE);
+    typedef HWND   (WINAPI *PCompWin)(HANDLE);
+
+    // ⚠ 动态取符号，不静态引用 imm32.lib：
+    //   x86 目标平台是 WinXP(SUBSYSTEM 5.01)，而 imm32 的部分导出在 XP 上
+    //   行为不同；诊断代码不该有能力影响正式产物的加载。
+    static HMODULE s_imm = NULL;
+    static BOOL s_tried = FALSE;
+    if (!s_tried) { s_tried = TRUE; s_imm = LoadLibraryW(L"imm32.dll"); }
+    if (!s_imm) { ProbeFmt(L, "  [%s] imm32.dll not loadable\n", tag); return; }
+
+    PGetCtx   pGetCtx  = (PGetCtx)  GetProcAddress(s_imm, "ImmGetContext");
+    POpen     pOpen    = (POpen)    GetProcAddress(s_imm, "ImmGetOpenStatus");
+    PCompW    pComp    = (PCompW)   GetProcAddress(s_imm, "ImmGetCompositionStringW");
+    PState    pState   = (PState)   GetProcAddress(s_imm, "ImmGetCompositionState");
+    PCompWin  pCompWin = (PCompWin) GetProcAddress(s_imm, "ImmGetCompositionWindow");
+    if (!pGetCtx || !pComp) { ProbeFmt(L, "  [%s] ImmGet* procs missing\n", tag); return; }
+
+    HANDLE himc = pGetCtx(target);
+    if (!himc) {
+        ProbeFmt(L, "  [%s] ImmGetContext=NULL  <- target cannot host an IME context at all\n", tag);
+        return;
+    }
+
+    if (pOpen)    ProbeFmt(L, "  [%s] imeOpen(1=Chinese,0=English)=%d\n", tag, pOpen(himc) ? 1 : 0);
+    if (pState)   ProbeFmt(L, "  [%s] compState(4=ACTIVE,0=NONE)=%d\n", tag, (int)pState(himc));
+    if (pCompWin) ProbeFmt(L, "  [%s] compWnd=0x%llx%s\n", tag,
+                           (unsigned long long)(ULONG_PTR)pCompWin(himc),
+                           pCompWin(himc) ? "" : "  (0 = no candidate window on screen)");
+
+    int need = pComp(himc, 1 /*GCS_COMPSTR*/, NULL, 0);
+    if (need <= 0) {
+        ProbeFmt(L, "  [%s] compStr=<EMPTY>  <- IME holds nothing\n", tag);
+        return;
+    }
+    wchar_t cbuf[256] = {0};
+    pComp(himc, 1, cbuf, 255);
+    wchar_t shown[1024];
+    int si = 0;
+    for (int i = 0; cbuf[i] && si < 1000; i++) {
+        wchar_t c = cbuf[i];
+        if (c < 0x20) shown[si++] = L'.';
+        else if (c < 0x80) shown[si++] = c;
+        else si += _snwprintf_s(shown + si, 1024 - si, _TRUNCATE, L"<U+%04X>", (unsigned)c);
+    }
+    shown[si] = 0;
+    ProbeFmt(L, "  [%s] compStr(len=%d)='%ls'\n", tag, need, shown);
+}
+
+static void FillEscaped(wchar_t* dst, int cap, const wchar_t* src) {
+    int si = 0;
+    if (!dst || cap < 12) return;
+    for (int i = 0; src[i] && si < cap - 12; i++) {
+        wchar_t c = src[i];
+        if (c < 0x20) dst[si++] = L'.';
+        else if (c < 0x80) dst[si++] = c;
+        else si += _snwprintf_s(dst + si, cap - si, _TRUNCATE, L"<U+%04X>", (unsigned)c);
+    }
+    dst[si] = 0;
+}
+
+// 启动指定程序并拉到前台，返回其主窗口。
+// ⚠ 之前只测了系统自带记事本，而用户实际失败的是 Edge 地址栏与 Notepad4。
+//   不同应用的前台/焦点/IME 上下文结构差别很大，只测一个无法定位问题。
+static HWND LaunchAppForeground(const wchar_t* path) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    if (!CreateProcessW(path, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return NULL;
+    DWORD newPid = pi.dwProcessId;
+    if (pi.hProcess) {
+        WaitForInputIdle(pi.hProcess, 10000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    PumpMs(2500);
+
+    // 直接按 pid 匹配顶层窗口 —— 不用 QueryFullProcessImageNameW，
+    // 那个 API 在 WinXP 上不存在，静态引用会破坏 x86(XP+) 的加载。
+    HWND found = NULL;
+    for (HWND w = GetTopWindow(NULL); w; w = GetNextWindow(w, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(w)) continue;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid != newPid) continue;
+        found = w;
+        break;
+    }
+    if (found) {
+        ShowWindow(found, SW_RESTORE);
+        BringWindowToTop(found);
+        SetForegroundWindow(found);
+        SetActiveWindow(found);
+        PumpMs(800);
+        if (GetForegroundWindow() != found) {
+            SetForegroundWindow(found);
+            SetActiveWindow(found);
+            PumpMs(600);
+        }
+    }
+    return found;
+}
+
 static void RunImeProbe() {
     ProbeLog L = ProbeOpen(TRUE);   // 追加：WriteStartupTrace 已写了第一段
 
     wchar_t exepath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exepath, MAX_PATH);
 
-    ProbeFmt(&L, "\n=== self-probe (FULL INIT) ===\n");
+    ProbeFmt(&L, "\n=== self-probe (FULL INIT, MULTI-TARGET) ===\n");
     ProbeFmt(&L, "exe=%ls\n", exepath);
     ProbeFmt(&L, "pid=%lu\n", GetCurrentProcessId());
 
-    // ⚠ 模拟点键那一轮依赖当前布局里确实有这些键。若用户配置是小键盘布局，
-    //   字母键不存在，ClickKeyByVk 会静默什么都不做→ 读回空文本，
-    //   会被误判成「注入被完全阻断」。所以先把键位表打出来自证。
-    ProbeFmt(&L, "layoutMode=%d nk=%d\n", g_layoutMode, g_nk);
+    // 布局自证：模拟点键那轮依赖当前布局确实有这些字母键
     {
         static const char kWant[] = "nihao";
         BOOL allFound = TRUE;
-        for (const char* s = kWant; *s; s++) {
-            int idx = FindKeyByVk((BYTE)toupper((unsigned char)*s));
-            ProbeFmt(&L, "  key '%c' vk=0x%02X -> idx=%d\n", *s,
-                     (BYTE)toupper((unsigned char)*s), idx);
-            if (idx < 0) allFound = FALSE;
-        }
-        int sp = FindKeyByVk(VK_SPACE);
-        ProbeFmt(&L, "  key ' ' vk=0x20 -> idx=%d\n", sp);
-        if (sp < 0) allFound = FALSE;
-        ProbeFmt(&L, "clickRoundPossible=%d%s\n", allFound ? 1 : 0,
-                 allFound ? "" : "  (layout lacks these keys; click round would be a false negative)");
+        for (const char* s = kWant; *s; s++)
+            if (FindKeyByVk((BYTE)toupper((unsigned char)*s)) < 0) allFound = FALSE;
+        if (FindKeyByVk(VK_SPACE) < 0) allFound = FALSE;
+        ProbeFmt(&L, "layoutMode=%d nk=%d clickRoundPossible=%d%s\n",
+                 g_layoutMode, g_nk, allFound ? 1 : 0,
+                 allFound ? "" : "  (layout lacks letters; click round would be a false negative)");
     }
 
-    // ---- 环境指纹：这几项就是本轮要验的「进程环境因素」----
     ProbeFmt(&L, "\n-- env fingerprint --\n");
     ProbeFmt(&L, "kbHook=%llu winHook=%llu fgHook=%llu\n",
              (unsigned long long)(ULONG_PTR)g_kbHook,
@@ -6538,26 +6645,6 @@ static void RunImeProbe() {
              (unsigned long long)(ULONG_PTR)g_hWnd,
              g_hWnd ? IsWindowVisible(g_hWnd) : 0,
              (unsigned long long)(ULONG_PTR)GetWindowLongW(g_hWnd, GWL_EXSTYLE));
-
-    // 动态取CoGetApartmentType：不静态引用，WinXP 目标平台上也能加载
-    {
-        typedef HRESULT (WINAPI *GetAptT)(int*, int*);
-        HMODULE ole = GetModuleHandleW(L"ole32.dll");
-        GetAptT f = ole ? (GetAptT)GetProcAddress(ole, "CoGetApartmentType") : NULL;
-        if (f) {
-            int t = -99, q = -99;
-            HRESULT hr = f(&t, &q);
-            const char* names[] = { "STA", "MTA", "NA", "MAINSTA", "ROAMSTA" };
-            const char* nm = (t >= 0 && t <= 4) ? names[t] : "?";
-            ProbeFmt(&L, "apartment=%s (hr=0x%08x)  <- 0=STA 1=MTA\n", nm, (unsigned)hr);
-        } else {
-            ProbeFmt(&L, "apartment=? (CoGetApartmentType unavailable)\n");
-        }
-    }
-
-    // 让定时器/钩子真的跑几百毫秒，确保 STA COM 初始化已发生
-    ProbeFmt(&L, "pumping messages for 700ms so TIMER_FOCUS/hooks run...\n");
-    PumpMs(700);
     {
         typedef HRESULT (WINAPI *GetAptT)(int*, int*);
         HMODULE ole = GetModuleHandleW(L"ole32.dll");
@@ -6565,139 +6652,133 @@ static void RunImeProbe() {
         if (f) {
             int t = -99, q = -99;
             f(&t, &q);
-            ProbeFmt(&L, "apartment after pump = %d (0=STA 1=MTA)\n", t);
+            const char* names[] = { "STA", "MTA", "NA", "MAINSTA", "ROAMSTA" };
+            const char* nm = (t >= 0 && t <= 4) ? names[t] : "?";
+            ProbeFmt(&L, "apartment=%s (%d)  0=STA 1=MTA\n", nm, t);
+        } else {
+            ProbeFmt(&L, "apartment=? (CoGetApartmentType unavailable)\n");
         }
     }
 
-    // ---- 自己拉起记事本并置前 ----
-    ProbeFmt(&L, "\n-- launching notepad ourselves --\n");
-    HWND np = NULL;
+    ProbeFmt(&L, "pumping 700ms so TIMER_FOCUS/hooks run (STA COM init happens there)...\n");
+    PumpMs(700);
+
+    // 三个目标：系统记事本（已知成功）/ Edge 地址栏 / Notepad4。
+    // 全部由 exe 自己拉起，不依赖用户手工准备。
+    struct Target { wchar_t name[32]; wchar_t path[MAX_PATH]; };
+    Target targets[3];
+    ZeroMemory(targets, sizeof(targets));
+
+    GetSystemDirectoryW(targets[0].path, MAX_PATH);
+    wcscat_s(targets[0].path, L"\\notepad.exe");
+    wcscpy_s(targets[0].name, 32, L"notepad");
+
     {
-        STARTUPINFOW si;
-        PROCESS_INFORMATION pi;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        WCHAR dir[MAX_PATH];
-        if (GetSystemDirectoryW(dir, MAX_PATH)) {
-            wcscat_s(dir, L"\\notepad.exe");
-            CreateProcessW(dir, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-            if (pi.hProcess) {
-                WaitForInputIdle(pi.hProcess, 8000);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+        const wchar_t* edges[] = {
+            L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            L"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
+        };
+        for (int i = 0; i < 2; i++)
+            if (GetFileAttributesW(edges[i]) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(targets[1].path, MAX_PATH, edges[i]);
+                break;
             }
-        }
-        PumpMs(1500);
-        for (HWND w = GetTopWindow(NULL); w; w = GetNextWindow(w, GW_HWNDNEXT)) {
-            if (!IsWindowVisible(w)) continue;
-            wchar_t cn[128] = {0};
-            GetClassNameW(w, cn, 128);
-            if (wcsstr(cn, L"Notepad")) { np = w; break; }
-        }
-        ProbeFmt(&L, "notepadHwnd=0x%llx\n", (unsigned long long)(ULONG_PTR)np);
-
-        if (np) {
-            ShowWindow(np, SW_RESTORE);
-            BringWindowToTop(np);
-            SetForegroundWindow(np);
-            SetActiveWindow(np);
-            PumpMs(700);
-            if (GetForegroundWindow() != np) {
-                SetForegroundWindow(np);
-                SetActiveWindow(np);
-                PumpMs(500);
+        wcscpy_s(targets[1].name, 32, L"msedge");
+    }
+    {
+        const wchar_t* np4[] = {
+            L"C:\\Program Files\\Notepad4\\Notepad4.exe",
+            L"C:\\Program Files (x86)\\Notepad4\\Notepad4.exe",
+            L"C:\\Notepad4\\Notepad4.exe"
+        };
+        for (int i = 0; i < 3; i++)
+            if (GetFileAttributesW(np4[i]) != INVALID_FILE_ATTRIBUTES) {
+                wcscpy_s(targets[2].path, MAX_PATH, np4[i]);
+                break;
             }
-        }
+        wcscpy_s(targets[2].name, 32, L"Notepad4");
     }
 
-    HWND fg = GetForegroundWindow();
-    char cls[128] = {0};
-    GetClassNameA(fg, cls, 128);
-    DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
-    HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
-    ProbeFmt(&L, "afterForce foreground=0x%llx class=%s%s\n",
-             (unsigned long long)(ULONG_PTR)fg, cls,
-             (fg == np) ? "  (OK)" : "  (FAILED to come to front)");
-    ProbeFmt(&L, "foregroundTid=%lu keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
-             tidFg, (unsigned long long)(ULONG_PTR)hkl);
-
-    BOOL looksLikeEditor = (strstr(cls, "Edit") || strstr(cls, "Notepad") ||
-                            strstr(cls, "Chrome") || strstr(cls, "Edge") || cls[0] == 0);
-    if (!looksLikeEditor) {
-        ProbeFmt(&L, "SKIP: foreground class is not a known text control\n");
-        if (L.bad) ProbeFmt(&L, "!! write error %lu occurred\n", L.err);
-        ProbeFmt(&L, "=== end ===\n");
-        ProbeClose(&L);
-        return;
-    }
-    ProbeFmt(&L, "\n");
-
-    // 两轮：
-    //  [1] 直接调 SendKey      —— 与上一轮成功的那次完全相同，作为对照组
-    //  [2] 模拟真实点键（鼠标）—— 用户实际操作走的就是这条路径
-    static const char* kNames[] = { "?", "direct SendKey", "simulated mouse click on our window" };
-
-    for (int round = 1; round <= 2; round++) {
-        // 清空目标：EM_SETSEL 全选 + Delete（整数参数，跨进程安全）
-        DWORD tid = GetWindowThreadProcessId(fg, NULL);
-        GUITHREADINFO gi = {sizeof(gi)};
-        HWND target = fg;
-        if (GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) target = gi.hwndFocus;
-        SendMessageTimeoutW(target, EM_SETSEL, 0, (WPARAM)-1, SMTO_ABORTIFHUNG, 1000, NULL);
-        SendKey(VK_DELETE, FALSE, FALSE, FALSE, FALSE);
-        Sleep(250);
-
-        static const char* p = "nihao";
-        for (const char* s = p; *s; s++) {
-            BYTE vk = (BYTE)toupper((unsigned char)*s);
-            if (round == 1) SendKey(vk, FALSE, FALSE, FALSE, FALSE);
-            else            ClickKeyByVk(vk);
+    for (int t = 0; t < 3; t++) {
+        if (!targets[t].path[0]) {
+            ProbeFmt(&L, "\n===== TARGET %ls: NOT INSTALLED (skipped) =====\n", targets[t].name);
+            continue;
         }
-        if (round == 1) SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
-        else            ClickKeyByVk(VK_SPACE);
+        ProbeFmt(&L, "\n===== TARGET %ls =====\n", targets[t].name);
 
-        Sleep(700);
+        HWND app = LaunchAppForeground(targets[t].path);
+        if (!app) {
+            ProbeFmt(&L, "!! failed to launch or locate its window\n");
+            continue;
+        }
 
-        tid = GetWindowThreadProcessId(fg, NULL);
+        HWND fg = GetForegroundWindow();
+        char cls[128] = {0};
+        GetClassNameA(fg, cls, 128);
+        DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+        HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
+        wchar_t title[128] = {0};
+        GetWindowTextW(fg, title, 128);
+        wchar_t titleEsc[512]; FillEscaped(titleEsc, 512, title);
+
+        ProbeFmt(&L, "appHwnd=0x%llx foreground=0x%llx class=%s%s\n",
+                 (unsigned long long)(ULONG_PTR)app,
+                 (unsigned long long)(ULONG_PTR)fg, cls,
+                 (fg == app) ? "  (OK)" : "  (NOT foreground - SetForegroundWindow blocked)");
+        ProbeFmt(&L, "foregroundTitle='%ls'\n", titleEsc);
+        ProbeFmt(&L, "keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
+                 (unsigned long long)(ULONG_PTR)hkl);
+
+        GUITHREADINFO gi;
         ZeroMemory(&gi, sizeof(gi));
         gi.cbSize = sizeof(gi);
-        target = fg;
-        if (GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) target = gi.hwndFocus;
-
+        HWND target = fg;
+        if (GetGUIThreadInfo(tidFg, &gi) && gi.hwndFocus) target = gi.hwndFocus;
         wchar_t tcls[64] = {0};
         GetClassNameW(target, tcls, 64);
+        ProbeFmt(&L, "focusTarget=0x%llx class=%ls\n",
+                 (unsigned long long)(ULONG_PTR)target, tcls);
 
-        wchar_t buf[256] = {0};
-        SendMessageTimeoutW(target, WM_GETTEXT, (WPARAM)256,
-                            (LPARAM)(ULONG_PTR)buf, SMTO_ABORTIFHUNG, 1500, NULL);
+        ProbeImeState(&L, target, "before");
 
-        wchar_t shown[1024];
-        int si2 = 0;
-        BOOL anyCjk = FALSE;
-        for (int i = 0; i < 255 && si2 < 1000; i++) {
-            wchar_t c = buf[i];
-            if (c == 0) break;
-            if (c >= 0x4E00 && c <= 0x9FFF) anyCjk = TRUE;
-            if (c < 0x20) { shown[si2++] = L'.'; }
-            else if (c < 0x80) { shown[si2++] = c; }
-            else si2 += _snwprintf_s(shown + si2, 1024 - si2, _TRUNCATE, L"<U+%04X>", (unsigned)c);
+        for (int round = 1; round <= 2; round++) {
+            // 清空：Ctrl+A + Delete
+            SendKey(VK_CONTROL, FALSE, TRUE, FALSE, FALSE);
+            SendKey((BYTE)'A', FALSE, FALSE, FALSE, FALSE);
+            SendKey(VK_DELETE, FALSE, FALSE, FALSE, FALSE);
+            PumpMs(300);
+
+            static const char kWant[] = "nihao";
+            if (round == 1) {
+                for (const char* s = kWant; *s; s++)
+                    SendKey((BYTE)toupper((unsigned char)*s), FALSE, FALSE, FALSE, FALSE);
+                SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
+            } else {
+                for (const char* s = kWant; *s; s++)
+                    ClickKeyByVk((BYTE)toupper((unsigned char)*s));
+                ClickKeyByVk(VK_SPACE);
+            }
+            PumpMs(700);
+
+            ProbeImeState(&L, target, round == 1 ? "after-round1" : "after-round2");
+
+            wchar_t buf[256] = {0};
+            SendMessageTimeoutW(target, WM_GETTEXT, (WPARAM)256,
+                                (LPARAM)(ULONG_PTR)buf, SMTO_ABORTIFHUNG, 1500, NULL);
+            wchar_t shown[1024]; FillEscaped(shown, 1024, buf);
+            BOOL anyCjk = FALSE;
+            for (int i = 0; buf[i]; i++)
+                if (buf[i] >= 0x4E00 && buf[i] <= 0x9FFF) anyCjk = TRUE;
+
+            ProbeFmt(&L, "  [%d] %s text='%ls' => %s\n", round,
+                     round == 1 ? "direct SendKey" : "mouse click     ",
+                     shown,
+                     anyCjk ? "OK CJK composed"
+                            : (buf[0] ? "FAIL raw ASCII, IME did not compose" : "FAIL nothing received"));
         }
-        shown[si2] = 0;
-
-        ProbeFmt(&L, "[%d] %s\n", round, kNames[round]);
-        ProbeFmt(&L, "  target=0x%llx class=%ls text='%ls'\n",
-                 (unsigned long long)(ULONG_PTR)target, tcls, shown);
-        if (anyCjk) {
-            ProbeFmt(&L, "  => OK: CJK composed (IME works)\n");
-        } else if (buf[0] == 0) {
-            ProbeFmt(&L, "  => FAIL: nothing received at all\n");
-        } else {
-            ProbeFmt(&L, "  => FAIL: raw ASCII, IME did NOT compose  <<<< THIS IS THE BUG\n");
-        }
-        ProbeFmt(&L, "\n");
     }
 
-    if (L.bad) ProbeFmt(&L, "!! write error %lu occurred\n", L.err);
+    if (L.bad) ProbeFmt(&L, "\n!! write error %lu occurred\n", L.err);
     ProbeFmt(&L, "=== end ===\n");
     ProbeClose(&L);
 }

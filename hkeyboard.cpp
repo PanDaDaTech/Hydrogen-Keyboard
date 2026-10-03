@@ -6622,6 +6622,21 @@ static void FillEscaped(wchar_t* dst, int cap, const wchar_t* src) {
     dst[si] = 0;
 }
 
+// ⚠ 关于 `ProbeFmt` 里的 `%ls`（曾经的伪 bug，已排查清楚，留此备注免得再犯）：
+//   `ProbeFmt` 底下是 `_vsnprintf_s`（**窄字符版**）。曾以为窄版里 `%ls` 会把
+//   `wchar_t*` 当 `char*` 逐字节读 —— **这是错的**。MSVC 明确规定：
+//   `%ls` / `%lc` / `%ws` / `%wc` **恒等于 wchar_t**，`%hs` / `%hc` 恒等于 char，
+//   与函数本身的宽窄无关。所以窄版 printf 里的 `%ls` 是合法的宽转窄转换符。
+//   （虚机日志里 `title='C:\Windows\system32\cmd.exe'` 一直显示正常，
+//     本就是这一点的实证 —— 既有那些 `%ls` 从来没打乱码过。）
+//
+//   **真正要当心的是另一件事**：宽转窄走**区域设置代码页**（ANSI code page），
+//   非 ASCII 字符会被吃掉或变成 `?`。这正是 `FillEscaped` 存在的理由 ——
+//   先把非 ASCII 统一转成 `<U+XXXX>`，剩下的纯 ASCII 转换才是无损的。
+//   ⇒ 打宽字符串到日志的**唯一正确姿势**：`FillEscaped` + `%ls`，两步缺一不可。
+//   绝不要为了「保险」再自己转一层窄串—— 那只会把已经转好的 `<U+XXXX>`
+//   又按代码页走一遍，纯属多余，且一旦代码页不是 ASCII 就可能出问题。
+
 // 用 Ctrl+A / Ctrl+C 把目标控件的真实文本取回到 out。
 // ⚠ 必须先清空剪贴板再发 Ctrl+C：剪贴板里可能还留着别的东西，
 //   目标若没响应 Ctrl+C，我们会读到上一次的旧值并据此误判。
@@ -6938,15 +6953,15 @@ static HWND LogForegroundFingerprint(ProbeLog* L, const char* tag) {
         wcscmp(fcls, L"TMemo") == 0 || wcscmp(fcls, L"SysEdit32") == 0 ||
         wcscmp(fcls, L"Scintilla") == 0;
 
-    ProbeFmt(L, "\n  [%s] foreground=0x%llx class=%s\n", tag,
+    ProbeFmt(&L, "\n  [%s] foreground=0x%llx class=%s\n", tag,
              (unsigned long long)(ULONG_PTR)fg, cls);
-    ProbeFmt(L, "  [%s] title='%ls'\n", tag, titleEsc);
-    ProbeFmt(L, "  [%s] keyboardLayout=0x%llx (0x08040804 = zh-CN)\n", tag,
+    ProbeFmt(&L, "  [%s] title='%ls'\n", tag, titleEsc);
+    ProbeFmt(&L, "  [%s] keyboardLayout=0x%llx (0x08040804 = zh-CN)\n", tag,
              (unsigned long long)(ULONG_PTR)hkl);
-    ProbeFmt(L, "  [%s] focus=0x%llx class='%ls' %s\n", tag,
+    ProbeFmt(&L, "  [%s] focus=0x%llx class='%ls' %s\n", tag,
              (unsigned long long)(ULONG_PTR)focus, fcls,
              looksEditable ? "(looks like a text control)" : "(SELF-DRAWN or top-level; normal for Chromium/Scintilla)");
-    ProbeFmt(L, "  [%s] imeUI(candidate window) visible=%d\n", tag,
+    ProbeFmt(&L, "  [%s] imeUI(candidate window) visible=%d\n", tag,
              ProbeImeUiWindow() ? 1 : 0);
     return fg;
 }
@@ -6968,7 +6983,45 @@ static BOOL EndsWithW(const wchar_t* s, const wchar_t* tail) {
     return wcscmp(s + (ls - lt), tail) == 0;
 }
 
-static void RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseClick) {
+// ========== 单个目标的测试结果（供最终对比表用）==========
+//
+// ⚠ 为什么一定要做「多目标对比」而不是一轮只测一个（用户提议过换目标，否掉了）：
+//
+//   系统自带原版记事本是**已知能打中文的对照组**。只测它等于又一次拿对照组
+//   当结论 —— 那正是第 14 轮的错。真正的信息在**对比**里：
+//
+//     notepad PASS + Edge/Notepad4 FAIL ⇒ 确认是「应用类型差异」（自绘控件），复现成功
+//     notepad PASS + 其他也PASS        ⇒ 没复现，说明还缺某个条件
+//     notepad FAIL                      ⇒ 出现真正的系统性故障，拿到复现了
+//
+//   ⇒ 一轮把能找到的目标全测一遍并出对比表，比让用户来回换目标快得多，
+//     也免得每次换目标都要重新等窗口起来。
+enum ProbeResult {
+    PR_SKIP = 0,     // 该目标不可用（没找到 / 起不来 / 置前失败）
+    PR_PASS,         // 中文组字上屏
+    PR_FAIL_ASCII,   // 只有 ASCII 进去了 —— IME 压根没组字
+    PR_FAIL_NOTHING, // 什么都没进去 —— 键在到达 IME 前就被吞
+    PR_FAIL_OTHER,   // 有中文但不是期望的那两个字
+    PR_UNVERIF,      // 读不回来（目标不认 Ctrl+C）
+};
+
+struct RoundRecord {
+    BOOL     ran;            // 这一轮是否真的跑了
+    BOOL     imeUiComposing; // 打 5 个字母后 IMEUI 候选窗是否出现
+    BOOL     gotOk;          // 剪贴板是否读回成功
+    wchar_t  got[192];       // 读回的文本（原始，未转义）
+    ProbeResult result;
+};
+
+// 单个目标跑一轮，返回该轮结论。viaMouseClick=FALSE 走 SendInput，
+// =TRUE 走完整点键路径（WndProc → OnLDown → HitKey → DoKeyAction → SendKey）。
+static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseClick,
+                                        BOOL* outImeUi, wchar_t* outGot, int gotCap,
+                                        BOOL* outGotOk) {
+    RoundRecord rec;
+    ZeroMemory(&rec, sizeof(rec));
+    rec.result = PR_SKIP;
+
     ClipBackup bak;
     Clip_Save(&bak);
 
@@ -6992,7 +7045,8 @@ static void RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseClick) {
     // 此刻 IME 应当正在组字，候选窗应该存在。
     // 这是「键到底有没有送到 IME」与「IME 收到但没组字」的唯一分界点。
     BOOL imeUi = ProbeImeUiWindow();
-    ProbeFmt(L, "  [round %d] after 5 letters: imeUI visible=%d  %s\n", round,
+    rec.imeUiComposing = imeUi;
+    ProbeFmt(&L, "  [round %d] after 5 letters: imeUI visible=%d  %s\n", round,
              imeUi ? 1 : 0,
              imeUi ? "<- IME IS composing (keys reached the IME)"
                    : "<- NO candidate window: IME never started composing");
@@ -7005,42 +7059,66 @@ static void RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseClick) {
     // 跨进程取证：Ctrl+A / Ctrl+C 把目标里的真实文本读回来
     wchar_t got[512] = {0};
     BOOL gotOk = GrabTargetText(got, 512);
+    rec.gotOk = gotOk;
+    wcsncpy_s(rec.got, 192, got, _TRUNCATE);
 
     wchar_t esc[1024]; FillEscaped(esc, 1024, got);
     const char* verdict;
     if (!gotOk) {
+        rec.result = PR_UNVERIF;
         verdict = "UNVERIFIABLE (clipboard readback failed; target may ignore Ctrl+C)";
     } else if (got[0] == 0) {
+        rec.result = PR_FAIL_NOTHING;
         verdict = "FAIL (target received NOTHING - keys were swallowed before the IME)";
     } else if (EndsWithW(got, kExpectTail)) {
+        rec.result = PR_PASS;
         verdict = "PASS (Chinese composed and committed)";
     } else {
         BOOL allAscii = TRUE;
         for (int i = 0; got[i]; i++) if (got[i] > 0x7F) allAscii = FALSE;
+        rec.result = allAscii ? PR_FAIL_ASCII : PR_FAIL_OTHER;
         verdict = allAscii
             ? "FAIL (raw ASCII came through - IME did NOT compose at all)"
             : "FAIL (some CJK, but not ending in the expected 2 chars)";
     }
-    ProbeFmt(L, "  [round %d] %s\n", round,
+    ProbeFmt(&L, "  [round %d] %s\n", round,
              viaMouseClick ? "via simulated MOUSE CLICK on the on-screen key"
                            : "via direct SendKey        ");
-    ProbeFmt(L, "  [round %d] readback='%ls'\n", round, esc);
-    ProbeFmt(L, "  [round %d] VERDICT: %s\n", round, verdict);
+    ProbeFmt(&L, "  [round %d] readback='%ls'\n", round, esc);
+    ProbeFmt(&L, "  [round %d] VERDICT: %s\n", round, verdict);
     // 额外线索：期望只有「你好」两个字，实际多出来的部分单独报出来，
     // 免得它混在 PASS 里被忽略（例如多出一个被 Ctrl+A 修饰键漏出去的「啊」）。
-    if (EndsWithW(got, kExpectTail)) {
+    if (rec.result == PR_PASS) {
         size_t ls = wcslen(got), lt = wcslen(kExpectTail);
         if (ls > lt) {
             wchar_t extra[64] = {0};
             wcsncpy_s(extra, 64, got, ls - lt);
             wchar_t eesc[256]; FillEscaped(eesc, 256, extra);
-            ProbeFmt(L, "  [round %d] NOTE: %d extra char(s) before the expected text: '%ls'\n",
+            ProbeFmt(&L, "  [round %d] NOTE: %d extra char(s) before the expected text: '%ls'\n",
                      round, (int)(ls - lt), eesc);
         }
     }
-    ProbeFmt(L, "  [round %d] imeUI after commit=%d\n\n", round, ProbeImeUiWindow() ? 1 : 0);
+    ProbeFmt(&L, "  [round %d] imeUI after commit=%d\n\n", round, ProbeImeUiWindow() ? 1 : 0);
 
     Clip_Restore(&bak);
+
+    if (outImeUi)   *outImeUi   = rec.imeUiComposing;
+    if (outGotOk)   *outGotOk   = rec.gotOk;
+    if (outGot && gotCap >= 8) wcsncpy_s(outGot, gotCap, rec.got, _TRUNCATE);
+    return rec.result;
+}
+
+// 把单轮判定结果压成表格里的一个短标签。
+// ⚠ 必须是**纯 ASCII 窄串**才能用 %s 打。
+static const char* VerdictTag(ProbeResult r) {
+    switch (r) {
+        case PR_PASS:         return "PASS";
+        case PR_FAIL_ASCII:   return "F-ASCII";
+        case PR_FAIL_NOTHING: return "F-EMPTY";
+        case PR_FAIL_OTHER:   return "F-OTHER";
+        case PR_UNVERIF:      return "UNVERIF";
+        default:              return "?";
+    }
 }
 
 static void RunImeProbe() {
@@ -7049,7 +7127,7 @@ static void RunImeProbe() {
     wchar_t exepath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exepath, MAX_PATH);
 
-    ProbeFmt(&L, "\n=== self-probe (FULL INIT, USER-SUPPLIED TARGET) ===\n");
+    ProbeFmt(&L, "\n=== self-probe (FULL INIT, ALL TARGETS COMPARED) ===\n");
     ProbeFmt(&L, "exe=%ls\n", exepath);
     ProbeFmt(&L, "pid=%lu\n", GetCurrentProcessId());
 
@@ -7104,7 +7182,7 @@ static void RunImeProbe() {
 
     // 候选目标类名，按用户报告的失败应用排序。
     // ⚠ 原版记事本故意排最后：它是已知能打中文的对照组，
-    //   拿它当兜底能验证「探针本身没问题」，但它**复现不了 issue #3**。
+    //   它 PASS 说明探针本身没问题，但**不能算issue #3 复现**。
     static const wchar_t* kWantCls[] = {
         L"Notepad4", L"Scintilla",          // 用户报告失败的 Scintilla 编辑器
         L"Chrome_WidgetWin",               // Edge / Chrome 自绘窗口
@@ -7113,15 +7191,11 @@ static void RunImeProbe() {
         L"Notepad",                        // ⚠ 已知成功的对照组，放最后
     };
 
-    // ---- 步骤 1：看看已经有什么在跑 ----
+    // ---- 步骤 1：枚举当前所有可见窗口，全部打印 ----
     //
     // ⚠ 放静态区而不是栈上：这个结构约 9.4 KB，
     //   而 -imeprobe 是在 WinMain 里跑的，栈上再叠一个没必要。
     static TargetScan sc;
-    HWND target = NULL;
-    wchar_t how[80] = {0};
-    BOOL   isControl = FALSE;
-
     ZeroMemory(&sc, sizeof(sc));
     sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
     EnumWindows(CbEnumTargets, (LPARAM)&sc);
@@ -7134,42 +7208,56 @@ static void RunImeProbe() {
                  i, (unsigned long long)(ULONG_PTR)sc.hits[i].hwnd, cesc, tesc);
     }
 
-    // 在已运行的窗口里按优先级找一个
-    for (int wi = 0; wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !target; wi++) {
+    // ---- 步骤 2：把「所有能用的目标」收集成一张清单 ----
+    //
+    // ⚠⚠ 为什么一轮要测**全部**而不是一个（用户提议「换成系统记事本」，只采纳一半）：
+    //
+    //   系统自带原版记事本是**已知能打中文的对照组**，只测它就是又一次拿对照组
+    //   当结论 —— 第 14 轮正是这么错的。真正的信息在**对比**里：
+    //
+    //     notepad PASS + Edge/Notepad4 FAIL ⇒ 确认是「应用类型差异」，复现成功
+    //     notepad PASS + 其他也 PASS       ⇒ 没复现，说明还缺某个条件
+    //     notepad FAIL                ⇒ 出现真正的系统性故障，拿到复现了
+    //
+    //   一轮测全部并出对比表，比让用户来回换目标快得多 —— 每次换目标都要
+    //   重新启动、重新等窗口、重新跑一遍，那是纯粹的浪费。
+    enum { kMaxTargets = 6 };
+    struct Tgt {
+        HWND    hwnd;
+        wchar_t label[80];
+        BOOL    isControl;   // 原版记事本 = 已知能打中文的对照组
+        BOOL    launched;    // 本轮是不是我们启动的
+        BOOL    usable;      // 置前 + 自证都过了才为 TRUE
+        ProbeResult r1, r2;
+        BOOL    ime1, ime2;
+    };
+    static Tgt tgts[kMaxTargets];
+    int nTgt = 0;
+
+    // 2a. 先收已经在跑的
+    for (int wi = 0; wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])); wi++) {
         for (int i = 0; i < sc.n; i++) {
-            if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
-                target = sc.hits[i].hwnd;
-                wcscpy_s(how, 80, kWantCls[wi]);
-                isControl = (wcscmp(kWantCls[wi], L"Notepad") == 0);
-                break;
-            }
+            if (!ContainsCI(sc.hits[i].cls, kWantCls[wi])) continue;
+            if (nTgt >= kMaxTargets) break;
+            Tgt* t = &tgts[nTgt++];
+            t->hwnd  = sc.hits[i].hwnd;
+            wcscpy_s(t->label, 80, kWantCls[wi]);
+            t->isControl = (wcscmp(kWantCls[wi], L"Notepad") == 0);
+            t->launched  = FALSE;
+            t->usable    = TRUE;      // 已经在跑，先假定可用，测的时候再自证
+            t->r1 = t->r2 = PR_SKIP;
+            break;
         }
     }
-    // 类名没中就退到标题匹配（Edge 窗口标题里通常带 "Edge"）
-    if (!target) {
-        static const wchar_t* kWantTitle[] = { L"Edge", L"Chrome", L"Notepad4", L"Firefox" };
-        for (int wi = 0; wi < 4 && !target; wi++) {
-            for (int i = 0; i < sc.n; i++) {
-                if (ContainsCI(sc.hits[i].title, kWantTitle[wi])) {
-                    target = sc.hits[i].hwnd;
-                    wcscpy_s(how, 80, kWantTitle[wi]);
-                    break;
-                }
-            }
-        }
-    }
+    ProbeFmt(&L, "\nstep 2: %d target(s) already running\n", nTgt);
 
-    if (target) {
-        ProbeFmt(&L, "\nstep 1: matched a RUNNING window by '%ls'\n", how);
-    } else {
-        // ---- 步骤 2：没有在跑的，那就自己启动一个 ----
-        //
-        // ⚠⚠ 上一轮就是漏了这一步，只枚举不启动，于是把「没运行」
-        //   误报成「没安装」—— 而 Win10 是预装 Edge 的，它只是没运行。
-        //   这是排障里极容易犯的一个错：**用「当前列表里没有」推断「不存在」**。
-        ProbeFmt(&L, "\nstep 1: no matching window is RUNNING.\n");
-        ProbeFmt(&L, "step 2: looking for an installed app to launch ...\n");
-
+    // ---- 步骤 3：不够就自己启动（Win10 预装 Edge，只是通常没在运行）----
+    //
+    // ⚠⚠ 第 16 轮就是漏了「启动」这一步，只枚举不启动，
+    //   于是把「没运行」误报成「没安装」——
+    //   **用「当前列表里没有」推断「不存在」，是排障里最容易犯的错**。
+    if (nTgt < 2) {
+        ProbeFmt(&L, "step 3: looking for an installed app to launch ...\n");
         wchar_t selfDir[MAX_PATH] = {0};
         HkDirOfSelf(selfDir, MAX_PATH);
         wchar_t appPath[MAX_PATH] = {0};
@@ -7177,124 +7265,191 @@ static void RunImeProbe() {
         wchar_t appArgs[MAX_PATH] = {0};
         BOOL ctrl = FALSE;
 
-        if (!FindLaunchableApp(selfDir, appPath, MAX_PATH, appLabel, 80,
-                               appArgs, MAX_PATH, &ctrl)) {
-            ProbeFmt(&L, "!! could not find ANY known app (no portable Notepad4\n");
-            ProbeFmt(&L, "!! next to the exe, no Edge/Chrome/Firefox installed).\n");
-            ProbeFmt(&L, "!! Not falling back to the foreground window - typing into\n");
-            ProbeFmt(&L, "!! whatever is in front produces a bogus sample.\n");
-            ProbeClose(&L);
-            return;
-        }
-        {
-            wchar_t pesc[1024]; FillEscaped(pesc, 1024, appPath);
-            ProbeFmt(&L, "step 2: will launch '%ls'\n", appLabel);
-            ProbeFmt(&L, "         at        '%ls'\n", pesc);
-        }
-
-        if (!HkLaunchApp(appPath, appArgs[0] ? appArgs : NULL)) {
-            ProbeFmt(&L, "!! CreateProcess failed, GetLastError=%lu\n", GetLastError());
-            ProbeFmt(&L, "!! Cannot test anything. Send this log back as-is.\n");
-            ProbeClose(&L);
-            return;
-        }
-
-        // ⚠⚠ **必须轮询等窗口出现，不能只靠 WaitForInputIdle**：
-        //   Chromium 启动后还要再建自己的窗口，可能要好几秒；
-        //   而 Edge 这类单实例应用若已在运行，CreateProcess 会**立刻返回**
-        //   （请求被转发给现有进程），新窗口可能过一会儿才出现。
-        //   固定等一次然后就枚举，很容易「窗口还没出来」→ 误判成没装。
-        ProbeFmt(&L, "step 2: launched, waiting for its window to appear ...\n");
-        for (int attempt = 0; attempt < 40 && !target; attempt++) {
-            PumpMs(500);
-            ZeroMemory(&sc, sizeof(sc));
-            sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
-            EnumWindows(CbEnumTargets, (LPARAM)&sc);
-            for (int wi = 0;
-                 wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !target; wi++) {
-                for (int i = 0; i < sc.n; i++) {
-                    if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
-                        target = sc.hits[i].hwnd;
-                        isControl = ctrl && (wcscmp(kWantCls[wi], L"Notepad") == 0);
-                        break;
+        if (FindLaunchableApp(selfDir, appPath, MAX_PATH, appLabel, 80,
+                              appArgs, MAX_PATH, &ctrl)) {
+            {
+                wchar_t pesc[1024]; FillEscaped(pesc, 1024, appPath);
+                ProbeFmt(&L, "         will launch '%ls'\n", appLabel);
+                ProbeFmt(&L, "         at        '%ls'\n", pesc);
+            }
+            if (HkLaunchApp(appPath, appArgs[0] ? appArgs : NULL)) {
+                // ⚠⚠ **必须轮询等窗口出现，不能只靠 WaitForInputIdle**：
+                //   Chromium 建自己的窗口要好几秒；Edge 这类单实例应用
+                //   若已在运行，CreateProcess 会**立刻返回**（请求转发给
+                //   现有进程），新窗口可能过一会儿才出现。
+                //   固定等一次就枚举，很容易「窗口还没出来」→ 误判成没装。
+                HWND found = NULL;
+                wchar_t foundCls[80] = {0};
+                for (int attempt = 0; attempt < 40 && !found; attempt++) {
+                    PumpMs(500);
+                    ZeroMemory(&sc, sizeof(sc));
+                    sc.cap = (int)(sizeof(sc.hits) / sizeof(sc.hits[0]));
+                    EnumWindows(CbEnumTargets, (LPARAM)&sc);
+                    for (int wi = 0;
+                         wi < (int)(sizeof(kWantCls) / sizeof(kWantCls[0])) && !found; wi++) {
+                        for (int i = 0; i < sc.n; i++) {
+                            if (ContainsCI(sc.hits[i].cls, kWantCls[wi])) {
+                                // 别把已经收进清单的那个再收一遍
+                                BOOL dup = FALSE;
+                                for (int k = 0; k < nTgt; k++)
+                                    if (tgts[k].hwnd == sc.hits[i].hwnd) dup = TRUE;
+                                if (dup) continue;
+                                found = sc.hits[i].hwnd;
+                                wcscpy_s(foundCls, 80, kWantCls[wi]);
+                                break;
+                            }
+                        }
                     }
+                    if (found)
+                        ProbeFmt(&L, "         window appeared after %d x 500ms\n", attempt + 1);
                 }
+                if (found && nTgt < kMaxTargets) {
+                    Tgt* t = &tgts[nTgt++];
+                    t->hwnd = found;
+                    wcscpy_s(t->label, 80, appLabel);
+                    t->isControl = ctrl;
+                    t->launched  = TRUE;
+                    t->usable    = TRUE;
+                    t->r1 = t->r2 = PR_SKIP;
+                    ProbeFmt(&L, "         added as target #%d\n", nTgt);
+                } else if (!found) {
+                    ProbeFmt(&L, "!! launched but NO usable window showed up in 20s.\n");
+                }
+            } else {
+                ProbeFmt(&L, "!! CreateProcess failed, GetLastError=%lu\n", GetLastError());
             }
-            if (target) {
-                ProbeFmt(&L, "         window appeared after %d x 500ms\n", attempt + 1);
-                break;
-            }
+        } else {
+            ProbeFmt(&L, "!! no known app found (no portable Notepad4 next to the exe,\n");
+            ProbeFmt(&L, "!! no Edge/Chrome/Firefox installed, no system notepad).\n");
         }
-
-        if (!target) {
-            ProbeFmt(&L, "!! launched '%ls' but NO usable window showed up in 20s.\n", appLabel);
-            ProbeFmt(&L, "!! Windows that are up right now:\n");
-            for (int i = 0; i < sc.n; i++) {
-                wchar_t tesc[512]; FillEscaped(tesc, 512, sc.hits[i].title);
-                wchar_t cesc[256]; FillEscaped(cesc, 256, sc.hits[i].cls);
-                ProbeFmt(&L, "  [%02d] class='%ls' title='%ls'\n", i, cesc, tesc);
-            }
-            ProbeClose(&L);
-            return;
-        }
-        wcscpy_s(how, 80, appLabel);
     }
 
-    ProbeFmt(&L, "\nchosen target: hwnd=0x%llx via '%ls'%s\n",
-             (unsigned long long)(ULONG_PTR)target, how,
-             isControl ? "   <-- CONTROL, this one is known to WORK" : "");
-
-    // ---- 步骤 3：强制置前，并复核 ----
-    //
-    // ⚠ 置前失败时**必须如实停下**：这时打出去的字符全落到别人家，
-    //   产出的样本看起来像 bug 复现，实际上是打错窗口。
-    BOOL fgOk = ForceForeground(target);
-    ProbeFmt(&L, "ForceForeground -> %s (GetForegroundWindow=0x%llx)\n",
-             fgOk ? "OK" : "REFUSED by the foreground lock",
-             (unsigned long long)(ULONG_PTR)GetForegroundWindow());
-    if (!fgOk) {
-        ProbeFmt(&L, "\n!! could NOT bring the target to the foreground. Every key\n");
-        ProbeFmt(&L, "!! would land in whatever is in front instead, so the result\n");
-        ProbeFmt(&L, "!! would be meaningless. NOT running the rounds.\n");
+    if (nTgt == 0) {
+        ProbeFmt(&L, "\n!! NO USABLE TARGET AT ALL. Cannot test anything.\n");
+        ProbeFmt(&L, "!! Not falling back to the foreground window - typing into\n");
+        ProbeFmt(&L, "!! whatever is in front produces a bogus sample.\n");
         ProbeClose(&L);
         return;
     }
 
-    LogForegroundFingerprint(&L, "initial");
+    // ---- 步骤 4：逐个测，最后出对比表 ----
+    ProbeFmt(&L, "\n*** RUNNING %d TARGET(S) ***\n", nTgt);
 
-    // ⚠⚠ 最后一层自证：置前成功**不等于焦点落在输入框上**。
-    //   Chromium 置前后焦点可能还在标签栏、菜单或文档空白处，
-    //   这时打出去的字对方根本不接。而 cmd.exe / PowerShell 这类控制台
-    //   压根没有可编辑控件，`keyboardLayout` 也会读出 0。
-    //   ⇒ 这两种情况一律中止，绝不产出一个会被误读成 bug 的 FAIL。
-    {
-        HWND fg = GetForegroundWindow();
-        char cls[128] = {0};
-        if (fg) GetClassNameA(fg, cls, 128);
-        DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
-        HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
-        if (hkl == NULL) {
-            ProbeFmt(&L, "\n!! ABORT: the foreground thread has NO keyboard layout "
-                         "(GetKeyboardLayout returned NULL).\n");
-            ProbeFmt(&L, "!! That means the focus is not on an editable control at all\n");
-            ProbeFmt(&L, "!! (a console window, or the desktop).\n");
-            ProbeClose(&L);
-            return;
+    for (int i = 0; i < nTgt; i++) {
+        Tgt* t = &tgts[i];
+        ProbeFmt(&L, "\n===== TARGET %d/%d : %ls%s%s =====\n", i + 1, nTgt, t->label,
+                 t->launched ? "  (launched by the probe)" : "  (already running)",
+                 t->isControl ? "  [CONTROL - known to WORK]" : "");
+
+        // 置前并复核。⚠ 置前失败必须**如实跳过这个目标**：
+        //   这时打出去的字符全落到别人家，样本看起来像 bug 复现，
+        //   实际上只是打错窗口 —— 那正是第 15 轮的两个假 FAIL。
+        BOOL fgOk = ForceForeground(t->hwnd);
+        ProbeFmt(&L, "ForceForeground -> %s (GetForegroundWindow=0x%llx)\n",
+                 fgOk ? "OK" : "REFUSED by the foreground lock",
+                 (unsigned long long)(ULONG_PTR)GetForegroundWindow());
+        if (!fgOk) {
+            ProbeFmt(&L, "!! SKIP this target - every key would land in the wrong window.\n");
+            t->usable = FALSE;
+            continue;
         }
-        if (strcmp(cls, "ConsoleWindowClass") == 0 ||
-            strstr(cls, "CASCADIA") != NULL) {
-            ProbeFmt(&L, "\n!! ABORT: the foreground window is a console ('%s').\n", cls);
-            ProbeFmt(&L, "!! Keys typed here go to the shell, never to an IME.\n");
-            ProbeClose(&L);
-            return;
+
+        LogForegroundFingerprint(&L, "target-initial");
+
+        // ⚠⚠ 开跑前的最后一层自证：置前成功**不等于焦点落在输入框上**。
+        //   Chromium 置前后焦点可能还在标签栏、菜单或文档空白处，
+        //   这时打出去的字对方根本不接。而控制台压根没有可编辑控件，
+        //   `GetKeyboardLayout` 会读出 NULL。
+        {
+            HWND fg = GetForegroundWindow();
+            char cls[128] = {0};
+            if (fg) GetClassNameA(fg, cls, 128);
+            DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+            HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
+            if (hkl == NULL) {
+                ProbeFmt(&L, "!! SKIP this target - the foreground thread has NO keyboard\n");
+                ProbeFmt(&L, "!! layout, so the focus is not on an editable control\n");
+                ProbeFmt(&L, "!! (a console window, or the desktop).\n");
+                t->usable = FALSE;
+                continue;
+            }
+            if (strcmp(cls, "ConsoleWindowClass") == 0 ||
+                strstr(cls, "CASCADIA") != NULL) {
+                ProbeFmt(&L, "!! SKIP this target - the foreground window is a console ('%s').\n", cls);
+                ProbeFmt(&L, "!! Keys typed here go to the shell, never to an IME.\n");
+                t->usable = FALSE;
+                continue;
+            }
         }
+
+        ProbeFmt(&L, "*** do NOT touch anything for ~20 seconds ***\n");
+
+        wchar_t got1[192] = {0}, got2[192] = {0};
+        BOOL ok1 = FALSE, ok2 = FALSE;
+        t->r1 = RunOneInjectionRound(&L, 1, FALSE, &t->ime1, got1, 192, &ok1);
+        t->r2 = RunOneInjectionRound(&L, 2, TRUE,  &t->ime2, got2, 192, &ok2);
     }
 
-    ProbeFmt(&L, "\n*** Do NOT touch anything for ~20 seconds. ***\n");
-    ProbeFmt(&L, "*** It types 'nihao'+Space into the target, twice.         ***\n");
+    // ---- 步骤 5：对比表 ----
+    //
+    // 这一步才是本轮存在的意义：**单看一个目标得不出结论，对比才行。**
+    ProbeFmt(&L, "\n================ SUMMARY (compare the rows!) ================\n");
+    // 列名全是纯 ASCII 窄串，直接 %s。
+    // 数据行的目标名是宽串 => FillEscaped 转纯 ASCII + `%ls`（见 FillEscaped 上方备注）。
+    ProbeFmt(&L, "%-22s %-8s %-8s %-7s %-7s %s\n",
+             "target", "r1", "r2", "imeUI1", "imeUI2", "note");
+    for (int i = 0; i < nTgt; i++) {
+        Tgt* t = &tgts[i];
+        if (!t->usable) {
+            ProbeFmt(&L, "%-22s %-8s %-8s %-7s %-7s %s\n",
+                     "SKIPPED", "-", "-", "-", "-",
+                     "could not be focused; not testable");
+            continue;
+        }
+        const char* s1 = VerdictTag(t->r1);
+        const char* s2 = VerdictTag(t->r2);
+        wchar_t nameEsc[256]; FillEscaped(nameEsc, 256, t->label);
+        char note[96] = {0};
+        if (t->isControl)
+            strcpy_s(note, sizeof(note), "CONTROL: Chinese is known to work here");
+        else if (t->r1 == PR_PASS)
+            strcpy_s(note, sizeof(note), "repro NOT reproduced on this target");
+        ProbeFmt(&L, "%-22s %-8s %-8s %-7d %-7d %s\n",
+                 nameEsc, s1, s2, t->ime1 ? 1 : 0, t->ime2 ? 1 : 0, note);
+    }
+    ProbeFmt(&L, "\n(legend: F-EMPTY = target got nothing; F-ASCII = raw letters came\n");
+    ProbeFmt(&L, " through with no IME composition; F-OTHER = some CJK but wrong;\n");
+    ProbeFmt(&L, " imeUI = was the IME candidate window on screen after 5 letters)\n");
 
-    RunOneInjectionRound(&L, 1, FALSE);   // 直接 SendInput
-    RunOneInjectionRound(&L, 2, TRUE);    // 走完整点键路径
+    // ---- 结论提示：把该看的组合直接说清楚 ----
+    {
+        const Tgt* ctrl = NULL;
+        const Tgt* bad  = NULL;
+        for (int i = 0; i < nTgt; i++) {
+            if (!tgts[i].usable) continue;
+            if (tgts[i].isControl && !ctrl) ctrl = &tgts[i];
+            else if (!tgts[i].isControl && tgts[i].r1 != PR_PASS) bad = &tgts[i];
+        }
+        ProbeFmt(&L, "\n---- WHAT THIS MEANS ----\n");
+        if (ctrl && ctrl->r1 == PR_PASS && bad) {
+            wchar_t badEsc[256]; FillEscaped(badEsc, 256, bad->label);
+            ProbeFmt(&L, "The control (built-in notepad) PASSED while '%ls' FAILED.\n", badEsc);
+            ProbeFmt(&L, "=> issue #3 IS reproduced. Injection works; the failure is\n");
+            ProbeFmt(&L, "   specific to that app (self-drawn control). Focus here next.\n");
+        } else if (ctrl && ctrl->r1 == PR_PASS) {
+            ProbeFmt(&L, "The control passed and so did everything else.\n");
+            ProbeFmt(&L, "=> NOT reproduced here. Chinese composition works in this\n");
+            ProbeFmt(&L, "   process on this machine, so the real failure needs a\n");
+            ProbeFmt(&L, "   condition this probe does not create. Report as-is.\n");
+        } else if (ctrl) {
+            ProbeFmt(&L, "The control (built-in notepad) FAILED too.\n");
+            ProbeFmt(&L, "=> that is a genuine system-wide reproduction - much easier\n");
+            ProbeFmt(&L, "   to debug. Look at the imeUI column to see where it breaks.\n");
+        } else {
+            ProbeFmt(&L, "No control target was available, so there is nothing to\n");
+            ProbeFmt(&L, "compare against. See the window list above.\n");
+        }
+    }
 
     if (L.bad) ProbeFmt(&L, "\n!! write error %lu occurred\n", L.err);
     ProbeFmt(&L, "=== end ===\n");

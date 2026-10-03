@@ -6671,7 +6671,35 @@ static void EnvTestInject() {
             fwprintf(f, L"判读（只看「你好」两个字在不在一起）：\n");
             fwprintf(f, L"  两段都出现「你好」  = 点击路径也没问题，需继续找差异\n");
             fwprintf(f, L"  第 2 段是 nihao     = **点击路径就是元凶**，定位完成\n");
-            fwprintf(f, L"  第 2 段是 n + 你好  = 点击的那个 n 没进 IME，之后才正常\n");
+            fwprintf(f, L"  第 2 段是 n + 你好  = 点击的那个 n 没进 IME，之后才正常\n\n");
+
+            // ---- 键表诊断（关键！）----
+            //
+            // ⚠ 上一轮"点 N 键"那版，用户反馈两段都是「你好」——
+            //   但第 2 段里**看不到那个本该多出来的 n**。
+            //   若真如此，说明 ClickOwnKey 根本没点下去，而它的前提是
+            //   FindKeyPos 能找到 N 键的坐标；FindKeyPos 又依赖 HitKey。
+            //   ⇒ 把键表的真实数据打出来：只要 k->x/y 是"格"单位（1.x、2.x）
+            //     而不是客户区像素，HitKey 就永远匹配不上，
+            //     **HKeyboard 的鼠标点击会整体失效** —— 那才是根因。
+            fwprintf(f, L"---- 键表诊断（排查用）----\n");
+            fwprintf(f, L"g_nk=%d  g_ww=%d  g_wh=%d  g_keyAreaX=%d\n",
+                     g_nk, g_ww, g_wh, g_keyAreaX);
+            for (int i = 0; i < g_nk && i < 6; i++) {
+                // ⚠ KeyDef.x/y/w/h 是 **int**（见其定义），这里必须用 %d。
+                //   写成 %.2f 会让 varargs 把一个 int 当 double 读，
+                //   结果是垃圾值甚至崩溃 —— 排查工具自己先崩就没意义了。
+                fwprintf(f, L"  keys[%d] vk=0x%02X  x=%d y=%d w=%d h=%d type=%d\n",
+                         i, g_keys[i].vk, g_keys[i].x, g_keys[i].y,
+                         g_keys[i].w, g_keys[i].h, (int)g_keys[i].type);
+            }
+            int nx = 0, ny = 0;
+            BOOL nf = FindKeyPos('N', &nx, &ny);
+            fwprintf(f, L"FindKeyPos(N) -> %ls  (x=%d y=%d)\n",
+                     nf ? L"found" : L"**NOT FOUND**", nx, ny);
+            fwprintf(f, L"（若这里是 NOT FOUND，或上面的 x/y 是 1.x 2.x 这种"
+                        L"「格」单位而不是几十上百的像素，\n"
+                        L"  就说明 HitKey 匹配不上 —— HKeyboard 的点击会整体失效）\n");
             fclose(f);
         }
     }

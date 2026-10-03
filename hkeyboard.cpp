@@ -2649,10 +2649,61 @@ static void TypeDomainText(const wchar_t* s) {
     }
 }
 
+// ---- -diag：最小诊断，记录"注入前后"的关键系统状态 ----
+//
+// 用途：issue #3 已经缩小到「用户**手动点击**按键 → 注入的按键不被微软拼音
+// 组字」，而**同样的注入由定时器触发时却正常**。两者在代码路径上已被逐一
+// 证明等价（SendKey ≡ SendTestKey、SetCapture/重绘均已排除），
+// 所以差异只可能在**注入那一刻的系统状态**上。
+//
+// 只记录跨进程可取、且与"输入法为什么会拒绝组字"直接相关的几项：
+//   前台窗口类名 / 焦点窗口 / 光标窗口(hwndCaret) / **鼠标左键是否按下** / 键盘布局
+//
+// ⚠ 重点看 LBTN：
+//   用户手动点击时，注入发生在 WM_LBUTTONDOWN 的处理过程中，
+//   此刻鼠标左键**必然是按下状态**；而定时器触发的注入不是。
+//   若两边的 LBTN 不同，差异就找到了 —— 那说明微软拼音在
+//   "鼠标按键按下期间"会拒绝处理注入的键盘事件。
+BOOL g_diag = FALSE;
+
+static void DiagSnap(const wchar_t* tag) {
+    if (!g_diag) return;
+
+    wchar_t self[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    wchar_t* slash = wcsrchr(self, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wchar_t path[MAX_PATH * 2] = {0};
+    _snwprintf_s(path, MAX_PATH * 2, _TRUNCATE, L"%lsdiag.txt", self);
+
+    FILE* f = NULL;
+    if (_wfopen_s(&f, path, L"a, ccs=UTF-8") != 0 || !f) return;
+
+    HWND fg = GetForegroundWindow();
+    char fgCls[64] = {0};
+    if (fg) GetClassNameA(fg, fgCls, 64);
+
+    DWORD tid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    GUITHREADINFO gi = {0};
+    gi.cbSize = sizeof(gi);
+    BOOL ok = (tid && GetGUIThreadInfo(tid, &gi));
+
+    BOOL lbtn = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+    HKL hkl = tid ? GetKeyboardLayout(tid) : NULL;
+
+    fwprintf(f, L"%-9ls fg=%-22hs focus=%-10p caret=%-10p LBTN=%d hkl=%p\n",
+             tag, fgCls,
+             (void*)(ok ? gi.hwndFocus : NULL),
+             (void*)(ok ? gi.hwndCaret : NULL),
+             (int)lbtn, (void*)hkl);
+    fclose(f);
+}
+
 static void DoKeyAction(const KeyDef* k) {
     if (!k) return;
     switch (k->type) {
     case K_LETTER:
+        DiagSnap(L"[before]");
         if (g_ct || g_al || g_winKey) {
             SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
@@ -2662,6 +2713,7 @@ static void DoKeyAction(const KeyDef* k) {
             if (g_sh) g_sh = FALSE;
             ClearWinLock();   // 普通键也退出 Win 锁定/切换状态
         }
+        DiagSnap(L"[after ]");
         break;
     case K_NORMAL:
         if (g_fnLayer && !g_fnWebLayout) {
@@ -6734,7 +6786,13 @@ static void EnvTestInject() {
     }
 
     // ---- 阶段 1：纯注入（基线）----
+    //
+    // ⚠ 这里的 DiagSnap 是关键对照：它记录的是**定时器触发注入**时的系统状态，
+    //   与用户**手动点击按键**时（DoKeyAction 里那次 DiagSnap）形成对照。
+    //   两边只有一处可能不同 —— LBTN（鼠标左键是否按下）—— 那就是元凶所在。
+    DiagSnap(L"[env-bef]");
     SendNihao();
+    DiagSnap(L"[env-aft]");
     SendTestKey(VK_RETURN, 1);
     SendTestKey(VK_RETURN, 1);
     Sleep(700);
@@ -6903,6 +6961,11 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // 说明见 g_noSetCapture 的定义处。**定位完就该删掉**，别留在正式版里。
     g_noSetCapture    = HasArg(cmd, "-noscapture") ? TRUE : FALSE;
     g_noClickRepaint  = HasArg(cmd, "-norepaint")  ? TRUE : FALSE;
+    // -diag：记录每次字母键注入前后的系统状态到 diag.txt（见 DiagSnap）
+    g_diag            = HasArg(cmd, "-diag")       ? TRUE : FALSE;
+    // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
+    // 少了这个没法比较（见 DiagSnap 的说明）。
+    if (g_envTest) g_diag = TRUE;
 
     BOOL isTouch = IsTouchDevice();
 

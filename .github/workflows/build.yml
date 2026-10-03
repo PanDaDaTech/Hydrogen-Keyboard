@@ -1,9 +1,13 @@
 name: Build
 
+# 这个工作流只负责「编译验证」：三架构各编一遍，把产物传成 artifact。
+# 发 Release 是 release.yml 的唯一职责（手动 workflow_dispatch，能自动补日期、
+# 会打7z 合并包、附件齐全）。两条路径都发 Release 会互相踩 ——
+# 推 tag 触发的这条没有 contents: write 权限，generate_release_notes 直接 403，
+# 还会把已存在的 Release 判成"Unexpected error"而让整轮 CI 变红。
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
@@ -18,7 +22,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: Locate Visual Studio
       id: vs
@@ -238,39 +242,25 @@ jobs:
         Get-Content -LiteralPath 'dist/release/HKeyboard_X86_X64_Arm64.sha256.txt'
 
     - name: Upload x86 artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: HKeyboard_x86
         path: dist/x86/HKeyboard_x86.exe
 
     - name: Upload x64 artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: HKeyboard_x64
         path: dist/x64/HKeyboard_x64.exe
 
     - name: Upload arm64 artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: HKeyboard_arm64
         path: dist/arm64/HKeyboard_arm64.exe
 
     - name: Upload checksums artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: HKeyboard_checksums
         path: dist/release/HKeyboard_X86_X64_Arm64.*.txt
-
-    - name: Create Release (on tag)
-      if: startsWith(github.ref, 'refs/tags/v')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          dist/x86/HKeyboard_x86.exe
-          dist/x64/HKeyboard_x64.exe
-          dist/arm64/HKeyboard_arm64.exe
-          dist/release/HKeyboard_X86_X64_Arm64.md5.txt
-          dist/release/HKeyboard_X86_X64_Arm64.sha256.txt
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

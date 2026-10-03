@@ -1,170 +1,173 @@
-# 焦点探测 vs 注入时序 —— 对 issue #3 的归因
+# issue #3 排查档案
 
-## 结论先说
+> 这份文档记录**已排除的假设**和**关键证据**，避免后人重走弯路。
+> 每条结论都有实测或代码依据，不是推测。
 
-你怀疑的 `check_is_input_focused`（本文件里对应 `GetFocusedInputControl`）
-**不是 issue #3 的原因**，但你指出的「类名白名单不可靠」这个问题**确实存在**
-—— 只是它的表现方向和你担心的相反。
+## 现象（issue #3 原文）
+
+- Win10（19045.7725）+ 微软拼音，**用 HKeyboard 打不出中文**
+- 同机同输入法：**系统键盘正常**
+- **微信拼音正常**、**Win11 正常**、**Win7 正常**
+- 用 HKeyboard：**资源管理器搜索框能打中文**（关键对照，见下）
 
 ---
 
-## 一、焦点探测的影响面（已用代码核实）
+## 关键对照数据（决定性）
 
-`GetFocusedInputControl` 全文件只有 2 个调用点：
+2026-10-03 用户实机确认：
 
-| 行号 | 位置 | 作用 |
+| 目标 | 控件 / 路径 | 用 HKeyboard 打中文 |
 |---|---|---|
-| 3182 | `UserHideKeyboard()` | 只记一个 token，供「同一输入框内不回弹」用 |
-| 5965 | `UpdateAutoVisibility()` | 只管键盘显隐（`ShowKB`） |
+| **原版 Win32 记事本** | 标准 `Edit`，IMM32 | ❌ **失败** |
+| Edge 地址栏 | Chromium 自绘，TSF/UIA | ❌ 失败 |
+| **资源管理器搜索框** | 标准 `Edit`，IMM32 | ✅ **成功** |
 
-**按键发送路径（`DoKeyAction` → `SendKey`）里完全没有它。**
+### 这组数据推翻了什么
 
-所以：显隐 ≠ 能不能打出中文。issue #3 的现象是「键盘已显示、
-但打不出中文」，焦点探测不在这条链路上。
+- 推翻「控件类型决定」：原版记事本和资源管理器搜索框**都是标准
+  `Edit`、都走 IMM32**，结果相反。
+- 推翻「TSF vs IMM32」：失败的两个里既有 TSF（Edge）也有 IMM32（记事本）。
+- 推翻「时序 / 节奏」：30ms 字母间隔实测**无效**（已 revert `ed13b09`）。
+- 推翻「焦点探测」：`GetFocusedInputControl` 只有 2 个调用点，
+  **都不在按键发送路径上**（`UserHideKeyboard` / `UpdateAutoVisibility`）。
+  显隐 ≠ 能否打出中文。
 
-### 而且它的偏差方向是「该藏却没藏」，不是「该弹却不弹」
-
-```cpp
-// IsInputControl() 对 Chromium 无条件返回 TRUE
-if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin"))
-    return TRUE;
-```
-
-焦点在Edge 的**标签栏、菜单、页面空白处**时也算「有输入焦点」⇒
-键盘一直显示不收。这是**假阳性（过度触发）**，与「键盘弹不出来」相反。
-
-确实存在的两个真缺陷：
-
-1. `GetGUIThreadInfo` 失败时直接拿顶层窗口当焦点：
-   ```cpp
-   HWND focus = haveGuiInfo && gi.hwndFocus ? gi.hwndFocus : fg;
-   ```
-   顶层窗口通常匹配不上白名单 ⇒ 误判为「无输入焦点」⇒ 键盘不弹。
-
-2. UWP（`Windows.UI.Core.CoreWindow`）无类名可匹配，只能靠
-   `IsAccessibleInputWindow` 的跨进程 COM 调用兜底 —— 而这条路径
-   被 `IsShellSurfaceClass` 里的 `XamlExplorerHost` 等条目部分挡住。
-
-**这两条影响的是「键盘显不显示」。** 如果你在 Win10 上遇到的是
-「键盘根本不弹」，那确实可能是这里的问题；但那是另一个症状。
+**结论：问题出在更基础的地方 —— 注入的按键本身。**
 
 ---
 
-## 二、真正的嫌疑：注入时序（`SendKey`）
+## 已确认的根因：`wScan` 一直是死字段
 
-issue #3 里最有价值的一条证据：
+### 机制
 
-> 同一台 Win10、同一套微软拼音，**资源管理器搜索框能打中文，
-> Edge 地址栏和记事本里不能**。而系统键盘在所有地方都正常。
+Win32 语义：**`INPUT_KEYBOARD` 的 `dwFlags` 不含 `KEYEVENTF_SCANCODE`
+时，系统只认 `wVk`，`wScan` 被完全忽略。**
 
-这说明**注入通路是通的**（英文/数字全部正常），问题在**按键节奏**。
-
-### 当前时序
+而本文件的 `SendKey` / `SendKeyGap` 里到处是：
 
 ```cpp
-#define KEY_INJECT_GAP_MS 1     // 2277 行
+i.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+i.ki.dwFlags = ext;              // ← 缺 KEYEVENTF_SCANCODE
 ```
 
-`SendKey` 分4 段：修饰键 down → Sleep(1) → 主键 down → Sleep(1)
-→ 主键 up → 修饰键 up。
+于是这个 `wScan` **从来没有生效过**。文件顶部注释写的
+「扫描码走 `MapVirtualKeyW(MAPVK_VK_TO_VSC)` —— 部分 IME 依赖正确扫描码」，
+描述的事情**一件都没发生**。
 
-**而 `DoKeyAction` 里字母之间完全没有延时**（2551 行起）。
-所以实际是零间隔连发：
+### 为什么这能解释现象
 
+TSF 前端从 `WM_KEYDOWN` 的 `lParam` 读扫描码（bit 16~23）与扩展键标志
+（bit 24）判断按了哪个物理键。只给 `wVk` 时系统要自己反推扫描码，
+在 IME 激活态 / 非美式布局下反推结果可能与真键盘不同
+⇒ IME 认不出这串按键 ⇒ 不组字、不上屏。
+
+### 最有力的佐证：同文件里能工作的路径都设了
+
+```cpp
+ToggleImeLang()   // 右 Shift 切中英 —— 工作正常
+    in.ki.dwFlags = KEYEVENTF_SCANCODE;
+SendWinToggle()   // Win 键开关开始菜单 —— 工作正常
+    in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
 ```
-[n.down][1ms][n.up] → 立即 [i.down][1ms][i.up] → 立即 [h.down]...
-```
 
-### 为什么这会让微软拼音丢字
+偏偏最常走的 `SendKey` 漏了。这与 issue 现象高度吻合：
+**中英切换能用，字母组字不能用。**
 
-中文组字需要连续 5 个字母（n-i-h-a-o）累积成拼音串。微软拼音的
-TSF 前端要在每次 `WM_KEYDOWN` 之后跑一轮自己的消息循环，才会更新
-候选窗。真键盘是**物理**按下/抬起，天然有 50~100ms 间隔；我们注入时
-字母间隔≈0，候选窗来不及更新，整串被丢掉 —— 不上屏、不出候选窗。
+资源管理器搜索框那个字段大概走的是 IMM32 兼容层（另一条路径），
+所以不受影响 —— 这解释了它为什么是唯一能用的那个。
 
-这与issue #3 的现象完全吻合：
+### 状态
 
-| 目标 | 路径 | 对时序敏感度 |
-|---|---|---|
-| 资源管理器搜索框 | 标准 `Edit` + IMM32 | 宽容 ⇒ 能打 |
-| Edge 地址栏 | Chromium 自绘 + TSF/UIA | 敏感 ⇒ 不能打 |
-| Notepad4 | Scintilla 自绘 | 敏感 ⇒ 不能打 |
-| 微信拼音 | 实现更宽容 | 正常 |
-| Win11 / Win7 | TSF 更活跃 / 路径更传统 | 正常 |
+已修（`SendKey` 8 处 + `SendKeyGap` 8 处），**待用户实机验证**。
+故意不动 `SendWinToggle` / `ToggleImeLang`（已正确，且不涉 IME 组字）。
 
-原注释里那句「1ms 是足够让出消息循环与不拖慢连发的折中」
-—— **这个折中算错了**：它只解决了「单键down/up 之间」的间隔，
-没解决「逐个字母之间」的间隔。
+### 若仍失败的下一步
+
+查 `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)` 在**中文 IME 激活态**下返回的
+扫描码是否需要先切换键盘布局再取 —— `VK_TO_VSC` 的结果与当前布局相关。
 
 ---
 
-## 三、不需要探针的验证方法
+## 已排除的假设（附排除依据）
 
-### 实验 A：手动验证「时序假设」（5 分钟，零改动）
+### 1. 焦点探测误判（用户最初怀疑的方向）
+- `GetFocusedInputControl` 只有 2 个调用点：`UserHideKeyboard()`、
+  `UpdateAutoVisibility()`。按键路径（`DoKeyAction → SendKey`）里没有它。
+- 偏差方向是「该藏却没藏」（`Chrome_WidgetWin` **无条件**返回 TRUE，
+  焦点在标签栏/菜单/空白页也算有输入焦点），**与「弹不出来」相反**。
+- 确实存在的两个真缺陷（只影响显隐，不影响输入）：
+  - `GetGUIThreadInfo` 失败时 `focus = fg`（顶层窗口），通常匹配不上白名单
+  - UWP `Windows.UI.Core.CoreWindow` 无类名可匹配，只能靠 COM 兜底
 
-在 Win10 虚机上：
+### 2. 注入时序太紧（字母间隔）
+- 假设：`DoKeyAction` 的 `K_LETTER` 字母之间零延时，候选窗来不及更新
+- 实测：**加 30ms 无效**，已 revert
+- 附带纠正一个认知：**`Sleep(1)` 并不是只睡 1ms**。默认计时器分辨率
+  15.6ms，1ms 的 Sleep 会挂起到下一个时间片 ≈15ms。所以「1ms 折中」
+  这个说法本身就是错的（它把「单键内 down↔up 间隔」和
+  「字母间间隔」混成了一件事）。
 
-1. 切到**微软拼音**中文态
-2. 用系统自带输入法候选框（`Win + 空格` 切到微软拼音），
-   在 Edge 地址栏**手动一个一个慢慢敲** n-i-h-a-o
-   —— 中间停顿明显 ⇒ 应该能出候选窗 ⇒ 证实「时序敏感」
-3. 再用**搜狗/微信拼音**同样手动敲
-   —— 对比是否更宽容
+### 3. 低层钩子误吞
+- 显式跳过 `LLKHF_INJECTED` + 无条件 `CallNextHookEx`
 
-若第2 步能出候选窗而HKeyboard 不能，时序假设成立。
+### 4. 代码抢焦点
+- 全文唯一的 `SetFocus` 在设置页色块编辑
 
-### 实验 B：直接把gap 调大（一次改动，可回滚）
+### 5. STA COM 初始化
+- 日志确认 `apartment AFTER pump=MAINSTA (3)`
 
-把 2277 行的
+### 6. `WS_EX_NOACTIVATE`
+- v1.1.1 同样带此样式，而 v1.1.1 无此问题
 
-```cpp
-#define KEY_INJECT_GAP_MS 1
-```
+### 7. 段内 down/up 一次性灌完
+- 已由 `KEY_INJECT_GAP_MS` 分段解决；本轮修复的正是配套的 SCANCODES
 
-改成
-
-```cpp
-#define KEY_INJECT_GAP_MS 12
-```
-
-并**额外**在 `DoKeyAction` 的 `K_LETTER` 分支里，
-每次发送后加一个字母间隔（见下方建议实现）。
-
-注意：`Sleep(1)` 在 Windows 上实际会挂起到 ~15ms 的时间片
-（默认计时器分辨率 15.6ms），所以 1ms 已经≈15ms；
-改成 12 会真的变成 ~15ms+ 的间隔，效果比想象中明显。
-
-代价：长按连发会变慢（`TIMER_REPEAT` 是 350ms 一个 tick，
-实际影响有限）。若嫌慢，可只给**字母**加间隔，
-功能键/导航键保持 1ms。
+### 8. 1ms 分段注入
+- 历史上试过并回退；本轮证明真问题是 SCANCODES 而非间隔大小
 
 ---
 
-## 四、建议的实现（若实验 B 证实假设）
+## 排查这条 issue 沉淀的通用铁律
 
-```cpp
-// 字母之间的组字间隔：微软拼音的 TSF 前端需要这个时间来更新候选窗。
-// ⚠ 与 KEY_INJECT_GAP_MS 是两件事：
-//    KEY_INJECT_GAP_MS = 单键内部 down↔up 的间隔
-//    KEY_LETTER_GAP_MS = 相邻两个字母之间的间隔
-//    后者才是「组字能否累积」的决定因素。
-#define KEY_LETTER_GAP_MS 30
-```
+1. **用「当前列表里没有」推断「不存在」** —— 探针曾把「Edge 没运行」
+   误报成「没装 Edge」（Win10 预装 Edge）。进程/窗口列表只能证明
+   「没在跑」。
 
-在 `DoKeyAction` 的 `K_LETTER` 分支，`SendKey` 之后加：
+2. **「总数够」不等于「结构够」** —— 探针门槛写成 `nTgt < 2`，
+   结果启动了一个浏览器就收工，没有对照组，跑完什么也没证明。
 
-```cpp
-Sleep(KEY_LETTER_GAP_MS);
-```
+3. **判定不能信任自己的意图，要验证客观事实** —— 光看「我启动的是
+   `notepad.exe`」就当对照组；实际那台机器的 `notepad.exe`
+   **已被替换成 Notepad4**（窗口类 `Notepad4`、焦点 `Scintilla`），
+   是故障环境本身。
 
-真键盘典型按键间隔是 50~100ms，30ms 是偏保守的下限。
+4. **判定的根本前提是「读回内容包含我们打进去的东西」** —— 缺这个前提时，
+   「有中文 ⇒ 中文上屏了」是循环论证。`Ctrl+A` 在自绘控件上会选中整页，
+   于是读到页面上原有的中文。
+
+5. **「读不到值」与「值就是空」是不同状态** —— 混淆会误杀空输入框
+   （空字段上按 `Ctrl+C` 剪贴板本来就是空的）。
+
+6. **先确认某段代码是否真在故障路径上，再讨论它有没有 bug** ——
+   假设往往指向真实缺陷，但**归因**可能错位。
+
+7. **同一个文件里"能工作的路径"是最快的线索来源** —— SCANCODES 这个根因
+   就是靠对比 `ToggleImeLang`（正常）与 `SendKey`（异常）发现的。
 
 ---
 
-## 五、附带说明：本机环境有个坑
+## 备查：环境的一个坑
 
-演练时发现：**本机 `%SystemRoot%\system32\notepad.exe` 已被替换成
-Notepad4**（窗口类 `Notepad4`、焦点在 `Scintilla`）。
+`%SystemRoot%\system32\notepad.exe` **已被替换成 Notepad4**
+（窗口类 `Notepad4`、焦点在 `Scintilla`）。
 
-所以在这台机器上，「用系统记事本当对照组」是**不成立的** ——
-它恰恰是故障环境本身。这一点在做任何对比实验时都要注意。
+做对比实验时**不能拿它当对照组** —— 它本身就是故障环境。
+
+---
+
+## 已撤回的诊断代码
+
+2026-10-03 撤回全部 IME 探针（17 个提交、约 +1400 行）。
+代码保留在分支 `backup-probe-work`。
+`hkeyboard.cpp` 中 `imeprobe` / `ProbeFmt` / `RunImeProbe` / `ProbeLog` /
+`WriteStartupTrace` 全部 0 残留，产物从 439296 B 降到约 400 KB。

@@ -6665,13 +6665,13 @@ static void EnvTestInject() {
         if (_wfopen_s(&f, note, L"w, ccs=UTF-8") == 0 && f) {
             fwprintf(f, L"HKeyboard -envtest   构建=%ls\n\n", BuildStampText());
             fwprintf(f, L"记事本里会有两段，用空行分开：\n");
-            fwprintf(f, L"  第 1 段 = 只做纯注入（基线，上次已确认成功）\n");
-            fwprintf(f, L"  第 2 段 = 先用真实鼠标**点击键盘上的 N 键**，再做同样的纯注入\n");
-            fwprintf(f, L"           （点击本身会打出一个 n，所以这段开头会多一个 n）\n\n");
-            fwprintf(f, L"判读：\n");
-            fwprintf(f, L"  两段都出现「你好」  = 点击也无害，问题在更深处（需再查）\n");
-            fwprintf(f, L"  第 2 段变成 nihao   = **点击动作就是元凶**，定位完成\n");
-            fwprintf(f, L"  两段都是 nihao      = 与上次结论矛盾，可能是环境变了\n");
+            fwprintf(f, L"  第 1 段 = 纯注入打 nihao + 空格   （基线，此前已确认成功）\n");
+            fwprintf(f, L"  第 2 段 = 用**真实鼠标依次点击**键盘上的 N I H A O，再点空格\n");
+            fwprintf(f, L"           —— 这等价于你自己手打一遍，是最直接的复现\n\n");
+            fwprintf(f, L"判读（只看「你好」两个字在不在一起）：\n");
+            fwprintf(f, L"  两段都出现「你好」  = 点击路径也没问题，需继续找差异\n");
+            fwprintf(f, L"  第 2 段是 nihao     = **点击路径就是元凶**，定位完成\n");
+            fwprintf(f, L"  第 2 段是 n + 你好  = 点击的那个 n 没进 IME，之后才正常\n");
             fclose(f);
         }
     }
@@ -6682,19 +6682,26 @@ static void EnvTestInject() {
     SendTestKey(VK_RETURN, 1);
     Sleep(700);
 
-    // ---- 阶段 2：真实鼠标点击键盘按键之后，再做同样的纯注入 ----
+    // ---- 阶段 2：**完全用真实点击**打一遍 nihao + 空格 ----
     //
-    // ⚠ 为什么点"按键"而不是点空白：OnLDown 里除了 DoKeyAction 还有
-    //   `SetCapture(hWnd)` 和 `InvalidateRect`，只有点中真实的键才会
-    //   走到那段代码。点空白区会在 `if (ki < 0) return;` 就返回，
-    //   测不到完整的点击路径。
+    // ⚠⚠ 上一版这里只点了一个 N 键，然后接纯注入 —— **那个设计有歧义**：
+    //   点 N 若成功进入组字（拼音串 "n"），后续注入的 "nihao" 会追加成
+    //   "nnihao"，上屏结果不可预期；点 N 若失败（打出英文 n），后面的
+    //   纯注入照样能独立组出「你好」。两种情况都会看到「你好」，
+    //   却指向完全相反的结论 —— 等于白测。
     //
-    // ⚠ 点 N 键会多打一个 n 出来 —— 这是**故意**的，它正好证明
-    //   "点击确实生效了"，不然后面判读时没法区分"点击没生效"和
-    //   "点击生效但没影响"。
-    ClickOwnKey('N');
-    Sleep(600);
-    SendNihao();
+    //   ⇒ 改成**全程真实点击**：五个字母 + 空格全部由鼠标点击产生。
+    //     这就和用户手打一模一样，结果无歧义：
+    //       出「你好」⇒ 点击路径正常；出 nihao ⇒ 点击路径就是元凶。
+    {
+        static const BYTE kL[5] = { 'N', 'I', 'H', 'A', 'O' };
+        for (int i = 0; i < 5; i++) {
+            ClickOwnKey(kL[i]);
+            Sleep(100);
+        }
+        Sleep(200);
+        ClickOwnKey(VK_SPACE);
+    }
 }
 
 // 打一遍 nihao + 空格（方式2 = 当前版本 SendKey 的做法）。

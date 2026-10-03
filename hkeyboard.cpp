@@ -6643,11 +6643,33 @@ static void FillEscaped(wchar_t* dst, int cap, const wchar_t* src) {
 static BOOL GrabTargetText(wchar_t* out, int cap) {
     if (!out || cap < 8) return FALSE;
     out[0] = 0;
+
+    // ⚠⚠⚠ 清空剪贴板**必须验证真的空了**，否则会读出**上一个目标**的内容。
+    //   实测（round 19 演练）：notepad 的 round 2 读回的不是自己的文本，
+    //   而是上一个目标（Edge）的页面内容 —— 典型的跨目标串台。
+    //   成因：`Clip_Clear()` 发出后目标窗口可能还没真正处理完，
+    //   而 `Ctrl+C` 拷到的是**清空前**还留在系统里的那一份。
+    //   ⇒ 清空 → 轮询确认为空 → 再继续；确不空就如实报告失败，
+    //     绝不能拿脏数据去判PASS/FAIL。
     Clip_Clear();
+    for (int i = 0; i < 20; i++) {
+        PumpMs(50);
+        wchar_t probe[8] = {0};
+        if (!Clip_ReadText(probe, 8) || probe[0] == 0) break;   // 空了
+    }
+
     SendKey((BYTE)'A', FALSE, TRUE, FALSE, FALSE);   // Ctrl+A 全选
-    PumpMs(150);
+    // ⚠ 150ms 太短：自绘控件（Chromium/Scintilla）处理全选要更久。
+    //   太早发 Ctrl+C 会拷到"全选还没生效"时的旧内容 —— 同样是串台。
+    PumpMs(350);
     SendKey((BYTE)'C', FALSE, TRUE, FALSE, FALSE);   // Ctrl+C 复制
-    PumpMs(600);
+    // 复制是异步的：等 clipboard 真正被填上，而不是死等一个固定时长。
+    for (int i = 0; i < 30; i++) {
+        PumpMs(50);
+        wchar_t probe[8] = {0};
+        if (Clip_ReadText(probe, 8) && probe[0]) break;
+    }
+    PumpMs(150);
     return Clip_ReadText(out, cap);
 }
 
@@ -7089,6 +7111,16 @@ static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseCli
 
     wchar_t esc[1024]; FillEscaped(esc, 1024, got);
     const char* verdict;
+    // ⚠⚠⚠ 判定的**根本前提**：读回来的东西必须**包含我们打进去的那两个字**。
+    //   不满足这个前提，任何结论都不成立 —— 因为 `Ctrl+A` 在自绘控件上
+    //   往往选不中输入框，会把**整个页面的文本**抓回来。
+    //   实测（round 19 演练）：Edge 读回
+    //       '网址栏的连接不安全..www.bing.com...ERR_SSL_PROTOCOL_ERROR....Microsoft Edge'
+    //   Firefox 读回整页 B 站弹幕，Chrome 读回 WorkBuddy 聊天记录 ——
+    //   全是页面上**本来就有的**中文，跟我们打的「你好」毫无关系。
+    //   若按「有非 ASCII 就判F-OTHER」，会得出"复现成功"的**假结论**。
+    //   ⇒ 一律先验证包含关系，不成立就归入 UNVERIF（不可信），不许硬判。
+    BOOL contains = (wcsstr(got, kExpectTail) != NULL);
     if (!gotOk) {
         rec.result = PR_UNVERIF;
         verdict = "UNVERIFIABLE (clipboard readback failed; target may ignore Ctrl+C)";
@@ -7098,18 +7130,39 @@ static ProbeResult RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseCli
     } else if (EndsWithW(got, kExpectTail)) {
         rec.result = PR_PASS;
         verdict = "PASS (Chinese composed and committed)";
+    } else if (!contains) {
+        // ⚠ 读回了一堆东西，但里面**根本没有「你好」** ⇒ 我们打的字没进去，
+        //   而读到的全是目标里原有的其它文本。**不能**据此判定 IME 行为。
+        rec.result = PR_UNVERIF;
+        verdict = "UNVERIFIABLE (readback does NOT contain the expected text at all - "
+                  "Ctrl+A almost certainly selected the whole page instead of the "
+                  "input field; whatever is here was already in the target)";
     } else {
         BOOL allAscii = TRUE;
         for (int i = 0; got[i]; i++) if (got[i] > 0x7F) allAscii = FALSE;
         rec.result = allAscii ? PR_FAIL_ASCII : PR_FAIL_OTHER;
         verdict = allAscii
             ? "FAIL (raw ASCII came through - IME did NOT compose at all)"
-            : "FAIL (some CJK, but not ending in the expected 2 chars)";
+            : "FAIL (contains the expected text plus extra leading text)";
     }
     ProbeFmt(L, "  [round %d] %s\n", round,
              viaMouseClick ? "via simulated MOUSE CLICK on the on-screen key"
                            : "via direct SendKey        ");
     ProbeFmt(L, "  [round %d] readback='%ls'\n", round, esc);
+    // ⚠ 读回的东西**明显过长**（远超「你好」两字的规模）几乎总是串台：
+    //   `Ctrl+A` 没选中输入框，而是把整个页面/文档选中了。
+    //   提前点出来，免得读日志时把那堆无关文本当成"打进去的字符"。
+    {
+        int glen = (int)wcslen(got);
+        if (glen > (int)(wcslen(kExpectTail) * 4)) {
+            wchar_t headEsc[128]; FillEscaped(headEsc, 128, got);
+            ProbeFmt(L, "  [round %d] NOTE: readback is %d chars, far more than the 2 we\n"
+                        "  [round %d]   typed. Ctrl+A most likely selected the WHOLE page,\n"
+                        "  [round %d]   so this text is what was ALREADY in the target.\n"
+                        "  [round %d]   head='%.60ls'\n",
+                     round, glen, round, round, round, headEsc);
+        }
+    }
     ProbeFmt(L, "  [round %d] VERDICT: %s\n", round, verdict);
     // 额外线索：期望只有「你好」两个字，实际多出来的部分单独报出来，
     // 免得它混在 PASS 里被忽略（例如多出一个被 Ctrl+A 修饰键漏出去的「啊」）。
@@ -7500,11 +7553,23 @@ static void RunImeProbe() {
     // ---- 结论提示：把该看的组合直接说清楚 ----
     {
         const Tgt* ctrl = NULL;
-        const Tgt* bad  = NULL;
+        const Tgt* bad  = NULL;   // 真正失败（打过字、但结果不对）
+        const Tgt* unk  = NULL;   // 不可信/ 测不了 —— **绝不能当成失败**
         for (int i = 0; i < nTgt; i++) {
             if (!tgts[i].usable) continue;
-            if (tgts[i].isControl && !ctrl) ctrl = &tgts[i];
-            else if (!tgts[i].isControl && tgts[i].r1 != PR_PASS) bad = &tgts[i];
+            if (tgts[i].isControl) { if (!ctrl) ctrl = &tgts[i]; continue; }
+            // ⚠⚠ 只有「确实打过字、且结果不对」才算失败目标。
+            //   PR_UNVERIF / PR_SKIP 一律归入"不可信"——
+            //   把不可信当失败，会重演 round 19 那次**假复现**：
+            //   Edge/Firefox/Chrome 的读回全是页面上原有的中文
+            //   （`Ctrl+A` 选中了整页而不是输入框），
+            //   若据此判 FAIL，就会报出"复现成功"的错误结论。
+            if (tgts[i].r1 == PR_FAIL_ASCII || tgts[i].r1 == PR_FAIL_NOTHING ||
+                tgts[i].r1 == PR_FAIL_OTHER) {
+                if (!bad) bad = &tgts[i];
+            } else {
+                if (!unk) unk = &tgts[i];
+            }
         }
         ProbeFmt(&L, "\n---- WHAT THIS MEANS ----\n");
         if (ctrl && ctrl->r1 == PR_PASS && bad) {
@@ -7512,6 +7577,17 @@ static void RunImeProbe() {
             ProbeFmt(&L, "The control (built-in notepad) PASSED while '%ls' FAILED.\n", badEsc);
             ProbeFmt(&L, "=> issue #3 IS reproduced. Injection works; the failure is\n");
             ProbeFmt(&L, "   specific to that app (self-drawn control). Focus here next.\n");
+            if (unk)
+                ProbeFmt(&L, "   (other targets were UNVERIFIABLE and prove nothing)\n");
+        } else if (ctrl && ctrl->r1 == PR_PASS && unk) {
+            // ⚠ 这是最容易误报"成功"的情形：没抓到真失败，只有一堆测不了的。
+            ProbeFmt(&L, "The control PASSED, and NO target produced a trustworthy FAIL.\n");
+            ProbeFmt(&L, "=> INCONCLUSIVE - this run does NOT prove anything either way.\n");
+            ProbeFmt(&L, "   The other targets came back UNVERIFIABLE: Ctrl+A did not select\n");
+            ProbeFmt(&L, "   the input field, so the readback was the page's own text rather\n");
+            ProbeFmt(&L, "   than what we typed. To make this conclusive, put the caret in a\n");
+            ProbeFmt(&L, "   real text field FIRST (e.g. Notepad4, or the browser address bar)\n");
+            ProbeFmt(&L, "   and re-run. Do not report this as 'not reproduced'.\n");
         } else if (ctrl && ctrl->r1 == PR_PASS) {
             ProbeFmt(&L, "The control passed and so did everything else.\n");
             ProbeFmt(&L, "=> NOT reproduced here. Chinese composition works in this\n");

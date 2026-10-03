@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (for example v1.0.0)
+        description: 'Release tag. Use the main version only (v2.0) and the build date is appended automatically (Beijing time) -> v2.0_20261003. You may also type the full tag yourself.'
         required: true
         type: string
       title:
-        description: Release title (leave empty to use the tag)
+        description: Release title (leave empty to use the resolved tag)
         required: false
         type: string
       draft:
@@ -41,14 +41,90 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Validate release tag
+      - name: Resolve release tag
+        id: tag
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RAW_TAG: ${{ inputs.tag }}
+          RAW_TITLE: ${{ inputs.title }}
+          RAW_PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
-            throw "Tag must use a version format such as v1.0.0 or v1.0.0-rc.1."
+          $ErrorActionPreference = 'Stop'
+
+          # ---- 版本号口径：主版本号 + 日期，如 v2.0_20261003 ----
+          # 可以只填主版本号（v2.0），日期由本step 按北京时间自动补齐；
+          # 也可以填完整 tag（v2.0_20261003 / v2.0_20261003-rc.1）原样使用。
+          $raw = "$env:RAW_TAG".Trim()
+          if ([string]::IsNullOrWhiteSpace($raw)) {
+            throw "Tag input is empty. Expected something like v2.0 or v2.0_20261003."
           }
+
+          if ($raw -notmatch '^v?(\d+)\.(\d+)(?:\.(\d+))?(?:_(\d{8}))?(?:[-+]([0-9A-Za-z.\-]+))?$') {
+            throw ("Invalid tag: '$raw'. Expected v<major>.<minor>, v<major>.<minor>.<patch>, " +
+                   "optionally followed by _YYYYMMDD and a prerelease suffix. Example: v2.0 or v2.0_20261003")
+          }
+          $major   = $Matches[1]
+          $minor   = $Matches[2]
+          $patch   = $Matches[3]
+          $date    = $Matches[4]
+          $suffix  = $Matches[5]
+
+          # 缺日期则按北京时间补齐（北京固定 UTC+8，夏令时不影响）
+          if ([string]::IsNullOrEmpty($date)) {
+              try {
+                  $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+              } catch {
+                  $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById('Asia/Shanghai')
+              }
+              $bj = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+              $date = $bj.ToString('yyyyMMdd')
+          } else {
+              $probe = [DateTime]::MinValue
+              if (-not [DateTime]::TryParseExact($date, 'yyyyMMdd',
+                                 [Globalization.CultureInfo]::InvariantCulture,
+                                 [Globalization.DateTimeStyles]::None, [ref]$probe)) {
+                  throw "Date part '$date' is not a valid calendar date. Expected YYYYMMDD, e.g. 20261003."
+              }
+          }
+
+          $resolved = "v$major.$minor"
+          if ($patch) { $resolved += ".$patch" }
+          $resolved += "_$date"
+          if ($suffix) { $resolved += "-$suffix" }
+
+          # ---- 与源码里的版本号对账，防止 tag 打成v3.0 而 exe 里还是 2.0 ----
+          $verFile = Join-Path $env:GITHUB_WORKSPACE 'resource.h'
+          if (Test-Path -LiteralPath $verFile) {
+              $m = [regex]::Match((Get-Content -LiteralPath $verFile -Raw), 'VER_FILEVERSION_STR\s+"([^"]+)"')
+              if ($m.Success) {
+                  $codeVer = $m.Groups[1].Value
+                  $codeMM = ($codeVer -split '\.')[0..1] -join '.'
+                  $tagMM  = "$major.$minor"
+                  if ($codeMM -ne $tagMM) {
+                      throw ("Version mismatch: tag says $tagMM but resource.h says $codeVer. " +
+                             "Update VER_FILEVERSION_STR in resource.h first, or fix the tag input.")
+                  }
+              }
+          }
+
+          # 带预发布后缀时强制标记为 prerelease，避免误发正式版
+          $prerelease = ("$env:RAW_PRERELEASE".Trim() -eq 'true')
+          if ($suffix) { $prerelease = $true }
+
+          $title = "$env:RAW_TITLE".Trim()
+          if ([string]::IsNullOrWhiteSpace($title)) { $title = $resolved }
+
+          "tag=$resolved"        | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$major.$minor" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "date=$date"           | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "title=$title"         | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "prerelease=$($prerelease.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          Write-Host "[Tag]input   : $raw"
+          Write-Host "[Tag] resolved: $resolved"
+          Write-Host "[Tag] title    : $title"
+          Write-Host "[Tag] date     : $date (Beijing)"
+          Write-Host "[Tag] prerelease: $prerelease"
 
       - name: Locate Visual Studio
         id: vs
@@ -281,7 +357,7 @@ jobs:
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: HKeyboard_${{ inputs.tag }}
+          name: HKeyboard_${{ steps.tag.outputs.tag }}
           if-no-files-found: error
           path: |
             dist/x86/HKeyboard_x86.exe
@@ -292,11 +368,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.tag }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: ${{ inputs.title || inputs.tag }}
+          name: ${{ steps.tag.outputs.title }}
           draft: ${{ inputs.draft }}
-          prerelease: ${{ inputs.prerelease }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

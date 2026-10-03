@@ -151,6 +151,28 @@ int g_keyHeight = 46;
 BOOL g_envTest = FALSE;
 int  g_envTestStage = 0;
 static void EnvTestInject();
+
+// ---- 排查开关：二分「点击按键」时究竟是哪个动作破坏了 IME 组字 ----
+//
+// 已确认的事实（2026-10-04）：
+//   · 点击**标题栏**（真实鼠标）→ 无害，IME 正常
+//   · 点击**按键**（真实鼠标）  → 微软拼音不组字（出英文）
+//   · `-envtest` 里用**注入**的鼠标点击按键 → 正常
+//   ⇒ 问题出在「真实鼠标点中按键」才会走到的那几行里。
+//
+// 而 `OnLDown` 中点标题栏不会执行、点按键才会执行的只有三件事：
+//   SetCapture(hWnd) / DoKeyAction(k) / InvalidateRect(...)
+// 其中 DoKeyAction → SendKey 已被 -envtest 证明等价于纯注入（能出中文），
+// 所以嫌疑集中在**另两个系统级副作用**上。这两个开关用来把它们分开：
+//
+//   -noscapture  跳过 OnLDown 里的 SetCapture（会改变系统鼠标捕获状态）
+//   -norepaint   跳过点击相关的 InvalidateRect（会触发一次全键盘重绘）
+//
+// ⚠ 两个都不能长期缺省 —— SetCapture 是为了在开始菜单弹出等情况下仍能收到
+//   鼠标抬起消息（否则按键高亮会卡住），重绘是为了高亮反馈。这里只是临时
+//   用来定位，找到元凶后再想不牺牲功能的办法。
+BOOL g_noSetCapture = FALSE;
+BOOL g_noClickRepaint = FALSE;
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
 
 #ifndef WM_DPICHANGED
@@ -6162,7 +6184,12 @@ static void OnLDown(HWND hWnd, int x, int y) {
     int ki = HitKey(x, y);
     if (ki < 0) return;
     g_pk = ki;
-    SetCapture(hWnd);   // 捕获鼠标，防止开始菜单等出现时抢走鼠标抬起消息导致键一直高亮
+    // ⚠ 排查开关 -noscapture：跳过鼠标捕获，用来验证 SetCapture 是否是
+    //   破坏微软拼音组字的元凶（见 g_noSetCapture 处的说明）。
+    //   跳过会带来副作用：鼠标在按键抬起前移出窗口时收不到 WM_LBUTTONUP，
+    //   按键高亮可能卡住 —— 定位阶段可以接受。
+    if (!g_noSetCapture)
+        SetCapture(hWnd);   // 捕获鼠标，防止开始菜单等出现时抢走鼠标抬起消息导致键一直高亮
     const KeyDef* k = &g_keys[ki];
     DoKeyAction(k);
 
@@ -6170,7 +6197,9 @@ static void OnLDown(HWND hWnd, int x, int y) {
         g_repeatKeyIdx = ki;
         SetTimer(hWnd, TIMER_REPEAT, 350, NULL);
     }
-    InvalidateRect(hWnd, 0, TRUE);
+    // ⚠ 排查开关 -norepaint：跳过点击后的全键盘重绘
+    if (!g_noClickRepaint)
+        InvalidateRect(hWnd, 0, TRUE);
 }
 
 static void OnLUp(HWND hWnd, int x, int y) {
@@ -6869,6 +6898,11 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // ⚠ 不能在这里 return —— 要让它正常启动到消息循环，
     //   再由 TIMER_ENVTEST 驱动注入，这样环境才是"真在跑的 HKeyboard"。
     g_envTest = HasArg(cmd, "-envtest") ? TRUE : FALSE;
+
+    // 排查开关：二分「点击按键」时哪个动作破坏了 IME 组字。
+    // 说明见 g_noSetCapture 的定义处。**定位完就该删掉**，别留在正式版里。
+    g_noSetCapture    = HasArg(cmd, "-noscapture") ? TRUE : FALSE;
+    g_noClickRepaint  = HasArg(cmd, "-norepaint")  ? TRUE : FALSE;
 
     BOOL isTouch = IsTouchDevice();
 

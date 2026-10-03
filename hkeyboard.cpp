@@ -6443,31 +6443,63 @@ static void InitTimePeriodApi() {
 static void RunImeProbe() {
     static const char* kNames[] = { "?", "SendKey(gap=1ms)", "SendKeyGap(gap=0)" };
 
-    wchar_t path[MAX_PATH];
-    if (!GetTempPathW(MAX_PATH, path)) return;
-    wcscat_s(path, L"hkeyboard_imeprobe.txt");
-
+    // ⚠ 结果写到**exe 同目录**，不写 %TEMP%：
+    //   测试时 exe 放在 VMware 共享文件夹里，写在 exe 旁边宿主机能直接读到，
+    //   省掉「去虚机里翻 %TEMP% 再拷回来」这一步。%TEMP% 在虚机里位置太偏。
+    //   写不出来时（只读目录 / 无权限）退回 %TEMP%，两条路径都试。
+    wchar_t dir[MAX_PATH];
+    wchar_t path[MAX_PATH] = {0};
+    if (GetModuleFileNameW(NULL, dir, MAX_PATH)) {
+        wchar_t* cut = wcsrchr(dir, L'\\');
+        if (cut) {
+            *cut = 0;
+            wcscpy_s(path, MAX_PATH, dir);
+            wcscat_s(path, L"\\hkeyboard_imeprobe.txt");
+        }
+    }
     FILE* fp = NULL;
-    _wfopen_s(&fp, path, L"w, ccs=UTF-8");
-    if (!fp) return;
+    if (path[0]) _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+    if (!fp) {
+        if (GetTempPathW(MAX_PATH, dir)) {
+            wcscpy_s(path, MAX_PATH, dir);
+            wcscat_s(path, L"hkeyboard_imeprobe.txt");
+            _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+        }
+    }
+    if (!fp) return;   // 两条路径都失败：无处可写，只能放弃
 
     HWND fg = GetForegroundWindow();
     char cls[128] = {0};
     GetClassNameA(fg, cls, 128);
 
+    wchar_t exepath[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, exepath, MAX_PATH);
+
     fprintf(fp, "=== hkeyboard IME self-probe ===\n");
+    fprintf(fp, "exe=%ls\n", exepath);
+    fprintf(fp, "output=%ls\n", path);
     fprintf(fp, "pid=%lu foreground=0x%llx class=%s\n",
             GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)fg, cls);
 
-    // 只在目标窗口类像文本编辑器时才测，避免往命令行 / 资源管理器里灌字符
+    DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
+    fprintf(fp, "foregroundTid=%lu keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
+            tidFg, (unsigned long long)(ULONG_PTR)hkl);
+
+    // 只在目标窗口类像文本编辑器时才测，避免往命令行 / 资源管理器里灌字符。
+    // ⚠ 不做限制也可以，但要在文件里写明 class 是什么 —— 万一用户停在命令行，
+    //   SKIP 本身也是有用的信息。
     BOOL looksLikeEditor = (strstr(cls, "Edit") || strstr(cls, "Notepad") ||
-                            strstr(cls, "Chrome") || strstr(cls, "Edge"));
+                            strstr(cls, "Chrome") || strstr(cls, "Edge") ||
+                            cls[0] == 0);
+    fprintf(fp, "looksLikeEditor=%d\n", looksLikeEditor);
     if (!looksLikeEditor) {
         fprintf(fp, "SKIP: foreground class is not a known text control\n");
+        fprintf(fp, "hint: focus Notepad (and click into the text area) first, then rerun\n");
         fclose(fp);
         return;
     }
-    fprintf(fp, "testing on class=%s\n\n", cls);
+    fprintf(fp, "\n");
 
     for (int round = 1; round <= 2; round++) {
         // 清空目标：Ctrl+A 然后 Delete（用 gap=0 快速路径，不干扰本轮测量对象）
@@ -6555,7 +6587,11 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     BOOL fLight  = (strstr(cmd, "-light") != NULL);
     BOOL fWall   = (strstr(cmd, "-wallpaper") != NULL);
     BOOL fHelp   = (HasArg(cmd, "-h") || HasArg(cmd, "-help") || HasArg(cmd, "-?"));
-    BOOL fImeProbe = HasArg(cmd, "-imeprobe");   // 仅诊断：进程内IME 自测，见RunImeProbe
+    // ⚠ 用 strstr 而不是 HasArg：HasArg 要求参数前后必须是空格或行尾，
+    //   经由 cmd / start / 双击等方式启动时 `-imeprobe` 常被 shell 改写或吞掉，
+    //   导致静默走正常流程（表现为「进程闪一下就没了、什么也没发生」）。
+    //   诊断开关宁可宽松匹配，误触发也比测不到强。
+    BOOL fImeProbe = (strstr(cmd, "-imeprobe") != NULL);   // 仅诊断，见 RunImeProbe
 
     // 主题参数解析
     if (fDark) g_themeMode = 1;

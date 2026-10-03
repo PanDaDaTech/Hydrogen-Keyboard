@@ -48,6 +48,10 @@ static const wchar_t* ArchName() {
 
 // 关于页显示的版本串 = "<VER_FILEVERSION_STR>_<构建日期>"，如 "2.0_20261002"。
 //
+// ⚠ 只有日期、不带时分 —— 这是**正式版**该有的样子：用户只需要知道
+//   "哪一天发布的"。精确到分秒的构建戳只在排查时需要，走 `-sendtest`
+//   那条诊断路径输出（见 BuildStampText），不往正式 UI 里塞。
+//
 // 日期为什么要在源码里做时区换算：
 //   __DATE__ / __TIME__ 是**编译器本地时间**，而 CI（GitHub Actions runner）的宿主时区是 UTC，
 //   用户在 UTC+8。直接印 __DATE__ 会在「北京时间 00:00~08:00」这段把日期显示成前一天。
@@ -76,6 +80,36 @@ static const wchar_t* BuildDateBeijing() {
     if (dd > dim[mm - 1]) { dd -= dim[mm - 1]; if (++mm > 12) { mm = 1; yy++; } }
 
     swprintf(buf, 16, L"%04d%02d%02d", yy, mm, dd);
+    return buf;
+}
+
+// 精确构建时刻（"20261003.2314"），**只给诊断路径用**，不进正式 UI。
+// 存在的理由：同一天会为排查构建很多次，只看到 "20261003" 无法分辨
+// 手里那个 exe 是哪一次构建的产物 —— 排查时这会白白浪费好几轮。
+static const wchar_t* BuildStampText() {
+    static wchar_t buf[24];
+    if (buf[0]) return buf;
+
+    static const char mon[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    int mm = 1;
+    for (int i = 0; i < 12; i++)
+        if (mon[i * 3] == __DATE__[0] && mon[i * 3 + 1] == __DATE__[1]
+            && mon[i * 3 + 2] == __DATE__[2]) { mm = i + 1; break; }
+    int dd = (__DATE__[4] == ' ') ? (__DATE__[5] - '0')
+                                  : (__DATE__[4] - '0') * 10 + (__DATE__[5] - '0');
+    int yy = (__DATE__[7] - '0') * 1000 + (__DATE__[8] - '0') * 100
+           + (__DATE__[9] - '0') * 10 + (__DATE__[10] - '0');
+    int hh = (__TIME__[0] - '0') * 10 + (__TIME__[1] - '0');
+    int mi = (__TIME__[3] - '0') * 10 + (__TIME__[4] - '0');
+
+    int total = hh * 60 + mi + 8 * 60;
+    dd += total / (24 * 60);
+    int bh = (total / 60) % 24, bm = total % 60;
+    int dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (mm == 2 && ((yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0)) dim[1] = 29;
+    while (dd > dim[mm - 1]) { dd -= dim[mm - 1]; if (++mm > 12) { mm = 1; yy++; } }
+
+    swprintf(buf, 24, L"%04d%02d%02d.%02d%02d", yy, mm, dd, bh, bm);
     return buf;
 }
 
@@ -6447,6 +6481,131 @@ static BOOL HasArg(const char* cmd, const char* arg) {
     return FALSE;
 }
 
+// ========== 注入方式对照实验（-sendtest）==========
+//
+// ⚠⚠⚠ 为什么需要这个入口（2026-10 加）：
+//
+//   issue #3（Win10 + 微软拼音打不出中文）排查了多轮都没解决，
+//   根本困难在于**无法区分下面三种可能**：
+//
+//     (a) 注入方式本身与微软拼音不兼容
+//     (b) HKeyboard 的其它部分（键盘钩子 / 定时器 / 焦点轮询）
+//         干扰了输入
+//     (c) 只是节奏或某个参数不对
+//
+//   用户每轮只能"实机试一次"，一轮几十分钟，而且结果无法归因 ——
+//   改了三次都没效果，就是因为一直分不清是哪个原因。
+//
+//   这个入口把变量降到**最低**：不装钩子、不建窗口、不建互斥体、
+//   不轮询焦点、不读剪贴板 —— 只有裸的注入调用。
+//   然后用 4 种方式各打一次 nihao，看哪一种能让微软拼音组字上屏。
+//
+//   一次实验就能定方向：
+//     · 某一种成功  ⇒ 照那种方式改 SendKey，问题解决
+//     · 四种全失败  ⇒ SendInput 这条路走不通，得换注入途径
+//                      （低级键盘钩子 / TSF API / 剪贴板粘贴）
+//     · 四种全成功  ⇒ 注入没问题，是 HKeyboard 的其它部分在干扰，
+//                      回头查钩子与定时器
+//
+// 用法：
+//   1. 打开记事本，把光标点进**空白**编辑区
+//   2. 确认输入法是微软拼音**中文态**
+//   3. 运行  HKeyboard_x64.exe -sendtest
+//   4. 3 秒内切回记事本（程序会等这 3 秒）
+//   5. 看记事本里出现了什么
+//
+// 结果判读（记事本里从上到下依次是 4 种方式的结果，用空行分开）：
+//   "你好"   = 该方式**有效**
+//   "nihao"  = 该方式下 IME 没组字
+//   该段空白 = 按键根本没送达
+//
+// 同目录会生成 sendtest_readme.txt（含构建戳与判读说明）。
+static void SendTestKey(BYTE vk, int method) {
+    UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+
+    if (method == 0) {
+        // 方式1：VK 两段（HKeyboard 最早的做法，不带 SCANCODES）
+        INPUT a = {};
+        a.type = INPUT_KEYBOARD;
+        a.ki.wVk = vk;
+        a.ki.wScan = (WORD)sc;
+        SendInput(1, &a, sizeof(INPUT));
+        Sleep(1);
+        a.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(1, &a, sizeof(INPUT));
+    } else if (method == 1) {
+        // 方式2：VK + KEYEVENTF_SCANCODE 两段（HKeyboard 当前的做法）
+        INPUT a = {};
+        a.type = INPUT_KEYBOARD;
+        a.ki.wVk = vk;
+        a.ki.wScan = (WORD)sc;
+        a.ki.dwFlags = KEYEVENTF_SCANCODE;
+        SendInput(1, &a, sizeof(INPUT));
+        Sleep(1);
+        a.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+        SendInput(1, &a, sizeof(INPUT));
+    } else if (method == 2) {
+        // 方式3：keybd_event（老 API，但很多 IME 对它更宽容）
+        keybd_event(vk, (BYTE)sc, 0, 0);
+        Sleep(1);
+        keybd_event(vk, (BYTE)sc, KEYEVENTF_KEYUP, 0);
+    } else {
+        // 方式4：一次性批量（down+up 塞进同一个 SendInput，零间隔）
+        INPUT a[2] = {};
+        a[0].type = INPUT_KEYBOARD;
+        a[0].ki.wVk = vk;
+        a[0].ki.wScan = (WORD)sc;
+        a[1] = a[0];
+        a[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, a, sizeof(INPUT));
+    }
+}
+
+static void RunSendTest() {
+    // 先落一份说明，免得用户看完记事本却不知道怎么判读
+    wchar_t self[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    wchar_t* slash = wcsrchr(self, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wchar_t note[MAX_PATH * 2] = {0};
+    _snwprintf_s(note, MAX_PATH * 2, _TRUNCATE, L"%lssendtest_readme.txt", self);
+
+    FILE* f = NULL;
+    if (_wfopen_s(&f, note, L"w, ccs=UTF-8") == 0 && f) {
+        fwprintf(f, L"HKeyboard 注入方式对照实验   构建=%ls\n\n", BuildStampText());
+        fwprintf(f, L"记事本里从上到下依次是 4 种方式的结果，空行分开：\n");
+        fwprintf(f, L"  第 1 段 = 方式1  VK 两段，不带 SCANCODES（最早的做法）\n");
+        fwprintf(f, L"  第 2 段 = 方式2  VK + KEYEVENTF_SCANCODE（当前版本的做法）\n");
+        fwprintf(f, L"  第 3 段 = 方式3  keybd_event\n");
+        fwprintf(f, L"  第 4 段 = 方式4  一次性批量（down+up 同一个 SendInput）\n\n");
+        fwprintf(f, L"判读：\n");
+        fwprintf(f, L"  出现「你好」  = 该方式有效\n");
+        fwprintf(f, L"  出现 nihao    = 该方式下 IME 没组字\n");
+        fwprintf(f, L"  该段空白      = 按键没送达\n\n");
+        fwprintf(f, L"哪一种成功就照那种改 SendKey。\n");
+        fwprintf(f, L"四种全失败 = SendInput 走不通，需要换注入途径。\n");
+        fwprintf(f, L"四种全成功 = 注入没问题，是 HKeyboard 其它部分在干扰。\n");
+        fclose(f);
+    }
+
+    Sleep(3000);   // 给用户切回记事本的时间
+
+    static const BYTE kLetters[5] = { 'N', 'I', 'H', 'A', 'O' };
+    for (int m = 0; m < 4; m++) {
+        for (int i = 0; i < 5; i++) {
+            SendTestKey(kLetters[i], m);
+            Sleep(30);
+        }
+        Sleep(200);
+        SendTestKey(VK_SPACE, m);      // 让 IME 上屏
+        Sleep(200);
+        SendTestKey(VK_RETURN, m);     // 两个回车 = 空行分隔
+        Sleep(80);
+        SendTestKey(VK_RETURN, m);
+        Sleep(500);
+    }
+}
+
 // 高精度计时器分辨率（动态加载 winmm，避免新增链接依赖）
 // SetTimer 默认受 ~15.6ms 系统计时粒度限制，动画会一顿一顿；
 // 进程级调到 1ms 让窗口滑动定时器按请求间隔触发。
@@ -6507,6 +6666,15 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // -h / -help / -?：仅显示命令行参数帮助，不打开主界面
     if (fHelp) {
         ShowHelpDialog(NULL);
+        return 0;
+    }
+
+    // -sendtest：注入方式对照实验（说明见 RunSendTest 上方的大段注释）。
+    // ⚠⚠ 必须在 `CreateMutexW` **之前**返回。否则若托盘里已有实例在跑，
+    //   就会被单实例逻辑转发消息后静默退出，实验根本跑不起来 ——
+    //   而用户看到的现象会是"运行了但没反应"，又是一次无谓的往返。
+    if (HasArg(cmd, "-sendtest")) {
+        RunSendTest();
         return 0;
     }
 

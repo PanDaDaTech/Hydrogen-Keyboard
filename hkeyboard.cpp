@@ -6440,6 +6440,41 @@ static void InitTimePeriodApi() {
 // WH_KEYBOARD_LL 低层钩子、50ms TIMER_FOCUS、WS_EX_NOACTIVATE 这几项。
 //
 // 结果写 %TEMP%\hkeyboard_imeprobe.txt，不弹任何 UI。
+// ========== 启动留痕（诊断用，无条件写） ==========
+//⚠ 教训：上一轮自测跑完，结果文件只有一个 BOM、没有任何内容，
+//   而 exe 确实以 code=0 退出了 —— 事后无法区分「没收到参数」与
+//   「收到了但中途 return」。**所以这里在任何分支之前就写一份启动痕迹**，
+//   把命令行原文、exe 路径、是否命中 -imeprobe 都记下来，
+//   以后再出「结果文件是空的」能立刻看出卡在哪一步。
+static void WriteStartupTrace(const char* cmd) {
+    wchar_t dir[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, dir, MAX_PATH)) return;
+    wchar_t* cut = wcsrchr(dir, L'\\');
+    if (!cut) return;
+    *cut = 0;
+
+    wchar_t path[MAX_PATH] = {0};
+    wcscpy_s(path, MAX_PATH, dir);
+    wcscat_s(path, L"\\hkeyboard_imeprobe.txt");
+
+    FILE* fp = NULL;
+    _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+    if (!fp) {
+        if (GetTempPathW(MAX_PATH, dir)) {
+            wcscpy_s(path, MAX_PATH, dir);
+            wcscat_s(path, L"hkeyboard_imeprobe.txt");
+            _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+        }
+    }
+    if (!fp) return;
+
+    fprintf(fp, "=== startup trace ===\n");
+    fprintf(fp, "cmdline = '%s'\n", (cmd && *cmd) ? cmd : "(empty)");
+    fprintf(fp, "hasArg  = %d\n", (strstr(cmd, "-imeprobe") != NULL) ? 1 : 0);
+    fprintf(fp, "time= %lu\n", GetTickCount());
+    fclose(fp);
+}
+
 static void RunImeProbe() {
     static const char* kNames[] = { "?", "SendKey(gap=1ms)", "SendKeyGap(gap=0)" };
 
@@ -6458,15 +6493,17 @@ static void RunImeProbe() {
         }
     }
     FILE* fp = NULL;
-    if (path[0]) _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+    // ⚠ 用追加模式（"a"）而不是覆盖（"w"）：WriteStartupTrace 已经写了启动痕迹，
+    //   这里追加内容，两者才能同时留在一个文件里供对账。
+    if (path[0]) _wfopen_s(&fp, path, L"a, ccs=UTF-8");
     if (!fp) {
         if (GetTempPathW(MAX_PATH, dir)) {
             wcscpy_s(path, MAX_PATH, dir);
             wcscat_s(path, L"hkeyboard_imeprobe.txt");
-            _wfopen_s(&fp, path, L"w, ccs=UTF-8");
+            _wfopen_s(&fp, path, L"a, ccs=UTF-8");
         }
     }
-    if (!fp) return;   // 两条路径都失败：无处可写，只能放弃
+    if (!fp) return;
 
     HWND fg = GetForegroundWindow();
     char cls[128] = {0};
@@ -6475,9 +6512,8 @@ static void RunImeProbe() {
     wchar_t exepath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exepath, MAX_PATH);
 
-    fprintf(fp, "=== hkeyboard IME self-probe ===\n");
+    fprintf(fp, "\n=== self-probe ===\n");
     fprintf(fp, "exe=%ls\n", exepath);
-    fprintf(fp, "output=%ls\n", path);
     fprintf(fp, "pid=%lu foreground=0x%llx class=%s\n",
             GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)fg, cls);
 
@@ -6559,6 +6595,19 @@ static void RunImeProbe() {
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_hInst = hI;
 
+    // ⚠ 诊断痕迹必须在**任何**其他初始化之前写：这样即使后面任何一步 return，
+    //   也能从文件看出程序启动过、命令行收到了什么。
+    WriteStartupTrace(cmd);
+
+    // ⚠ 自测也必须在这里**立即**执行，不能等到后面：
+    //   GDI+ / 内嵌字体 / TimeBeginPeriod(1) / DetectWinVersion / 各钩子都是
+    //   「可能影响 IME 的进程环境因素」，测 IME 就必须**排除**它们，
+    //   否则测的是「初始化之后的环境」，不是出问题的那个环境。
+    if (strstr(cmd, "-imeprobe")) {
+        RunImeProbe();
+        return 0;
+    }
+
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
         typedef BOOL (WINAPI *SetDpiAwareProc)();
@@ -6587,11 +6636,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     BOOL fLight  = (strstr(cmd, "-light") != NULL);
     BOOL fWall   = (strstr(cmd, "-wallpaper") != NULL);
     BOOL fHelp   = (HasArg(cmd, "-h") || HasArg(cmd, "-help") || HasArg(cmd, "-?"));
-    // ⚠ 用 strstr 而不是 HasArg：HasArg 要求参数前后必须是空格或行尾，
-    //   经由 cmd / start / 双击等方式启动时 `-imeprobe` 常被 shell 改写或吞掉，
-    //   导致静默走正常流程（表现为「进程闪一下就没了、什么也没发生」）。
-    //   诊断开关宁可宽松匹配，误触发也比测不到强。
-    BOOL fImeProbe = (strstr(cmd, "-imeprobe") != NULL);   // 仅诊断，见 RunImeProbe
 
     // 主题参数解析
     if (fDark) g_themeMode = 1;
@@ -6603,13 +6647,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // -h / -help / -?：仅显示命令行参数帮助，不打开主界面
     if (fHelp) {
         ShowHelpDialog(NULL);
-        return 0;
-    }
-
-    // -imeprobe：仅诊断。**在建任何窗口/钩子/定时器之前**先在进程内打一次字，
-    // 结果写 %TEMP%\hkeyboard_imeprobe.txt 后退出，用于判断 IME 问题是否来自本进程环境。
-    if (fImeProbe) {
-        RunImeProbe();
         return 0;
     }
 

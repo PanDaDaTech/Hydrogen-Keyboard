@@ -6643,6 +6643,14 @@ static void RunSendTest() {
 // ⚠ 用定时器触发，**不在 WinMain 里 Sleep**。真实按键也是"短暂阻塞 UI 线程
 //   后立即返回"，用定时器才与它等价；直接 Sleep 会把消息循环堵很久，
 //   那是另一种（不真实的）状态，测出来的东西不可信。
+// 下面 EnvTestInject 用到的三个辅助函数定义在其后，先声明。
+// （顺序上它们必须排在 EnvTestInject 之后 —— 因为要用到 HitKey /
+//   g_keys 等前面定义的东西，而把 EnvTestInject 挪到最后又要动
+//   WinMain 附近的结构，声明在前最省事。）
+static void SendNihao();
+static BOOL FindKeyPos(BYTE vk, int* outX, int* outY);
+static void ClickOwnKey(BYTE vk);
+
 static void EnvTestInject() {
     // 落一份构建戳，方便确认这次实验跑的是哪一版。
     // （-sendtest 已有同样的机制，实测确实用上了：能确认用户手上的 exe 是哪次构建）
@@ -6656,21 +6664,97 @@ static void EnvTestInject() {
         FILE* f = NULL;
         if (_wfopen_s(&f, note, L"w, ccs=UTF-8") == 0 && f) {
             fwprintf(f, L"HKeyboard -envtest   构建=%ls\n\n", BuildStampText());
-            fwprintf(f, L"结果请到记事本里看（3 秒后自动注入 nihao，再过 3 秒退出）：\n");
-            fwprintf(f, L"  出现「你好」 = 环境无辜，问题在 SendKey 或「点击按键」这个动作\n");
-            fwprintf(f, L"  出现 nihao   = 环境在干扰注入，需逐个摘掉：\n");
-            fwprintf(f, L"                 WH_KEYBOARD_LL 钩子 -> 窗口 -> WinEvent 钩子 -> 定时器\n");
+            fwprintf(f, L"记事本里会有两段，用空行分开：\n");
+            fwprintf(f, L"  第 1 段 = 只做纯注入（基线，上次已确认成功）\n");
+            fwprintf(f, L"  第 2 段 = 先用真实鼠标**点击键盘上的 N 键**，再做同样的纯注入\n");
+            fwprintf(f, L"           （点击本身会打出一个 n，所以这段开头会多一个 n）\n\n");
+            fwprintf(f, L"判读：\n");
+            fwprintf(f, L"  两段都出现「你好」  = 点击也无害，问题在更深处（需再查）\n");
+            fwprintf(f, L"  第 2 段变成 nihao   = **点击动作就是元凶**，定位完成\n");
+            fwprintf(f, L"  两段都是 nihao      = 与上次结论矛盾，可能是环境变了\n");
             fclose(f);
         }
     }
 
+    // ---- 阶段 1：纯注入（基线）----
+    SendNihao();
+    SendTestKey(VK_RETURN, 1);
+    SendTestKey(VK_RETURN, 1);
+    Sleep(700);
+
+    // ---- 阶段 2：真实鼠标点击键盘按键之后，再做同样的纯注入 ----
+    //
+    // ⚠ 为什么点"按键"而不是点空白：OnLDown 里除了 DoKeyAction 还有
+    //   `SetCapture(hWnd)` 和 `InvalidateRect`，只有点中真实的键才会
+    //   走到那段代码。点空白区会在 `if (ki < 0) return;` 就返回，
+    //   测不到完整的点击路径。
+    //
+    // ⚠ 点 N 键会多打一个 n 出来 —— 这是**故意**的，它正好证明
+    //   "点击确实生效了"，不然后面判读时没法区分"点击没生效"和
+    //   "点击生效但没影响"。
+    ClickOwnKey('N');
+    Sleep(600);
+    SendNihao();
+}
+
+// 打一遍 nihao + 空格（方式2 = 当前版本 SendKey 的做法）。
+static void SendNihao() {
     static const BYTE kL[5] = { 'N', 'I', 'H', 'A', 'O' };
     for (int i = 0; i < 5; i++) {
-        SendTestKey(kL[i], 1);      // 方式2 = 当前版本 SendKey 的做法
+        SendTestKey(kL[i], 1);
         Sleep(30);
     }
     Sleep(200);
     SendTestKey(VK_SPACE, 1);       // 上屏
+}
+
+// 反查某个 vk 对应的按键在**窗口坐标**里的位置。
+//
+// ⚠ 刻意不自己算"格单位 → dpiScale → scaleX"那套换算：那一串乘除
+//   容易写错，而且各布局（默认/小键盘/网页层）还不一样。
+//   直接拿现成的 HitKey 反查，得到的坐标一定和点击处理用的是同一套。
+static BOOL FindKeyPos(BYTE vk, int* outX, int* outY) {
+    for (int y = 0; y < g_wh; y += 2) {
+        for (int x = 0; x < g_ww; x += 2) {
+            int ki = HitKey(x, y);
+            if (ki >= 0 && g_keys[ki].vk == vk) {
+                if (outX) *outX = x;
+                if (outY) *outY = y;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+// 对键盘上的某个键做一次**真实鼠标点击**（走 SendInput，与用户手点等价）。
+static void ClickOwnKey(BYTE vk) {
+    if (!g_hWnd || !IsWindow(g_hWnd)) return;
+    int kx = 0, ky = 0;
+    if (!FindKeyPos(vk, &kx, &ky)) return;
+
+    POINT pt = { kx, ky };
+    ClientToScreen(g_hWnd, &pt);
+
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw < 2 || sh < 2) return;
+
+    INPUT mi = {};
+    mi.type = INPUT_MOUSE;
+    mi.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    mi.mi.dx = (LONG)(((LONGLONG)pt.x * 65535) / (sw - 1));
+    mi.mi.dy = (LONG)(((LONGLONG)pt.y * 65535) / (sh - 1));
+    SendInput(1, &mi, sizeof(INPUT));
+    Sleep(60);
+
+    mi.mi.dwFlags = MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE;
+    SendInput(1, &mi, sizeof(INPUT));
+    Sleep(60);
+
+    mi.mi.dwFlags = MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE;
+    SendInput(1, &mi, sizeof(INPUT));
+    Sleep(120);
 }
 
 // 高精度计时器分辨率（动态加载 winmm，避免新增链接依赖）

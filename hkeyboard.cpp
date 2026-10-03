@@ -2253,72 +2253,10 @@ static BOOL IsActive(const KeyDef* k) {
 // ========== IME-Compatible Input Injection ==========
 // ⚠ 必须用 SendInput（keybd_event 已废弃且拦不到高权限窗口），扫描码走
 //   MapVirtualKeyW(MAPVK_VK_TO_VSC) —— 部分 IME 依赖正确扫描码。
-//
-// ⚠⚠ **注入必须分段，down/up 之间要让出消息循环**（Win10 微软拼音不收，issue #3）
-//
-//   现象：Win10 + 微软拼音打不出中文，但**微信拼音正常**、**Win11 正常**、
-//   **Win7 正常**，而且**同一台机器上资源管理器搜索框里能打中文、
-//   Edge 地址栏和记事本里不能**。
-//   这组对照说明注入通路本身是通的（英文/数字全部正常），微软拼音的状态机
-//   只是不接受这种「一个 SendInput 里down+up 全部灌完、零延时」的节奏。
-//
-//   原理：微软拼音的 TSF 前端要在 WM_KEYDOWN 之后**跑一轮自己的消息循环**
-//   才开始组字；down 与 up 在同一个 SendInput 里同批到达时，它还没来得及
-//   进入组字状态就收到了 KEYUP，于是整串被丢掉 —— 不上屏、不出候选窗。
-//   微信拼音的实现更宽容，Win11 / Win7 的 IME 容错更高，所以都不复现。
-//   Chromium（Edge）与纯文本控件对按键节奏最敏感，资源管理器的搜索框反而宽容，
-//   于是出现「换个窗口就能用」的迷惑现象。
-//
-//   佐证：本文件原有的 ToggleImeLang / SendWinToggle **都**是「分两次发送 +
-//   Sleep(50)」并在注释里写明了「避免过快 down+up 被 IME 忽略」，
-//   偏偏 SendKey 这条最常走的路径漏了 —— 现在按同样的思路补上。
-//
-//   ⚠ 延时不能省，也不能给太大：太大则长按连发（TIMER_REPEAT 40ms 一个 tick）
-//   会因为 Sleep 累积而拖慢。1ms 是「足够让出消息循环」与「不拖慢连发」的折中。
-#define KEY_INJECT_GAP_MS 1
-
-// gapMs = 0 表示「不分段、一次性 SendInput 灌完」，即v2.0 修复前的行为。
-// 只给**连续大量注入**的场景用（Fn 层的网址后缀键TypeDomainText、长按连发）：
-// 那里本来就不会触发中文组字，逐键 1ms 的延时只会累积成几十毫秒的卡顿。
-// ⚠ 绝不要给「用户敲单个键」用 —— 那正是 issue #3 的场景，需要让出消息循环。
-static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs) {
-    if (gapMs == 0) {
-        // 快速路径：还原成一次性批量注入（与修复前逐字一致）
-        INPUT inputs[12] = {};
-        int count = 0;
-        UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-        BOOL isExt = (vk == VK_RCONTROL || vk == VK_RMENU ||
-                      vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN ||
-                      vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT ||
-                      vk == VK_INSERT || vk == VK_DELETE || vk == VK_LWIN || vk == VK_RWIN ||
-                      vk == VK_NUMLOCK);
-        DWORD ext = isExt ? KEYEVENTF_EXTENDEDKEY : 0;
-        if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD;
-                  i.ki.wVk = VK_CONTROL; i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); }
-        if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY; }
-        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); }
-        if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
-                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_EXTENDEDKEY; }
-        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext; }
-        { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.wScan = (WORD)sc; i.ki.dwFlags = ext | KEYEVENTF_KEYUP; }
-        if (win) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_LWIN;
-                   i.ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY; }
-        if (sh) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_SHIFT;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP; }
-        if (al) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_MENU;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY; }
-        if (ct) { INPUT& i = inputs[count++]; i.type = INPUT_KEYBOARD; i.ki.wVk = VK_CONTROL;
-                  i.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC); i.ki.dwFlags = KEYEVENTF_KEYUP; }
-        SendInput(count, inputs, sizeof(INPUT));
-        return;
-    }
-    // 正常路径：下面那个 SendKey 的分段实现
-    SendKey(vk, sh, ct, al, win);
-}
-
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
+    INPUT inputs[12] = {};
+    int count = 0;
+
     UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 
     // 判断扩展键（右 Ctrl/Alt、方向键、Win 等；右 Shift 不带 E0 扩展标志）
@@ -2331,97 +2269,78 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
 
     DWORD extFlag = isExtended ? KEYEVENTF_EXTENDEDKEY : 0;
 
-    // ---- 第 1 段：修饰键按下（一次 SendInput，顺序 ct → al → sh → win）----
-    {
-        INPUT mods[4] = {};
-        int mc = 0;
-        if (ct) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_CONTROL;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
-            mc++;
-        }
-        if (al) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_MENU;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-            mc++;
-        }
-        if (sh) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_SHIFT;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
-            mc++;
-        }
-        if (win) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_LWIN;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-            mc++;
-        }
-        if (mc > 0) SendInput(mc, mods, sizeof(INPUT));
-        if (mc > 0) Sleep(KEY_INJECT_GAP_MS);
+    // 按下修饰键
+    if (ct) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_CONTROL;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+        count++;
+    }
+    if (al) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_MENU;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
+        inputs[count].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+        count++;
+    }
+    if (sh) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_SHIFT;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+        count++;
+    }
+    if (win) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_LWIN;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
+        inputs[count].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+        count++;
     }
 
-    // ---- 第 2 段：目标键 down（以 VK 形式发送，TSF/IME 可正确拦截 WM_KEYDOWN）----
-    {
-        INPUT down = {};
-        down.type = INPUT_KEYBOARD;
-        down.ki.wVk = vk;
-        down.ki.wScan = (WORD)sc;
-        down.ki.dwFlags = extFlag;
-        SendInput(1, &down, sizeof(INPUT));
+    // 目标键 down + up（以 VK 形式发送，TSF/IME 可正确拦截 WM_KEYDOWN）
+    inputs[count].type = INPUT_KEYBOARD;
+    inputs[count].ki.wVk = vk;
+    inputs[count].ki.wScan = (WORD)sc;
+    inputs[count].ki.dwFlags = extFlag;
+    count++;
+
+    inputs[count].type = INPUT_KEYBOARD;
+    inputs[count].ki.wVk = vk;
+    inputs[count].ki.wScan = (WORD)sc;
+    inputs[count].ki.dwFlags = extFlag | KEYEVENTF_KEYUP;
+    count++;
+
+    // 释放修饰键
+    if (win) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_LWIN;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
+        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+        count++;
+    }
+    if (sh) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_SHIFT;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
+        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
+        count++;
+    }
+    if (al) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_MENU;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
+        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+        count++;
+    }
+    if (ct) {
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = VK_CONTROL;
+        inputs[count].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+        inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
+        count++;
     }
 
-    // 关键延时：给 IME 的 TSF 前端跑一轮消息循环、进入组字状态
-    Sleep(KEY_INJECT_GAP_MS);
-
-    // ---- 第 3 段：目标键 up ----
-    {
-        INPUT up = {};
-        up.type = INPUT_KEYBOARD;
-        up.ki.wVk = vk;
-        up.ki.wScan = (WORD)sc;
-        up.ki.dwFlags = extFlag | KEYEVENTF_KEYUP;
-        SendInput(1, &up, sizeof(INPUT));
-    }
-
-    // ---- 第 4 段：修饰键抬起（逆序win → sh → al → ct，与按下相反）----
-    {
-        INPUT mods[4] = {};
-        int mc = 0;
-        if (win) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_LWIN;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
-            mc++;
-        }
-        if (sh) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_SHIFT;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP;
-            mc++;
-        }
-        if (al) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_MENU;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_MENU, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
-            mc++;
-        }
-        if (ct) {
-            mods[mc].type = INPUT_KEYBOARD;
-            mods[mc].ki.wVk = VK_CONTROL;
-            mods[mc].ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
-            mods[mc].ki.dwFlags = KEYEVENTF_KEYUP;
-            mc++;
-        }
-        if (mc > 0) SendInput(mc, mods, sizeof(INPUT));
-    }
+    SendInput(count, inputs, sizeof(INPUT));
 }
 
 // 输入法中英文切换：由左右 Shift 的第 2 次点击触发（用右 Shift 扫描码，与真实右 Shift 一致）。
@@ -2543,9 +2462,7 @@ static void TypeDomainText(const wchar_t* s) {
         } else {
             continue;
         }
-        // 网址后缀是「一次性把整串打完」，不会进中文组字 —— 走 gap=0 的快速路径，
-        // 否则每个字符 2 次 Sleep(1)，20 字符的域名就是 40ms 的卡顿。
-        SendKeyGap((BYTE)vk, sh, FALSE, FALSE, FALSE, 0);
+        SendKey((BYTE)vk, sh, FALSE, FALSE);
     }
 }
 
@@ -6430,17 +6347,26 @@ static void InitTimePeriodApi() {
 }
 
 // ========== IME 自测（-imeprobe，仅诊断用） ==========
-// 用途：在**本进程内**走与真实按键完全相同的注入路径，然后读回前台控件文本，
-// 用来区分「注入写法不对」与「本进程环境影响 IME 组字」。
+// 用途：在**完整初始化后的本进程内**走与真实点击完全相同的路径，
+// 然后读回前台控件文本，用来区分「注入写法不对」与「本进程环境影响IME 组字」。
 //
 // 背景（Win10 22H2 19045.2006 实测）：一个独立 PowerShell 探针裸调 SendInput
 // 在同一台机器、同一个记事本、微软拼音中文状态下**能打出「你好」**，
-// 证明「SendInput + wVk + wScan 一次性注入」这个写法本身没问题。
-// 若本自测却打出「nihao」，差异只可能来自本进程 —— 主UI 线程的 STA COM 初始化
-// （IsStartMenuOpen 的CoInitializeEx / EnsureAccessibilityCom）、
-// WH_KEYBOARD_LL 低层钩子、50ms TIMER_FOCUS、WS_EX_NOACTIVATE 这几项。
+// 说明注入写法本身没问题。而用户真实使用（键盘窗口已显示、鼠标点轻键）
+// 却打不出中文 —— 两者的唯一系统性差异就是**本进程的环境**：
+// 主 UI 线程的 STA COM 初始化（IsStartMenuOpen / EnsureAccessibilityCom 的
+// CoInitializeEx）、WH_KEYBOARD_LL 低层钩子、50ms TIMER_FOCUS、WS_EX_NOACTIVATE。
 //
-// 结果写 %TEMP%\hkeyboard_imeprobe.txt，不弹任何 UI。
+// ⚠⚠ **自测必须跑在完整初始化之后**（这是一个被实测纠正过的设计错误）：
+//   早期版本把 -imeprobe 的触发点放在 WinMain 最开头、所有初始化之前，
+//   理由是「测 IME 就要排除 GDI+/字体/定时器这些环境因素」。
+//   那是**倒因为果**：真实故障恰恰发生在这些都起来之后，
+//   提前 return 等于把要查的因素自己全排除了，于是测出「两轮都组字成功」
+//   的假阴性，白白多跑两轮往返。现在改成走完整启动流程，
+//   窗口/钩子/定时器/STA COM 全部就绪后再测，并且额外手动泵一段消息循环
+//   （PumpMs），确保 TIMER_FOCUS 真的执行过、CoInitializeEx 真的发生过。
+//
+// 结果写 exe 同目录（失败则退回 %TEMP%）的 hkeyboard_imeprobe.txt，不弹任何 UI。
 // ========== 启动留痕（诊断用，无条件写） ==========
 //⚠ 教训：上一轮自测跑完，结果文件只有一个 BOM、没有任何内容，
 //   而 exe 确实以 code=0 退出了 —— 事后无法区分「没收到参数」与
@@ -6534,30 +6460,116 @@ static void WriteStartupTrace(const char* cmd) {
     ProbeClose(&L);
 }
 
+static void PumpMs(DWORD ms) {
+    // 手动泵消息：让 TIMER_FOCUS / WinEvent /钩子回调真的跑起来。
+    // 只有这样「主 UI 线程已被 CoInitializeEx 初始化成 STA」才成立 ——
+    // 而这正是头号嫌疑，不泵消息就等于没测它。
+    DWORD end = GetTickCount() + ms;
+    MSG m;
+    while (GetTickCount() < end) {
+        while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) {
+            if (m.message == WM_QUIT) return;
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        Sleep(10);
+    }
+}
+
+static int FindKeyByVk(BYTE vk) {
+    for (int i = 0; i < g_nk; i++)
+        if (g_keys[i].vk == vk) return i;
+    return -1;
+}
+
+// 模拟真实用户点键：把鼠标消息发给**自己**的窗口，走完整的
+// WndProc → OnLDown → HitKey → DoKeyAction → SendKey 路径。
+// 用户的真实操作就是这条路径（窗口 WS_EX_NOACTIVATE，鼠标点它不会抢焦点）。
+static void ClickKeyByVk(BYTE vk) {
+    int ki = FindKeyByVk(vk);
+    if (ki < 0 || !g_hWnd) return;
+    const KeyDef* k = &g_keys[ki];
+    int x = k->x + k->w / 2;
+    int y = k->y + k->h / 2;
+    LPARAM lp = MAKELPARAM(x, y);
+    SendMessageW(g_hWnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+    Sleep(40);
+    SendMessageW(g_hWnd, WM_LBUTTONUP, 0, lp);
+    Sleep(40);
+}
+
 static void RunImeProbe() {
-    static const char* kNames[] = { "?", "SendKey(gap=1ms)", "SendKeyGap(gap=0)" };
-
     ProbeLog L = ProbeOpen(TRUE);   // 追加：WriteStartupTrace 已写了第一段
-
-    HWND fg = GetForegroundWindow();
-    char cls[128] = {0};
-    GetClassNameA(fg, cls, 128);
 
     wchar_t exepath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exepath, MAX_PATH);
 
-    ProbeFmt(&L, "\n=== self-probe ===\n");
+    ProbeFmt(&L, "\n=== self-probe (FULL INIT) ===\n");
     ProbeFmt(&L, "exe=%ls\n", exepath);
-    ProbeFmt(&L, "pid=%lu foreground=0x%llx class=%s\n",
-             GetCurrentProcessId(), (unsigned long long)(ULONG_PTR)fg, cls);
+    ProbeFmt(&L, "pid=%lu\n", GetCurrentProcessId());
 
-    DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
-    HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
-    ProbeFmt(&L, "foregroundTid=%lu keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
-             tidFg, (unsigned long long)(ULONG_PTR)hkl);
+    // ⚠ 模拟点键那一轮依赖当前布局里确实有这些键。若用户配置是小键盘布局，
+    //   字母键不存在，ClickKeyByVk 会静默什么都不做→ 读回空文本，
+    //   会被误判成「注入被完全阻断」。所以先把键位表打出来自证。
+    ProbeFmt(&L, "layoutMode=%d nk=%d\n", g_layoutMode, g_nk);
+    {
+        static const char kWant[] = "nihao";
+        BOOL allFound = TRUE;
+        for (const char* s = kWant; *s; s++) {
+            int idx = FindKeyByVk((BYTE)toupper((unsigned char)*s));
+            ProbeFmt(&L, "  key '%c' vk=0x%02X -> idx=%d\n", *s,
+                     (BYTE)toupper((unsigned char)*s), idx);
+            if (idx < 0) allFound = FALSE;
+        }
+        int sp = FindKeyByVk(VK_SPACE);
+        ProbeFmt(&L, "  key ' ' vk=0x20 -> idx=%d\n", sp);
+        if (sp < 0) allFound = FALSE;
+        ProbeFmt(&L, "clickRoundPossible=%d%s\n", allFound ? 1 : 0,
+                 allFound ? "" : "  (layout lacks these keys; click round would be a false negative)");
+    }
 
-    //⚠ 自己拉起记事本并置前，不再要求用户手工准备 ——
-    //   手工准备既易错（用户已经点了记事本却仍没识别到），也让测试不可复现。
+    // ---- 环境指纹：这几项就是本轮要验的「进程环境因素」----
+    ProbeFmt(&L, "\n-- env fingerprint --\n");
+    ProbeFmt(&L, "kbHook=%llu winHook=%llu fgHook=%llu\n",
+             (unsigned long long)(ULONG_PTR)g_kbHook,
+             (unsigned long long)(ULONG_PTR)g_winHook,
+             (unsigned long long)(ULONG_PTR)g_fgHook);
+    ProbeFmt(&L, "g_hWnd=0x%llx visible=%d exStyle=0x%llx\n",
+             (unsigned long long)(ULONG_PTR)g_hWnd,
+             g_hWnd ? IsWindowVisible(g_hWnd) : 0,
+             (unsigned long long)(ULONG_PTR)GetWindowLongW(g_hWnd, GWL_EXSTYLE));
+
+    // 动态取CoGetApartmentType：不静态引用，WinXP 目标平台上也能加载
+    {
+        typedef HRESULT (WINAPI *GetAptT)(int*, int*);
+        HMODULE ole = GetModuleHandleW(L"ole32.dll");
+        GetAptT f = ole ? (GetAptT)GetProcAddress(ole, "CoGetApartmentType") : NULL;
+        if (f) {
+            int t = -99, q = -99;
+            HRESULT hr = f(&t, &q);
+            const char* names[] = { "STA", "MTA", "NA", "MAINSTA", "ROAMSTA" };
+            const char* nm = (t >= 0 && t <= 4) ? names[t] : "?";
+            ProbeFmt(&L, "apartment=%s (hr=0x%08x)  <- 0=STA 1=MTA\n", nm, (unsigned)hr);
+        } else {
+            ProbeFmt(&L, "apartment=? (CoGetApartmentType unavailable)\n");
+        }
+    }
+
+    // 让定时器/钩子真的跑几百毫秒，确保 STA COM 初始化已发生
+    ProbeFmt(&L, "pumping messages for 700ms so TIMER_FOCUS/hooks run...\n");
+    PumpMs(700);
+    {
+        typedef HRESULT (WINAPI *GetAptT)(int*, int*);
+        HMODULE ole = GetModuleHandleW(L"ole32.dll");
+        GetAptT f = ole ? (GetAptT)GetProcAddress(ole, "CoGetApartmentType") : NULL;
+        if (f) {
+            int t = -99, q = -99;
+            f(&t, &q);
+            ProbeFmt(&L, "apartment after pump = %d (0=STA 1=MTA)\n", t);
+        }
+    }
+
+    // ---- 自己拉起记事本并置前 ----
     ProbeFmt(&L, "\n-- launching notepad ourselves --\n");
     HWND np = NULL;
     {
@@ -6568,16 +6580,14 @@ static void RunImeProbe() {
         WCHAR dir[MAX_PATH];
         if (GetSystemDirectoryW(dir, MAX_PATH)) {
             wcscat_s(dir, L"\\notepad.exe");
-            CreateProcessW(dir, NULL, NULL, NULL, FALSE,
-                           0, NULL, NULL, &si, &pi);
+            CreateProcessW(dir, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
             if (pi.hProcess) {
                 WaitForInputIdle(pi.hProcess, 8000);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
             }
         }
-        Sleep(1200);
-        //枚举顶层窗口找 Notepad（比 FindWindow 稳，能同时匹配新版记事本类名）
+        PumpMs(1500);
         for (HWND w = GetTopWindow(NULL); w; w = GetNextWindow(w, GW_HWNDNEXT)) {
             if (!IsWindowVisible(w)) continue;
             wchar_t cn[128] = {0};
@@ -6591,97 +6601,100 @@ static void RunImeProbe() {
             BringWindowToTop(np);
             SetForegroundWindow(np);
             SetActiveWindow(np);
-            Sleep(700);
-            // 置前可能被拒，前台不是它就再试一次
+            PumpMs(700);
             if (GetForegroundWindow() != np) {
                 SetForegroundWindow(np);
                 SetActiveWindow(np);
-                Sleep(500);
+                PumpMs(500);
             }
-            fg = GetForegroundWindow();
-            cls[0] = 0;
-            GetClassNameA(fg, cls, 128);
-            ProbeFmt(&L, "afterForce foreground=0x%llx class=%s  %s\n",
-                     (unsigned long long)(ULONG_PTR)fg, cls,
-                     (fg == np) ? "(OK, ours is foreground)" : "(FAILED to come to front)");
-        } else {
-            ProbeFmt(&L, "!! could not find a notepad window\n");
         }
     }
 
-    // 只在目标窗口类像文本编辑器时才测，避免往命令行 / 资源管理器里灌字符。
+    HWND fg = GetForegroundWindow();
+    char cls[128] = {0};
+    GetClassNameA(fg, cls, 128);
+    DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
+    ProbeFmt(&L, "afterForce foreground=0x%llx class=%s%s\n",
+             (unsigned long long)(ULONG_PTR)fg, cls,
+             (fg == np) ? "  (OK)" : "  (FAILED to come to front)");
+    ProbeFmt(&L, "foregroundTid=%lu keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
+             tidFg, (unsigned long long)(ULONG_PTR)hkl);
+
     BOOL looksLikeEditor = (strstr(cls, "Edit") || strstr(cls, "Notepad") ||
-                            strstr(cls, "Chrome") || strstr(cls, "Edge") ||
-                            cls[0] == 0);
-    ProbeFmt(&L, "looksLikeEditor=%d\n", looksLikeEditor);
+                            strstr(cls, "Chrome") || strstr(cls, "Edge") || cls[0] == 0);
     if (!looksLikeEditor) {
         ProbeFmt(&L, "SKIP: foreground class is not a known text control\n");
-        ProbeFmt(&L, "hint: this build launches notepad by itself; if we got here,\n");
-        ProbeFmt(&L, "      SetForegroundWindow was blocked. Switch to Notepad manually\n");
-        ProbeFmt(&L, "      and run again.\n");
+        if (L.bad) ProbeFmt(&L, "!! write error %lu occurred\n", L.err);
+        ProbeFmt(&L, "=== end ===\n");
         ProbeClose(&L);
         return;
     }
     ProbeFmt(&L, "\n");
 
+    // 两轮：
+    //  [1] 直接调 SendKey      —— 与上一轮成功的那次完全相同，作为对照组
+    //  [2] 模拟真实点键（鼠标）—— 用户实际操作走的就是这条路径
+    static const char* kNames[] = { "?", "direct SendKey", "simulated mouse click on our window" };
+
     for (int round = 1; round <= 2; round++) {
-        // 清空目标：Ctrl+A 然后 Delete（用 gap=0 快速路径，不干扰本轮测量对象）
-        SendKeyGap(VK_CONTROL, FALSE, TRUE, FALSE, FALSE, 0);
-        SendKeyGap((BYTE)'A', FALSE, FALSE, FALSE, FALSE, 0);
-        SendKeyGap(VK_DELETE, FALSE, FALSE, FALSE, FALSE, 0);
-        Sleep(200);
-
-        const char* p = "nihao";
-        for (const char* s = p; *s; s++) {
-            BYTE vk = (BYTE)toupper((unsigned char)*s);
-            if (round == 1) SendKey(vk, FALSE, FALSE, FALSE, FALSE);
-            else           SendKeyGap(vk, FALSE, FALSE, FALSE, FALSE, 0);
-        }
-        if (round == 1) SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
-        else           SendKeyGap(VK_SPACE, FALSE, FALSE, FALSE, FALSE, 0);
-
-        Sleep(700);
-
-        // 读回前台线程焦点控件文本
+        // 清空目标：EM_SETSEL 全选 + Delete（整数参数，跨进程安全）
         DWORD tid = GetWindowThreadProcessId(fg, NULL);
         GUITHREADINFO gi = {sizeof(gi)};
         HWND target = fg;
+        if (GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) target = gi.hwndFocus;
+        SendMessageTimeoutW(target, EM_SETSEL, 0, (WPARAM)-1, SMTO_ABORTIFHUNG, 1000, NULL);
+        SendKey(VK_DELETE, FALSE, FALSE, FALSE, FALSE);
+        Sleep(250);
+
+        static const char* p = "nihao";
+        for (const char* s = p; *s; s++) {
+            BYTE vk = (BYTE)toupper((unsigned char)*s);
+            if (round == 1) SendKey(vk, FALSE, FALSE, FALSE, FALSE);
+            else            ClickKeyByVk(vk);
+        }
+        if (round == 1) SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
+        else            ClickKeyByVk(VK_SPACE);
+
+        Sleep(700);
+
+        tid = GetWindowThreadProcessId(fg, NULL);
+        ZeroMemory(&gi, sizeof(gi));
+        gi.cbSize = sizeof(gi);
+        target = fg;
         if (GetGUIThreadInfo(tid, &gi) && gi.hwndFocus) target = gi.hwndFocus;
 
         wchar_t tcls[64] = {0};
         GetClassNameW(target, tcls, 64);
 
-        // WM_GETTEXT 的 lParam 是缓冲区地址，类型是 LPARAM(整型)，
-        // 直接传 wchar_t* 编译不过（C2664），必须先转成指针值再强转成 LPARAM。
         wchar_t buf[256] = {0};
         SendMessageTimeoutW(target, WM_GETTEXT, (WPARAM)256,
-                            (LPARAM)(ULONG_PTR)buf,
-                            SMTO_ABORTIFHUNG, 1500, NULL);
+                            (LPARAM)(ULONG_PTR)buf, SMTO_ABORTIFHUNG, 1500, NULL);
 
-        //把不可打印字符替成 '.'，免得控制台里出现乱码；
-        // 非 ASCII（组字结果）转成 U+XXXX 形式，便于区分「组字了」与「原样字母」。
         wchar_t shown[1024];
         int si2 = 0;
+        BOOL anyCjk = FALSE;
         for (int i = 0; i < 255 && si2 < 1000; i++) {
             wchar_t c = buf[i];
             if (c == 0) break;
+            if (c >= 0x4E00 && c <= 0x9FFF) anyCjk = TRUE;
             if (c < 0x20) { shown[si2++] = L'.'; }
             else if (c < 0x80) { shown[si2++] = c; }
-            else {
-                si2 += _snwprintf_s(shown + si2, 1024 - si2, _TRUNCATE,
-                                    L"<U+%04X>", (unsigned)c);
-            }
+            else si2 += _snwprintf_s(shown + si2, 1024 - si2, _TRUNCATE, L"<U+%04X>", (unsigned)c);
         }
         shown[si2] = 0;
 
-        ProbeFmt(&L, "[%s]\n", kNames[round]);
+        ProbeFmt(&L, "[%d] %s\n", round, kNames[round]);
         ProbeFmt(&L, "  target=0x%llx class=%ls text='%ls'\n",
                  (unsigned long long)(ULONG_PTR)target, tcls, shown);
-
-        if (wcscmp(buf, L"\x4f60\x597d") == 0)          ProbeFmt(&L, "  => IME OK (composed)\n");
-        else if (wcsncmp(buf, L"nihao", 5) == 0)       ProbeFmt(&L, "  => IME NOT composing\n");
-        else if (buf[0] == 0)                          ProbeFmt(&L, "  => nothing received\n");
-        else                                           ProbeFmt(&L, "  => other\n");
+        if (anyCjk) {
+            ProbeFmt(&L, "  => OK: CJK composed (IME works)\n");
+        } else if (buf[0] == 0) {
+            ProbeFmt(&L, "  => FAIL: nothing received at all\n");
+        } else {
+            ProbeFmt(&L, "  => FAIL: raw ASCII, IME did NOT compose  <<<< THIS IS THE BUG\n");
+        }
+        ProbeFmt(&L, "\n");
     }
 
     if (L.bad) ProbeFmt(&L, "!! write error %lu occurred\n", L.err);
@@ -6696,14 +6709,13 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     //   也能从文件看出程序启动过、命令行收到了什么。
     WriteStartupTrace(cmd);
 
-    // ⚠ 自测也必须在这里**立即**执行，不能等到后面：
-    //   GDI+ / 内嵌字体 / TimeBeginPeriod(1) / DetectWinVersion / 各钩子都是
-    //   「可能影响 IME 的进程环境因素」，测 IME 就必须**排除**它们，
-    //   否则测的是「初始化之后的环境」，不是出问题的那个环境。
-    if (strstr(cmd, "-imeprobe")) {
-        RunImeProbe();
-        return 0;
-    }
+    // ⚠ -imeprobe **不再**提前 return了。
+    //   上一轮把它放在所有初始化之前跑，测出「两轮都组字成功」的假阴性 ——
+    //   因为真实故障发生在「键盘窗口已显示、钩子已装、50ms 定时器在跑、
+    //   主 UI 线程已被CoInitializeEx 初始化成 STA」之后，
+    //   提前 return 等于把要查的环境因素自己全排除了。
+    //   现在改成走完整启动流程，等环境稳定后再注入（见文件末尾的消息循环处）。
+    BOOL fImeProbe = (strstr(cmd, "-imeprobe") != NULL);
 
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
@@ -6752,7 +6764,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     if (tOnly && !isTouch) return 0;
 
     g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
-    if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS && !fImeProbe) {
         CloseHandle(g_mutex);
         HWND ew = FindWindowW(L"HKeyboard", 0);
         if (ew) {
@@ -6813,6 +6825,17 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
 
     MSG msg;
+    // ⚠ 自测在**完整初始化之后**、进入 GetMessage 循环之前跑一次。
+    //   此刻键盘窗口已创建并显示、WH_KEYBOARD_LL 与两个 WinEvent 钩子已装、
+    //   TIMER_FOCUS(50ms) 已启动、WS_EX_NOACTIVATE 已生效 —— 与真实使用状态一致。
+    //   但 GetMessage 还没跑，所以定时器/钩子回调此刻尚未执行过；为了让
+    //   「STA COM 初始化」这个头号嫌疑真的发生，下面手动泵一小段消息循环。
+    if (fImeProbe) {
+        RunImeProbe();
+        if (IsWindow(hWnd)) DestroyWindow(hWnd);
+        return 0;
+    }
+
     while (GetMessage(&msg, 0, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);

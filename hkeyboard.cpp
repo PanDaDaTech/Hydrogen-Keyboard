@@ -6498,65 +6498,116 @@ static void ClickKeyByVk(BYTE vk) {
     Sleep(40);
 }
 
-// 读回目标控件的 IME 状态：是否中文态、是否在组字、组字串内容。
-// ⚠ 为什么必须读这个：光看 WM_GETTEXT 只能知道「最后留下了什么」，
-//   区分不出「IME 根本没收到键」与「IME 收到了但没组字」。
-//   ImmGetCompositionString 直接问 IME「你缓冲区里现在有什么」，
-//   是唯一能区分这两种情况的手段。
-// ⚠ ImmGetContext 需要的是**焦点控件**的 HIMC，而它同时也是「这个控件
-//   能不能承载 IME 上下文」的判据 —— 返回 NULL 说明目标压根不是输入控件，
-//   键打进去也不会组字。这种情况必须与「注入被吞」区分开。
-static void ProbeImeState(ProbeLog* L, HWND target, const char* tag) {
-    typedef HANDLE (WINAPI *PGetCtx)(HWND);
-    typedef BOOL   (WINAPI *POpen)(HANDLE);
-    typedef LONG   (WINAPI *PCompW)(HANDLE, DWORD, LPWSTR, int);
-    typedef BOOL   (WINAPI *PState)(HANDLE);
-    typedef HWND   (WINAPI *PCompWin)(HANDLE);
+// ========== 跨进程取证：剪贴板 + IME 候选窗 ==========
+// ⚠⚠⚠ **上一轮（三个目标）测出的数据全部作废**，测量链路本身断了三处，
+//   这一处最隐蔽：
+//
+//   上一轮用 `WM_GETTEXT` 当作「目标控件的文本」。但 **WM_GETTEXT 只对标准
+//   Edit 控件有值**。Edge 地址栏是 Chromium 自绘、Notepad4 是 Scintilla，
+//   发 WM_GETTEXT 拿回来的是**窗口标题**
+//   （`https://xrgzs.ysepan.com - 用户配置 1 - Microsoft Edge`），
+//   而标题里恰好带「用户配置」四个中文，于是「文本含不含 CJK」这个判据
+//   把一个**失败的目标判成了成功**。判读时又没先确认焦点落在输入框上，
+//   于是「Edge 也 OK」这条结论完全是假的。
+//
+//   现在换成两个**跨进程安全**的取证手段：
+//
+//   ① **剪贴板**：Ctrl+A / Ctrl+C 是所有文本控件的通用协议（标准 Edit、
+//      Chromium Omnibox、Scintilla 全都支持），读回来的就是用户眼睛看到的
+//      那个字符串。顺带把判定从「含任意 CJK」收紧成「精确等于预期串」。
+//
+//   ② **IME 候选窗**：IME 组字时会在屏幕上开一个类名为 `IMEUI` 的顶层窗口。
+//      枚举它，就知道「IME 到底有没有开始组字」—— 这是纯用户态可见的量。
+//
+//   ⚠ 顺带说明为什么上一轮 `ImmGetContext` 全是 NULL：**HIMC 是线程私有的**，
+//   跨进程取不到是设计如此，不是「目标不支持 IME」。上一轮把它当成
+//   「目标压根不能承载 IME 上下文」的判据，方向整个搞反了 ——
+//   所以 notepad 的原生 Edit 也报 NULL，当时就该意识到是方法错了。
+struct ClipBackup { BOOL valid; HANDLE h; UINT fmt; };
 
-    // ⚠ 动态取符号，不静态引用 imm32.lib：
-    //   x86 目标平台是 WinXP(SUBSYSTEM 5.01)，而 imm32 的部分导出在 XP 上
-    //   行为不同；诊断代码不该有能力影响正式产物的加载。
-    static HMODULE s_imm = NULL;
-    static BOOL s_tried = FALSE;
-    if (!s_tried) { s_tried = TRUE; s_imm = LoadLibraryW(L"imm32.dll"); }
-    if (!s_imm) { ProbeFmt(L, "  [%s] imm32.dll not loadable\n", tag); return; }
-
-    PGetCtx   pGetCtx  = (PGetCtx)  GetProcAddress(s_imm, "ImmGetContext");
-    POpen     pOpen    = (POpen)    GetProcAddress(s_imm, "ImmGetOpenStatus");
-    PCompW    pComp    = (PCompW)   GetProcAddress(s_imm, "ImmGetCompositionStringW");
-    PState    pState   = (PState)   GetProcAddress(s_imm, "ImmGetCompositionState");
-    PCompWin  pCompWin = (PCompWin) GetProcAddress(s_imm, "ImmGetCompositionWindow");
-    if (!pGetCtx || !pComp) { ProbeFmt(L, "  [%s] ImmGet* procs missing\n", tag); return; }
-
-    HANDLE himc = pGetCtx(target);
-    if (!himc) {
-        ProbeFmt(L, "  [%s] ImmGetContext=NULL  <- target cannot host an IME context at all\n", tag);
-        return;
+// OpenClipboard 会因别的窗口正开着剪贴板而失败（我们刚让目标 Ctrl+C 过，
+// 它可能还没 CloseClipboard），必须重试而不是直接放弃。
+static BOOL Clip_OpenRetry() {
+    for (int i = 0; i < 30; i++) {
+        if (OpenClipboard(NULL)) return TRUE;
+        Sleep(50);
     }
+    return FALSE;
+}
 
-    if (pOpen)    ProbeFmt(L, "  [%s] imeOpen(1=Chinese,0=English)=%d\n", tag, pOpen(himc) ? 1 : 0);
-    if (pState)   ProbeFmt(L, "  [%s] compState(4=ACTIVE,0=NONE)=%d\n", tag, (int)pState(himc));
-    if (pCompWin) ProbeFmt(L, "  [%s] compWnd=0x%llx%s\n", tag,
-                           (unsigned long long)(ULONG_PTR)pCompWin(himc),
-                           pCompWin(himc) ? "" : "  (0 = no candidate window on screen)");
+static void Clip_Save(ClipBackup* b) {
+    b->valid = FALSE; b->h = NULL; b->fmt = 0;
+    if (!Clip_OpenRetry()) return;
+    HANDLE src = GetClipboardData(CF_UNICODETEXT);
+    if (src) {
+        SIZE_T n = GlobalSize(src);
+        if (n == 0) n = 1024;
+        HANDLE dst = GlobalAlloc(GMEM_MOVEABLE, n);
+        if (dst) {
+            const wchar_t* s = (const wchar_t*)GlobalLock(src);
+            void* d = GlobalLock(dst);
+            if (s && d) {
+                memcpy(d, s, n);
+                b->valid = TRUE; b->fmt = CF_UNICODETEXT; b->h = dst;
+            }
+            if (d) GlobalUnlock(dst);
+            if (s) GlobalUnlock(src);
+            if (!b->valid) GlobalFree(dst);   // 没拷成就把刚分配的还回去，别泄漏
+        }
+    }
+    CloseClipboard();
+}
 
-    int need = pComp(himc, 1 /*GCS_COMPSTR*/, NULL, 0);
-    if (need <= 0) {
-        ProbeFmt(L, "  [%s] compStr=<EMPTY>  <- IME holds nothing\n", tag);
-        return;
+static void Clip_Restore(const ClipBackup* b) {
+    if (!Clip_OpenRetry()) { if (b->valid) GlobalFree(b->h); return; }
+    EmptyClipboard();
+    // 成功时 SetClipboardData 接管这块内存所有权，不能再 GlobalFree
+    if (b->valid) SetClipboardData(b->fmt, b->h);
+    CloseClipboard();
+}
+
+static void Clip_Clear() {
+    if (Clip_OpenRetry()) { EmptyClipboard(); CloseClipboard(); }
+}
+
+static BOOL Clip_ReadText(wchar_t* out, int cap) {
+    if (!out || cap < 8) return FALSE;
+    out[0] = 0;
+    if (!Clip_OpenRetry()) return FALSE;
+    BOOL ok = FALSE;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const wchar_t* s = (const wchar_t*)GlobalLock(h);
+        if (s) {
+            int i = 0;
+            for (; s[i] && i < cap - 1; i++) out[i] = s[i];
+            out[i] = 0;
+            ok = TRUE;
+        }
+        if (s) GlobalUnlock(h);
     }
-    wchar_t cbuf[256] = {0};
-    pComp(himc, 1, cbuf, 255);
-    wchar_t shown[1024];
-    int si = 0;
-    for (int i = 0; cbuf[i] && si < 1000; i++) {
-        wchar_t c = cbuf[i];
-        if (c < 0x20) shown[si++] = L'.';
-        else if (c < 0x80) shown[si++] = c;
-        else si += _snwprintf_s(shown + si, 1024 - si, _TRUNCATE, L"<U+%04X>", (unsigned)c);
+    CloseClipboard();
+    return ok;
+}
+
+static BOOL CALLBACK CbEnumImeUi(HWND w, LPARAM p) {
+    BOOL* found = (BOOL*)p;
+    if (!IsWindowVisible(w)) return TRUE;
+    wchar_t c[64] = {0};
+    GetClassNameW(w, c, 64);
+    // 微软拼音候选窗类名 = IMEUI；旧版 IMM32 = MSCTFIME UI
+    if (wcscmp(c, L"IMEUI") == 0 || wcscmp(c, L"MSCTFIME UI") == 0) {
+        *found = TRUE;
+        return FALSE;
     }
-    shown[si] = 0;
-    ProbeFmt(L, "  [%s] compStr(len=%d)='%ls'\n", tag, need, shown);
+    return TRUE;
+}
+
+// 屏幕上有没有 IME 候选窗：组字过程中存在，组完或压根没组字则不存在。
+static BOOL ProbeImeUiWindow() {
+    BOOL found = FALSE;
+    EnumWindows(CbEnumImeUi, (LPARAM)&found);
+    return found;
 }
 
 static void FillEscaped(wchar_t* dst, int cap, const wchar_t* src) {
@@ -6571,47 +6622,167 @@ static void FillEscaped(wchar_t* dst, int cap, const wchar_t* src) {
     dst[si] = 0;
 }
 
-// 启动指定程序并拉到前台，返回其主窗口。
-// ⚠ 之前只测了系统自带记事本，而用户实际失败的是 Edge 地址栏与 Notepad4。
-//   不同应用的前台/焦点/IME 上下文结构差别很大，只测一个无法定位问题。
-static HWND LaunchAppForeground(const wchar_t* path) {
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    if (!CreateProcessW(path, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return NULL;
-    DWORD newPid = pi.dwProcessId;
-    if (pi.hProcess) {
-        WaitForInputIdle(pi.hProcess, 10000);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
-    PumpMs(2500);
+// 用 Ctrl+A / Ctrl+C 把目标控件的真实文本取回到 out。
+// ⚠ 必须先清空剪贴板再发 Ctrl+C：剪贴板里可能还留着别的东西，
+//   目标若没响应 Ctrl+C，我们会读到上一次的旧值并据此误判。
+static BOOL GrabTargetText(wchar_t* out, int cap) {
+    if (!out || cap < 8) return FALSE;
+    out[0] = 0;
+    Clip_Clear();
+    SendKey((BYTE)'A', FALSE, TRUE, FALSE, FALSE);   // Ctrl+A 全选
+    PumpMs(150);
+    SendKey((BYTE)'C', FALSE, TRUE, FALSE, FALSE);   // Ctrl+C 复制
+    PumpMs(600);
+    return Clip_ReadText(out, cap);
+}
 
-    // 直接按 pid 匹配顶层窗口 —— 不用 QueryFullProcessImageNameW，
-    // 那个 API 在 WinXP 上不存在，静态引用会破坏 x86(XP+) 的加载。
-    HWND found = NULL;
-    for (HWND w = GetTopWindow(NULL); w; w = GetNextWindow(w, GW_HWNDNEXT)) {
-        if (!IsWindowVisible(w)) continue;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(w, &pid);
-        if (pid != newPid) continue;
-        found = w;
-        break;
+// ========== 自测目标：用户手动聚焦，探针只管注入 ==========
+// ⚠⚠⚠ **为什么不再由 exe 自动拉起应用**（这是一个被用户一句话点破的设计错误）：
+//
+//   上一版让 exe 自己 CreateProcess 拉起目标再测。问题在于**虚机上能拉起来的
+//   应用，恰好就是那个已知能打中文的应用** —— 系统自带的原版 Win32 记事本。
+//   用户实际失败的是 Win11 上的 Notepad4（Scintilla）和 Edge 地址栏
+//   （Chromium 自绘），虚机上这两个要么根本没有、要么焦点压根落不到输入框。
+//
+//   于是「三个目标」实际测的是：**已知成功的对照组 + 两个坏测量**，
+//   没有任何一个目标复现了 issue #3。上一轮那份「Edge 也 OK」的结论
+//   完全是假阳性（读的是窗口标题里的「用户配置」四个字）。
+//
+//   现在改成：**目标由用户手动准备，探针只负责注入与取证**。
+//   这与真实使用场景完全一致 —— 用户本来就是先点进输入框、再用屏幕键盘打字。
+
+// 把当前前台窗口的完整指纹写进日志，并**明确报告焦点是否落在输入控件上**。
+// ⚠ 上一轮就是因为没做这个自证，才把「焦点在网页上」误读成「Edge 通过」。
+static HWND LogForegroundFingerprint(ProbeLog* L, const char* tag) {
+    HWND fg = GetForegroundWindow();
+    char cls[128] = {0};
+    if (fg) GetClassNameA(fg, cls, 128);
+    DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
+    wchar_t title[192] = {0};
+    if (fg) GetWindowTextW(fg, title, 192);
+    wchar_t titleEsc[512]; FillEscaped(titleEsc, 512, title);
+
+    GUITHREADINFO gi;
+    ZeroMemory(&gi, sizeof(gi));
+    gi.cbSize = sizeof(gi);
+    HWND focus = NULL;
+    if (tidFg && GetGUIThreadInfo(tidFg, &gi)) focus = gi.hwndFocus;
+    wchar_t fcls[64] = {0};
+    if (focus) GetClassNameW(focus, fcls, 64);
+
+    // 焦点是否「看起来像个能承载文本的控件」。
+    // ⚠ 这只是启发式判断，不能作为结论 —— Chromium/Scintilla 都是自绘控件，
+    //   焦点落在顶层窗口上也可能是正常的。所以最终判据仍然是剪贴板读回。
+    BOOL looksEditable =
+        wcscmp(fcls, L"Edit") == 0 || wcscmp(fcls, L"RichEdit20W") == 0 ||
+        wcscmp(fcls, L"RichEdit50W") == 0 || wcscmp(fcls, L"RICHEDIT") == 0 ||
+        wcscmp(fcls, L"TMemo") == 0 || wcscmp(fcls, L"SysEdit32") == 0 ||
+        wcscmp(fcls, L"Scintilla") == 0;
+
+    ProbeFmt(L, "\n  [%s] foreground=0x%llx class=%s\n", tag,
+             (unsigned long long)(ULONG_PTR)fg, cls);
+    ProbeFmt(L, "  [%s] title='%ls'\n", tag, titleEsc);
+    ProbeFmt(L, "  [%s] keyboardLayout=0x%llx (0x08040804 = zh-CN)\n", tag,
+             (unsigned long long)(ULONG_PTR)hkl);
+    ProbeFmt(L, "  [%s] focus=0x%llx class='%ls' %s\n", tag,
+             (unsigned long long)(ULONG_PTR)focus, fcls,
+             looksEditable ? "(looks like a text control)" : "(SELF-DRAWN or top-level; normal for Chromium/Scintilla)");
+    ProbeFmt(L, "  [%s] imeUI(candidate window) visible=%d\n", tag,
+             ProbeImeUiWindow() ? 1 : 0);
+    return fg;
+}
+
+// 期望结果：拼音 nihao + 空格，中文态下「你」「好」两字必须上屏。
+//
+// ⚠ 判定用「结尾是否为『你好』」而不是「全文精确等于某串」。
+//   原因：上一轮实测读回的是「啊你好」—— 比你预期的多一个「啊」。
+//   那个多出来的「啊」本身就是一条线索（怀疑是 Ctrl+A 修饰键在某处漏了一个
+//   字面量 'a' 进去，恰好被 IME 组成了「啊」），不能把它当成正常结果、
+//   更不能写死成期望值，否则真正的 bug 会被「精确匹配」这个判据掩盖掉。
+//   现在分开报告两件事：① 中文有没有组字上屏（issue #3 本体）
+//   ② 有没有多出意料之外的字（另一个待查问题）。
+static const wchar_t kExpectTail[] = L"\x4F60\x597D";   // 「你好」
+
+static BOOL EndsWithW(const wchar_t* s, const wchar_t* tail) {
+    size_t ls = wcslen(s), lt = wcslen(tail);
+    if (lt > ls) return FALSE;
+    return wcscmp(s + (ls - lt), tail) == 0;
+}
+
+static void RunOneInjectionRound(ProbeLog* L, int round, BOOL viaMouseClick) {
+    ClipBackup bak;
+    Clip_Save(&bak);
+
+    // 清空目标：Ctrl+A 然后 Delete。两步之间留间隔，让控件真正处理完。
+    SendKey((BYTE)'A', FALSE, TRUE, FALSE, FALSE);
+    PumpMs(200);
+    SendKey(VK_DELETE, FALSE, FALSE, FALSE, FALSE);
+    PumpMs(400);
+
+    LogForegroundFingerprint(L, viaMouseClick ? "pre-click" : "pre-sendkey");
+
+    // 注入 nihao（不送空格，先看 IME 有没有开始组字）
+    static const char kWant[] = "nihao";
+    for (const char* s = kWant; *s; s++) {
+        BYTE vk = (BYTE)toupper((unsigned char)*s);
+        if (viaMouseClick) ClickKeyByVk(vk);
+        else             SendKey(vk, FALSE, FALSE, FALSE, FALSE);
     }
-    if (found) {
-        ShowWindow(found, SW_RESTORE);
-        BringWindowToTop(found);
-        SetForegroundWindow(found);
-        SetActiveWindow(found);
-        PumpMs(800);
-        if (GetForegroundWindow() != found) {
-            SetForegroundWindow(found);
-            SetActiveWindow(found);
-            PumpMs(600);
+    PumpMs(500);
+
+    // 此刻 IME 应当正在组字，候选窗应该存在。
+    // 这是「键到底有没有送到 IME」与「IME 收到但没组字」的唯一分界点。
+    BOOL imeUi = ProbeImeUiWindow();
+    ProbeFmt(L, "  [round %d] after 5 letters: imeUI visible=%d  %s\n", round,
+             imeUi ? 1 : 0,
+             imeUi ? "<- IME IS composing (keys reached the IME)"
+                   : "<- NO candidate window: IME never started composing");
+
+    // 送空格上屏
+    if (viaMouseClick) ClickKeyByVk(VK_SPACE);
+    else             SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
+    PumpMs(700);
+
+    // 跨进程取证：Ctrl+A / Ctrl+C 把目标里的真实文本读回来
+    wchar_t got[512] = {0};
+    BOOL gotOk = GrabTargetText(got, 512);
+
+    wchar_t esc[1024]; FillEscaped(esc, 1024, got);
+    const char* verdict;
+    if (!gotOk) {
+        verdict = "UNVERIFIABLE (clipboard readback failed; target may ignore Ctrl+C)";
+    } else if (got[0] == 0) {
+        verdict = "FAIL (target received NOTHING - keys were swallowed before the IME)";
+    } else if (EndsWithW(got, kExpectTail)) {
+        verdict = "PASS (Chinese composed and committed)";
+    } else {
+        BOOL allAscii = TRUE;
+        for (int i = 0; got[i]; i++) if (got[i] > 0x7F) allAscii = FALSE;
+        verdict = allAscii
+            ? "FAIL (raw ASCII came through - IME did NOT compose at all)"
+            : "FAIL (some CJK, but not ending in the expected 2 chars)";
+    }
+    ProbeFmt(L, "  [round %d] %s\n", round,
+             viaMouseClick ? "via simulated MOUSE CLICK on the on-screen key"
+                           : "via direct SendKey        ");
+    ProbeFmt(L, "  [round %d] readback='%ls'\n", round, esc);
+    ProbeFmt(L, "  [round %d] VERDICT: %s\n", round, verdict);
+    // 额外线索：期望只有「你好」两个字，实际多出来的部分单独报出来，
+    // 免得它混在 PASS 里被忽略（例如多出一个被 Ctrl+A 修饰键漏出去的「啊」）。
+    if (EndsWithW(got, kExpectTail)) {
+        size_t ls = wcslen(got), lt = wcslen(kExpectTail);
+        if (ls > lt) {
+            wchar_t extra[64] = {0};
+            wcsncpy_s(extra, 64, got, ls - lt);
+            wchar_t eesc[256]; FillEscaped(eesc, 256, extra);
+            ProbeFmt(L, "  [round %d] NOTE: %d extra char(s) before the expected text: '%ls'\n",
+                     round, (int)(ls - lt), eesc);
         }
     }
-    return found;
+    ProbeFmt(L, "  [round %d] imeUI after commit=%d\n\n", round, ProbeImeUiWindow() ? 1 : 0);
+
+    Clip_Restore(&bak);
 }
 
 static void RunImeProbe() {
@@ -6620,7 +6791,7 @@ static void RunImeProbe() {
     wchar_t exepath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exepath, MAX_PATH);
 
-    ProbeFmt(&L, "\n=== self-probe (FULL INIT, MULTI-TARGET) ===\n");
+    ProbeFmt(&L, "\n=== self-probe (FULL INIT, USER-SUPPLIED TARGET) ===\n");
     ProbeFmt(&L, "exe=%ls\n", exepath);
     ProbeFmt(&L, "pid=%lu\n", GetCurrentProcessId());
 
@@ -6645,137 +6816,45 @@ static void RunImeProbe() {
              (unsigned long long)(ULONG_PTR)g_hWnd,
              g_hWnd ? IsWindowVisible(g_hWnd) : 0,
              (unsigned long long)(ULONG_PTR)GetWindowLongW(g_hWnd, GWL_EXSTYLE));
+
+    // ⚠ 泵消息**之前**打一次 COM 状态：此时尚未初始化，必然是 -1(CURRENT)，
+    //   这本身不是异常，只是给后面的复查做对照。
+    typedef HRESULT (WINAPI *GetAptT)(int*, int*);
+    HMODULE ole = GetModuleHandleW(L"ole32.dll");
+    GetAptT fApt = ole ? (GetAptT)GetProcAddress(ole, "CoGetApartmentType") : NULL;
     {
-        typedef HRESULT (WINAPI *GetAptT)(int*, int*);
-        HMODULE ole = GetModuleHandleW(L"ole32.dll");
-        GetAptT f = ole ? (GetAptT)GetProcAddress(ole, "CoGetApartmentType") : NULL;
-        if (f) {
-            int t = -99, q = -99;
-            f(&t, &q);
-            const char* names[] = { "STA", "MTA", "NA", "MAINSTA", "ROAMSTA" };
-            const char* nm = (t >= 0 && t <= 4) ? names[t] : "?";
-            ProbeFmt(&L, "apartment=%s (%d)  0=STA 1=MTA\n", nm, t);
-        } else {
-            ProbeFmt(&L, "apartment=? (CoGetApartmentType unavailable)\n");
-        }
+        int t = -99, q = -99;
+        if (fApt) fApt(&t, &q);
+        ProbeFmt(&L, "apartment BEFORE pump=%d (-1 = CURRENT, expected: COM not yet init'd)\n", t);
     }
 
     ProbeFmt(&L, "pumping 700ms so TIMER_FOCUS/hooks run (STA COM init happens there)...\n");
     PumpMs(700);
 
-    // 三个目标：系统记事本（已知成功）/ Edge 地址栏 / Notepad4。
-    // 全部由 exe 自己拉起，不依赖用户手工准备。
-    struct Target { wchar_t name[32]; wchar_t path[MAX_PATH]; };
-    Target targets[3];
-    ZeroMemory(targets, sizeof(targets));
-
-    GetSystemDirectoryW(targets[0].path, MAX_PATH);
-    wcscat_s(targets[0].path, L"\\notepad.exe");
-    wcscpy_s(targets[0].name, 32, L"notepad");
-
+    // ⚠ 泵消息**之后**必须再打一次 —— 上一版改造时把这次复查弄丢了，
+    //   于是上一轮结果里那个孤零零的 apartment=(-1) 看着像异常，
+    //   实际上只是打印时机在泵消息之前。
     {
-        const wchar_t* edges[] = {
-            L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-            L"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
-        };
-        for (int i = 0; i < 2; i++)
-            if (GetFileAttributesW(edges[i]) != INVALID_FILE_ATTRIBUTES) {
-                wcscpy_s(targets[1].path, MAX_PATH, edges[i]);
-                break;
-            }
-        wcscpy_s(targets[1].name, 32, L"msedge");
-    }
-    {
-        const wchar_t* np4[] = {
-            L"C:\\Program Files\\Notepad4\\Notepad4.exe",
-            L"C:\\Program Files (x86)\\Notepad4\\Notepad4.exe",
-            L"C:\\Notepad4\\Notepad4.exe"
-        };
-        for (int i = 0; i < 3; i++)
-            if (GetFileAttributesW(np4[i]) != INVALID_FILE_ATTRIBUTES) {
-                wcscpy_s(targets[2].path, MAX_PATH, np4[i]);
-                break;
-            }
-        wcscpy_s(targets[2].name, 32, L"Notepad4");
+        int t = -99, q = -99;
+        if (fApt) fApt(&t, &q);
+        const char* names[] = { "STA", "MTA", "NA", "MAINSTA", "ROAMSTA" };
+        const char* nm = (t >= 0 && t <= 4) ? names[t] : "?";
+        ProbeFmt(&L, "apartment AFTER pump=%s (%d)  0=STA 1=MTA\n", nm, t);
     }
 
-    for (int t = 0; t < 3; t++) {
-        if (!targets[t].path[0]) {
-            ProbeFmt(&L, "\n===== TARGET %ls: NOT INSTALLED (skipped) =====\n", targets[t].name);
-            continue;
-        }
-        ProbeFmt(&L, "\n===== TARGET %ls =====\n", targets[t].name);
+    ProbeFmt(&L, "\n*** TARGET = whatever window is in the foreground NOW. ***\n");
+    ProbeFmt(&L, "*** Switch to the app that fails, click into its text field,  ***\n");
+    ProbeFmt(&L, "*** then come back and run this probe. Do NOT touch anything   ***\n");
+    ProbeFmt(&L, "*** for 20 seconds - it types 'nihao'+Space on its own.        ***\n");
 
-        HWND app = LaunchAppForeground(targets[t].path);
-        if (!app) {
-            ProbeFmt(&L, "!! failed to launch or locate its window\n");
-            continue;
-        }
+    LogForegroundFingerprint(&L, "initial");
 
-        HWND fg = GetForegroundWindow();
-        char cls[128] = {0};
-        GetClassNameA(fg, cls, 128);
-        DWORD tidFg = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
-        HKL hkl = tidFg ? GetKeyboardLayout(tidFg) : NULL;
-        wchar_t title[128] = {0};
-        GetWindowTextW(fg, title, 128);
-        wchar_t titleEsc[512]; FillEscaped(titleEsc, 512, title);
-
-        ProbeFmt(&L, "appHwnd=0x%llx foreground=0x%llx class=%s%s\n",
-                 (unsigned long long)(ULONG_PTR)app,
-                 (unsigned long long)(ULONG_PTR)fg, cls,
-                 (fg == app) ? "  (OK)" : "  (NOT foreground - SetForegroundWindow blocked)");
-        ProbeFmt(&L, "foregroundTitle='%ls'\n", titleEsc);
-        ProbeFmt(&L, "keyboardLayout=0x%llx (0x08040804 = zh-CN)\n",
-                 (unsigned long long)(ULONG_PTR)hkl);
-
-        GUITHREADINFO gi;
-        ZeroMemory(&gi, sizeof(gi));
-        gi.cbSize = sizeof(gi);
-        HWND target = fg;
-        if (GetGUIThreadInfo(tidFg, &gi) && gi.hwndFocus) target = gi.hwndFocus;
-        wchar_t tcls[64] = {0};
-        GetClassNameW(target, tcls, 64);
-        ProbeFmt(&L, "focusTarget=0x%llx class=%ls\n",
-                 (unsigned long long)(ULONG_PTR)target, tcls);
-
-        ProbeImeState(&L, target, "before");
-
-        for (int round = 1; round <= 2; round++) {
-            // 清空：Ctrl+A + Delete
-            SendKey(VK_CONTROL, FALSE, TRUE, FALSE, FALSE);
-            SendKey((BYTE)'A', FALSE, FALSE, FALSE, FALSE);
-            SendKey(VK_DELETE, FALSE, FALSE, FALSE, FALSE);
-            PumpMs(300);
-
-            static const char kWant[] = "nihao";
-            if (round == 1) {
-                for (const char* s = kWant; *s; s++)
-                    SendKey((BYTE)toupper((unsigned char)*s), FALSE, FALSE, FALSE, FALSE);
-                SendKey(VK_SPACE, FALSE, FALSE, FALSE, FALSE);
-            } else {
-                for (const char* s = kWant; *s; s++)
-                    ClickKeyByVk((BYTE)toupper((unsigned char)*s));
-                ClickKeyByVk(VK_SPACE);
-            }
-            PumpMs(700);
-
-            ProbeImeState(&L, target, round == 1 ? "after-round1" : "after-round2");
-
-            wchar_t buf[256] = {0};
-            SendMessageTimeoutW(target, WM_GETTEXT, (WPARAM)256,
-                                (LPARAM)(ULONG_PTR)buf, SMTO_ABORTIFHUNG, 1500, NULL);
-            wchar_t shown[1024]; FillEscaped(shown, 1024, buf);
-            BOOL anyCjk = FALSE;
-            for (int i = 0; buf[i]; i++)
-                if (buf[i] >= 0x4E00 && buf[i] <= 0x9FFF) anyCjk = TRUE;
-
-            ProbeFmt(&L, "  [%d] %s text='%ls' => %s\n", round,
-                     round == 1 ? "direct SendKey" : "mouse click     ",
-                     shown,
-                     anyCjk ? "OK CJK composed"
-                            : (buf[0] ? "FAIL raw ASCII, IME did not compose" : "FAIL nothing received"));
-        }
+    HWND fg = GetForegroundWindow();
+    if (!fg) {
+        ProbeFmt(&L, "\n!! no foreground window at all - cannot test\n");
+    } else {
+        RunOneInjectionRound(&L, 1, FALSE);   // 直接 SendInput
+        RunOneInjectionRound(&L, 2, TRUE);    // 走完整点键路径
     }
 
     if (L.bad) ProbeFmt(&L, "\n!! write error %lu occurred\n", L.err);

@@ -646,36 +646,49 @@ static const char* AfClsName(HWND h) {
     return buf;
 }
 
+// ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
+//   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
+//   文件被创建（BOM 在），但 fprintf 一个字都没落盘，实测三次都是空文件。
+//   与其继续跟 CRT 的 `ccs` 转码较劲，直接拿内核 API 追加，行为完全可控。
+//   日志内容全是 ASCII，也不需要任何编码转换。
+static void AfWriteRaw(const char* line) {
+    if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
+    HANDLE h = CreateFileW(g_afLogPath, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(h, line, (DWORD)strlen(line), &wr, NULL);
+    CloseHandle(h);
+    g_afLogLines++;
+}
+
 static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                   BOOL recentClick, BOOL clickInFg, BOOL byKey,
                   BOOL await, BOOL vis, BOOL motion, const char* decision) {
     if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
-    FILE* f = NULL;
-    if (_wfopen_s(&f, g_afLogPath, L"a, ccs=UTF-8") != 0 || !f) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(f,
-            "%02d:%02d:%02d.%03d %-7s fg=%-24s fgTop=%p click=%p(%-20s) "
-            "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d => %s\n",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
-            AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
-            AfClsName(g_lastClickTopHwnd), (int)recentClick, (int)clickInFg,
-            (int)byKey, (int)await, (void*)input, (int)vis, (int)motion, decision);
-    fclose(f);
-    g_afLogLines++;
+    char buf[400];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "%02d:%02d:%02d.%03d %-7s fg=%-24s fgTop=%p click=%p(%-20s) "
+                "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d => %s\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
+                AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
+                AfClsName(g_lastClickTopHwnd), (int)recentClick, (int)clickInFg,
+                (int)byKey, (int)await, (void*)input, (int)vis, (int)motion, decision);
+    AfWriteRaw(buf);
 }
 
 // 直接写一行（不带那些字段，用于阶段标记）
 static void AfNote(const char* text) {
     if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
-    FILE* f = NULL;
-    if (_wfopen_s(&f, g_afLogPath, L"a, ccs=UTF-8") != 0 || !f) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(f, "%02d:%02d:%02d.%03d === %s\n", st.wHour, st.wMinute, st.wSecond,
-            st.wMilliseconds, text);
-    fclose(f);
-    g_afLogLines++;
+    char buf[256];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%02d:%02d:%02d.%03d === %s\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, text);
+    AfWriteRaw(buf);
 }
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
@@ -7381,10 +7394,11 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         wchar_t* sl = wcsrchr(lp, L'\\');
         if (sl) *(sl + 1) = 0;
         wcscat_s(lp, MAX_PATH, L"afdiag.txt");
-        // 只在这里清一次文件（用 "w"），之后全部走追加
-        FILE* f0 = NULL;
-        if (_wfopen_s(&f0, lp, L"w, ccs=UTF-8") == 0 && f0) fclose(f0);
+        // 先把路径存好（AfNote 要用），再用 CREATE_ALWAYS 清一次文件
         wcscpy_s(g_afLogPath, MAX_PATH, lp);
+        HANDLE h0 = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h0 != INVALID_HANDLE_VALUE) CloseHandle(h0);
         {
             char buf[160];
             _snprintf_s(buf, 160, _TRUNCATE,

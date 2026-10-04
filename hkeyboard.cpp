@@ -497,6 +497,7 @@ static void HandleCloseAction(HWND hWnd);
 static void ExitApplicationAnimated();
 static void OpenClosePrompt();
 static void RecreateFontsAndLayout();
+static void InvalidateFitTier(void);      // 作废「同宽键统一字号」的缓存（见 FitUnifiedTier）
 static double GetSystemDpiScale();
 static void InitWindowSizeForDpi();
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
@@ -1010,11 +1011,24 @@ static int FullColX(float col, double u, int gap, const float* bc, int nb) {
 // 放一个键：宽度由「列位到列位」直接相减，不再由「本行键数」除出来。
 // base 是这一块（主区 0 / 导航区 15 / 数字区 18）的起始列，表里写块内列位更好读，
 // 但换算必须用全局列位 —— 否则导航区/数字区会被画到主区左边那一列上。
+//
+// ⚠⚠ 2026-10-04 修：宽度**不能**用 `FullColX(c1) - FullColX(c0) - gap`。
+//   FullColX 里含「跨块补偿 b*gap」，而 bc 的取值恰好是下一块的起始列
+//   （bc = {15, 18}，导航区起点 15、数字区起点 18）。于是**右端正好落在块边界上的
+//   那一列**（导航区第 3 列 = Pause/PgUp/PgDn、主区每行最后一列、数字区最后一列）
+//   会凭空多吃一个 gap —— 实测导航区三列宽 57/58/**63**，第三列多 6px。
+//   后果不是"看起来挤"，而是**同一排 1u 键宽度不等 → FitKeyFont 逐键选档时
+//   窄列的 ScrLk / Home 被降档，字号比同排的 Pause 小一号**（用户实机截图）。
+//
+//   ⇒ 宽度改为只按「列位差 × u」算，跨块补偿只作用于 x 起点（那是它本来的用途：
+//     把导航区/数字区整体右移，让开块间间隙）。
 static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, int gap,
                     const float* bc, int nb) {
-    int xa = FullColX(base + s.col, u, gap, bc, nb);
-    int xb = FullColX(base + s.col + s.w, u, gap, bc, nb);
-    AddKey(xa, yy, xb - xa - gap, kh, s.vk, s.type);
+    float c0 = base + s.col, c1 = c0 + s.w;
+    int xa = FullColX(c0, u, gap, bc, nb);
+    int w  = (int)floor(c1 * u + 0.5) - (int)floor(c0 * u + 0.5) - gap;
+    if (w < 1) w = 1;
+    AddKey(xa, yy, w, kh, s.vk, s.type);
 }
 
 // ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）--------------------
@@ -1535,6 +1549,7 @@ static void BuildFnSurf(int y, double u) {
 
 static void BuildKeys() {
     g_nk = 0;
+    InvalidateFitTier();          // 键位几何变了，缓存的「同宽键统一档位」必须重算
 
     double dpiScale = GetSystemDpiScale();
     double baseW = 980.0 * dpiScale;
@@ -2219,6 +2234,79 @@ static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW) {
     for (int i = 0; i < 8; i++)
         if (ladder[i] && MeasureTextW(dc, s, ladder[i]) <= maxW) return ladder[i];
     return g_f6;
+}
+
+// ===== 同宽键的字号必须一致（2026-10-04）=====
+//
+// ⚠ FitUnifiedTier 要遍历全盘键读它们的标签与「有没有图形」，这两个函数定义在
+//   本文件更靠后的位置（KeyText / KeyHasGlyph），必须在此前置声明 —— 否则 C2065。
+static const wchar_t* KeyText(const KeyDef* k);
+static BOOL KeyHasGlyph(const KeyDef* k);
+
+// 统一档位的缓存：**每帧每个键只算一次**。
+// 代价说明：FitUnifiedTier 单次要遍历全盘键（约 120）× 8 档 MeasureString，
+// 若每个键都独立调用，一帧就是上千次 GDI+ 量宽 —— 绘制会明显变卡。
+// 这里按「键索引」缓存本帧结果，绘制循环里每个键最多算一次（约 120×8 次），
+// 且绘制结束后（下一次按键/改布局/改字体时）自动作废。
+static int  g_fitTierCache[MAX_KEYS];
+static BOOL g_fitTierValid = FALSE;
+
+void InvalidateFitTier(void) { g_fitTierValid = FALSE; }
+//
+// 症状：全尺寸布局的导航区一排三个 1u 键里，ScrLk 与 Home 的字号比 Pause 小一号。
+//
+// 成因不是宽度本身，而是 FitKeyFont **逐键独立**选档：这一排三个键的标签宽度只差
+// 几个像素（PrtSc 34 / ScrLk 35 / Pause 40），可用宽又刚好卡在某一档的边界上，于是
+// 宽度稍大的 ScrLk / Home 被判「放不下」而降到下一档。同样的标签在别的窗口宽度下
+// 又能放下 —— 于是「有时候齐、有时候不齐」，很难靠调阈值稳定。
+//
+// ⇒ 改为**按标签所在的一组同宽键统一取档**：把该组里所有标签都放不下的最大档位
+//   算出来（也就是取最保守的那个），整组共用。这样：
+//     · 同一排 / 同一区块里所有 1u 键字号必然相同（观感统一）
+//     · 仍然保证每个标签都完整（取的是组内最严要求，不会截字）
+//   代价是个别标签会「比它本来能用的字号略小一点」—— 用一致性换这半档，值。
+//
+// 只在「标签是纯文字」时生效（图标+文字组合另有 DrawKeyLabel 的阶梯），
+// 且只在同一 y 行、同一 x 区段内比较，避免把退格这种宽键和小键混为一谈。
+static int FitTierForText(HDC dc, const wchar_t* s, int maxW) {
+    HFONT ladder[8] = { g_f14, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
+    for (int i = 0; i < 8; i++)
+        if (ladder[i] && MeasureTextW(dc, s, ladder[i]) <= maxW) return i;
+    return 7;                                   // 地板档
+}
+
+// 取「本键所在同宽键组」统一后的档位。groupW = 组内键宽，maxW = 本键可用宽。
+static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
+    int worst = FitTierForText(dc, KeyText(self), selfMaxW);
+    int gw = self->w;
+    int gx0 = self->x, gx1 = self->x + self->w;
+    for (int i = 0; i < g_nk; i++) {
+        const KeyDef* k = &g_keys[i];
+        if (k->w != gw) continue;                // 只看同宽键
+        if (k->y != self->y) continue;           // 只看同一行
+        if (k->x < gx0 - gw || k->x > gx1 + gw) continue;   // 同一区段（左右各一格容差）
+        if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
+        const wchar_t* s = KeyText(k);
+        if (!s || !s[0]) continue;
+        int t = FitTierForText(dc, s, k->w - (int)(6 * GetSystemDpiScale()));
+        if (t > worst) worst = t;                // 取最严（档位序号越大字号越小）
+    }
+    return worst;
+}
+
+static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_t* s, int maxW) {
+    if (!s || !s[0] || maxW <= 0) return g_f14;
+    HFONT ladder[8] = { g_f14, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
+    if (!g_fitTierValid) {
+        for (int i = 0; i < MAX_KEYS; i++) g_fitTierCache[i] = -1;
+        g_fitTierValid = TRUE;
+    }
+    int t = g_fitTierCache[idx];
+    if (t < 0) {
+        t = FitUnifiedTier(dc, self, maxW);
+        g_fitTierCache[idx] = t;
+    }
+    return ladder[t] ? ladder[t] : g_f6;
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -3464,7 +3552,9 @@ static void DrawKeys(HDC dc) {
         // 放不下时按 FitKeyFont 降档 —— 全尺寸布局的导航区只有 1u 宽。
         // 全部键（含退格）走同一个降档阶梯：不再给退格单独用大号字，
         // 否则「Backspace」这个长词会顶出键帽。
-        HFONT f = FitKeyFont(dc, txt, k->w - (int)(6 * GetSystemDpiScale()));
+        // 同宽键统一字号（见 FitUnifiedTier 的说明）：否则同一排里 ScrLk / Home
+        // 会因为标签稍宽而单独降一档，与旁边的 Pause 不齐。
+        HFONT f = FitKeyFontUnified(dc, i, k, txt, k->w - (int)(6 * GetSystemDpiScale()));
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
         // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
@@ -3500,7 +3590,11 @@ static void DrawKeys(HDC dc) {
             DrawTextKey(dc, k, txt, f, textC);
         }
     }
+    // 下一帧的档位缓存作废：本帧算出来的统一档位只对**当前几何与字体**有效，
+    // 而按下 Shift / Fn、改变窗口大小、改配色都会让键面标签或可用宽变化。
+    InvalidateFitTier();
 }
+
 static int HitKey(int x, int y) {
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];

@@ -6102,12 +6102,58 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
     return FALSE;
 }
 
+// 目标窗口所属线程是否还在正常处理消息。
+//
+// ⚠⚠ 存在的理由（用户实测的「自动呼出卡死」）：
+//   下面 IsAccessibleInputWindow 里的 AccessibleObjectFromWindow 是**跨进程
+//   COM 调用**，目标进程一旦无响应（弹模态框、正在启动、死循环），它会阻塞
+//   很久甚至不返回。而这个探测由 **50ms 的焦点轮询**驱动 ——
+//
+//     UI 线程僵死
+//       → WM_TIMER 得不到处理（它在消息队列里优先级很低）
+//       → 窗口滑动动画停在半路，g_mainMotion.active 一直是 TRUE
+//       → UpdateAutoVisibility 开头那道「动画期间不评估」的保护**永久生效**
+//       → 自动呼出彻底失效
+//
+//   症状完全吻合用户的描述：**整个程序完全无响应**、**有时恢复有时不恢复**
+//   （目标恢复响应 / 永久挂着）、**切换窗口和长时间没用后最容易出现**。
+//
+//   SMTO_ABORTIFHUNG 会在目标 hung 时立刻返回，把「无限期阻塞」压成
+//   「有界的最多 timeoutMs」。这一步挡在 COM 调用之前，是性价比最高的防线。
+static BOOL IsWindowResponsive(HWND hw, UINT timeoutMs) {
+    if (!hw || !IsWindow(hw)) return FALSE;
+    DWORD_PTR res = 0;
+    return SendMessageTimeoutW(hw, WM_NULL, 0, 0,
+                               SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                               timeoutMs, &res) != 0;
+}
+
 static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
+    // ⚠ 先确认目标还活着，再做跨进程 COM 探测（见 IsWindowResponsive 的说明）。
+    //   100ms 是权衡值：正常进程的 WM_NULL 在 1ms 内返回，繁忙进程几十毫秒也够；
+    //   真 hung 的会被 SMTO_ABORTIFHUNG 立刻打回。
+    if (!IsWindowResponsive(hWnd, 100)) return FALSE;
+
     AccessibleObjectFromWindowProc proc = GetAccessibleObjectFromWindow();
     if (!proc || !EnsureAccessibilityCom() || !hWnd) return FALSE;
 
+#ifdef HK_DIAG
+    LONGLONG probeT0 = QpcNowMs();
+#endif
     IAccessible* root = NULL;
     HRESULT hr = proc(hWnd, OBJID_CLIENT, IID_IAccessibleLocal, (void**)&root);
+#ifdef HK_DIAG
+    // 记一笔慢探测：即使做了响应性预检，COM 调用仍可能因为树很大而慢。
+    // 排查「卡死」时先看 diag.txt 里有没有这行 —— 有就说明元凶在这。
+    {
+        LONGLONG dt = QpcNowMs() - probeT0;
+        if (dt >= 150) {
+            wchar_t buf[64] = {0};
+            _snwprintf_s(buf, 64, _TRUNCATE, L"[slowprobe] %lld ms", dt);
+            DiagSnap(buf);
+        }
+    }
+#endif
     if (FAILED(hr) || !root) return FALSE;
 
     ULONG_PTR detected = 0;
@@ -6204,7 +6250,29 @@ static void UpdateAutoVisibility() {
     if (!g_af || !g_hWnd) return;
     // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
     // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
-    if (g_mainMotion.active) return;
+    if (g_mainMotion.active) {
+        // ⚠⚠ 兜底：动画靠 WM_TIMER（15ms）推进，而 WM_TIMER 在消息队列里
+        //   优先级很低 —— 一旦 UI 线程被跨进程调用阻塞过久，定时器没能收尾，
+        //   `g_mainMotion.active` 就会一直是 TRUE，上面那道 return 于是让
+        //   **自动呼出永久失效**。这正是用户实测「有时候不会恢复」的路径。
+        //   这里按时间戳补一次收尾，保证无论定时器发生什么都能自愈。
+        //   余量给足（动画时长 + 1000ms），避免误判正常的慢帧。
+        if (QpcNowMs() - g_mainMotion.started >
+            (LONGLONG)g_mainMotion.duration + 1000) {
+            HWND mh = g_mainMotion.hWnd;
+            WindowMotionFinish f = g_mainMotion.finish;
+            int mx = g_mainMotion.x, my = g_mainMotion.toY;
+            g_mainMotion.active = FALSE;          // 先清标志，避免重入
+            if (mh && IsWindow(mh)) {
+                KillTimer(mh, TIMER_WINDOW_ANIM);
+                SetWindowPos(mh, HWND_TOPMOST, mx, my, 0, 0,
+                             SWP_NOSIZE | SWP_NOACTIVATE);
+                if (f == MOTION_HIDE) ShowWindow(mh, SW_HIDE);
+                else if (f == MOTION_DESTROY) DestroyWindow(mh);
+            }
+        }
+        return;
+    }
 
     HWND input = GetFocusedInputControl();
     if (input) {

@@ -664,6 +664,11 @@ static int g_dbgAccFound = -1;
 //   `g_vis` 只是软件标志位，和 `IsWindowVisible` 可能不一致。
 static int g_dbgVisWnd = -1;
 static int g_dbgRc[4] = {0, 0, 0, 0};
+// 诊断：ShowKB 的调用来源（调用点自己设，ShowKB 里读出）。
+// ⚠ 用户日志里 SHOW/HIDE 成对交替、且都是 isManual=TRUE —— 最像
+//   「有东西在反复启动第二个实例，触发了 WM_SHOW_KEYBOARD 转发」。
+//   这个标记能直接指出是谁调的。
+static const char* g_dbgShowFrom = "(startup)";
 
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
 //   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
@@ -3514,9 +3519,14 @@ static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
 
 static void ShowKB(BOOL show, BOOL isManual) {
     // 诊断（-afdiag）：谁在显示/隐藏键盘
-    AfLog("ShowKB", GetForegroundWindow(), NULL,
-          isManual ? (HWND)1 : NULL, 0, 0, 0, isManual, g_vis,
-          g_mainMotion.active, show ? "SHOW" : "HIDE");
+    {
+        char sb[96];
+        _snprintf_s(sb, sizeof(sb), _TRUNCATE, "%s|manual=%d",
+                    g_dbgShowFrom, (int)isManual);
+        AfLog("ShowKB", GetForegroundWindow(), NULL, NULL, 0, 0, 0, 0, g_vis,
+              g_mainMotion.active, sb);
+        g_dbgShowFrom = "(?)";
+    }
     if (!g_hWnd) return;
     if (g_exiting && show) return;
     RECT work = {0};
@@ -6148,7 +6158,7 @@ static void ShowMenu(HWND hWnd) {
     DestroyMenu(m);
 
     if (id == ID_MENU_TOGGLE) {
-        ToggleKB();
+        g_dbgShowFrom = "tray-menu2"; ToggleKB();
     } else if (id == ID_MENU_AUTO) {
         g_af = !g_af;
         IniSetInt(L"General", L"AutoPopup", g_af ? 1 : 0);
@@ -6877,6 +6887,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         UpdateAutoVisibility();
         return 0;
     case WM_SHOW_KEYBOARD:
+        // 诊断：这个分支来自单实例消息转发 —— 每次有第二个 HKeyboard 启动，
+        // 就会往已有实例发这条消息（w = 新实例是否要求隐藏）。
+        g_dbgShowFrom = "WM_SHOW_KEYBOARD";
         if (w) {
             ApplyTheme();
             ShowKB(TRUE, TRUE);
@@ -6980,7 +6993,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(w)) {
-        case ID_MENU_TOGGLE: ToggleKB(); break;
+        case ID_MENU_TOGGLE: g_dbgShowFrom = "tray-menu"; ToggleKB(); break;
         case ID_MENU_AUTO:
             g_af = !g_af;
             IniSetInt(L"General", L"AutoPopup", g_af ? 1 : 0);
@@ -6994,7 +7007,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_TRAY:
         if (l == WM_LBUTTONUP || l == WM_LBUTTONDBLCLK) {
-            ToggleKB();
+            g_dbgShowFrom = "tray-click"; ToggleKB();
         } else if (l == WM_RBUTTONUP) {
             ShowMenu(hWnd);
         }

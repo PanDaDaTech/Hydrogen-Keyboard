@@ -635,9 +635,10 @@ static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收�
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 static DWORD     g_userHidInTick = 0;    // 手动收起的时刻（防回弹的超时兜底用）
 
-// ⚠⚠ 临时诊断（定位自动呼出问题用，**定位完即删**）：
-//   带 -afdiag 启动时把每次判断的关键量和 ShowKB 的调用来源追加到 afdiag.txt。
-//   不传该参数时 g_afLogPath 为空，除一次判空外零开销。
+// ===== 临时诊断（-afdiag，定位自动呼出问题用）=====
+//   ⚠ 只有带 `-afdiag` 参数启动时才真正工作（此时 g_afLogPath 非空）；
+//     正常启动时 AfLog / AfNote 第一行就 return，g_dbg* 只是被赋值不被读取，
+//     **正式版零开销**（不做文件 IO、不留日志字符串）。定位结束后可整块删除。
 // ⚠ 用**路径**而不是常驻 FILE*：日志改用"每次追加打开、写完即关"。
 //   原因：原来用 `L"w"` 常驻打开，只要有一次重复启动（脚本杀进程的间隙、
 //   手动又点了一次 exe），新实例就会**把已有内容整个截断** ——

@@ -7338,7 +7338,13 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_noClickRepaint  = HasArg(cmd, "-norepaint")  ? TRUE : FALSE;
     // -diag：记录每次字母键注入前后的系统状态到 diag.txt（见 DiagSnap）
     g_diag            = HasArg(cmd, "-diag")       ? TRUE : FALSE;
-    // -afdiag：自动呼出诊断日志（临时，定位完删）
+    // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
+    // 少了这个没法比较（见 DiagSnap 的说明）。
+    if (g_envTest) g_diag = TRUE;
+#endif  // HK_DIAG
+
+    // ⚠ -afdiag 必须放在 #endif **外面** —— 它要能在正式版里工作。
+    //   自动呼出诊断日志（临时，定位完删）
     if (HasArg(cmd, "-afdiag")) {
         wchar_t lp[MAX_PATH] = {0};
         GetModuleFileNameW(NULL, lp, MAX_PATH);
@@ -7347,10 +7353,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         wcscat_s(lp, MAX_PATH, L"afdiag.txt");
         _wfopen_s(&g_afLog, lp, L"w, ccs=UTF-8");
     }
-    // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
-    // 少了这个没法比较（见 DiagSnap 的说明）。
-    if (g_envTest) g_diag = TRUE;
-#endif  // HK_DIAG
 
     BOOL isTouch = IsTouchDevice();
 

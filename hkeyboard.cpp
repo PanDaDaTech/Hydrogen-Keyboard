@@ -610,7 +610,13 @@ BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同�
 BOOL        g_physNum = FALSE;
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
-BOOL        g_afAutoHide = TRUE;       // 自动呼出开启时，收起键盘后同一输入框内不自动回弹（ini: General/AutoHide）
+// 自动隐藏：**点击输入框以外的区域时自动收起键盘**（ini: General/AutoHide）。
+// ⚠ 2026-10-04 语义变更：这个开关原来控制的是"收起后在同一输入框内不自动回弹"
+//   （防回弹），名不副实 —— 用户实测「键盘不会自动隐藏，只能手动最小化」。
+//   现在它管的是**真正的自动隐藏**；防回弹改为**无条件生效**（见 UserHideKeyboard
+//   与 UpdateAutoVisibility 里的说明：它是必要条件，没有它手动收起会立刻被弹回）。
+//   ini 键名沿用 AutoHide，老配置继续可用。
+BOOL        g_afAutoHide = TRUE;
 static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收起（自动收起开启时不回弹）
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
@@ -3466,7 +3472,10 @@ static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 // 最小化只是「暂时不要」，不能等同于「我不想看到它」。
 // 「明确不想看到」的语义由标题栏的 ⏑ 按钮（HideToTray）承担，见其定义。
 static void UserHideKeyboard() {
-    if (g_afAutoHide) {
+    // ⚠ 防回弹记录**无条件生效**（原来受 g_afAutoHide 控制，但那个开关已改为
+    //   管"自动隐藏"）。防回弹是必要条件：没有它，用户手动收起后会被
+    //   UpdateAutoVisibility 立刻弹回来，"手动收起"这个动作就失效了。
+    {
         HWND input = GetFocusedInputControl();
         if (input) {
             g_userHidInInput = TRUE;
@@ -4161,8 +4170,8 @@ static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row) {
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
-    // 常规 Tab 行序（自动收起行仅在自动呼出开启时存在）：
-    //   g_af 开：0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
+    // 常规 Tab 行序（自动隐藏行仅在自动呼出开启时存在）：
+    //   g_af 开：0=自动呼出 1=自动隐藏 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
     //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=界面语言
     // 布局 Tab（「按键图标样式」行已删）：0=键盘布局 1=Fn 网页布局 2=小键盘按钮
     int rowIndex;
@@ -4536,8 +4545,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         if (g_af) {
             RECT ra = SettingsRowRect(m, 1);
             DrawSettingRowContent(dc, m, ra, HKICON_CLOCK, NULL,
-                                  T(L"自动收起", L"Auto Hide"),
-                                  T(L"收起键盘后在同一输入框内不自动弹出", L"Stay hidden after minimizing in the same input"),
+                                  T(L"自动隐藏", L"Auto Hide"),
+                                  T(L"点击输入框以外时自动隐藏键盘", L"Hide the keyboard when clicking outside the input"),
                                   g_sHov == S_HIT_AUTOHIDE, SettingsSwitchTextRight(m, ra));
             DrawSettingSwitch(dc, m, ra, g_afAutoHide, S_HIT_AUTOHIDE);
         }
@@ -6343,12 +6352,30 @@ static void UpdateAutoVisibility() {
     if (input) {
         g_lastNonInput = 0;
         g_manualShow = FALSE;
-        // 自动收起开启：用户刚在该输入框中手动收起时不回弹；
-        // 焦点换到其它输入控件后恢复正常自动呼出（token 同源比较）
-        if (g_afAutoHide && g_userHidInInput &&
+        // 防回弹（**无条件**，见 UserHideKeyboard 的说明）：用户刚在该输入框中
+        // 手动收起时不回弹；焦点换到其它输入控件后恢复正常自动呼出（token 同源比较）
+        if (g_userHidInInput &&
             g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken)
             return;
         g_userHidInInput = FALSE;
+
+        // ⚠⚠ 自动隐藏：用户刚点击了输入框以外的区域 -> 立刻收起键盘。
+        //   这是 g_afAutoHide（"自动隐藏"）真正管的事 —— 用户要的是
+        //   "点到别处就收起来"，而不是"等失去焦点 + 1 秒延迟"。
+        //   · 点在键盘自己 / 设置窗 / 关闭提示窗上 -> 不算"点到了别处"
+        //     （点键盘按键绝不能把键盘收起来）
+        //   · 点在输入控件所属窗口内 -> 不算（浏览器里点页面即在此列）
+        if (g_afAutoHide && g_vis && g_lastClickTick &&
+            GetTickCount() - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS &&
+            !LastClickHitInputWindow(input)) {
+            HWND hit = WindowFromPoint(g_lastClickPt);
+            HWND topHit = hit ? GetAncestor(hit, GA_ROOT) : NULL;
+            if (topHit && topHit != g_hWnd && topHit != g_settingsHwnd &&
+                topHit != g_closePromptHwnd) {
+                ShowKB(FALSE, FALSE);
+                return;
+            }
+        }
 
         // ⚠⚠ 只在"用户刚主动操作过"时才呼出（见 g_lastClickTick 处的说明）。
         //   这样「只是切换窗口看别的东西」不会弹键盘；

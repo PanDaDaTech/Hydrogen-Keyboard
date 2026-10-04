@@ -566,7 +566,7 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
 ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
-int         g_hideDelayMs = 1000;      // 自动隐藏延迟（固定 1 秒，不提供设置）
+int         g_hideDelayMs = 300;       // 失焦后的自动隐藏延迟（用户实测 1 秒太慢，收到 300ms）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
 
 // 语言切换：g_lang=0 简体中文，1 English；返回当前语言对应的文案
@@ -619,6 +619,7 @@ BOOL        g_af = TRUE;
 BOOL        g_afAutoHide = TRUE;
 static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收起（自动收起开启时不回弹）
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
+static DWORD     g_userHidInTick = 0;    // 手动收起的时刻（防回弹的超时兜底用）
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=默认 1=小键盘 2=全尺寸（完整）
@@ -3480,6 +3481,7 @@ static void UserHideKeyboard() {
         if (input) {
             g_userHidInInput = TRUE;
             g_hiddenInputToken = g_detectedInputToken;
+            g_userHidInTick = GetTickCount();
         }
     }
     ShowKB(FALSE, TRUE);
@@ -5060,7 +5062,7 @@ static void LoadConfig() {
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
-    g_hideDelayMs = 1000;   // 自动隐藏延迟固定 1 秒
+    g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
@@ -6357,51 +6359,57 @@ static void UpdateAutoVisibility() {
         if (fgNow != g_lastFg) { g_lastFg = fgNow; g_fgAwaitUserInput = TRUE; }
     }
 
+    DWORD nowTick = GetTickCount();
+
+    // ⚠⚠⚠ 先结算"用户是否刚主动操作过"，**放在所有 return 之前**。
+    //   之前这段在 if (input) 里面、排在那段可能 return 的自动隐藏之后 ——
+    //   一旦自动隐藏提前 return，这次操作就永远解除不了 g_fgAwaitUserInput，
+    //   结果就是「点了输入框也不弹、而且再也弹不出来」。
+    //   用户实测的「点击输入框且窗口在前台时不会自动呼出」正是这条路径。
     HWND input = GetFocusedInputControl();
+    BOOL recentClick  = (g_lastClickTick && nowTick - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS);
+    BOOL byKey        = (g_lastKeyTick && nowTick - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
+    BOOL clickOnInput = (recentClick && input && LastClickHitInputWindow(input));
+    if (byKey || clickOnInput) g_fgAwaitUserInput = FALSE;
+
     if (input) {
         g_lastNonInput = 0;
         g_manualShow = FALSE;
-        // 防回弹（**无条件**，见 UserHideKeyboard 的说明）：用户刚在该输入框中
-        // 手动收起时不回弹；焦点换到其它输入控件后恢复正常自动呼出（token 同源比较）
-        if (g_userHidInInput &&
-            g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken)
-            return;
-        g_userHidInInput = FALSE;
 
-        // ⚠⚠ 自动隐藏：用户刚点击了输入框以外的区域 -> 立刻收起键盘。
-        //   这是 g_afAutoHide（"自动隐藏"）真正管的事 —— 用户要的是
-        //   "点到别处就收起来"，而不是"等失去焦点 + 1 秒延迟"。
+        // 防回弹：用户刚在这个输入框里手动收起过，别立刻弹回来。
+        // ⚠ 2026-10-04 改法：**命中就 return；没命中也不立刻清标记**。
+        //   原来 `g_userHidInInput = FALSE;` 是无条件执行的，而焦点探测返回的
+        //   token 并不总落在同一个东西上（有时是控件、有时是 caret 窗口），
+        //   只要有一次对不上，标记就被清掉、防回弹**永久失效** ——
+        //   用户看到的就是「莫名其妙又弹回来」。现在改为：
+        //   token 对不上也先按住，直到 8 秒超时才放行。
+        if (g_userHidInInput) {
+            if (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken) return;
+            if (nowTick - g_userHidInTick < 8000) return;
+            g_userHidInInput = FALSE;
+        }
+
+        // 自动隐藏：用户刚点击了输入框以外的区域 -> 立刻收起键盘。
         //   · 点在键盘自己 / 设置窗 / 关闭提示窗上 -> 不算"点到了别处"
         //     （点键盘按键绝不能把键盘收起来）
         //   · 点在输入控件所属窗口内 -> 不算（浏览器里点页面即在此列）
-        if (g_afAutoHide && g_vis && g_lastClickTick &&
-            GetTickCount() - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS &&
-            !LastClickHitInputWindow(input)) {
+        //   ⚠ 这里再加一道"顶层窗口必须不同"的确认：宁可少收一次，
+        //     也不要因为误判把刚弹出来的键盘收掉。
+        if (g_afAutoHide && g_vis && recentClick && !clickOnInput) {
             HWND hit = WindowFromPoint(g_lastClickPt);
             HWND topHit = hit ? GetAncestor(hit, GA_ROOT) : NULL;
+            HWND topInput = GetAncestor(input, GA_ROOT);
             if (topHit && topHit != g_hWnd && topHit != g_settingsHwnd &&
-                topHit != g_closePromptHwnd) {
+                topHit != g_closePromptHwnd && topHit != topInput) {
                 ShowKB(FALSE, FALSE);
                 return;
             }
         }
 
-        // ⚠⚠ 只在"用户刚主动操作过"时才呼出（见 g_lastClickTick 处的说明）。
-        //   这样「只是切换窗口看别的东西」不会弹键盘；
-        //   「点输入框」和「用键盘聚焦到输入框」才弹。
-        {
-            DWORD now = GetTickCount();
-            BOOL byMouse = (g_lastClickTick && now - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS &&
-                            LastClickHitInputWindow(input));
-            BOOL byKey   = (g_lastKeyTick && now - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
-            // "点输入框"或"敲键盘"都算用户主动要输入 -> 解除切换窗口后的封锁
-            if (byMouse || byKey) g_fgAwaitUserInput = FALSE;
-            // 仍处于"切换窗口后还没操作过"的状态 -> 不弹
-            // （网页自动聚焦搜索框、同窗口内 Tab 跳转不受影响：那些情况下
-            //   前台窗口没变过，g_fgAwaitUserInput 一直是 FALSE）
-            if (g_fgAwaitUserInput) return;
-        }
-
+        // 仍处于"切换窗口后还没操作过"的状态 -> 不弹
+        // （网页自动聚焦搜索框、同窗口内 Tab 跳转不受影响：那些情况下
+        //   前台窗口没变过，g_fgAwaitUserInput 一直是 FALSE）
+        if (g_fgAwaitUserInput) return;
         if (!g_manualHide && !g_vis) ShowKB(TRUE, FALSE);
         return;
     }

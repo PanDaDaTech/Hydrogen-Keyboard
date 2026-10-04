@@ -6324,20 +6324,22 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
         //   ⇒ 修法：角色不匹配时，用 get_accChild 把这个 child 的 IAccessible
         //     取下来**继续往下钻**，与 VT_DISPATCH 分支保持一致。
         //     focus.lVal == 0 是 CHILDID_SELF（就是自身），无子可下钻。
+        // ⚠ get_accChild 的原型（CI x86 编译器给出，oleacc.h:596）：
+        //     HRESULT get_accChild(VARIANT varID, IDispatch **ppdispChild);
+        //   **两参数、IDispatch** 是出参** —— 既不是三参数，也不是返回值
+        //   （前两次分别报 C2660 / C2440，别再凭印象写）。
+        //
+        //   MSAA 语义：**varID 就是要取的那个子元素 id**（不是"父对象 id"）。
+        //   `get_accFocus` 返回 VT_I4 时，lVal 是焦点元素在**本对象**下的
+        //   childId —— 直接把它当 varID 传下去即可取到该元素的对象。
+        //   `focus.lVal == 0` 是 CHILDID_SELF（焦点就是 acc 自己），无子可取。
         if (focus.lVal == 0) return FALSE;
         VARIANT varId;
         ZeroMemory(&varId, sizeof(varId));
         varId.vt = VT_I4;
-        varId.lVal = 0;                       // varID：保留，必须为 0
-        VARIANT varChild;
-        ZeroMemory(&varChild, sizeof(varChild));
-        varChild.vt = VT_I4;
-        varChild.lVal = focus.lVal;           // varChild：要取的子元素 id
-        // ⚠ get_accChild(VARIANT varID, VARIANT varChild) 只有**两个**参数，
-        //   IDispatch* 是**返回值**（不是出参）—— 写成三参会报
-        //   C2660: function does not take 3 arguments（CI x86 实测）。
-        IDispatch* pdispChild = acc->get_accChild(varId, varChild);
-        if (pdispChild) {
+        varId.lVal = focus.lVal;              // 要取的元素 id
+        IDispatch* pdispChild = NULL;
+        if (SUCCEEDED(acc->get_accChild(varId, &pdispChild)) && pdispChild) {
             IAccessible* childAcc = NULL;
             HRESULT hrChild = pdispChild->QueryInterface(IID_IAccessibleLocal,
                                                          (void**)&childAcc);

@@ -793,6 +793,18 @@ BOOL        g_shiftOnce = FALSE;        // 单击的一次性待用态
 static DWORD g_shiftLastTap = 0;        // 上次点击 Shift 的时刻（双击窗口判定）
 static const DWORD SHIFT_DOUBLE_MS = 350;   // 双击间隔上限
 BOOL        g_shiftDoubleTap = TRUE;    // 设置项：启用 Shift 双击锁定（ini: General/ShiftDoubleTap）
+
+// 用掉一次"一次性 Shift"：双击锁定模式下，单击 Shift 只对下一个键生效。
+// 锁定态（g_shiftLock）下不动 —— 那是用户明确要连续输入的。
+static void ReleaseShiftOnce(void) {
+    if (g_shiftDoubleTap && g_shiftOnce && !g_shiftLock) {
+        g_shiftOnce = FALSE;
+        g_sh = FALSE;
+    } else {
+        g_sh = FALSE;
+    }
+}
+
 int         g_keyIconStyle = 2;        // 键面始终「图标+文字」；「仅文字」模式已按实机反馈下线
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
@@ -3022,17 +3034,6 @@ static void DoKeyAction(const KeyDef* k) {
     // ⚠ 所有按键都在此统一等待 —— 空格尤其重要：它负责把候选框里的中文上屏，
     //   若在左键按下期间注入，中文同样上不去（这正是 issue #3 的主诉之一）。
     WaitForLeftButtonUp();
-// 用掉一次"一次性 Shift"：双击锁定模式下，单击 Shift 只对下一个键生效。
-// 锁定态（g_shiftLock）下不动 —— 那是用户明确要连续输入的。
-static void ReleaseShiftOnce(void) {
-    if (g_shiftDoubleTap && g_shiftOnce && !g_shiftLock) {
-        g_shiftOnce = FALSE;
-        g_sh = FALSE;
-    } else {
-        g_sh = FALSE;
-    }
-}
-
     switch (k->type) {
     case K_LETTER:
 #ifdef HK_DIAG

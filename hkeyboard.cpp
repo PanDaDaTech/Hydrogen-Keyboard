@@ -483,7 +483,14 @@ enum KeyAlign { KA_CENTER = 0, KA_LEFT = 1, KA_RIGHT = 2 };
 // symShift：仅 K_SYM 有效 —— TRUE 取键盘布局的副（Shift）符号，FALSE 取主符号。
 // 网页层同时要 `[ ] \ ; '`（主符号格）与 `{ } | : "`（副符号格），一个 bool 就能分开。
 // align：键面标签的对齐（见 KeyAlign），由布局表给出，绘制时落在 DrawTextKey。
-struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift; unsigned char align; };
+// block = 这个键属于键盘的哪个区块（全尺寸布局才有区分）：
+//   0 = 主区 / 其它布局（默认、小键盘 —— 它们本来就是一整块）
+//   1 = 导航区（PrtSc/ScrLk/Pause…那 3 列）
+//   2 = 数字区（Num//*−…那 4 列）
+// ⚠ 2026-10-04 新增：键面标签的字号要**按区块统一**，需要知道每个键属于哪一块。
+//   判据不能靠 x 坐标猜 —— 导航区与数字区紧邻，列中心距只有键宽的 1.1 倍。
+struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift;
+                unsigned char align; unsigned char block; };
 
 // C++ 函数前置声明
 static void ShowKB(BOOL show, BOOL isManual = FALSE);
@@ -877,12 +884,13 @@ static void InitWindowSizeForDpi() {
 }
 
 static int AddKey(int x, int y, int w, int h, short vk, KeyType type, BOOL symShift = FALSE,
-                  int align = KA_CENTER) {
+                  int align = KA_CENTER, int block = 0) {
     if (g_nk >= MAX_KEYS) return g_nk;
     KeyDef* k = &g_keys[g_nk++];
     k->x = x; k->y = y; k->w = w; k->h = h; k->vk = vk; k->type = type;
     k->symShift = symShift ? 1 : 0;
     k->align = (unsigned char)align;
+    k->block = (unsigned char)block;
     return g_nk;
 }
 
@@ -1023,12 +1031,12 @@ static int FullColX(float col, double u, int gap, const float* bc, int nb) {
 //   ⇒ 宽度改为只按「列位差 × u」算，跨块补偿只作用于 x 起点（那是它本来的用途：
 //     把导航区/数字区整体右移，让开块间间隙）。
 static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, int gap,
-                    const float* bc, int nb) {
+                    const float* bc, int nb, int block = 0) {
     float c0 = base + s.col, c1 = c0 + s.w;
     int xa = FullColX(c0, u, gap, bc, nb);
     int w  = (int)floor(c1 * u + 0.5) - (int)floor(c0 * u + 0.5) - gap;
     if (w < 1) w = 1;
-    AddKey(xa, yy, w, kh, s.vk, s.type);
+    AddKey(xa, yy, w, kh, s.vk, s.type, FALSE, KA_CENTER, block);
 }
 
 // ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）--------------------
@@ -1216,7 +1224,7 @@ static void BuildComplete(int y, BOOL webFn) {
             if (!nav[i].k) continue;
             int yy = y + nav[i].r * (KH + gap);
             for (int j = 0; j < nav[i].n; j++)
-                FullPut(FULL_U_MAIN, nav[i].k[j], yy, KH, u, gap, bc, nb);
+                FullPut(FULL_U_MAIN, nav[i].k[j], yy, KH, u, gap, bc, nb, 1);  // 1=导航区
         }
     }
 
@@ -1230,7 +1238,7 @@ static void BuildComplete(int y, BOOL webFn) {
             int yy = y + (i + 1) * (KH + gap);
             for (int j = 0; j < num[i].n; j++) {
                 const KbKeySpec& s = num[i].k[j];
-                FullPut(FULL_U_MAIN + FULL_U_NAV, s, yy, s.vrow == 2 ? h2 : KH, u, gap, bc, nb);
+                FullPut(FULL_U_MAIN + FULL_U_NAV, s, yy, s.vrow == 2 ? h2 : KH, u, gap, bc, nb, 2);  // 2=数字区
             }
         }
     }
@@ -2267,7 +2275,8 @@ void InvalidateFitTier(void) { g_fitTierValid = FALSE; }
 //   代价是个别标签会「比它本来能用的字号略小一点」—— 用一致性换这半档，值。
 //
 // 只在「标签是纯文字」时生效（图标+文字组合另有 DrawKeyLabel 的阶梯），
-// 且只在同一 y 行、同一 x 区段内比较，避免把退格这种宽键和小键混为一谈。
+// 且只与**同一区块内同宽**的键比较 —— 避免把退格这种宽键和小键混为一谈。
+// ⚠ 分组单元是「区块」而不是行或列，两轮返工都证明行/列都不对（详见 FitUnifiedTier）。
 static int FitTierForText(HDC dc, const wchar_t* s, int maxW) {
     HFONT ladder[8] = { g_f14, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
     for (int i = 0; i < 8; i++)
@@ -2279,12 +2288,30 @@ static int FitTierForText(HDC dc, const wchar_t* s, int maxW) {
 static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     int worst = FitTierForText(dc, KeyText(self), selfMaxW);
     int gw = self->w;
-    int gx0 = self->x, gx1 = self->x + self->w;
+    // 分组判据 = **区块 + 键宽**（不是坐标，也不是行/列）。
+    //
+    // ⚠⚠ 2026-10-04 用户实机截图连报两次：
+    //   第一次「ScrLk / Home 比 Pause 小一号」；
+    //   修完按「同行」分组后，第二次变成「**Ins / Del / End 偏大**」。
+    //   两次都是同一类错误：**分组粒度选错**。
+    //
+    //   ▸ 按「同行」分 → 导航区是 3×3 方阵，每行各自为政：
+    //     Ins 只跟 PrtSc 比、Del 只跟 PgUp 比，这俩标签都短、不需降档 ⇒ 第 1 列保持大字号；
+    //     而需要降档的 Home / PgDn 在**上一行**，比不到。
+    //   ▸ 按「同列」分 → 离线复算发现导航区列距只有键宽的 1.11 倍
+    //     （W=1400 时列距 63 / 键宽 57），列中心判据会把三列**全部混成一组**，
+    //     于是 ScrLk / Pause 又被拉小 —— 只是把「不齐」换成「全都小」。
+    //
+    //   ⇒ 正确的分组单元是**区块**（见 KeyDef::block 的说明）：
+    //     导航区那 9 个键是一个语义整体（九宫格），字号必须一致；
+    //     数字区同理。键位构建时就把 block 标好，比任何坐标推断都可靠。
+    //
+    //   主区（block 0）也参与：它的 1u 键（字母/数字/F 键）同样按统一档，
+    //   否则主区字母是大字号、导航区是小字号，两块之间又不齐了。
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
+        if (k->block != self->block) continue;   // 只看同一区块
         if (k->w != gw) continue;                // 只看同宽键
-        if (k->y != self->y) continue;           // 只看同一行
-        if (k->x < gx0 - gw || k->x > gx1 + gw) continue;   // 同一区段（左右各一格容差）
         if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
         const wchar_t* s = KeyText(k);
         if (!s || !s[0]) continue;
@@ -4166,7 +4193,12 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
 }
 
 static int SettingsRowCount(int tab) {
-    if (tab == 0) return g_af ? 7 : 6;
+    // ⚠⚠ 2026-10-04 修：原来返回 `g_af ? 7 : 6`，**漏算了「Shift 双击锁定」那一行**。
+    //   行序（见 SettingsRowHidden 里的 closeRow）：g_af 开时用到 closeRow+5 = 7，
+    //   即索引 0..7 共 **8** 行；关时用到 closeRow+5 = 6，共 **7** 行。
+    //   少算一行 ⇒ SettingsCardRect 的 bottom 少一行高，SettingsDesiredHeight
+    //   算出的窗口就偏矮 ⇒ **「界面语言」那一行被裁在窗口外**（用户实机截图）。
+    if (tab == 0) return g_af ? 8 : 7;
     if (tab == 3) return 3;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
     if (tab == 1) return 3;
     return 0;

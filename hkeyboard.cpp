@@ -659,6 +659,11 @@ static HWND     g_dbgCaret = NULL;
 static int g_dbgResp = -1;
 static int g_dbgAcc = 0;
 static int g_dbgAccFound = -1;
+// 键盘窗口的**实际**可见性与矩形。
+// ⚠ 这是用来验证「程序以为显示着、用户却看不到」这个猜想的：
+//   `g_vis` 只是软件标志位，和 `IsWindowVisible` 可能不一致。
+static int g_dbgVisWnd = -1;
+static int g_dbgRc[4] = {0, 0, 0, 0};
 
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
 //   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
@@ -688,13 +693,15 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
                 "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
                 "gui=%d focusCls=%-22s isInput=%d caret=%p "
-                "resp=%d hr=0x%X found=%d => %s\n",
+                "resp=%d hr=0x%X found=%d | "
+                "visWnd=%d rect=%d,%d %dx%d => %s\n",
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
                 AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
                 (int)recentClick, (int)clickInFg,
                 (int)byKey, (int)await, (void*)input, (int)vis, (int)motion,
                 g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput,
                 (void*)g_dbgCaret, g_dbgResp, (unsigned)g_dbgAcc, g_dbgAccFound,
+                g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3],
                 decision);
     AfWriteRaw(buf);
 }
@@ -6488,6 +6495,14 @@ static void UpdateAutoVisibility() {
 
     HWND input = GetFocusedInputControl();
     // 诊断（-afdiag）：记录这次评估的全部输入量
+    {
+        g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;
+        RECT wr = {0, 0, 0, 0};
+        if (g_hWnd) GetWindowRect(g_hWnd, &wr);
+        g_dbgRc[0] = (int)wr.left;  g_dbgRc[1] = (int)wr.top;
+        g_dbgRc[2] = (int)(wr.right - wr.left);
+        g_dbgRc[3] = (int)(wr.bottom - wr.top);
+    }
     AfLog("eval", fgNow, fgTop, input, recentClick, clickInFg, byKey,
           g_fgAwaitUserInput, g_vis, g_mainMotion.active,
           input ? "hasInput" : "noInput");

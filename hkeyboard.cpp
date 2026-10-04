@@ -2428,8 +2428,10 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     //
     //   `k->w != gw` 精确比较 ⇒ **第 2 列与第 1、3 列互相不参与统一**，
     //   分组又裂成两半 ⇒ 导航区仍然出现两种字号。
-    //   ⚠ 这就是前两轮「改了分组粒度（同行→同列→按区块）却怎么都不齐」的
-    //   真正原因 —— 粒度选对了，但**同宽的判据本身是坏的**。
+    //   ⚠ 这里当时被误判成"前两轮不齐的真正原因" —— **它不是**。
+    //     真正的根因是下面循环里的判据写反（见 `if (KeyHasGlyph(k)) continue;` 处，
+    //     2026-10-05 用 CI -fontdiag 表定位）。这个容差改动本身是对的、要保留，
+    //     但它单独并不能修好问题 —— 循环空转时容差多少都没区别。
     //
     // ⇒ 改为「键宽差 ≤ 2px 视为同宽」（覆盖 1px 取整误差；真正的不同宽度键
     //   —— 退格 2u、回车 1.5u、Shift 2.25u —— 差几十 px，不会被误并入）。
@@ -2488,7 +2490,30 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
         if (!sameGroup(k->block) || !sameGroup(self->block)) continue;
         int dw = k->w - gw; if (dw < 0) dw = -dw;
         if (dw > 2) continue;
-        if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
+        // ⚠⚠⚠ 2026-10-05 根因（第四次报「同一区块字号不统一」，前三轮全在改分组粒度，
+        //   都没碰到这里）：**这里写反了**。
+        //
+        //   `KeyHasGlyph(k)` 返回 TRUE = **有图形**（Tab / Caps / Shift / Enter / 退格 /
+        //   方向键 / Win / Menu）。图标键走 DrawKeyLabel 自己那套阶梯，**不该**参与
+        //   纯文字的统一（它们的"可用宽"里还要留出图标位）。
+        //   所以这里应该 `continue` 掉**有图形**的键 —— 即 `if (KeyHasGlyph(k)) continue;`。
+        //
+        //   原来写的是 `if (!KeyHasGlyph(k)) continue;`（注释还写着"纯文字键才参与"），
+        //   实际效果恰好相反：**把纯文字键全部跳过，只留下图标键**。而图标键
+        //   （Tab 80 / Caps 94 / Shift 151…）都被上面的 `dw > 2` 挡掉了 ——
+        //   于是这个循环**永远是空转**，`worst` 恒等于 `FitTierInLadder(自己)`。
+        //
+        //   ⇒ 整个"同宽键统一字号"等于没生效，实际是**逐键独立选档**：
+        //        Ins / Del / End（3 字母，14pt 放得下） → 停在 t=0
+        //        Home / PgUp / PgDn / PrtSc / ScrLk / Pause（4~5 字母） → 掉到 t=4
+        //     这正是用户三次截图的「同一排 / 同一区块里有些字大有些字小」。
+        //
+        //   证据（CI -fontdiag，1280 全尺寸，导航区 9 键 w/gW/mW 全部相同 52/51/45）：
+        //        t=4 PrtSc  t=4 ScrLk  t=4 Pause
+        //        t=0 Ins    t=4 Home   t=4 PgUp
+        //        t=0 Del    t=0 End    t=4 PgDn
+        //     分组参数完全一致却给出两种档位 ⇒ 只可能是循环没把同组标签算进去。
+        if (KeyHasGlyph(k)) continue;            // 图标键不参与（走 DrawKeyLabel 自己的阶梯）
         const wchar_t* s = KeyText(k);
         if (!s || !s[0]) continue;
         int t = FitTierInLadder(dc, s, groupMaxW, L);

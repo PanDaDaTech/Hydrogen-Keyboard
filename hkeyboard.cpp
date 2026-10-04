@@ -800,7 +800,10 @@ BOOL        g_shiftLock = FALSE;        // 双击锁定态（界面高亮据此�
 BOOL        g_shiftOnce = FALSE;        // 单击的一次性待用态
 static DWORD g_shiftLastTap = 0;        // 上次点击 Shift 的时刻（双击窗口判定）
 static const DWORD SHIFT_DOUBLE_MS = 350;   // 双击间隔上限
-BOOL        g_shiftDoubleTap = TRUE;    // 设置项：启用 Shift 双击锁定（ini: General/ShiftDoubleTap）
+// ⚠ 默认**关闭**（2026-10-04 用户要求）。双击锁定改变了 Shift 的既有语义
+//   （单击原本是「锁定、再点切中/英输入法」），属于**要主动开启**的新行为，
+//   不该替用户默认打开。ini 缺省值同步为 0。
+BOOL        g_shiftDoubleTap = FALSE;   // 设置项：启用 Shift 双击锁定（ini: General/ShiftDoubleTap）
 
 // 用掉一次"一次性 Shift"：双击锁定模式下，单击 Shift 只对下一个键生效。
 // 锁定态（g_shiftLock）下不动 —— 那是用户明确要连续输入的。
@@ -2308,9 +2311,15 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     //
     //   主区（block 0）也参与：它的 1u 键（字母/数字/F 键）同样按统一档，
     //   否则主区字母是大字号、导航区是小字号，两块之间又不齐了。
+    //
+    // ⚠ **数字区（block 2）不参与统一**：它的标签全是单个数字/符号（0-9 / * - +），
+    //   天然都放得下最大档；一旦参与，就会被同宽的「Enter」「Num」拖着一起降档，
+    //   把整块数字区的小字号变得比主区还小。用户实机截图明确指出这一点。
+    //   ⇒ 只对 block 0（主区）与 block 1（导航区）统一。
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         if (k->block != self->block) continue;   // 只看同一区块
+        if (k->block == 2) continue;             // 数字区保持原样（见上）
         if (k->w != gw) continue;                // 只看同宽键
         if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
         const wchar_t* s = KeyText(k);
@@ -4579,6 +4588,13 @@ static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     else if (hit == S_HIT_NPBTN) rowIndex = 2;
     else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
     else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
+    // ⚠⚠ 2026-10-04 修：原来 S_HIT_SHDLOCK 落到最后的 else，被当成「Shift 符号」
+    //   （g_af 开时 rowIndex 5 / 关时 4）。而它的真实行号是 closeRow+4
+    //   （开时 6 / 关时 5）⇒ **动画重绘到了上面那一行**，
+    //   用户看到的是「点 Shift 双击锁定，动画却跑到 Shift 符号上」。
+    else if (hit == S_HIT_SHIFTSYM) rowIndex = g_af ? 5 : 4;
+    else if (hit == S_HIT_SHDLOCK)  rowIndex = g_af ? 6 : 5;
+    else if (hit == S_HIT_LANG_DROP) rowIndex = g_af ? 7 : 6;
     else rowIndex = g_af ? 5 : 4;
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(120 * m.dpi);
@@ -5461,7 +5477,7 @@ static void LoadConfig() {
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
-    g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 1) != 0);
+    g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 0) != 0);
     g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;

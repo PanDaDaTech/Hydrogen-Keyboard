@@ -2819,8 +2819,13 @@ static const wchar_t* KeyTextInto(const KeyDef* k, wchar_t* out, size_t n) {
         case 0x27: lit = L"\x2192"; break;
         case 0x28: lit = L"\x2193"; break;
         case 0x2C: lit = L"PrtSc"; break;
-        case 0x91: lit = L"ScrLk"; break;   // VK_SCROLL（原来是 0x46 = 字母 F，已修）
-        case 0x13: lit = L"Pause"; break;
+        // ⚠ 2026-10-05：导航区统一档由「本区最长标签」决定，而全尺寸下 1u 键的
+        //   可用宽只有 46px。ScrLk(5) / Pause(5) / Home(4) 三个标签在 10pt 档
+        //   恰好超宽 1~3px，把整个导航区拖到 9pt。缩成 3 字母后导航区稳定在 10pt，
+        //   与主区 14pt 一同构成用户要的「主区大一点、导航区略小」。
+        //   Scr / Pse / Hom 都是键帽上通行的缩写（Pse = Pause 的常见节略写法）。
+        case 0x91: lit = L"Scr"; break;   // VK_SCROLL（原来是 0x46 = 字母 F，已修）
+        case 0x13: lit = L"Pse"; break;
         case 0x08: {
             // 退格：宽键显示全称 Backspace，窄键用 Bksp。
             // 判据 = 「可用宽 vs 实测文字宽」，与 FitKeyFont 同源（两边都走 MeasureTextW，
@@ -2838,7 +2843,7 @@ static const wchar_t* KeyTextInto(const KeyDef* k, wchar_t* out, size_t n) {
             break;
         }
         case 0x2D: lit = L"Ins"; break;
-        case 0x24: lit = L"Home"; break;
+        case 0x24: lit = L"Hom"; break;   // 同 Pause / ScrLk：4 字母在 10pt 档超宽，缩为 Hom
         case 0x21: lit = L"PgUp"; break;
         case 0x23: lit = L"End"; break;
         case 0x22: lit = L"PgDn"; break;

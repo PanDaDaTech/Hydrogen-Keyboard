@@ -690,7 +690,7 @@ static LONG     g_dbgFocusRole = -1;
 // ⚠ 要验证的假设：「点输入框」会触发 FOCUS 事件、「点空白处」不触发 ——
 //   如果成立，这就是区分两者的天然信号（比轮询 a11y 更可靠）。
 static DWORD    g_lastFocusEvTick = 0;
-static DWORD    g_lastFocusEvHwnd = 0;
+static HWND     g_lastFocusEvHwnd = NULL;   // ⚠ 必须是 HWND（x64 下 64 位，DWORD 会截断）
 // 键盘窗口的**实际**可见性与矩形。
 // ⚠ 这是用来验证「程序以为显示着、用户却看不到」这个猜想的：
 //   `g_vis` 只是软件标志位，和 `IsWindowVisible` 可能不一致。
@@ -728,8 +728,7 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
     DWORD fevNow = g_lastFocusEvTick ? (GetTickCount() - g_lastFocusEvTick) : 0xFFFFFFFFu;
     // feh：最近一次 FOCUS 事件的来源窗口是否**就是当前前台顶层窗口**
     // （避免把"其它应用弹窗抢焦点"的噪音误当成"用户聚焦了输入框"）
-    int fehMatch = (g_lastFocusEvHwnd && fgTop &&
-                    (HWND)(ULONG_PTR)g_lastFocusEvHwnd == fgTop) ? 1 : 0;
+    int fehMatch = (g_lastFocusEvHwnd && fgTop && g_lastFocusEvHwnd == fgTop) ? 1 : 0;
     char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
@@ -6670,7 +6669,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
     if (!g_af || !g_hWnd) return;
     if (event == EVENT_OBJECT_FOCUS) {
         g_lastFocusEvTick = GetTickCount();
-        g_lastFocusEvHwnd = (DWORD)(ULONG_PTR)hwnd;
+        g_lastFocusEvHwnd = hwnd;
     }
     if (event == EVENT_OBJECT_FOCUS || event == EVENT_SYSTEM_FOREGROUND ||
         (event == EVENT_OBJECT_SHOW && idObject == OBJID_CARET))

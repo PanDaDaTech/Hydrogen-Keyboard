@@ -630,13 +630,21 @@ BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示�
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 // 实体 NumLock 锁定态（GetAsyncKeyState(VK_NUMLOCK) 的 bit0），全尺寸数字区的 Num 键跟着它高亮
 BOOL        g_physNum = FALSE;
-// 屏幕键盘**自己**的小键盘锁定态（2026-10-04）。
-// ⚠ 为什么不能只靠 g_physNum（实体灯）：`SendKey(0x90)` 翻的是**目标线程**的
-//   NumLock，而 g_physNum 读的是**本线程**的 —— 两者会不同步。不同步时就出现
-//   用户实测的问题：「小键盘无法锁定、数字打不进去」（界面显示已锁定，实际
-//   发出去的还是光标键 Ins/Del/Home…）。
-// ⇒ 屏幕键盘自持状态：小键盘数字键按它决定**注入数字键还是光标键**，
-//   NumLock 键只翻它自己、不再发 VK_NUMLOCK 给目标进程。
+// 屏幕键盘的小键盘锁定态（2026-10-04）。**它就是系统真实状态**。
+//
+// ⇒ 谁写它：点小键盘的 Num 键时，注入 VK_NUMLOCK 后**从系统读回**
+//   （`GetKeyState(VK_NUMLOCK) & 1`），见 OnKeyDown 的 0x90 分支。
+// ⇒ 它决定两件事：
+//   ① 数字区 Num 键的高亮（IsActive 读它）
+//   ② 小键盘数字键注入数字键（VK_NUMPAD0-9）还是光标键（NumpadNavKey）
+//
+// ⚠ 血泪史（第 17~20 轮，四轮返工），**别再改回去**：
+//   17 轮 只翻不发      → 目标程序收不到 NumLock
+//   18 轮 加发但自取反  → 界面假亮、与真实状态相反
+//   19 轮 读回但重试 3 次 → 重复注入 = 反复翻转，「时好时坏」
+//   20 轮 单次注入+等待 → ✓
+// ⇒ **三条铁律**：① 唯一真值是系统状态；② 锁存键走 VK 路径（不带 SCANCODE）；
+//   ③ **绝不重复注入**（每注一次翻一次，不是「重试」而是「继续翻」）。
 static BOOL g_npLock = TRUE;            // TRUE = 数字（小键盘）模式
 static BOOL g_npLockInit = FALSE;       // 首次跟实体灯对齐后置位
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
@@ -2812,8 +2820,10 @@ static const wchar_t* KeyText(const KeyDef* k) {
 
 static BOOL IsActive(const KeyDef* k) {
     if (k->vk == 0x14 && g_cp) return TRUE;
-    // NumLock：跟实体键盘的锁定灯走（GetAsyncKeyState(VK_NUMLOCK) 的 bit0）
-    // NumLock 高亮跟屏幕键盘自己的锁定态（不是实体灯，见 g_npLock 处说明）
+    // NumLock 高亮跟 g_npLock —— 它就是**系统真实锁定态**（点 Num 键时读回
+    // `GetKeyState(VK_NUMLOCK)` 得到的那个值，见 OnKeyDown 里 0x90 分支）。
+    // ⚠ 不要再改成「跟实体灯走」或「自己取反」：第 17~20 轮在这上面反复翻车
+    //   （假亮、不同步、反复翻转）。**唯一真值是系统状态。**
     if (k->vk == 0x90 && g_npLock) return TRUE;
     if ((k->vk == VK_SHIFT || k->vk == VK_LSHIFT || k->vk == VK_RSHIFT) && (g_sh || g_physShift)) return TRUE;
     if (k->vk == 0x11 && g_ct) return TRUE;
@@ -3435,34 +3445,46 @@ static void DoKeyAction(const KeyDef* k) {
             //   继续重发 ⇒ **状态被又翻回去**，等于按一次却翻了奇数次。
             //   这正是「灯不亮 / 触发不了」这类症状的另一种来源。
             // ⇒ 先记起始值，判据用 `now != before`（翻转语义），与起始态无关。
-            BOOL before = (GetKeyState(VK_NUMLOCK) & 1) != 0;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                // ⚠⚠⚠ **不能用 SendKey**（用户第 19 轮实测：实体键盘灯仍不亮）。
-                //
-                //   `SendKey` 第 2 段强制带 `KEYEVENTF_SCANCODE` —— 那是 issue #3
-                //   「Win10 + 微软拼音丢字」的修复所必需，对**字符键**有效。
-                //   但锁存键（NumLock/CapsLock/ScrollLock）的翻转由键盘布局层
-                //   按 **VK** 处理，扫描码路径（`MapVirtualKeyW(0x90)` = 0xE045，
-                //   带 E1 前缀）会被**直接忽略** ⇒ 字符键都正常，唯独灯不亮。
-                //
-                // ⇒ 这里只给 wVk、**不设 wScan、不设 KEYEVENTF_SCANCODE**，
-                //   仅保留 KEYEVENTF_EXTENDEDKEY（真键盘 NumLock 是 E0 45）。
-                //   down/up 成对一次。这正是各类「程序化切 NumLock」方案的写法。
-                {
-                    INPUT pair[2] = {};
-                    pair[0].type = INPUT_KEYBOARD;
-                    pair[0].ki.wVk = VK_NUMLOCK;                 // wScan 留 0
-                    pair[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;  // ⚠ 刻意无 SCANCODE
-                    pair[1] = pair[0];
-                    pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
-                    SendInput(2, pair, sizeof(INPUT));
-                }
-                // 锁存键要让系统真的翻转，需要给消息循环一点时间
-                Sleep(KEY_INJECT_GAP_MS);
-                if (((GetKeyState(VK_NUMLOCK) & 1) != 0) != before) break;  // 已翻转
-                if (attempt < 2) Sleep(40);
+            // ⚠⚠⚠ 2026-10-04 第 20 轮用户反馈：「关>开、开>关，有时候却正常」——
+            //   **这是我上一版的重试逻辑在反复翻转**。
+            //
+            //   上一版：注入 → `Sleep(KEY_INJECT_GAP_MS)`（**只有 1ms**）→ 读回。
+            //   锁存键的翻转由系统**异步**处理，1ms 内未必生效 ⇒ 读到旧值 ⇒
+            //   判定「没翻转」⇒ **再注入一次** …… 最多 3 次。
+            //
+            //   离线复算（attempt × 系统延迟）证明这是个**双重 bug**：
+            //     系统 1ms 内生效 → 第 1 次就读到翻转 → 1 次注入，恰好对
+            //     系统 40ms 才生效 → 3 次都读到旧值 → **注入了 3 次**
+            //                     （翻转 3 次 = 奇数次，真实态确实翻了）
+            //                     但 g_npLock 取的是**最后一次那个旧读数**
+            //                     ⇒ **界面显示与真实状态相反**
+            //   ⇒ 这就是「有时候正常有时候不正常」的来源：**取决于系统延迟
+            //     与 1ms 的赛跑结果**，所以时好时坏。
+            //
+            // ⇒ 修法两条：
+            //   ① **只注入一次**。重复注入不是「重试」，是**继续翻转**——
+            //     锁存键每收到一次就翻一次，注入 N 次 = 翻 N 次。
+            //     既然第 20 轮改成 VK 路径后已能生效，就不需要重试。
+            //   ② 读回要**等够时间**：给系统一个确定的等待窗口，而不是 1ms。
+            //     期间反复读，**一旦变化就立刻采用**（不注入、只观察）。
+            {
+                INPUT pair[2] = {};
+                pair[0].type = INPUT_KEYBOARD;
+                pair[0].ki.wVk = VK_NUMLOCK;                 // wScan 留 0
+                pair[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;  // ⚠ 刻意无 SCANCODE
+                pair[1] = pair[0];
+                pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+                SendInput(2, pair, sizeof(INPUT));           // ← 只注一次
             }
-            g_npLock = (GetKeyState(VK_NUMLOCK) & 1) != 0;   // 以系统真实状态为准
+            // 等系统真正翻转：最多 200ms，每 10ms 读一次，变了就停。
+            // ⚠ 期间**只读不注入** —— 注入会把状态再翻回去（第 ① 条）。
+            BOOL now = (GetKeyState(VK_NUMLOCK) & 1) != 0;
+            for (int wait = 0; wait < 20; wait++) {
+                if (now != before) break;                     // 已翻转
+                Sleep(10);
+                now = (GetKeyState(VK_NUMLOCK) & 1) != 0;
+            }
+            g_npLock = now;                                  // 以系统真实状态为准
             g_physNum = g_npLock;                            // 数字区 Num 键高亮同步
             InvalidateRect(g_hWnd, 0, TRUE);
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();

@@ -829,6 +829,22 @@ HANDLE      g_mutex = 0;
 HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0;   // 键面字体（单字重，见字体显示方案 v6）
 HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：只给 1u 键塞不下的长标签用（见 FitKeyFont）
 HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
+
+// 导航区（block 1）**专用**的一套字体：字号 = 常规档 × NAV_FONT_SCALE。
+//
+// ⚠ 2026-10-04 用户指定的 B 方案：导航区单独缩一点，数字区一个字都不动。
+//   默认全尺寸 1280×404 实测（MiSans + MakeFont 的 em 换算）：
+//       常规 14pt 档 em=20px，`Pause` 需 60px，而 1u 键宽只有 52px ⇒ 放不下
+//       × 0.85 后  em=17px，`Pause` 需 51px ≤ 52px ⇒ **九键全部停在 14pt 档**
+//   而同宽的 `Num`（3 字母）在常规 14pt 需 48px ≤ 52px，也是 14pt 档
+//   ⇒ **导航区九键与 Num 同档、同号**，且长标签完整不裁。
+//
+// ⚠ 0.85 是**量出来的**，不是拍脑袋。改默认窗口尺寸 / 改键宽后必须重量：
+//   判据 = 「压缩后最长标签宽度 ≤ 组内最小 1u 键宽」。
+HFONT       g_nf14 = 0, g_nf13 = 0, g_nf12 = 0;   // 导航区专用（14/13/12）
+HFONT       g_nf10 = 0, g_nf9  = 0, g_nf8 = 0;    // 导航区专用（10/9/8）
+HFONT       g_nf7  = 0;                           // 导航区专用地板档
+#define NAV_FONT_SCALE 0.85                        // 导航区字号压缩系数
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
 static HFONT g_sfSec = 0;                                                          // 14 档大字号（关于页产品名）
@@ -877,12 +893,9 @@ static void InitWindowSizeForDpi() {
         g_ww = (int)(430 * dpiScale);
         g_wh = (int)(320 * dpiScale);
     } else if (g_layoutMode == 2) { // 全尺寸（完整键盘）：6 行，主区+导航区+数字区
-        // ⚠ 2026-10-04 用户指定：2240×599。
-        //   2240 DIP 下 1u 键宽约 93px —— 导航区那 5 字母标签（Pause/PrtSc/ScrLk）
-        //   在 14pt 下需 51px，宽裕得多，不必再降档（见 FitUnifiedTier 的说明）。
-        //   599 DIP 高：键高约 90 DIP，正好是字号的增长上限 kFontGrowCapH。
-        g_ww = (int)(2240 * dpiScale);
-        g_wh = (int)(599 * dpiScale);
+        // 1280×404：宽高比接近常见全尺寸板，键帽不会被横向拉扁
+        g_ww = (int)(1280 * dpiScale);
+        g_wh = (int)(404 * dpiScale);
     } else {                        // 全尺寸
         g_ww = (int)(980 * dpiScale);
         g_wh = (int)(320 * dpiScale);
@@ -1748,6 +1761,14 @@ static void RecreateFontsAndLayout() {
     if (g_f8)  DeleteObject(g_f8);
     if (g_f7)  DeleteObject(g_f7);
     if (g_f6)  DeleteObject(g_f6);
+    // 导航区专用字体同样要释放，否则**每次改 DPI / 切布局泄漏 7 个 HFONT**
+    if (g_nf14) DeleteObject(g_nf14);
+    if (g_nf13) DeleteObject(g_nf13);
+    if (g_nf12) DeleteObject(g_nf12);
+    if (g_nf10) DeleteObject(g_nf10);
+    if (g_nf9)  DeleteObject(g_nf9);
+    if (g_nf8)  DeleteObject(g_nf8);
+    if (g_nf7)  DeleteObject(g_nf7);
 
     double dpiScale = GetSystemDpiScale();
 
@@ -1794,6 +1815,18 @@ static void RecreateFontsAndLayout() {
     g_f8 = MakeFont((int)(8 * finalFontScale + 0.5));
     g_f7 = MakeFont((int)(7 * finalFontScale + 0.5));
     g_f6 = MakeFont((int)(6 * finalFontScale + 0.5));
+
+    // 导航区专用：同一档位但字号 × NAV_FONT_SCALE（0.85）。理由见声明处。
+    {
+        const double navFS = finalFontScale * NAV_FONT_SCALE;
+        g_nf14 = MakeFont((int)(14 * navFS + 0.5));
+        g_nf13 = MakeFont((int)(13 * navFS + 0.5));
+        g_nf12 = MakeFont((int)(12 * navFS + 0.5));
+        g_nf10 = MakeFont((int)(10 * navFS + 0.5));
+        g_nf9  = MakeFont((int)( 9 * navFS + 0.5));
+        g_nf8  = MakeFont((int)( 8 * navFS + 0.5));
+        g_nf7  = MakeFont((int)( 7 * navFS + 0.5));
+    }
 
     // 「Backspace」在最小字号档（g_f12）下的实际容纳宽，字体一改就重量一次。
     // 退格标签要不要缩写成 Bksp**只能**跟这个实测值比：
@@ -2283,16 +2316,49 @@ void InvalidateFitTier(void) { g_fitTierValid = FALSE; }
 // 只在「标签是纯文字」时生效（图标+文字组合另有 DrawKeyLabel 的阶梯），
 // 且只与**同一区块内同宽**的键比较 —— 避免把退格这种宽键和小键混为一谈。
 // ⚠ 分组单元是「区块」而不是行或列，两轮返工都证明行/列都不对（详见 FitUnifiedTier）。
-static int FitTierForText(HDC dc, const wchar_t* s, int maxW) {
-    HFONT ladder[8] = { g_f14, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
+// 降档阶梯。档位序号 0 = 最大字号，7 = 地板。
+//   g_f*  常规档（主区 / 数字区）
+//   g_nf* 导航区专用档，字号 = 常规 × NAV_FONT_SCALE（B 方案）
+//
+// ⚠⚠ **量宽与取字体必须用同一套**（2026-10-04 踩过）：
+//   拿 g_f*（常规）去量 g_nf*（压缩后）实际画出来的字，量到的宽度比实际大
+//   1/0.85 ≈ 18% ⇒ 误判「放不下」⇒ 白白降档 ⇒ **压缩等于白做**。
+struct FontLadder {
+    HFONT f[8];
+};
+
+static FontLadder MainLadder() {
+    FontLadder L;
+    L.f[0]=g_f14; L.f[1]=g_f13; L.f[2]=g_f12; L.f[3]=g_f10;
+    L.f[4]=g_f9;  L.f[5]=g_f8;  L.f[6]=g_f7;  L.f[7]=g_f6;
+    return L;
+}
+
+static FontLadder NavLadder() {
+    FontLadder L;
+    L.f[0]=g_nf14; L.f[1]=g_nf13; L.f[2]=g_nf12; L.f[3]=g_nf10;
+    L.f[4]=g_nf9;  L.f[5]=g_nf8;  L.f[6]=g_nf7;  L.f[7]=0;
+    return L;
+}
+
+// 按给定阶梯选档：第一个量得下的档，全放不下则地板档。
+static int FitTierInLadder(HDC dc, const wchar_t* s, int maxW, const FontLadder& L) {
     for (int i = 0; i < 8; i++)
-        if (ladder[i] && MeasureTextW(dc, s, ladder[i]) <= maxW) return i;
+        if (L.f[i] && MeasureTextW(dc, s, L.f[i]) <= maxW) return i;
     return 7;                                   // 地板档
+}
+
+static int FitTierForText(HDC dc, const wchar_t* s, int maxW) {
+    return FitTierInLadder(dc, s, maxW, MainLadder());
 }
 
 // 取「本键所在同宽键组」统一后的档位。groupW = 组内键宽，maxW = 本键可用宽。
 static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
-    int worst = FitTierForText(dc, KeyText(self), selfMaxW);
+    // ⚠ 2026-10-04（B 方案）：导航区（block 1）**必须用 g_nf* 量宽**。
+    //   它的字号是常规档 × 0.85；拿 g_f*（常规）去量，量到的宽度比实际绘制
+    //   大 18% ⇒ 误判「放不下」⇒ 白白降档 ⇒ **压缩就白做了**。
+    const FontLadder L = (self->block == 1) ? NavLadder() : MainLadder();
+    int worst = FitTierInLadder(dc, KeyText(self), selfMaxW, L);
     int gw = self->w;
     // 分组判据 = **区块 + 键宽**（不是坐标，也不是行/列）。
     //
@@ -2365,13 +2431,22 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     //
     // ⇒ 导航区（block 1）**不扣边距**：横向居中绘制（DrawTextC 走整键矩形居中），
     //   标签不会贴到键帽边缘，实测 14pt 的 `Pause` 51px 放进 51px 键宽也不溢出。
-    //   主区（block 0）保持扣边距不变 —— 它的标签都是单字符/短词，从没因此降档，
-    //   不在用户这次要求的范围内（教训：别顺手扩大改动面）。
-    int edge = (self->block == 1) ? 0 : (int)(6 * GetSystemDpiScale());
+    //
+    // ⇒ 数字区（block 2）也**不扣边距**，但**字号一个字都不改**（仍是常规档）：
+    //   数字区在 FitUnifiedTier 的分组循环里被 `if (k->block == 2) continue;`
+    //   排除，它只算**自己**那一键的档位 —— 也就是 `Num`。
+    //   `Num` 标签 3 个字母，14pt 需 **48px**；原先扣 6px 后可用宽只剩 46px
+    //   ⇒ 差 2px 掉到 13pt，于是「导航区 14pt vs Num 13pt」又差一档。
+    //   去掉这 6px 扣减后 48 ≤ 52 ⇒ `Num` 停在 **14pt**，与导航区**完全同档**。
+    //   ⚠ 这**不是**改数字区的字号（用户明确要求数字区不要动），
+    //     只是不再拿边距去卡它 —— 数字区其余键都是单字符、本来就在 14pt，无变化。
+    //
+    //   主区（block 0）保持扣边距不变：它的标签都是单字符/短词，从没因此降档。
+    int edge = (self->block == 0) ? (int)(6 * GetSystemDpiScale()) : 0;
     int groupMaxW = groupW - edge;
     if (groupMaxW < 1) groupMaxW = groupW;       // 极窄兜底
     // self 的档位也改用组内最小宽重算，避免 self 是最宽那列时定出偏大的档
-    worst = FitTierForText(dc, KeyText(self), groupMaxW);
+    worst = FitTierInLadder(dc, KeyText(self), groupMaxW, L);
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         if (k->block != self->block) continue;
@@ -2381,15 +2456,17 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
         if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
         const wchar_t* s = KeyText(k);
         if (!s || !s[0]) continue;
-        int t = FitTierForText(dc, s, groupMaxW);
+        int t = FitTierInLadder(dc, s, groupMaxW, L);
         if (t > worst) worst = t;                // 取最严（档位序号越大字号越小）
     }
     return worst;
 }
 
 static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_t* s, int maxW) {
-    if (!s || !s[0] || maxW <= 0) return g_f14;
-    HFONT ladder[8] = { g_f14, g_f13, g_f12, g_f10, g_f9, g_f8, g_f7, g_f6 };
+    // ⚠ 必须与 FitUnifiedTier 用**同一套**阶梯：那里用 g_nf* 量，这里就取 g_nf*。
+    //   取错会画出与量宽时不同的字号（要么溢出、要么白白偏小）。
+    const FontLadder L = (self && self->block == 1) ? NavLadder() : MainLadder();
+    if (!s || !s[0] || maxW <= 0) return L.f[0] ? L.f[0] : g_f14;
     if (!g_fitTierValid) {
         for (int i = 0; i < MAX_KEYS; i++) g_fitTierCache[i] = -1;
         g_fitTierValid = TRUE;
@@ -2399,7 +2476,8 @@ static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_
         t = FitUnifiedTier(dc, self, maxW);
         g_fitTierCache[idx] = t;
     }
-    return ladder[t] ? ladder[t] : g_f6;
+    if (L.f[t]) return L.f[t];
+    return L.f[7] ? L.f[7] : g_f6;               // 地板档
 }
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
@@ -3359,9 +3437,30 @@ static void DoKeyAction(const KeyDef* k) {
             // ⇒ 先记起始值，判据用 `now != before`（翻转语义），与起始态无关。
             BOOL before = (GetKeyState(VK_NUMLOCK) & 1) != 0;
             for (int attempt = 0; attempt < 3; attempt++) {
-                SendKey(0x90, FALSE, FALSE, FALSE, FALSE);
+                // ⚠⚠⚠ **不能用 SendKey**（用户第 19 轮实测：实体键盘灯仍不亮）。
+                //
+                //   `SendKey` 第 2 段强制带 `KEYEVENTF_SCANCODE` —— 那是 issue #3
+                //   「Win10 + 微软拼音丢字」的修复所必需，对**字符键**有效。
+                //   但锁存键（NumLock/CapsLock/ScrollLock）的翻转由键盘布局层
+                //   按 **VK** 处理，扫描码路径（`MapVirtualKeyW(0x90)` = 0xE045，
+                //   带 E1 前缀）会被**直接忽略** ⇒ 字符键都正常，唯独灯不亮。
+                //
+                // ⇒ 这里只给 wVk、**不设 wScan、不设 KEYEVENTF_SCANCODE**，
+                //   仅保留 KEYEVENTF_EXTENDEDKEY（真键盘 NumLock 是 E0 45）。
+                //   down/up 成对一次。这正是各类「程序化切 NumLock」方案的写法。
+                {
+                    INPUT pair[2] = {};
+                    pair[0].type = INPUT_KEYBOARD;
+                    pair[0].ki.wVk = VK_NUMLOCK;                 // wScan 留 0
+                    pair[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;  // ⚠ 刻意无 SCANCODE
+                    pair[1] = pair[0];
+                    pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+                    SendInput(2, pair, sizeof(INPUT));
+                }
+                // 锁存键要让系统真的翻转，需要给消息循环一点时间
+                Sleep(KEY_INJECT_GAP_MS);
                 if (((GetKeyState(VK_NUMLOCK) & 1) != 0) != before) break;  // 已翻转
-                if (attempt < 2) Sleep(30);                     // 稍候再试
+                if (attempt < 2) Sleep(40);
             }
             g_npLock = (GetKeyState(VK_NUMLOCK) & 1) != 0;   // 以系统真实状态为准
             g_physNum = g_npLock;                            // 数字区 Num 键高亮同步
@@ -7601,6 +7700,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_f10); DeleteObject(g_f9);
         DeleteObject(g_f8); DeleteObject(g_f7); DeleteObject(g_f6);
+        // 导航区专用字体（见 RecreateFontsAndLayout 处的说明）
+        DeleteObject(g_nf14); DeleteObject(g_nf13); DeleteObject(g_nf12);
+        DeleteObject(g_nf10); DeleteObject(g_nf9);
+        DeleteObject(g_nf8);  DeleteObject(g_nf7);
         DeleteObject(g_sfBig); DeleteObject(g_sfRow); DeleteObject(g_sfCtrl);
         DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);

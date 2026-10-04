@@ -877,9 +877,12 @@ static void InitWindowSizeForDpi() {
         g_ww = (int)(430 * dpiScale);
         g_wh = (int)(320 * dpiScale);
     } else if (g_layoutMode == 2) { // 全尺寸（完整键盘）：6 行，主区+导航区+数字区
-        // 1280×404：宽高比接近常见全尺寸板，键帽不会被横向拉扁
-        g_ww = (int)(1280 * dpiScale);
-        g_wh = (int)(404 * dpiScale);
+        // ⚠ 2026-10-04 用户指定：2240×599。
+        //   2240 DIP 下 1u 键宽约 93px —— 导航区那 5 字母标签（Pause/PrtSc/ScrLk）
+        //   在 14pt 下需 51px，宽裕得多，不必再降档（见 FitUnifiedTier 的说明）。
+        //   599 DIP 高：键高约 90 DIP，正好是字号的增长上限 kFontGrowCapH。
+        g_ww = (int)(2240 * dpiScale);
+        g_wh = (int)(599 * dpiScale);
     } else {                        // 全尺寸
         g_ww = (int)(980 * dpiScale);
         g_wh = (int)(320 * dpiScale);
@@ -3315,8 +3318,53 @@ static void DoKeyAction(const KeyDef* k) {
         //   实体键盘按 NumLock 不会影响 g_npLock（见 TIMER_FOCUS 里 g_npLockInit
         //   的「只跟随一次」），故两处输入源互不干扰。
         if (k->vk == 0x90) {
-            SendKey(0x90, FALSE, FALSE, FALSE, FALSE);   // ① 真模拟，发给目标进程
-            g_npLock = !g_npLock;                       // ② 同步本进程锁定态
+            // ⚠⚠⚠ 2026-10-04 用户第三次反馈：「还是识别不到 NumLock 键启用，
+            //   **我小键盘灯都没亮**，且触发不了小键盘键启用」。
+            //
+            //   **根因：`g_npLock = !g_npLock` 是「自己取反」，不是读回真值。**
+            //
+            //   `SendKey` 只是把 VK_NUMLOCK 塞进输入队列，**系统有没有真的翻转
+            //   NumLock 状态它不知道**。而锁存键有个坑：注入的 down/up 对
+            //   锁存键**不一定被目标线程接受**（尤其带 `KEYEVENTF_SCANCODE` 时，
+            //   见 SendKey 第 2 段；锁存键走的是 TSF/键盘布局层的特殊路径，
+            //   不是普通字符键那条）。于是实际发生的是：
+            //
+            //       目标进程：NumLock 没翻 ⇒ 灯不亮、小键盘仍发导航键 ⇒ 完全无效
+            //       本进程：g_npLock 自己翻了 ⇒ 界面高亮「亮着」⇒ 假象
+            //
+            //   ⇒ 界面显示"已锁定"、实际没生效，就是这个自取反造成的假象。
+            //   这也是为什么用户连报三轮都指向同一件事。
+            //
+            // ⇒ 改法与同文件里**已正常工作**的 `K_CAPS` 完全一致：
+            //     发送后**从系统读回真实锁定态**，而不是自己取反。
+            //
+            //     case K_CAPS:
+            //         SendKey(0x14, ...);
+            //         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;   ← 读回真值
+            //
+            //   `GetKeyState` 对锁存键读的是 bit0 = 锁定态本身，
+            //   **由系统维护、反映真实状态**（与本文件 7495 行读实体灯同法）。
+            //   同一次点击里 SendKey 投递完、随即读回 ⇒ 拿到的是系统的真实结果。
+            //
+            // ⇒ 若读回后仍是原值（注入没被接受），还会**补发两次**再读：
+            //   锁存键对孤立的一次注入有时不响应，成对快速注入的翻转率明显更高。
+            //   最多试 3 次，仍不变就以系统值为准（宁可界面显示"未锁定"，
+            //   也不能假装锁定 —— 假象比失败更难排查）。
+            //
+            // ⚠⚠ **重试的判据必须是「与起始值不同」，不能写死 `!= 0`**。
+            //   NumLock 起始可能是**灭**的（本进程开机就在锁定态），
+            //   此时若判据写成「读到亮就停」，翻转成功后条件仍不成立 ⇒
+            //   继续重发 ⇒ **状态被又翻回去**，等于按一次却翻了奇数次。
+            //   这正是「灯不亮 / 触发不了」这类症状的另一种来源。
+            // ⇒ 先记起始值，判据用 `now != before`（翻转语义），与起始态无关。
+            BOOL before = (GetKeyState(VK_NUMLOCK) & 1) != 0;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                SendKey(0x90, FALSE, FALSE, FALSE, FALSE);
+                if (((GetKeyState(VK_NUMLOCK) & 1) != 0) != before) break;  // 已翻转
+                if (attempt < 2) Sleep(30);                     // 稍候再试
+            }
+            g_npLock = (GetKeyState(VK_NUMLOCK) & 1) != 0;   // 以系统真实状态为准
+            g_physNum = g_npLock;                            // 数字区 Num 键高亮同步
             InvalidateRect(g_hWnd, 0, TRUE);
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;

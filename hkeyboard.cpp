@@ -629,8 +629,15 @@ static DWORD     g_userHidInTick = 0;    // 手动收起的时刻（防回弹的
 
 // ⚠⚠ 临时诊断（定位自动呼出问题用，**定位完即删**）：
 //   带 -afdiag 启动时把每次判断的关键量和 ShowKB 的调用来源追加到 afdiag.txt。
-//   不传该参数时 g_afLog 为 NULL，除一次空指针检查外零开销。
-static FILE* g_afLog = NULL;
+//   不传该参数时 g_afLogPath 为空，除一次判空外零开销。
+// ⚠ 用**路径**而不是常驻 FILE*：日志改用"每次追加打开、写完即关"。
+//   原因：原来用 `L"w"` 常驻打开，只要有一次重复启动（脚本杀进程的间隙、
+//   手动又点了一次 exe），新实例就会**把已有内容整个截断** ——
+//   表现就是 afdiag.txt 只剩一个 BOM、一行都没有。
+//   改成追加后，多实例、中途被杀都不会丢内容。
+static wchar_t g_afLogPath[MAX_PATH] = {0};
+static int     g_afLogLines = 0;      // 已写行数（够多就停，别把磁盘写爆）
+#define AFLOG_MAX_LINES 4000
 
 static const char* AfClsName(HWND h) {
     static char buf[80];
@@ -642,17 +649,33 @@ static const char* AfClsName(HWND h) {
 static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                   BOOL recentClick, BOOL clickInFg, BOOL byKey,
                   BOOL await, BOOL vis, BOOL motion, const char* decision) {
-    if (!g_afLog) return;
+    if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
+    FILE* f = NULL;
+    if (_wfopen_s(&f, g_afLogPath, L"a, ccs=UTF-8") != 0 || !f) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(g_afLog,
+    fprintf(f,
             "%02d:%02d:%02d.%03d %-7s fg=%-24s fgTop=%p click=%p(%-20s) "
             "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d => %s\n",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
             AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
             AfClsName(g_lastClickTopHwnd), (int)recentClick, (int)clickInFg,
             (int)byKey, (int)await, (void*)input, (int)vis, (int)motion, decision);
-    fflush(g_afLog);
+    fclose(f);
+    g_afLogLines++;
+}
+
+// 直接写一行（不带那些字段，用于阶段标记）
+static void AfNote(const char* text) {
+    if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
+    FILE* f = NULL;
+    if (_wfopen_s(&f, g_afLogPath, L"a, ccs=UTF-8") != 0 || !f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%02d:%02d:%02d.%03d === %s\n", st.wHour, st.wMinute, st.wSecond,
+            st.wMilliseconds, text);
+    fclose(f);
+    g_afLogLines++;
 }
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
@@ -6672,10 +6695,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, PhysKeyHookProc, g_hInst, 0);
         // 全局鼠标钩子：只记录点击落点，供自动呼出判断"这次是不是用户点出来的"
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, PhysMouseHookProc, g_hInst, 0);
-        if (g_afLog) {
-            fprintf(g_afLog, "== mouse hook=%p kb hook=%p (NULL means FAILED)\n",
-                    (void*)g_mouseHook, (void*)g_kbHook);
-            fflush(g_afLog);
+        {
+            char buf[128];
+            _snprintf_s(buf, 128, _TRUNCATE,
+                        "hooks: mouse=%p kb=%p (NULL means FAILED)",
+                        (void*)g_mouseHook, (void*)g_kbHook);
+            AfNote(buf);
         }
         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;  // 启动时同步 CapsLock 状态
         SetTimer(hWnd, TIMER_FOCUS, 50, 0);
@@ -6851,6 +6876,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 KillTimer(hWnd, TIMER_REPEAT);
             }
         } else if (w == TIMER_FOCUS) {
+            // 诊断：定时器心跳（每 100 次 = 约 5 秒记一次，确认轮询确实在跑）
+            {
+                static int beat = 0;
+                if (++beat >= 100) { beat = 0; AfNote("timer alive (TIMER_FOCUS)"); }
+            }
             // Win 锁定/高亮状态与开始菜单状态同步：
             // 开始菜单（无论由本键盘还是任务栏打开）一旦显示，即清除 Win 锁定，避免高亮残留。
             if (g_winKey && IsStartMenuOpen()) {
@@ -7351,27 +7381,29 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         wchar_t* sl = wcsrchr(lp, L'\\');
         if (sl) *(sl + 1) = 0;
         wcscat_s(lp, MAX_PATH, L"afdiag.txt");
-        _wfopen_s(&g_afLog, lp, L"w, ccs=UTF-8");
-        if (g_afLog) {
-            fprintf(g_afLog, "=== started with -afdiag, build %s %s ===\n",
-                    __DATE__, __TIME__);
-            fflush(g_afLog);
+        // 只在这里清一次文件（用 "w"），之后全部走追加
+        FILE* f0 = NULL;
+        if (_wfopen_s(&f0, lp, L"w, ccs=UTF-8") == 0 && f0) fclose(f0);
+        wcscpy_s(g_afLogPath, MAX_PATH, lp);
+        {
+            char buf[160];
+            _snprintf_s(buf, 160, _TRUNCATE,
+                        "started with -afdiag, build %s %s, pid=%lu",
+                        __DATE__, __TIME__, (unsigned long)GetCurrentProcessId());
+            AfNote(buf);
         }
     }
 
     BOOL isTouch = IsTouchDevice();
 
     if (tOnly && !isTouch) return 0;
-    if (g_afLog) { fprintf(g_afLog, "--- passed single-instance check, creating window ---\n"); fflush(g_afLog); }
+    AfNote("--- passed single-instance check, creating window ---");
 
     g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         // 诊断：上次 afdiag.txt 只有 BOM、一行都没有，最可能就是走的这条路 ——
         // 旧实例还在跑，新进程转发消息后静默退出，日志自然空白。
-        if (g_afLog) {
-            fprintf(g_afLog, "!!! ANOTHER INSTANCE ALREADY RUNNING -> exit now\n");
-            fflush(g_afLog);
-        }
+        AfNote("!!! ANOTHER INSTANCE ALREADY RUNNING -> exit now");
         CloseHandle(g_mutex);
         HWND ew = FindWindowW(L"HKeyboard", 0);
         if (ew) {

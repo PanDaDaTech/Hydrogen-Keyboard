@@ -586,6 +586,11 @@ HHOOK       g_mouseHook = 0;          // 全局鼠标低级钩子（只记录"�
 //   · 键盘操作 —— 不校验落点，直接放行（用户明确要求"键盘聚焦到输入框
 //     （Tab / Ctrl+F / 自动聚焦）时也要弹"）。
 #define AUTOSHOW_INPUT_WINDOW_MS 1500
+// 失焦"防抖"窗口：焦点探测会**爆发式**失败（用户日志实测：80ms 内连续 6 条
+// noInput，fg 为空 —— GetForegroundWindow 瞬时返回 NULL）。失焦必须**持续**
+// 超过这个时长才算真的失焦，否则会把 g_userHidInInput（手动收起标记）误清，
+// 用户看到的是「手动收起后过几秒键盘自己弹回来」。
+#define AUTOSHOW_INPUT_GRACE_MS 500
 static DWORD g_lastClickTick = 0;      // 最后一次真实鼠标左键点击
 static POINT g_lastClickPt = {0, 0};   // 它的屏幕坐标
 static DWORD g_lastKeyTick = 0;        // 最后一次真实键盘按键
@@ -610,6 +615,9 @@ static HWND  g_lastClickTopHwnd = NULL;
 // 会间歇性返回 NULL，直接据此隐藏会让键盘闪烁（用户看到的"莫名其妙回弹"）。
 // 连续几次都拿不到才认为真的失焦。
 static int   g_noInputStreak = 0;
+// 失焦开始的时刻（首次越过"连续确认"门槛时记录，输入焦点恢复时清零）。
+// 与 AUTOSHOW_INPUT_GRACE_MS 配合，滤掉爆发式抖动 —— 见其定义处说明。
+static DWORD g_noInputSinceTick = 0;
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 // 实体 NumLock 锁定态（GetAsyncKeyState(VK_NUMLOCK) 的 bit0），全尺寸数字区的 Num 键跟着它高亮
@@ -659,6 +667,17 @@ static HWND     g_dbgCaret = NULL;
 static int g_dbgResp = -1;
 static int g_dbgAcc = 0;
 static int g_dbgAccFound = -1;
+// 类名快速路径的**补查**（诊断专用）：类名命中后（QQ / 浏览器 / Electron 走这条路）
+// 再补一次 accessibility 查询，验证"a11y 能否分辨『焦点在输入框』与『焦点在
+// 空白处』" —— 这两者光看窗口类名分辨不出来，而它正是"点空白自动隐藏"的关键。
+//   g_dbgExtraMs       补查耗时 ms（-1 = 本 tick 没跑）
+//   g_dbgExtraOk       补查结果（-1 = 没跑 / 0 = 未找到可编辑焦点 / 1 = 找到）
+//   g_dbgExtraDue      本 tick 是否安排补查（UpdateAutoVisibility 在用户操作窗口内置位）
+//   g_dbgExtraLastTick 上次补查时刻（降频用；跨进程 COM 有成本）
+static int      g_dbgExtraMs = -1;
+static int      g_dbgExtraOk = -1;
+static BOOL     g_dbgExtraDue = FALSE;
+static DWORD    g_dbgExtraLastTick = 0;
 // 键盘窗口的**实际**可见性与矩形。
 // ⚠ 这是用来验证「程序以为显示着、用户却看不到」这个猜想的：
 //   `g_vis` 只是软件标志位，和 `IsWindowVisible` 可能不一致。
@@ -698,7 +717,7 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
                 "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
                 "gui=%d focusCls=%-22s isInput=%d caret=%p "
-                "resp=%d hr=0x%X found=%d | "
+                "resp=%d hr=0x%X found=%d | xms=%d xok=%d | "
                 "visWnd=%d rect=%d,%d %dx%d => %s\n",
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
                 AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
@@ -706,6 +725,7 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 (int)byKey, (int)await, (void*)input, (int)vis, (int)motion,
                 g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput,
                 (void*)g_dbgCaret, g_dbgResp, (unsigned)g_dbgAcc, g_dbgAccFound,
+                g_dbgExtraMs, g_dbgExtraOk,
                 g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3],
                 decision);
     AfWriteRaw(buf);
@@ -6412,6 +6432,19 @@ static HWND GetFocusedInputControl() {
     if (haveGuiInfo) {
         if (IsInputControl(focus)) {
             g_detectedInputToken = (ULONG_PTR)focus;
+            // 诊断（-afdiag）：类名快速路径补查一次 accessibility。
+            // ⚠ 纯验证用，**不影响返回值**。仅在诊断模式 + 用户操作窗口内
+            //   （g_dbgExtraDue）+ 距上次补查 ≥300ms 时执行。
+            if (g_dbgExtraDue && g_afLogPath[0]) {
+                DWORD nx = GetTickCount();
+                if (nx - g_dbgExtraLastTick >= 300) {
+                    g_dbgExtraLastTick = nx;
+                    ULONG_PTR tok2 = 0;
+                    BOOL ok2 = IsAccessibleInputWindow(focus, &tok2);
+                    g_dbgExtraMs = (int)(GetTickCount() - nx);
+                    g_dbgExtraOk = ok2 ? 1 : 0;
+                }
+            }
             return focus;
         }
 
@@ -6503,6 +6536,11 @@ static void UpdateAutoVisibility() {
     // 用户主动操作（点在前台窗口内 / 敲键盘）-> 解除"切换窗口"的封锁
     if (byKey || clickInFg) g_fgAwaitUserInput = FALSE;
 
+    // 诊断：本 tick 默认无补查；用户操作窗口内才安排（须在 GetFocusedInputControl
+    // 之前清/置，否则会把补查刚写入的结果清掉）
+    g_dbgExtraMs = -1;
+    g_dbgExtraOk = -1;
+    g_dbgExtraDue = (g_afLogPath[0] && (recentClick || byKey)) ? TRUE : FALSE;
     HWND input = GetFocusedInputControl();
     // 诊断（-afdiag）：记录这次评估的全部输入量
     {
@@ -6519,6 +6557,7 @@ static void UpdateAutoVisibility() {
     if (input) {
         g_lastNonInput = 0;
         g_noInputStreak = 0;
+        g_noInputSinceTick = 0;   // 输入焦点恢复，失焦计时清零（见失焦分支防抖说明）
         g_manualShow = FALSE;
 
         // 防回弹：用户刚在这个输入框里手动收起过，别立刻弹回来。
@@ -6558,8 +6597,20 @@ static void UpdateAutoVisibility() {
     //   连续 4 次（约 200ms，叠加下面的 hideDelay 已足够）都没焦点才继续。
     g_noInputStreak++;
     if (g_noInputStreak < 4) return;
+    if (g_noInputSinceTick == 0) g_noInputSinceTick = nowTick;
 
-    g_userHidInInput = FALSE;   // 焦点确实已离开输入框，清除手动收起标记
+    // ⚠⚠ 防抖（2026-10-04 用户日志实测，修的是「手动收起后过几秒键盘自己弹回来」）：
+    //   焦点探测会**爆发式**失败 —— 日志里出现过 80ms 内连续 6 条 noInput 的采样，
+    //   根因是 `GetForegroundWindow` 瞬时返回 NULL。只按"连续次数"判定时，
+    //   这种抖动会穿过上面那道门槛，把 g_userHidInInput（手动收起标记）清掉，
+    //   防回弹于是永久失效 —— 下一次轮到 input 有效就直接弹回来了。
+    //   ⇒ 改为按**失焦持续时间**判定：只有失焦真的持续了
+    //     AUTOSHOW_INPUT_GRACE_MS 以上，才认为焦点确实离开了。
+    //   ⚠ 这里**只保护这一句**：下面的隐藏流程保持原有节奏（80ms 级的爆发抖动
+    //     本来就穿不过 300ms 的 hideDelay），避免把隐藏时机整体拖慢。
+    if (nowTick - g_noInputSinceTick >= AUTOSHOW_INPUT_GRACE_MS)
+        g_userHidInInput = FALSE;
+    if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
     if (!g_vis) {
         // 隐藏滑动被打断（如拖动标题栏）后窗口可能仍残留可见：直接收尾藏到任务栏底部

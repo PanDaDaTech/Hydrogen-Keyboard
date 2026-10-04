@@ -687,6 +687,11 @@ static DWORD    g_dbgExtraLastTick = 0;
 //   frole               → 实际拿到的 role（白名单目前只有 0x2A / 0x34）
 static int      g_dbgFocusVt = -1;
 static LONG     g_dbgFocusRole = -1;
+// 诊断：最近一次 UIA 探测的结果（UiaHasTextFocus 写，AfLog 读 —— 必须定义在此之前）
+static int      g_dbgUiaHr = -999;   // GetFocusedElement 的 HRESULT
+static int      g_dbgUiaCt = -1;     // ControlType（50004=Edit 50030=Document）
+static int      g_dbgUiaKf = -1;     // CurrentHasKeyboardFocus
+static int      g_dbgUiaTp = -1;     // IsTextPatternAvailable 属性
 // 「该前台窗口（Chrome/Electron 系）是否**没有可用的 a11y 通道**」——
 // 由 GetFocusedInputControl 在每次探测后更新，驱动 IsInputControl 里
 // Chrome_WidgetWin 的类名兜底是否生效。详见该函数内的说明。
@@ -6303,12 +6308,6 @@ static BOOL AccessibleRoleIsEditable(IAccessible* acc, VARIANT child) {
 static IUIAutomation* g_uia = NULL;
 static BOOL g_uiaTried = FALSE;
 
-// 诊断：最近一次 UIA 探测的结果
-static int  g_dbgUiaHr = -999;        // GetFocusedElement 的 HRESULT
-static int  g_dbgUiaCt = -1;          // ControlType（50004=Edit 50030=Document）
-static int  g_dbgUiaKf = -1;          // CurrentHasKeyboardFocus
-static int  g_dbgUiaTp = -1;          // CurrentIsTextPatternAvailable
-
 static BOOL EnsureUia() {
     if (g_uiaTried) return g_uia != NULL;
     g_uiaTried = TRUE;
@@ -6329,13 +6328,23 @@ static BOOL UiaHasTextFocus() {
     g_dbgUiaCt = -1; g_dbgUiaKf = -1; g_dbgUiaTp = -1;
     if (FAILED(hr) || !el) return FALSE;
     CONTROLTYPEID ct = 0;
-    BOOL hasKf = FALSE, hasTp = FALSE;
+    BOOL hasKf = FALSE;
     el->get_CurrentControlType(&ct);
     el->get_CurrentHasKeyboardFocus(&hasKf);
-    el->get_CurrentIsTextPatternAvailable(&hasTp);
     g_dbgUiaCt = (int)ct;
     g_dbgUiaKf = hasKf ? 1 : 0;
-    g_dbgUiaTp = hasTp ? 1 : 0;
+    // ⚠ IUIAutomationElement **没有** `get_CurrentIsTextPatternAvailable` 方法
+    //   （CI x86 报 C2039: is not a member of）。这类"能力查询"在 UIA 里
+    //   统一走 `GetCurrentPropertyValue(UIA_IsTextPatternAvailablePropertyId)`。
+    VARIANT vPat;
+    ZeroMemory(&vPat, sizeof(vPat));
+    if (SUCCEEDED(el->GetCurrentPropertyValue(UIA_IsTextPatternAvailablePropertyId,
+                                               &vPat)) && vPat.vt == VT_BOOL) {
+        g_dbgUiaTp = vPat.boolVal ? 1 : 0;
+    } else {
+        g_dbgUiaTp = -1;
+    }
+    VariantClear(&vPat);
     el->Release();
     if (!hasKf) return FALSE;
     // UIA_EditControlTypeId(50004) / UIA_DocumentControlTypeId(50030)

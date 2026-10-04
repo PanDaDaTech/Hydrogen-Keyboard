@@ -626,6 +626,34 @@ BOOL        g_afAutoHide = TRUE;
 static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收起（自动收起开启时不回弹）
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 static DWORD     g_userHidInTick = 0;    // 手动收起的时刻（防回弹的超时兜底用）
+
+// ⚠⚠ 临时诊断（定位自动呼出问题用，**定位完即删**）：
+//   带 -afdiag 启动时把每次判断的关键量和 ShowKB 的调用来源追加到 afdiag.txt。
+//   不传该参数时 g_afLog 为 NULL，除一次空指针检查外零开销。
+static FILE* g_afLog = NULL;
+
+static const char* AfClsName(HWND h) {
+    static char buf[80];
+    buf[0] = 0;
+    if (h) GetClassNameA(h, buf, 80);
+    return buf;
+}
+
+static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
+                  BOOL recentClick, BOOL clickInFg, BOOL byKey,
+                  BOOL await, BOOL vis, BOOL motion, const char* decision) {
+    if (!g_afLog) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_afLog,
+            "%02d:%02d:%02d.%03d %-7s fg=%-24s fgTop=%p click=%p(%-20s) "
+            "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d => %s\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
+            AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
+            AfClsName(g_lastClickTopHwnd), (int)recentClick, (int)clickInFg,
+            (int)byKey, (int)await, (void*)input, (int)vis, (int)motion, decision);
+    fflush(g_afLog);
+}
 BOOL        g_closeToTray = FALSE;     // × 关闭行为：TRUE=隐藏到托盘，FALSE=直接退出（默认直接退出）
 BOOL        g_rememberClose = FALSE;   // 记住“× 关闭行为”的选择（持久化到注册表）
 int         g_layoutMode = 0;          // 键盘布局：0=默认 1=小键盘 2=全尺寸（完整）
@@ -3423,6 +3451,10 @@ static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
 }
 
 static void ShowKB(BOOL show, BOOL isManual) {
+    // 诊断（-afdiag）：谁在显示/隐藏键盘
+    AfLog("ShowKB", GetForegroundWindow(), NULL,
+          isManual ? (HWND)1 : NULL, 0, 0, 0, isManual, g_vis,
+          g_mainMotion.active, show ? "SHOW" : "HIDE");
     if (!g_hWnd) return;
     if (g_exiting && show) return;
     RECT work = {0};
@@ -6387,6 +6419,10 @@ static void UpdateAutoVisibility() {
     if (byKey || clickInFg) g_fgAwaitUserInput = FALSE;
 
     HWND input = GetFocusedInputControl();
+    // 诊断（-afdiag）：记录这次评估的全部输入量
+    AfLog("eval", fgNow, fgTop, input, recentClick, clickInFg, byKey,
+          g_fgAwaitUserInput, g_vis, g_mainMotion.active,
+          input ? "hasInput" : "noInput");
     if (input) {
         g_lastNonInput = 0;
         g_noInputStreak = 0;
@@ -6636,6 +6672,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, PhysKeyHookProc, g_hInst, 0);
         // 全局鼠标钩子：只记录点击落点，供自动呼出判断"这次是不是用户点出来的"
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, PhysMouseHookProc, g_hInst, 0);
+        if (g_afLog) {
+            fprintf(g_afLog, "== mouse hook=%p kb hook=%p (NULL means FAILED)\n",
+                    (void*)g_mouseHook, (void*)g_kbHook);
+            fflush(g_afLog);
+        }
         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;  // 启动时同步 CapsLock 状态
         SetTimer(hWnd, TIMER_FOCUS, 50, 0);
         return 0;
@@ -7297,6 +7338,15 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_noClickRepaint  = HasArg(cmd, "-norepaint")  ? TRUE : FALSE;
     // -diag：记录每次字母键注入前后的系统状态到 diag.txt（见 DiagSnap）
     g_diag            = HasArg(cmd, "-diag")       ? TRUE : FALSE;
+    // -afdiag：自动呼出诊断日志（临时，定位完删）
+    if (HasArg(cmd, "-afdiag")) {
+        wchar_t lp[MAX_PATH] = {0};
+        GetModuleFileNameW(NULL, lp, MAX_PATH);
+        wchar_t* sl = wcsrchr(lp, L'\\');
+        if (sl) *(sl + 1) = 0;
+        wcscat_s(lp, MAX_PATH, L"afdiag.txt");
+        _wfopen_s(&g_afLog, lp, L"w, ccs=UTF-8");
+    }
     // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
     // 少了这个没法比较（见 DiagSnap 的说明）。
     if (g_envTest) g_diag = TRUE;

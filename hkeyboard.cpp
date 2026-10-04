@@ -502,9 +502,6 @@ static void InitWindowSizeForDpi();
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
 static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
-// ⚠ 前向声明必需：LastClickHitInputWindow 定义在 WinEventProc / 鼠标钩子那一带
-//   （文件靠后），而 UpdateAutoVisibility 在它之前就要用它判断"点击落点"。
-static BOOL LastClickHitInputWindow(HWND input);
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
@@ -604,6 +601,15 @@ static DWORD g_lastKeyTick = 0;        // 最后一次真实键盘按键
 //   键盘照样会自己弹出来 —— 等于没解决问题。
 static HWND g_lastFg = NULL;
 static BOOL g_fgAwaitUserInput = FALSE;
+// 最近一次点击**落点所属的顶层窗口**。在鼠标钩子里当场算好 ——
+// ⚠ 不要等到 UpdateAutoVisibility 里再 WindowFromPoint：那时窗口可能已经变了，
+//   而且判断"点的是不是输入控件"若依赖 GetFocusedInputControl 的返回值，
+//   会因为**焦点转移滞后**而误判（用户实测的「点输入框反而被收掉/不弹」）。
+static HWND  g_lastClickTopHwnd = NULL;
+// 连续"没有输入焦点"的评估次数。焦点探测（GetGUIThreadInfo / hwndCaret）
+// 会间歇性返回 NULL，直接据此隐藏会让键盘闪烁（用户看到的"莫名其妙回弹"）。
+// 连续几次都拿不到才认为真的失焦。
+static int   g_noInputStreak = 0;
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 // 实体 NumLock 锁定态（GetAsyncKeyState(VK_NUMLOCK) 的 bit0），全尺寸数字区的 Num 键跟着它高亮
@@ -6361,46 +6367,47 @@ static void UpdateAutoVisibility() {
 
     DWORD nowTick = GetTickCount();
 
-    // ⚠⚠⚠ 先结算"用户是否刚主动操作过"，**放在所有 return 之前**。
-    //   之前这段在 if (input) 里面、排在那段可能 return 的自动隐藏之后 ——
-    //   一旦自动隐藏提前 return，这次操作就永远解除不了 g_fgAwaitUserInput，
-    //   结果就是「点了输入框也不弹、而且再也弹不出来」。
-    //   用户实测的「点击输入框且窗口在前台时不会自动呼出」正是这条路径。
-    HWND input = GetFocusedInputControl();
-    BOOL recentClick  = (g_lastClickTick && nowTick - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS);
-    BOOL byKey        = (g_lastKeyTick && nowTick - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
-    BOOL clickOnInput = (recentClick && input && LastClickHitInputWindow(input));
-    if (byKey || clickOnInput) g_fgAwaitUserInput = FALSE;
+    // ⚠⚠⚠ 全部判断都不再依赖 `input`（GetFocusedInputControl 的返回值
+    //   滞后于焦点转移，用它做"点击落点"比较会误判 —— 用户实测
+    //   「点了输入框反而被收掉 / 再点也不弹」就是这条）。
+    //   改用「点击落点所属顶层窗口 == 当前前台窗口」这个稳定得多的判据。
+    HWND fgNow = GetForegroundWindow();
+    HWND fgTop = fgNow ? GetAncestor(fgNow, GA_ROOT) : NULL;
 
+    // 前台窗口变了 -> 进入"等待用户操作"状态
+    if (fgNow != g_lastFg) { g_lastFg = fgNow; g_fgAwaitUserInput = TRUE; }
+
+    BOOL recentClick = (g_lastClickTick && nowTick - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS);
+    BOOL byKey       = (g_lastKeyTick && nowTick - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
+    // 点击落点是否在当前前台窗口内（点在任务栏 / 桌面 / 别的应用上都不算）
+    BOOL clickInFg   = (recentClick && g_lastClickTopHwnd && fgTop &&
+                        g_lastClickTopHwnd == fgTop);
+
+    // 用户主动操作（点在前台窗口内 / 敲键盘）-> 解除"切换窗口"的封锁
+    if (byKey || clickInFg) g_fgAwaitUserInput = FALSE;
+
+    HWND input = GetFocusedInputControl();
     if (input) {
         g_lastNonInput = 0;
+        g_noInputStreak = 0;
         g_manualShow = FALSE;
 
         // 防回弹：用户刚在这个输入框里手动收起过，别立刻弹回来。
-        // ⚠ 2026-10-04 改法：**命中就 return；没命中也不立刻清标记**。
-        //   原来 `g_userHidInInput = FALSE;` 是无条件执行的，而焦点探测返回的
-        //   token 并不总落在同一个东西上（有时是控件、有时是 caret 窗口），
-        //   只要有一次对不上，标记就被清掉、防回弹**永久失效** ——
-        //   用户看到的就是「莫名其妙又弹回来」。现在改为：
-        //   token 对不上也先按住，直到 8 秒超时才放行。
+        // ⚠ token 对不上也先按住，直到超时才放行（原来无条件清标记，
+        //   只要有一次对不上防回弹就永久失效 —— 用户看到的"莫名其妙回弹"）。
         if (g_userHidInInput) {
             if (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken) return;
             if (nowTick - g_userHidInTick < 8000) return;
             g_userHidInInput = FALSE;
         }
 
-        // 自动隐藏：用户刚点击了输入框以外的区域 -> 立刻收起键盘。
-        //   · 点在键盘自己 / 设置窗 / 关闭提示窗上 -> 不算"点到了别处"
-        //     （点键盘按键绝不能把键盘收起来）
-        //   · 点在输入控件所属窗口内 -> 不算（浏览器里点页面即在此列）
-        //   ⚠ 这里再加一道"顶层窗口必须不同"的确认：宁可少收一次，
-        //     也不要因为误判把刚弹出来的键盘收掉。
-        if (g_afAutoHide && g_vis && recentClick && !clickOnInput) {
-            HWND hit = WindowFromPoint(g_lastClickPt);
-            HWND topHit = hit ? GetAncestor(hit, GA_ROOT) : NULL;
-            HWND topInput = GetAncestor(input, GA_ROOT);
-            if (topHit && topHit != g_hWnd && topHit != g_settingsHwnd &&
-                topHit != g_closePromptHwnd && topHit != topInput) {
+        // 自动隐藏：用户刚点击了前台窗口以外的区域 -> 立刻收起键盘。
+        //   · 点键盘自己 / 设置窗 / 关闭提示窗 -> 不算"点到了别处"
+        //   · 点在当前前台窗口内 -> 不算（点输入框、点页面都在此列）
+        if (g_afAutoHide && g_vis && recentClick && !clickInFg) {
+            if (g_lastClickTopHwnd && g_lastClickTopHwnd != g_hWnd &&
+                g_lastClickTopHwnd != g_settingsHwnd &&
+                g_lastClickTopHwnd != g_closePromptHwnd) {
                 ShowKB(FALSE, FALSE);
                 return;
             }
@@ -6417,7 +6424,13 @@ static void UpdateAutoVisibility() {
     HWND fg = GetForegroundWindow();
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return;
 
-    g_userHidInInput = FALSE;   // 焦点已离开输入框，清除手动收起标记
+    // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量），
+    //   只凭一次就拿去隐藏会让键盘闪烁 —— 用户看到的"莫名其妙回弹"。
+    //   连续 4 次（约 200ms，叠加下面的 hideDelay 已足够）都没焦点才继续。
+    g_noInputStreak++;
+    if (g_noInputStreak < 4) return;
+
+    g_userHidInInput = FALSE;   // 焦点确实已离开输入框，清除手动收起标记
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
     if (!g_vis) {
         // 隐藏滑动被打断（如拖动标题栏）后窗口可能仍残留可见：直接收尾藏到任务栏底部
@@ -6452,23 +6465,12 @@ static LRESULT CALLBACK PhysMouseHookProc(int nCode, WPARAM wParam, LPARAM lPara
         if (!(m->flags & LLMHF_INJECTED) && wParam == WM_LBUTTONDOWN) {
             g_lastClickTick = GetTickCount();
             g_lastClickPt = m->pt;
+            // 当场记下落点的顶层窗口（供 UpdateAutoVisibility 判断"点的是不是当前前台窗口"）
+            HWND h = WindowFromPoint(m->pt);
+            g_lastClickTopHwnd = h ? GetAncestor(h, GA_ROOT) : NULL;
         }
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
-}
-
-// 最近那次鼠标点击是否落在"输入控件所属的窗口"里。
-// ⚠ 不能只跟控件本身比：浏览器 / Electron 场景下 GetFocusedInputControl 返回的
-//   是渲染宿主窗口，用户点的是页面里的位置，命中点常常是它的子孙窗口；
-//   所以退一步比顶层窗口是否同一个。
-static BOOL LastClickHitInputWindow(HWND input) {
-    if (!input || !g_lastClickTick) return FALSE;
-    HWND hit = WindowFromPoint(g_lastClickPt);
-    if (!hit) return FALSE;
-    if (hit == input || IsChild(input, hit)) return TRUE;
-    HWND topHit = GetAncestor(hit, GA_ROOT);
-    HWND topInput = GetAncestor(input, GA_ROOT);
-    return (topHit && topInput && topHit == topInput);
 }
 
 // ===== 实体键盘状态监控（WH_KEYBOARD_LL） =====

@@ -646,6 +646,13 @@ static const char* AfClsName(HWND h) {
     return buf;
 }
 
+// 诊断：GetFocusedInputControl 的中间结果（每次调用刷新，AfLog 时读出）
+static char     g_dbgFocusCls[80] = {0};
+static int      g_dbgHaveGui = -1;
+static int      g_dbgIsInput = -1;
+static unsigned g_dbgFlags = 0;
+static HWND     g_dbgCaret = NULL;
+
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
 //   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
 //   文件被创建（BOM 在），但 fprintf 一个字都没落盘，实测三次都是空文件。
@@ -669,14 +676,17 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
     if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char buf[400];
+    char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "%02d:%02d:%02d.%03d %-7s fg=%-24s fgTop=%p click=%p(%-20s) "
-                "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d => %s\n",
+                "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
+                "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
+                "gui=%d focusCls=%-22s isInput=%d flags=0x%X caret=%p => %s\n",
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
                 AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
-                AfClsName(g_lastClickTopHwnd), (int)recentClick, (int)clickInFg,
-                (int)byKey, (int)await, (void*)input, (int)vis, (int)motion, decision);
+                (int)recentClick, (int)clickInFg,
+                (int)byKey, (int)await, (void*)input, (int)vis, (int)motion,
+                g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput, g_dbgFlags,
+                (void*)g_dbgCaret, decision);
     AfWriteRaw(buf);
 }
 
@@ -6360,6 +6370,15 @@ static HWND GetFocusedInputControl() {
     GUITHREADINFO gi = {sizeof(gi)};
     BOOL haveGuiInfo = GetGUIThreadInfo(tid, &gi);
     HWND focus = haveGuiInfo && gi.hwndFocus ? gi.hwndFocus : fg;
+
+    // 诊断：记录这次判断的关键中间量（见 g_dbgFocusCls 的说明）
+    {
+        strncpy_s(g_dbgFocusCls, sizeof(g_dbgFocusCls), AfClsName(focus), _TRUNCATE);
+        g_dbgHaveGui = haveGuiInfo ? 1 : 0;
+        g_dbgIsInput = IsInputControl(focus) ? 1 : 0;
+        g_dbgFlags   = haveGuiInfo ? (unsigned)gi.flags : 0;
+        g_dbgCaret   = haveGuiInfo ? gi.hwndCaret : NULL;
+    }
     if (haveGuiInfo) {
         if (IsInputControl(focus)) {
             g_detectedInputToken = (ULONG_PTR)focus;

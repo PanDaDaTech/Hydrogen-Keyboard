@@ -508,6 +508,8 @@ static void InvalidateFitTier(void);      // 作废「同宽键统一字号」�
 static double GetSystemDpiScale();
 static void InitWindowSizeForDpi();
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
+// 只失效某个 vk 对应的那一格键（定义在绘制函数区，OnKeyDown 里点 Num 键要用）
+static void InvalidateKeyByVk(HWND hWnd, short vk);
 static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
 static BOOL LoadLayoutWindowRect(RECT* out);
@@ -3497,15 +3499,21 @@ static void DoKeyAction(const KeyDef* k) {
             //   ⇒ 这就是「有时候正常有时候不正常」的来源：**取决于系统延迟
             //     与 1ms 的赛跑结果**，所以时好时坏。
             //
-            // ⇒ 修法两条：
-            //   ① **只注入一次**。重复注入不是「重试」，是**继续翻转**——
-            //     锁存键每收到一次就翻一次，注入 N 次 = 翻 N 次。
-            //     既然第 20 轮改成 VK 路径后已能生效，就不需要重试。
-            //   ② 读回要**等够时间**：给系统一个确定的等待窗口，而不是 1ms。
-            //     期间反复读，**一旦变化就立刻采用**（不注入、只观察）。
-            // 注入一次 VK_NUMLOCK（走 VK 路径、不带 SCANCODE —— 锁存键的
-            // 翻转由键盘布局层按 VK 处理，扫描码路径会被忽略）。
-            // ⚠ **只注一次**：锁存键每收到一次就翻一次，重发不是"重试"而是"继续翻"。
+            // ⇒ 修法与最终形态（第 21~24 轮的结论汇总）：
+            //   ① 注入**只发一次**，走 **VK 路径**（`wVk = VK_NUMLOCK`、
+            //      不带 `KEYEVENTF_SCANCODE`）—— 锁存键的翻转由键盘布局层
+            //      按 VK 处理，扫描码路径会被忽略（第 21 轮实测：加 SCANCODE 灯不亮）。
+            //      ⚠ 重复注入不是"重试"而是"继续翻转"：锁存键每收到一次就翻一次，
+            //      注入 N 次 = 翻 N 次。第 20 轮的重试逻辑正是「时好时坏」的来源。
+            //   ② **不在点击里等读回**（第 24 轮）：上一版在这里死等最多 200ms，
+            //      把 WndProc 堵住 ⇒ 掉帧、点键手感停顿，就是用户说的"卡卡的"。
+            //      翻转结果不需要当场知道 —— TIMER_FOCUS 每 50ms 无条件读回
+            //      真实锁定态并对齐高亮（见 WM_TIMER 里那段），可以自愈。
+            //   ③ `before` **必须在注入之前读**：注入到锁定位更新是异步的，
+            //      若读完再注入，某次系统落实得快时 `!before` 会算反。
+            //      先读旧值 ⇒ `!before` 严格等于「预期翻转结果」。
+            //   ④ 高亮立刻按预期值画出来（视觉上跟手），只失效 Num 那一格。
+            BOOL before = ReadSystemNumLock();
             {
                 INPUT pair[2] = {};
                 pair[0].type = INPUT_KEYBOARD;
@@ -3515,20 +3523,9 @@ static void DoKeyAction(const KeyDef* k) {
                 pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
                 SendInput(2, pair, sizeof(INPUT));
             }
-            // 读回**真实锁定态**（GetKeyState 的低位，见 ReadSystemNumLock 的实测说明）。
-            // 最多等 200ms：给系统一点时间把翻转落到锁定位上，变了就停。
-            // ⚠ 期间**只读不注入**；判据用 `now != before`（翻转语义），
-            //   不能写死 `!= 0` —— 起始可能是"灭"，写死会把状态又翻回去。
-            BOOL before = ReadSystemNumLock();
-            BOOL now = before;
-            for (int wait = 0; wait < 20; wait++) {
-                Sleep(10);
-                now = ReadSystemNumLock();
-                if (now != before) break;                     // 已翻转
-            }
-            g_npLock = now;                                  // 以系统真实状态为准
+            g_npLock = !before;                              // 预期值，TIMER 会校正
             g_physNum = g_npLock;                            // 数字区 Num 键高亮同步
-            InvalidateRect(g_hWnd, 0, TRUE);
+            InvalidateKeyByVk(g_hWnd, VK_NUMLOCK);           // 只重画 Num 那格
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;
         }
@@ -3914,6 +3911,44 @@ static int HitKey(int x, int y) {
             return i;
     }
     return -1;
+}
+
+// 只失效「某个 vk 对应的那一格键」，而不是整个窗口。
+//
+// 背景：TIMER_FOCUS 每 50ms 校正一次物理键/锁定键状态，原先一有变化就
+// `InvalidateRect(hWnd, 0, TRUE)` —— 全窗重绘 + 擦背景。本窗口的重绘不是
+// 直接往屏幕画，而是**先整张 32bpp 帧缓存重画一遍**（RenderKbFrameInto），
+// 几十个圆角矩形 + 文字 alpha 混合 ⇒ 每次几十毫秒，体感就是"卡卡的"。
+//
+// 状态变化实际只影响 1~4 个键帽（Shift / Win / Num / Caps）。
+// 收窄成按格失效后：
+//   · WM_PAINT 里只 BitBlt 脏区（见那里的说明）；
+//   · 帧缓存即使因签名变化整张重建，重建后的呈现面积也只有这几格。
+//
+// ⚠ 帧缓存的重建由 `EnsureKbFrameCache` 的签名比对决定，**与本函数的
+//   失效范围无关** —— 也就是说本函数省下来的是「上屏面积」，不是「绘制量」。
+//   （要连绘制量一起省，得把键帽状态从签名里拆出来做单键重画；
+//     收益有限、改动面大，本轮不做。）
+//
+// vk 的匹配容错：物理态按 **左右成对** 上报（pShift 是 L/R 的或），
+// 因此传 VK_LSHIFT 时也要把 RSHIFT 那格一起失效；VK_LWIN 同理。
+// 找不到任何匹配键时什么都不做：该键不在当前布局里（例如数字区已收起），
+// 状态值已经存进 g_* 变量，下次切回该布局会按新状态重画，不会留下错误高亮。
+static void InvalidateKeyByVk(HWND hWnd, short vk) {
+    short alt = 0;
+    if (vk == VK_LSHIFT) alt = VK_RSHIFT;
+    else if (vk == VK_RSHIFT) alt = VK_LSHIFT;
+    else if (vk == VK_LWIN) alt = VK_RWIN;
+    else if (vk == VK_RWIN) alt = VK_LWIN;
+
+    for (int i = 0; i < g_nk; i++) {
+        const KeyDef* k = &g_keys[i];
+        if (k->vk != vk && (alt == 0 || k->vk != alt)) continue;
+        // 外扩 2px：圆角/描边/按下态的发光都在键矩形外沿一点点，
+        // 不留余量会切出一条没重画的边。
+        RECT r = { k->x - 2, k->y - 2, k->x + k->w + 2, k->y + k->h + 2 };
+        InvalidateRect(hWnd, &r, FALSE);
+    }
 }
 
 // ========== 主窗口帧缓存（首帧预热 + 动画/重绘零开销呈现） ==========
@@ -5752,7 +5787,7 @@ static void LoadConfig() {
     // 键面固定「图标+文字」：不再提供「仅文字」模式（实机反馈），设置页也没有对应行了。
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
-    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
+    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
     g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 0) != 0);
     g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);
@@ -7553,18 +7588,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc = {0, 0, g_ww, g_wh};
+        // ⚠⚠ 2026-10-04 第 24 轮（卡顿）：确保缓存**在 Blit 之前**就绪。
+        //   注意 EnsureKbFrameCache 内部会按签名决定「复用 or 重画整张缓存」。
+        //   本函数只负责把缓存里对应的那块贴上去，贴的范围收窄见下。
         EnsureKbFrameCache(hWnd);
         BOOL useKbCache = g_kbCacheBmp && g_kbCacheDc && g_kbCacheBits &&
                           g_kbCacheW == g_ww && g_kbCacheH == g_wh;
+        // ⚠ 只贴**脏区**（ps.rcPaint），不再无条件 BitBlt 整个窗口。
+        //   这就是本轮"只失效几个键帽"能真正省下开销的关键一步 ——
+        //   否则前面 InvalidateKeyByVk 收窄了失效范围，这里又整窗贴回去，
+        //   等于白改（Blit 本身不贵，但**整窗 Blit 会顺带把
+        //   DWM 合成 / 重绘区域放大回整窗**，把收益吃光）。
+        //   rcPaint 是本次绘制需要覆盖的矩形，全窗失效时它就等于整窗，
+        //   所以这条改动对原有全窗刷新路径**语义完全等价**。
+        RECT dirty = ps.rcPaint;
+        if (dirty.right <= dirty.left || dirty.bottom <= dirty.top) dirty = rc;
+        int dx = dirty.left, dy = dirty.top;
+        int dw = dirty.right - dirty.left;
+        int dh = dirty.bottom - dirty.top;
         if (useKbCache) {
-            BitBlt(dc, 0, 0, g_ww, g_wh, g_kbCacheDc, 0, 0, SRCCOPY);
+            BitBlt(dc, dx, dy, dw, dh, g_kbCacheDc, dx, dy, SRCCOPY);
         } else {
             // 缓存创建失败时回退到逐帧全量绘制
             WindowPaintSurfaceLocal surface = BeginWindowPaintSurface(dc, hWnd, rc);
             ClearWindowBackBuffer(surface.dc, hWnd, g_ww, g_wh);
             DrawHeader(surface.dc);
             DrawKeys(surface.dc);
-            BitBlt(dc, 0, 0, g_ww, g_wh, surface.dc, 0, 0, SRCCOPY);
+            BitBlt(dc, dx, dy, dw, dh, surface.dc, dx, dy, SRCCOPY);
             EndWindowPaintSurface(&surface);
         }
         EndPaint(hWnd, &ps);
@@ -7713,19 +7763,50 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 //     物理按键、屏幕键盘点击、甚至别的程序切 NumLock，
                 //     下一 tick（几十毫秒内）高亮自动纠正 —— **可以自愈**。
                 //     这才是「高亮 = 真实状态」这一条恒等式最直接的写法。
+                // ⚠⚠ 2026-10-04 第 24 轮（卡顿）：
+                //   这里原先对**整个窗口** `InvalidateRect(hWnd, 0, TRUE)`
+                //   （erase=TRUE ⇒ 先擦背景再重画）。NumLock 每按一次至少走
+                //   一次这条路径，且 sh/win/caps 任一变化也会走 ⇒ 每 50ms
+                //   都有机会触发一次全窗重绘 + 背景擦除。
+                //   在全尺寸布局下窗口 1280×404、几十个键帽，
+                //   全局重绘 30~50ms 量级 ⇒ 用户可感的"卡卡的"。
+                //
+                //   ⇒ 两处收窄（本轮只改**代价**，不改**语义**：
+                //     谁该亮、谁该灭，与上一轮完全一致）：
+                //     ① erase 由 TRUE 改 FALSE —— 本窗口 WM_ERASEBKGND
+                //        本来就 `return 1`（不擦），传 TRUE 只是让系统多发一次
+                //        擦除通知，纯浪费。
+                //     ② 不再全窗失效，而是只失效**受影响的那几格**：
+                //        NumLock 态变化 → 数字区 Num 键；
+                //        修饰键态变化 → 对应键帽。
+                //        实现上统一走一个「按键状态找矩形」的小工具
+                //        （InvalidateKeyByVk）。
+                //
+                //   ⚠ 两个 g_* 名字要分清（上一版这里有个隐蔽的耦合 bug）：
+                //       g_npLock  —— NumLock 高亮的**唯一**依据（是否显示锁定）
+                //       g_physNum —— 物理态快照，只用于「有没有变」的判定
+                //     上一版在第一个 if 里顺手写了 `g_physNum = pNum`，
+                //     于是下面 `dNum = (g_physNum != pNum)` **恒为假** ——
+                //     靠第一个 if 已经失效过那格才没出问题。这里解耦：
+                //     g_physNum 只在下面统一更新，谁变谁失效，判据自洽。
                 BOOL pNum   = ReadSystemNumLock();
                 BOOL pCaps  = (GetKeyState(VK_CAPITAL) & 1) != 0;
-                if (g_npLock != pNum) {          // NumLock 高亮：与真实锁定态对齐
-                    g_npLock = pNum;
-                    InvalidateRect(hWnd, 0, TRUE);
-                }
-                if (g_physShift != pShift || g_physWin != pWin ||
-                    g_physNum != pNum || g_cp != pCaps) {
+                BOOL dLock  = (g_npLock != pNum);        // 高亮依据变了
+                BOOL dShift = (g_physShift != pShift);
+                BOOL dWin   = (g_physWin != pWin);
+                BOOL dNum   = (g_physNum != pNum);
+                BOOL dCaps  = (g_cp != pCaps);
+                if (dLock) g_npLock = pNum;              // 与真实锁定态对齐
+                if (dShift || dWin || dNum || dCaps || dLock) {
                     g_physShift = pShift;
                     g_physWin = pWin;
                     g_physNum = pNum;
                     g_cp = pCaps;
-                    InvalidateRect(hWnd, 0, TRUE);
+                    // 按「哪几个变了」逐个失效，别再整窗重画。
+                    if (dShift) { InvalidateKeyByVk(hWnd, VK_LSHIFT); }
+                    if (dWin)   { InvalidateKeyByVk(hWnd, VK_LWIN); }
+                    if (dNum || dLock) { InvalidateKeyByVk(hWnd, VK_NUMLOCK); }
+                    if (dCaps)  { InvalidateKeyByVk(hWnd, VK_CAPITAL); }
                 }
             }
 

@@ -686,6 +686,10 @@ static DWORD    g_dbgExtraLastTick = 0;
 //   frole               → 实际拿到的 role（白名单目前只有 0x2A / 0x34）
 static int      g_dbgFocusVt = -1;
 static LONG     g_dbgFocusRole = -1;
+// 「该前台窗口（Chrome/Electron 系）是否**没有可用的 a11y 通道**」——
+// 由 GetFocusedInputControl 在每次探测后更新，驱动 IsInputControl 里
+// Chrome_WidgetWin 的类名兜底是否生效。详见该函数内的说明。
+BOOL            g_chromeClassFallback = TRUE;
 // 诊断：最近一次 EVENT_OBJECT_FOCUS 的时刻与来源（WinEventProc 更新，AfLog 读出）。
 // ⚠ 要验证的假设：「点输入框」会触发 FOCUS 事件、「点空白处」不触发 ——
 //   如果成立，这就是区分两者的天然信号（比轮询 a11y 更可靠）。
@@ -6300,6 +6304,47 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
             if (token) *token = AccessibleIdentityToken(acc, focus) ^ ((ULONG_PTR)(DWORD)focus.lVal << 4);
             return TRUE;
         }
+        // ⚠⚠⚠ 2026-10-04 第七轮：**这里以前是 `return FALSE;`** —— 根因就在这。
+        //
+        //   用户日志实测（Chrome 系应用，908 次采样）：
+        //       frole = 0x0F = ROLE_SYSTEM_GROUPING   739 次（81%）
+        //       frole = 0x29 = ROLE_SYSTEM_ANIMATION  168 次
+        //       frole = 0x2A = ROLE_SYSTEM_TEXT（白名单内）  0 次
+        //   也就是说 **Chrome 从不把焦点放在输入框本身，而是放在一个"容器"元素上**，
+        //   真正的输入框是那个容器的**子节点**。
+        //
+        //   而 VT_I4 这条分支不匹配就返回 FALSE，把容器整个判死 ——
+        //   于是「QQ / 浏览器 / Electron 的输入框在 a11y 树里永远认不出来」，
+        //   `IsAccessibleInputWindow` 恒 FALSE，键盘只能靠类名粗判兜着，
+        //   而类名粗判又分不出"点在输入框"还是"点在空白处"。
+        //
+        //   ⚠ 注意 `VT_DISPATCH` 分支一直是**会递归**的（`depth+1`），
+        //     只有 VT_I4 分支漏了 —— 两条路径行为不一致，这次的 bug 正在于此。
+        //
+        //   ⇒ 修法：角色不匹配时，用 get_accChild 把这个 child 的 IAccessible
+        //     取下来**继续往下钻**，与 VT_DISPATCH 分支保持一致。
+        //     focus.lVal == 0 是 CHILDID_SELF（就是自身），无子可下钻。
+        if (focus.lVal == 0) return FALSE;
+        VARIANT varId;
+        ZeroMemory(&varId, sizeof(varId));
+        varId.vt = VT_I4;
+        varId.lVal = 0;                       // varID：保留，必须为 0
+        VARIANT varChild;
+        ZeroMemory(&varChild, sizeof(varChild));
+        varChild.vt = VT_I4;
+        varChild.lVal = focus.lVal;           // varChild：要取的子元素 id
+        IDispatch* pdispChild = NULL;
+        if (SUCCEEDED(acc->get_accChild(varId, varChild, &pdispChild)) && pdispChild) {
+            IAccessible* childAcc = NULL;
+            HRESULT hrChild = pdispChild->QueryInterface(IID_IAccessibleLocal,
+                                                         (void**)&childAcc);
+            pdispChild->Release();
+            if (SUCCEEDED(hrChild) && childAcc) {
+                BOOL deeper = AccessibleHasEditableFocus(childAcc, depth + 1, token);
+                childAcc->Release();
+                if (deeper) return TRUE;
+            }
+        }
         return FALSE;
     }
 
@@ -6409,10 +6454,22 @@ static BOOL IsInputControl(HWND hw) {
         strstr(buf, "Search") || strstr(buf, "InputSite") || strstr(buf, "TXGuiFoundation"))
         return TRUE;
 
-    // Chromium/Electron（NTQQ、Chrome、Edge 等）：网页内容获得键盘焦点时
-    // Win32 焦点落在渲染宿主/组件窗口上，视为输入区域
-    if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin"))
-        return TRUE;
+    // ⚠⚠⚠ 2026-10-04 第七轮：Chromium/Electron（NTQQ / Chrome / Edge / WorkBuddy）
+    //   原先在这里**无条件** `return TRUE` —— 类名粗判。
+    //
+    //   后果（用户日志实证，QQ 段 406/406 = 100%）：不管焦点实际在输入框还是
+    //   页面空白，都判"有输入焦点" ⇒ 「点空白自动隐藏」对 Chrome 系**天然失效**，
+    //   只能靠 `AccessibleHasEditableFocus` 的 VT_I4 下钻修复来分辨。
+    //
+    //   ⇒ 现在改为：**先让 a11y 精判说话**（见 GetFocusedInputControl 里
+    //     `g_chromeClassNoA11y` 的用法）；只有该进程**根本不提供 a11y**
+    //     （COM 不可用）时才退回这条类名兜底，避免把兼容性也一起砍掉 ——
+    //     2026-10-04 之前已经因为"砍降级路径"把浏览器/UWP/Electron 的
+    //     自动呼出全废过一次（那次是砍 `if (!haveGuiInfo) return NULL`）。
+    if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin")) {
+        extern BOOL g_chromeClassFallback;
+        return g_chromeClassFallback;
+    }
 
     return FALSE;
 }
@@ -6453,6 +6510,39 @@ static HWND GetFocusedInputControl() {
         g_dbgCaret   = haveGuiInfo ? gi.hwndCaret : NULL;
     }
     if (haveGuiInfo) {
+        // ⚠⚠⚠ 2026-10-04 第七轮：Chromium/Electron 系（NTQQ / Chrome / Edge /
+        //   WorkBuddy）**不再走类名粗判**，改由 a11y 精判决定。
+        //
+        //   为什么必须改：类名判据只能回答"这个窗口是不是 Chromium 系"，
+        //   回答不了"焦点此刻在输入框里还是页面上"。用户日志实证 QQ 段
+        //   `hasInput` 406/406 = 100% —— 永远判"有输入焦点"，
+        //   于是「点空白自动隐藏」对这类应用**永远不触发**。
+        //
+        //   为什么**不能**简单删掉：2026-10-04 之前砍降级路径（`if (!haveGuiInfo)
+        //   return NULL`）曾把浏览器 / UWP / Electron 的自动呼出**全废**，
+        //   用户实测「NTQQ 有时可以有时不行、浏览器/UWP/Electron 完全不弹」。
+        //   ⇒ 保留类名作为**兜底**，但只在"a11y 通道确实不可用"时才用它。
+        {
+            char cbuf[128] = {0};
+            GetClassNameA(focus, cbuf, 128);
+            if (strstr(cbuf, "Chrome_RenderWidgetHostHWND") || strstr(cbuf, "Chrome_WidgetWin")) {
+                ULONG_PTR tok = 0;
+                BOOL editable = IsAccessibleInputWindow(focus, &tok);
+                // a11y 通道是否可用：COM 初始化成功 + AccessibleObjectFromWindow
+                // 返回了有效对象。不可用时才允许类名兜底。
+                BOOL a11yUsable = (g_dbgAcc == 0) ||       // S_OK
+                                  (g_dbgAcc == (int)0x8004DF00) ||  // E_ACCESSDENIED：树在但受限
+                                  (g_dbgAcc == (int)0x8001010A);    // RPC_E_INVALID_INTERFACE
+                g_chromeClassFallback = !a11yUsable;
+                if (editable) {
+                    g_detectedInputToken = tok ? tok : (ULONG_PTR)focus;
+                    return focus;
+                }
+                // a11y 明确说"焦点不在可编辑元素上"（点空白处）-> 判无输入焦点
+                if (a11yUsable) return NULL;
+                // a11y 通道不可用 -> 落到下面的类名兜底
+            }
+        }
         if (IsInputControl(focus)) {
             g_detectedInputToken = (ULONG_PTR)focus;
             // 诊断（-afdiag）：类名快速路径补查一次 accessibility。

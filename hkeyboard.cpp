@@ -6333,8 +6333,11 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
         ZeroMemory(&varChild, sizeof(varChild));
         varChild.vt = VT_I4;
         varChild.lVal = focus.lVal;           // varChild：要取的子元素 id
-        IDispatch* pdispChild = NULL;
-        if (SUCCEEDED(acc->get_accChild(varId, varChild, &pdispChild)) && pdispChild) {
+        // ⚠ get_accChild(VARIANT varID, VARIANT varChild) 只有**两个**参数，
+        //   IDispatch* 是**返回值**（不是出参）—— 写成三参会报
+        //   C2660: function does not take 3 arguments（CI x86 实测）。
+        IDispatch* pdispChild = acc->get_accChild(varId, varChild);
+        if (pdispChild) {
             IAccessible* childAcc = NULL;
             HRESULT hrChild = pdispChild->QueryInterface(IID_IAccessibleLocal,
                                                          (void**)&childAcc);

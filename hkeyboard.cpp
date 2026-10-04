@@ -6333,18 +6333,20 @@ static BOOL UiaHasTextFocus() {
     el->get_CurrentHasKeyboardFocus(&hasKf);
     g_dbgUiaCt = (int)ct;
     g_dbgUiaKf = hasKf ? 1 : 0;
-    // ⚠ IUIAutomationElement **没有** `get_CurrentIsTextPatternAvailable` 方法
-    //   （CI x86 报 C2039: is not a member of）。这类"能力查询"在 UIA 里
-    //   统一走 `GetCurrentPropertyValue(UIA_IsTextPatternAvailablePropertyId)`。
-    VARIANT vPat;
-    ZeroMemory(&vPat, sizeof(vPat));
-    if (SUCCEEDED(el->GetCurrentPropertyValue(UIA_IsTextPatternAvailablePropertyId,
-                                               &vPat)) && vPat.vt == VT_BOOL) {
-        g_dbgUiaTp = vPat.boolVal ? 1 : 0;
-    } else {
-        g_dbgUiaTp = -1;
-    }
-    VariantClear(&vPat);
+    // `IsTextPatternAvailable` 是**能力（capability）**，UIA 里没有
+    // `get_CurrentIsTextPatternAvailable` 方法，只能走 GetCurrentPropertyValue。
+    //
+    // ⚠⚠ 但这里**不能调 `VariantClear`** —— 它在 `oleaut32.lib`，而本项目的
+    //   链接行（build_cpp.bat / build.yml）**没有 oleaut32**（只有 ole32）。
+    //   arm64 job 因此报 `LNK2019: unresolved external __imp_VariantClear`。
+    //   ⇒ 改用 `GetCurrentPropertyValue` 的**布尔版**重载
+    //     `GetCurrentPropertyValueEx`？—— 那个也要 VARIANT。
+    //   ⇒ 最稳的办法：**不查这个属性**。它只是诊断用的辅助信息，
+    //     判定的关键只有 `ControlType` + `HasKeyboardFocus`（两者都是
+    //     纯 getter，不需要 VARIANT、不需要额外 lib）。
+    //     需要看这个值时，用 UIA 的 `CurrentIsTextPatternAvailable` 由
+    //     **调用方**（有 lib 的地方）查，或直接看 ControlType 即可。
+    g_dbgUiaTp = -2;   // -2 = 本程序不查（避免引入 oleaut32 依赖）
     el->Release();
     if (!hasKf) return FALSE;
     // UIA_EditControlTypeId(50004) / UIA_DocumentControlTypeId(50030)

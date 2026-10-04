@@ -512,7 +512,7 @@ static void HandleCloseAction(HWND hWnd);
 static void ExitApplicationAnimated();
 static void OpenClosePrompt();
 static void RecreateFontsAndLayout();
-static void InvalidateFitTier(void);      // 作废「同宽键统一字号」的缓存（见 FitUnifiedTier）
+static void InvalidateFitTier(void);      // 作废「区块统一字号」的缓存（见 FitUnifiedTier）
 static double GetSystemDpiScale();
 static void InitWindowSizeForDpi();
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
@@ -1619,7 +1619,7 @@ static void BuildFnSurf(int y, double u) {
 
 static void BuildKeys() {
     g_nk = 0;
-    InvalidateFitTier();          // 键位几何变了，缓存的「同宽键统一档位」必须重算
+    InvalidateFitTier();          // 键位几何变了，缓存的「区块统一档位」必须重算
 
     double dpiScale = GetSystemDpiScale();
     double baseW = 980.0 * dpiScale;
@@ -2332,29 +2332,33 @@ static BOOL KeyHasGlyph(const KeyDef* k);
 // 缓冲区版（写进调用方缓冲）—— 定义在更后面，同样要前置声明。
 #define KEY_TEXT_MAX 16
 static const wchar_t* KeyTextInto(const KeyDef* k, wchar_t* out, size_t n);
-// 统一档位计算（定义在下面一点），UnifiedTierNow 与 FontDiagDump 都要用。
-static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW);
+// 区块统一档计算（定义在下面一点），BlockTierNow 与 FontDiagDump 都要用。
+static int FitUnifiedTier(HDC dc, unsigned char block);
 
-// 统一档位的**每帧一次**缓存。
+// 统一档位的**每帧一次**缓存（按区块各一份）。
 //
-// 代价说明（第 27 轮实测）：FitUnifiedTier 要遍历主区 + 导航区**全部**纯文字键
+// 代价说明（第 27 轮实测）：FitUnifiedTier 要遍历该区块**全部**纯文字键
 // × 8 档 MeasureString（约 100 键 × 8 = 800 次 GDI+ 量宽）。若逐键调用，
 // 一帧就是 100 × 800 = 8 万次 —— 用户实机反馈「卡得要死」。
 //
-// ⚠ 第 28 轮起：整个主区 + 导航区**就是同一个组**（见 FitUnifiedTier），
-//   所以一帧**只需要算一次**，全盘共用。缓存退化为一个 int。
-static int  g_unifiedTier = 0;
-static BOOL g_unifiedTierValid = FALSE;
+// ⚠ 第 29 轮：**主区与导航区各自成组、各算一档**（见 FitUnifiedTier）。
+//   一帧各算一次即可（2 次），仍然远低于逐键调用。
+//   索引：0 = 主区(block 0)，1 = 导航区(block 1)，2 = 数字区(block 2)。
+static int  g_blockTier[3] = { 0, 0, 0 };
+static BOOL g_blockTierValid = FALSE;
 
-void InvalidateFitTier(void) { g_unifiedTierValid = FALSE; }
+void InvalidateFitTier(void) { g_blockTierValid = FALSE; }
 
-// 取当前帧的统一档位（没有就现算一次）。绘制循环里所有纯文字键共用它。
-static int UnifiedTierNow(HDC dc, const KeyDef* self, int selfMaxW) {
-    if (!g_unifiedTierValid) {
-        g_unifiedTier = FitUnifiedTier(dc, self, selfMaxW);
-        g_unifiedTierValid = TRUE;
+// 取指定区块当前帧的档位（没有就现算一次）。
+static int BlockTierNow(HDC dc, unsigned char blk) {
+    if (blk > 2) blk = 0;
+    if (!g_blockTierValid) {
+        g_blockTier[0] = FitUnifiedTier(dc, 0);
+        g_blockTier[1] = FitUnifiedTier(dc, 1);
+        g_blockTier[2] = FitUnifiedTier(dc, 2);
+        g_blockTierValid = TRUE;
     }
-    return g_unifiedTier;
+    return g_blockTier[blk];
 }
 
 // 降档阶梯。档位序号 0 = 最大字号，7 = 地板。
@@ -2381,42 +2385,40 @@ static int FitTierInLadder(HDC dc, const wchar_t* s, int maxW, const FontLadder&
     return 7;                                   // 地板档
 }
 
-// ⚠ 统一字号的**分组判据**（第 28 轮）：区块，不按键宽拆。
+// ⚠ 统一字号的**分组判据**（第 29 轮）：**区块各自成组**。
 //
-// 分组判据 = **区块**（block 0 主区 + block 1 导航区合并；数字区 block 2 退出）。
+//   第 28 轮把「主区 + 导航区」合成一个组，本意是让全键盘只有一个字号。
+//   但用户反馈「默认窗口大小字体看着有点小」—— 因为把两块合并后，
+//   **导航区的长标签（Delete / Pause / Insert / ScrLk 等 5~6 字母键）
+//   把整个键盘的档位一起拖下去**，而主区字母键在最大档都还有富余。
 //
-//   第 28 轮定论（用户第四轮反馈「全尺寸 Ctrl 等处字体大得要死，全尺寸就统一字体大小」）：
-//   **不再按键宽拆组**。上一轮用「键宽差 ≤ 2px」把 1u 键与 1.25u 键（Ctrl / Alt / Win）
-//   分成了两组 —— 1.25u 组里只有 Ctrl / Alt 这几个 3~4 字母的短标签，全都放得下最大档，
-//   于是它们停在 14pt，与 1u 的字母键（受 Pause / Backspace 牵连降到 12pt）差一档，
-//   观感就是「Ctrl 那边大得要死」。
+//   ⇒ 用户定稿（第 29 轮）：**分组拆回「主区」「导航区」各自成组**。
+//       主区   → 实测 t=0（14pt，字母 / Esc / Ctrl / Alt / F1~F12 全都放得下）
+//       导航区 → 实测 t=3（10pt，被 6 字母的 Delete 限制）
+//     用户原话：「字体还能再大一点吗」+「导航栏的字体大小就别动了，
+//     感觉导航栏按钮字体这个大小，再扩大个 0.5 就差不多了」。
 //
-//   ⇒ 正确做法：**整个主区 + 导航区是一个组**，取全组最严档一并套用。
-//     每个键仍按**自己实际可用宽**去量它自己的标签（宽键本来就更容易放得下，
-//     不会被窄键的无理要求连累）；但**最终档位是全组统一的**。
+//   ⚠ 这**不是**回到第 25 轮那个被否掉的「导航区 ×0.85 缩放」方案 ——
+//     那套是给导航区**预先打折**（身份决定字号），本方案仍由**可用宽度**决定档位，
+//     只是不再强迫两块共用一个档。用户明确接受「两块可以不一样大」。
 //
-//   这样「全尺寸统一下字体大小且自适应」才真正成立：
-//     · 自适应 = 量宽用的是真实键宽与真实标签
-//     · 统一   = 档位由组内最严的那条决定，全组同一个 HFONT
-//
-//   数字区（block 2）仍单独退出 —— 它的标签全是单字符，参与就会被 Num/Enter 拖小。
-static BOOL InUnifiedGroup(unsigned char blk) { return (blk == 0 || blk == 1); }
+//   数字区（block 2）仍单独成组 —— 它的标签全是单字符，天然放得下最大档。
+static BOOL InUnifiedGroup(unsigned char blk, unsigned char want) {
+    return blk == want;
+}
 
-// 全组统一档：遍历主区 + 导航区所有纯文字键，取「每一键在它自己的可用宽下都不超宽」
+// 该区块的统一档：遍历**本区块**所有纯文字键，取「每一键在它自己的可用宽下都不超宽」
 // 的最大档位（即最严档）。宽键（1.25u 的 Ctrl / Alt、2u 的退格…）按自己宽度量。
-// 参数 self / selfMaxW 只是为了让调用点签名统一，实际不参与计算（整盘一次算完）。
-static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
-    (void)self; (void)selfMaxW;
+static int FitUnifiedTier(HDC dc, unsigned char block) {
     const FontLadder L = MainLadder();
     int worst = 0;
     BOOL any = FALSE;
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
-        if (!InUnifiedGroup(k->block)) continue;
+        if (!InUnifiedGroup(k->block, block)) continue;
         // 图标键（Tab / Caps / Shift / Enter / 退格 / 方向键 / Win / Menu）不参与 ——
         // 它们走 DrawKeyLabel 自己那套「图标 + 名字」阶梯，可用宽里还要留图标位。
         if (KeyHasGlyph(k)) continue;
-        // 图标样式选「文字」时它们才落回纯文字，这里也一并算进来（保守，只会更统一）。
         wchar_t s[KEY_TEXT_MAX];
         KeyTextInto(k, s, KEY_TEXT_MAX);
         if (!s[0]) continue;
@@ -2429,9 +2431,9 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     return any ? worst : 0;
 }
 
-// ⚠ 2026-10-05 第 28 轮：**tier 由调用方传入**，本函数不再自己量档。
-//   档位是全键盘（主区 + 导航区）统一算一次的结果（见 UnifiedTierNow），
-//   逐键调 FitUnifiedTier 会让一帧退化成数万次量宽 ⇒ 卡。
+// ⚠ 2026-10-05 第 29 轮：**tier 由调用方传入**，本函数不再自己量档。
+//   档位是按区块算一次的结果（见 BlockTierNow），逐键调 FitUnifiedTier
+//   会让一帧退化成数万次量宽 ⇒ 卡。
 static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_t* s, int maxW, int tier) {
     (void)idx; (void)self; (void)maxW;
     // ⚠ 2026-10-04 第 25 轮：全键盘只有一套阶梯（导航区专用档已删）。
@@ -2453,9 +2455,11 @@ static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_
 // 程序用的是 GDI+ MeasureString 的包围盒（更宽）。
 // ⇒ 与其继续拿近似值推演，不如让程序自己把**它实际算出来的东西**交出来。
 //
-// 输出列：idx block w maxW glyph tier label
-// 判读方法（第 28 轮）：全主区 + 导航区**应当**是同一个 tier。
-//   若同一 block 里出现两个不同 tier，说明还有键被排除在组外，看 block / glyph 列定位。
+// 输出列：idx block w maxW glyph t_own t_block label
+// 判读方法（第 29 轮）：**同一 block 内** t_block 应当处处相同；
+//   block 之间允许不同（这是本方案的预期：主区大、导航区小、数字区最大）。
+//   t_own 是"这一键孤立看能放多大"—— t_own 比 t_block 小的键，
+//   就是**把本区块档位拖下去的那个键**（例：导航区的 Pause / Home）。
 static void FontDiagDump() {
     if (!g_fontDiag) return;
 
@@ -2472,9 +2476,9 @@ static void FontDiagDump() {
     HDC dc = GetDC(0);
     fwprintf(f, L"# layoutMode=%d  g_ww=%d g_wh=%d keyHeight=%d keyGap=%d keyAreaX=%d dpi=%.3f\n",
              g_layoutMode, g_ww, g_wh, g_keyHeight, g_keyGap, g_keyAreaX, GetSystemDpiScale());
-    fwprintf(f, L"# cols: idx block w groupW maxW tier label\n");
+    fwprintf(f, L"# cols: idx block w maxW glyph t_own t_block label\n");
 
-    // 逐键打印。FitUnifiedTier 每次都会遍历全盘 —— 这里刻意**不走缓存**，
+    // 逐键打印。FitUnifiedTier 每次都会遍历本区块 —— 这里刻意**不走缓存**，
     // 直接算才是"当前几何的真值"。
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
@@ -2484,12 +2488,11 @@ static void FontDiagDump() {
         if (!s[0]) continue;
 
         const int maxW = k->w - (int)(6 * GetSystemDpiScale());
-        int tier = FitUnifiedTier(dc, k, maxW);
-        // 第 28 轮起：全主区 + 导航区是**同一个组**，全盘 tier 必然相同。
-        // 这里仍逐键打印，是为了看出「有没有哪个键的 tier 与大盘不一致」
-        // （不一致就说明它被排除了组，看 block 列即可定位）。
-        fwprintf(f, L"%3d  b%d  w=%-4d mW=%-4d glyph=%d t=%d  %ls\n",
-                 i, (int)k->block, k->w, maxW, (int)KeyHasGlyph(k), tier, s);
+        // t_own = 本键自己按可用宽能到的最大档；t_block = 本区块统一档（实际绘制用的）。
+        int tOwn = k->w > 0 ? FitTierInLadder(dc, s, maxW, MainLadder()) : 0;
+        int tBlk = FitUnifiedTier(dc, k->block);
+        fwprintf(f, L"%3d  b%d  w=%-4d mW=%-4d glyph=%d t_own=%d t_block=%d  %ls\n",
+                 i, (int)k->block, k->w, maxW, (int)KeyHasGlyph(k), tOwn, tBlk, s);
     }
     ReleaseDC(0, dc);
     fclose(f);
@@ -3821,8 +3824,8 @@ static void DrawHeader(HDC dc) {
 }
 
 static void DrawKeys(HDC dc) {
-    // 统一档位每帧重算一次（几何 / 字体 / 标签都可能变）。
-    g_unifiedTierValid = FALSE;
+    // 各区块统一档位每帧重算一次（几何 / 字体 / 标签都可能变）。
+    g_blockTierValid = FALSE;
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         BOOL active = IsActive(k);
@@ -3860,22 +3863,22 @@ static void DrawKeys(HDC dc) {
 
         DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, outline, 8);
 
-        // ---- 全键盘（主区 + 导航区）共用一次量档 ----
-        // FitUnifiedTier 一次要遍历约 100 个纯文字键 × 8 档 MeasureString。
-        // 逐键调用一帧就是 8 万次 GDI+ 量宽（实测「卡得要死」），
-        // 所以整帧只算一次，所有纯文字键共用同一个 tier。
-        int tier = UnifiedTierNow(dc, k, k->w - (int)(6 * GetSystemDpiScale()));
+        // ---- 按**本键所在区块**取统一档 ----
+        // 主区 / 导航区 / 数字区各自成组、各算一档（见 FitUnifiedTier）；
+        // 每帧每组只算一次（BlockTierNow 里有缓存），不逐键量。
+        int tier = BlockTierNow(dc, k->block);
 
         // ⚠ 文本必须存在**本作用域的局部缓冲**里（不能拿 static 包装的指针）：
-        //   上面 UnifiedTierNow → FitUnifiedTier 会调 KeyTextInto 遍历全组键，
+        //   上面 BlockTierNow → FitUnifiedTier 会调 KeyTextInto 遍历本组键，
         //   覆盖 static buf —— 结果就是全键盘都画出最后那个键的字
         //   （见文件上方第 27 轮血案注释）。
         wchar_t txtBuf[KEY_TEXT_MAX];
         const wchar_t* txt = KeyTextInto(k, txtBuf, KEY_TEXT_MAX);
         // 界面只有一个字面：不加粗。修饰键靠底色（C_REGULAR）与文字色（C_BTN_CONTENT）
         // 区分，与设置页 Tab 的选中态同一套逻辑 —— 少了「有些字粗有些字细」的杂音。
-        // 全键盘统一字号（见 FitUnifiedTier 的说明）：整盘 1u / 1.25u / 1.5u 键
-        // 共用同一个档位，不再出现「Ctrl 那边大得要死、字母这边小一号」。
+        // 同一区块内统一字号（见 FitUnifiedTier 的说明）：主区（含 1u 字母与
+        // 1.25u 的 Ctrl/Alt）共用一个档位，不再出现「Ctrl 那边大得要死、字母这边小一号」；
+        // 导航区、数字区各算各的，互不拖累。
         HFONT f = FitKeyFontUnified(dc, i, k, txt, k->w - (int)(6 * GetSystemDpiScale()), tier);
 
         // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；

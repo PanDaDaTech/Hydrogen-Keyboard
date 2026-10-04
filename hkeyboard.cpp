@@ -8,6 +8,7 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <oleacc.h>
+#include <uiautomation.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -738,7 +739,7 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
                 "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
                 "gui=%d focusCls=%-22s isInput=%d caret=%p "
-                "resp=%d hr=0x%X found=%d | xms=%d xok=%d | fvt=%d frole=0x%X fev=%u feh=%d | "
+                "resp=%d hr=0x%X found=%d | xms=%d xok=%d | fvt=%d frole=0x%X fev=%u feh=%d | uct=%d ukf=%d utp=%d | "
                 "visWnd=%d rect=%d,%d %dx%d => %s\n",
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
                 AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
@@ -748,6 +749,7 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 (void*)g_dbgCaret, g_dbgResp, (unsigned)g_dbgAcc, g_dbgAccFound,
                 g_dbgExtraMs, g_dbgExtraOk,
                 g_dbgFocusVt, (unsigned)g_dbgFocusRole, (unsigned)fevNow, fehMatch,
+                g_dbgUiaCt, g_dbgUiaKf, g_dbgUiaTp,
                 g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3],
                 decision);
     AfWriteRaw(buf);
@@ -6284,6 +6286,64 @@ static BOOL AccessibleRoleIsEditable(IAccessible* acc, VARIANT child) {
     return TRUE;
 }
 
+// ===== UI Automation 焦点探测（Chrome / Electron 系专用）=====
+//
+// ⚠ 为什么需要它（2026-10-04 第七~九轮实测）：
+//   MSAA 那套 `get_accFocus` + childId 在 Chrome / Electron 上走不通 ——
+//   日志 746 次采样里 `frole=0x2A`（TEXT，白名单内）只有 23 行（3%），
+//   `frole=0x0F`（GROUPING，容器）有 526 行。原因见 AccessibleHasEditableFocus
+//   里的说明：焦点落在容器元素上，childId 语义又别扭，下钻穿不进去。
+//
+//   UIA 直接给答案：`GetFocusedElement()` 拿当前焦点元素，再看它的
+//   `CurrentControlType` 是不是可编辑类（Edit / Document）。
+//   —— **不碰 childId、不递归**，Chrome 的 a11y provider 原生支持。
+//
+// ⚠ 兼容性：UIA 需要 Vista+（本程序最低 XP）。XP 上 CoCreateInstance 会失败，
+//   此时返回 FALSE，调用方自动退回类名兜底 / MSAA 路径 —— 行为与之前一致。
+static IUIAutomation* g_uia = NULL;
+static BOOL g_uiaTried = FALSE;
+
+// 诊断：最近一次 UIA 探测的结果
+static int  g_dbgUiaHr = -999;        // GetFocusedElement 的 HRESULT
+static int  g_dbgUiaCt = -1;          // ControlType（50004=Edit 50030=Document）
+static int  g_dbgUiaKf = -1;          // CurrentHasKeyboardFocus
+static int  g_dbgUiaTp = -1;          // CurrentIsTextPatternAvailable
+
+static BOOL EnsureUia() {
+    if (g_uiaTried) return g_uia != NULL;
+    g_uiaTried = TRUE;
+    if (!EnsureAccessibilityCom()) return FALSE;   // COM 没初始化就免谈
+    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), NULL,
+                                  CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation),
+                                  (void**)&g_uia);
+    if (FAILED(hr)) g_uia = NULL;
+    return g_uia != NULL;
+}
+
+// 焦点元素是否是可编辑控件
+static BOOL UiaHasTextFocus() {
+    if (!EnsureUia()) return FALSE;
+    IUIAutomationElement* el = NULL;
+    HRESULT hr = g_uia->GetFocusedElement(&el);
+    g_dbgUiaHr = (int)hr;
+    g_dbgUiaCt = -1; g_dbgUiaKf = -1; g_dbgUiaTp = -1;
+    if (FAILED(hr) || !el) return FALSE;
+    CONTROLTYPEID ct = 0;
+    BOOL hasKf = FALSE, hasTp = FALSE;
+    el->get_CurrentControlType(&ct);
+    el->get_CurrentHasKeyboardFocus(&hasKf);
+    el->get_CurrentIsTextPatternAvailable(&hasTp);
+    g_dbgUiaCt = (int)ct;
+    g_dbgUiaKf = hasKf ? 1 : 0;
+    g_dbgUiaTp = hasTp ? 1 : 0;
+    el->Release();
+    if (!hasKf) return FALSE;
+    // UIA_EditControlTypeId(50004) / UIA_DocumentControlTypeId(50030)
+    // —— 文本框与网页富文本区（contenteditable / 页面内输入）
+    if (ct == 50004 || ct == 50030) return TRUE;
+    return FALSE;
+}
+
 static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* token) {
     // ⚠ 深度上限 3 → 6（2026-10-04）：Chrome 系的 a11y 树很深
     //   （窗口 → 文档 → 容器 → 输入框…），3 层可能永远够不到焦点元素。
@@ -6329,15 +6389,24 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
         //   **两参数、IDispatch** 是出参** —— 既不是三参数，也不是返回值
         //   （前两次分别报 C2660 / C2440，别再凭印象写）。
         //
-        //   MSAA 语义：**varID 就是要取的那个子元素 id**（不是"父对象 id"）。
-        //   `get_accFocus` 返回 VT_I4 时，lVal 是焦点元素在**本对象**下的
-        //   childId —— 直接把它当 varID 传下去即可取到该元素的对象。
-        //   `focus.lVal == 0` 是 CHILDID_SELF（焦点就是 acc 自己），无子可取。
+        //   ⚠ 2026-10-04 第九轮实测：**MSAA 这条路在 Chrome 上走不通。**
+        //     第七轮加的下钻在这两个条件下同时失效：
+        //       · `get_accFocus` 返回 VT_I4 时，lVal 只是"焦点在本对象下的
+        //         childId"，`get_accChild` 拿它当 varID 去问，语义并不保证
+        //         返回焦点对象本身（MSAA 这套 childId/varID 的组合语义很别扭）
+        //       · 实测 746 行日志里 `frole=0x2A`（TEXT）只有 23 行（3%），
+        //         `frole=0x0F`（GROUPING）有 526 行 —— 下钻基本没穿透
+        //     ⇒ Chrome / Electron 系**改用 UI Automation**（见 UiaHasTextFocus）：
+        //       `IUIAutomation::GetFocusedElement()` 直接给焦点元素，
+        //       再用 `CurrentControlType` / `CurrentIsKeyboardFocusable` 判断，
+        //       完全绕开 MSAA 的 childId 语义。
+        //     MSAA 保留给传统 Win32 控件（Edit / RichEdit / Scintilla 等），
+        //     那条路是好的 —— 别把它的逻辑一起改坏。
         if (focus.lVal == 0) return FALSE;
         VARIANT varId;
         ZeroMemory(&varId, sizeof(varId));
         varId.vt = VT_I4;
-        varId.lVal = focus.lVal;              // 要取的元素 id
+        varId.lVal = focus.lVal;              // 焦点元素的 childId
         IDispatch* pdispChild = NULL;
         if (SUCCEEDED(acc->get_accChild(varId, &pdispChild)) && pdispChild) {
             IAccessible* childAcc = NULL;
@@ -6531,8 +6600,13 @@ static HWND GetFocusedInputControl() {
             char cbuf[128] = {0};
             GetClassNameA(focus, cbuf, 128);
             if (strstr(cbuf, "Chrome_RenderWidgetHostHWND") || strstr(cbuf, "Chrome_WidgetWin")) {
+                // ⚠ 第九轮：**优先走 UIA**（`GetFocusedElement` 直接给焦点元素，
+                //   不碰 MSAA 那套别扭的 childId）。UIA 不可用（XP / COM 失败）
+                //   才退回 MSAA，再退回类名兜底。
                 ULONG_PTR tok = 0;
-                BOOL editable = IsAccessibleInputWindow(focus, &tok);
+                BOOL editable = UiaHasTextFocus();
+                BOOL uiaOk = EnsureUia();
+                if (!editable && !uiaOk) editable = IsAccessibleInputWindow(focus, &tok);
                 // ⚠⚠⚠ 2026-10-04 第八轮：**上一版这里的判据是错的，直接造成回归**
                 //   （用户实测「输入框反而不弹出了」）。
                 //

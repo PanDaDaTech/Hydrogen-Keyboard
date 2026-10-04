@@ -55,6 +55,8 @@ static const wchar_t* ArchName() {
 //   -noscapture  跳过 OnLDown 里的 SetCapture
 //   -norepaint   跳过点击后的重绘
 //   -diag        记录每次按键注入前后的系统状态到 diag.txt
+//   -fontdiag    把全键盘「每个键的标签 / 键宽 / 分组宽 / 最终档位」dump 到 fontdiag.txt
+//                （用来定位「同一区块字号不统一」，见 FontDiagDump）
 //
 // ⚠ **正式发布版一律不定义这个宏** —— 上面这些参数与代码一行都不会
 //   编进 exe，命令行只保留正式参数（-show / -hide / -dark / -help ...）。
@@ -179,6 +181,12 @@ int g_keyHeight = 46;
 BOOL g_envTest = FALSE;
 int  g_envTestStage = 0;
 static void EnvTestInject();
+
+// -fontdiag：键面字号诊断。
+// ⚠ 前向声明的理由同 EnvTestInject：调用点在 RecreateFontsAndLayout（文件中部），
+//   而实现必须放在 FitUnifiedTier / KeyText 之后（它要用这两个函数）。
+BOOL g_fontDiag = FALSE;
+static void FontDiagDump();
 
 // ---- 排查开关：二分「点击按键」时究竟是哪个动作破坏了 IME 组字 ----
 //
@@ -1867,6 +1875,10 @@ static void RecreateFontsAndLayout() {
         g_bkspTextW = MeasureTextW(dc, L"Backspace", g_f12);
         ReleaseDC(0, dc);
     }
+
+#ifdef HK_DIAG
+    if (g_fontDiag) FontDiagDump();
+#endif
 }
 
 static void Fill(HDC dc, int x, int y, int w, int h, DWORD c) {
@@ -2503,6 +2515,68 @@ static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_
     if (L.f[t]) return L.f[t];
     return L.f[7] ? L.f[7] : g_f6;               // 地板档
 }
+
+#ifdef HK_DIAG
+// ---- -fontdiag：把「每个键的标签 / 键宽 / 分组宽 / 最终档位」dump 成表 ----
+//
+// 用途：用户连续三次反馈「同一区块字号不统一」，而**离线复算**（unified_font_tier.py）
+// 每次都说"应该统一"。两者必有一个错，而分歧只能在**真实的 GDI+ 量宽**上 ——
+// 离线脚本用的是 PIL 的 advance，程序用的是 GDI+ MeasureString 的包围盒（更宽）。
+// ⇒ 与其继续拿近似值推演，不如让程序自己把**它实际算出来的东西**交出来。
+//
+// 输出列：
+//   idx  block  w   groupW  maxW  label   tier  →  结论
+// 判读方法：同一 block 里出现两个不同的 tier，就说明分组没把它们并到一起 ——
+// 这时看它们的 w / groupW 是否一致即可定位（w 差 > 2 就是被容差踢出去了）。
+static void FontDiagDump() {
+    if (!g_fontDiag) return;
+
+    wchar_t self[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    wchar_t* slash = wcsrchr(self, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wchar_t path[MAX_PATH * 2] = {0};
+    _snwprintf_s(path, MAX_PATH * 2, _TRUNCATE, L"%lsfontdiag.txt", self);
+
+    FILE* f = NULL;
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
+
+    HDC dc = GetDC(0);
+    fwprintf(f, L"# layoutMode=%d  g_ww=%d g_wh=%d keyHeight=%d keyGap=%d keyAreaX=%d dpi=%.3f\n",
+             g_layoutMode, g_ww, g_wh, g_keyHeight, g_keyGap, g_keyAreaX, GetSystemDpiScale());
+    fwprintf(f, L"# cols: idx block w groupW maxW tier label\n");
+
+    // 逐键打印。FitUnifiedTier 会遍历全盘 —— 这里刻意**不走缓存**，
+    // 缓存是按绘制顺序的 idx、且每帧作废，直接算才是"当前几何的真值"。
+    for (int i = 0; i < g_nk; i++) {
+        const KeyDef* k = &g_keys[i];
+        const wchar_t* s = KeyText(k);
+        if (!s || !s[0]) continue;
+
+        const int maxW = k->w - (int)(6 * GetSystemDpiScale());
+        // 复刻 FitUnifiedTier 的分组，把 groupW 一并打出来（判据必须与它逐字一致）
+        auto sameGroup = [&](unsigned char b) { return (b == 0 || b == 1); };
+        int gw = k->w;
+        int groupW = gw;
+        for (int j = 0; j < g_nk; j++) {
+            const KeyDef* kk = &g_keys[j];
+            if (!sameGroup(kk->block) || !sameGroup(k->block)) continue;
+            int dw = kk->w - gw; if (dw < 0) dw = -dw;
+            if (dw > 2) continue;
+            if (kk->w < groupW) groupW = kk->w;
+        }
+        int delta = maxW - k->w;
+        int groupMaxW = groupW + delta;
+        if (groupMaxW < 1) groupMaxW = groupW;
+
+        int tier = FitUnifiedTier(dc, k, maxW);
+        fwprintf(f, L"%3d  b%d  w=%-4d gW=%-4d mW=%-4d t=%d  %ls\n",
+                 i, (int)k->block, k->w, groupW, groupMaxW, tier, s);
+    }
+    ReleaseDC(0, dc);
+    fclose(f);
+}
+#endif  // HK_DIAG
 
 // 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
 // 否则 16px 图标的线会连带缩细，与制作工具的观感对不上。
@@ -8242,6 +8316,8 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_noClickRepaint  = HasArg(cmd, "-norepaint")  ? TRUE : FALSE;
     // -diag：记录每次字母键注入前后的系统状态到 diag.txt（见 DiagSnap）
     g_diag            = HasArg(cmd, "-diag")       ? TRUE : FALSE;
+    // -fontdiag：键面字号诊断表（见 FontDiagDump）。字体建好后自动 dump 一次。
+    g_fontDiag        = HasArg(cmd, "-fontdiag")   ? TRUE : FALSE;
     // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
     // 少了这个没法比较（见 DiagSnap 的说明）。
     if (g_envTest) g_diag = TRUE;

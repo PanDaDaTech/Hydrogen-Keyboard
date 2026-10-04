@@ -1,0 +1,91 @@
+name: FontDiag
+
+# 临时诊断工作流：构建一份带 HK_DIAG 的 x64 版，跑 -fontdiag 把
+# 「每个键的标签 / 键宽 / 分组宽 / 最终档位」表打出来。
+#
+# 目的：定位「同一区块键面字号不统一」—— 离线复算（unified_font_tier.py）
+# 一直说"应该统一"，实机却分裂。分歧只可能在**真实的 GDI+ 量宽**上。
+# 与其继续拿近似值推演，不如让程序自己交出它实际算出的数。
+#
+# 用完即删（定位结束后把这个文件删掉）。
+on:
+  workflow_dispatch:
+
+env:
+  YY_THUNKS_VER: 1.2.2
+  VC_LTL_VER: 5.3.1
+
+jobs:
+  fontdiag:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Locate Visual Studio
+      id: vs
+      shell: cmd
+      run: |
+        set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+        for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do (
+            echo VS_PATH=%%i>> "%GITHUB_OUTPUT%"
+        )
+
+    - name: Build x64 with HK_DIAG
+      shell: cmd
+      run: |
+        call "${{ steps.vs.outputs.VS_PATH }}\Common7\Tools\VsDevCmd.bat" -arch=x64
+        if %errorlevel% neq 0 exit /b 1
+        if not exist "build\diag" mkdir "build\diag"
+        if not exist "dist\diag" mkdir "dist\diag"
+
+        rc /nologo /c65001 /fo "build\diag\hkeyboard.res" "hkeyboard.rc"
+        if %errorlevel% neq 0 exit /b %errorlevel%
+
+        cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- ^
+           /DHK_DIAG /D_WIN32_WINNT=0x0501 ^
+           /c "hkeyboard.cpp" /Fo"build\diag\hkeyboard.obj"
+        if %errorlevel% neq 0 exit /b %errorlevel%
+
+        cl /nologo /utf-8 /O2 /MT /D_HAS_EXCEPTIONS=0 /GR- /d2FH4- ^
+           "build\diag\hkeyboard.obj" "build\diag\hkeyboard.res" ^
+           /link /OUT:"dist\diag\HKeyboard_diag.exe" /SUBSYSTEM:WINDOWS,5.02 /MANIFEST:NO ^
+           Comctl32.lib Shell32.lib Gdi32.lib User32.lib Advapi32.lib Imm32.lib
+        if %errorlevel% neq 0 exit /b %errorlevel%
+        echo [diag] Build succeeded.
+
+    - name: Run -fontdiag for each layout mode
+      shell: pwsh
+      run: |
+        $exe = "dist\diag\HKeyboard_diag.exe"
+        foreach ($mode in 0, 2) {
+          # 每个布局模式单独一个目录，避免 ini 互相污染
+          $dir = "run_$mode"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item $exe "$dir\HKeyboard_diag.exe"
+
+          # 预置 ini：[Keyboard] Layout = mode，其余用默认
+          $ini = "[Keyboard]`r`nLayout=$mode`r`nFnWebLayout=0`r`n"
+          Set-Content -LiteralPath "$dir\HKeyboard.ini" -Value $ini -Encoding utf8
+
+          Write-Host "=========== Layout mode $mode ==========="
+          $p = Start-Process -FilePath "$dir\HKeyboard_diag.exe" `
+                             -ArgumentList "-fontdiag" -PassThru
+          Start-Sleep -Seconds 6
+          try { $p | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+
+          if (Test-Path "$dir\fontdiag.txt") {
+            Get-Content "$dir\fontdiag.txt"
+          } else {
+            Write-Host "(no fontdiag.txt produced)"
+            Get-ChildItem $dir | Format-Table Name, Length
+          }
+        }
+
+    - name: Upload fontdiag txt
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: fontdiag
+        path: run_*/fontdiag.txt

@@ -6533,19 +6533,40 @@ static HWND GetFocusedInputControl() {
             if (strstr(cbuf, "Chrome_RenderWidgetHostHWND") || strstr(cbuf, "Chrome_WidgetWin")) {
                 ULONG_PTR tok = 0;
                 BOOL editable = IsAccessibleInputWindow(focus, &tok);
-                // a11y 通道是否可用：COM 初始化成功 + AccessibleObjectFromWindow
-                // 返回了有效对象。不可用时才允许类名兜底。
-                BOOL a11yUsable = (g_dbgAcc == 0) ||       // S_OK
-                                  (g_dbgAcc == (int)0x8004DF00) ||  // E_ACCESSDENIED：树在但受限
-                                  (g_dbgAcc == (int)0x8001010A);    // RPC_E_INVALID_INTERFACE
-                g_chromeClassFallback = !a11yUsable;
+                // ⚠⚠⚠ 2026-10-04 第八轮：**上一版这里的判据是错的，直接造成回归**
+                //   （用户实测「输入框反而不弹出了」）。
+                //
+                //   上一版写的是「`hr == S_OK` 就认为 a11y 通道可用 → 一律
+                //   `return NULL`」。**错在把"拿到了根对象"当成"树里有可编辑元素"**：
+                //   `AccessibleObjectFromWindow` 返回 S_OK 只说明 COM 通道打通了，
+                //   完全不代表遍历能找到输入框。日志实测（746 次采样）：
+                //       hr = 0x0 (S_OK)      725 行  ← 我据此判定"通道可用"
+                //       frole = 0x2A (TEXT)    23 行  ← 真正走到白名单的只有 3%
+                //   于是「焦点明明在输入框上」也被 `return NULL` 判成"点在空白"
+                //   → 永不弹出。**"能问"不等于"问出了想要的答案"。**
+                //
+                //   ⇒ 修正后的判据（只认"证据"，不认"通道"）：
+                //     · `editable == TRUE`              -> 找到可编辑元素，判有焦点
+                //     · `hr != S_OK`（连根对象都拿不到）   -> 判定为"a11y 不可用"
+                //     · `hr == S_OK` 但没找到            -> **不确定**，
+                //       退回类名兜底（宁可多弹，不要不弹）
+                BOOL hrOk = (g_dbgAcc == 0);
                 if (editable) {
                     g_detectedInputToken = tok ? tok : (ULONG_PTR)focus;
+                    g_chromeClassFallback = FALSE;
                     return focus;
                 }
-                // a11y 明确说"焦点不在可编辑元素上"（点空白处）-> 判无输入焦点
-                if (a11yUsable) return NULL;
-                // a11y 通道不可用 -> 落到下面的类名兜底
+                if (hrOk) {
+                    // S_OK 但没找到可编辑元素：a11y **没有给出否定答案**
+                    // （Chrome 的树把焦点放在 GROUPING 容器上，本函数下钻能力
+                    //   还不足以穿透到真正的输入框）。此时不能判"无输入焦点"。
+                    //   → 退回类名兜底，保持旧行为（能弹），等下钻能力补齐
+                    //     再收紧。**宁可多弹一次，不能一次都不弹。**
+                    g_chromeClassFallback = TRUE;
+                } else {
+                    // 连根对象都拿不到（COM 不可用 / 目标无 a11y）
+                    g_chromeClassFallback = TRUE;
+                }
             }
         }
         if (IsInputControl(focus)) {

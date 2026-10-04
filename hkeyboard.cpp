@@ -782,6 +782,17 @@ BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动�
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
+
+// ===== Shift 双击锁定（2026-10-04 新增）=====
+// 需求：「设置里加个选项：Shift 键能快速按两下锁定」。
+//   单击 Shift = 一次性（下一个键带上 Shift 就自动释放，行为同实体键盘）
+//   双击 Shift = 锁定（后续连续输入都带 Shift，直到再点一次解除）
+//  —— 这样输入 ! @ # 之类的重复特殊符号时，不用每敲一个都点一次 Shift。
+BOOL        g_shiftLock = FALSE;        // 双击锁定态（界面高亮据此）
+BOOL        g_shiftOnce = FALSE;        // 单击的一次性待用态
+static DWORD g_shiftLastTap = 0;        // 上次点击 Shift 的时刻（双击窗口判定）
+static const DWORD SHIFT_DOUBLE_MS = 350;   // 双击间隔上限
+BOOL        g_shiftDoubleTap = TRUE;    // 设置项：启用 Shift 双击锁定（ini: General/ShiftDoubleTap）
 int         g_keyIconStyle = 2;        // 键面始终「图标+文字」；「仅文字」模式已按实机反馈下线
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
@@ -3011,6 +3022,17 @@ static void DoKeyAction(const KeyDef* k) {
     // ⚠ 所有按键都在此统一等待 —— 空格尤其重要：它负责把候选框里的中文上屏，
     //   若在左键按下期间注入，中文同样上不去（这正是 issue #3 的主诉之一）。
     WaitForLeftButtonUp();
+// 用掉一次"一次性 Shift"：双击锁定模式下，单击 Shift 只对下一个键生效。
+// 锁定态（g_shiftLock）下不动 —— 那是用户明确要连续输入的。
+static void ReleaseShiftOnce(void) {
+    if (g_shiftDoubleTap && g_shiftOnce && !g_shiftLock) {
+        g_shiftOnce = FALSE;
+        g_sh = FALSE;
+    } else {
+        g_sh = FALSE;
+    }
+}
+
     switch (k->type) {
     case K_LETTER:
 #ifdef HK_DIAG
@@ -3018,11 +3040,11 @@ static void DoKeyAction(const KeyDef* k) {
 #endif
         if (g_ct || g_al || g_winKey) {
             SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
-            g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+            ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         } else {
             BOOL us = g_sh ? !(GetKeyState(VK_CAPITAL) & 1) : FALSE;
             SendKey(k->vk, us, FALSE, FALSE);
-            if (g_sh) g_sh = FALSE;
+            ReleaseShiftOnce();
             ClearWinLock();   // 普通键也退出 Win 锁定/切换状态
         }
 #ifdef HK_DIAG
@@ -3056,7 +3078,7 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
-        g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+        ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_SPECIAL:
         if (k->vk >= 0x200 && k->vk <= 0x205) {   // 网址后缀键
@@ -3116,7 +3138,7 @@ static void DoKeyAction(const KeyDef* k) {
         // 网页层符号键：键面画什么就发什么。symShift=1 的格子（! @ # …）内部自动带 Shift，
         // 所以不需要用户先点 Shift，点击结果与键面永远一致。
         SendKey(k->vk, k->symShift ? TRUE : FALSE, g_ct, g_al, g_winKey);
-        g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+        ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_MOD:
         if (k->vk == VK_RSHIFT || k->vk == VK_SHIFT || k->vk == VK_LSHIFT) {
@@ -3132,7 +3154,34 @@ static void DoKeyAction(const KeyDef* k) {
             //   退出的唯一入口留给那一层 Row4 的 Fn 键。
             BOOL keepFn = (g_fnLayer && g_fnWebLayout);
             BOOL wasFn = g_fnLayer;
-            if (g_sh) {
+
+            if (g_shiftDoubleTap) {
+                // ---- 新模式：单击 = 一次性，双击 = 锁定 ----
+                DWORD now = GetTickCount();
+                BOOL isDouble = (g_shiftLastTap && (now - g_shiftLastTap) <= SHIFT_DOUBLE_MS);
+                g_shiftLastTap = now;
+
+                if (g_shiftLock) {
+                    // 已在锁定态 → 再点一次解除
+                    g_shiftLock = FALSE;
+                    g_shiftOnce = FALSE;
+                    g_sh = FALSE;
+                    if (!keepFn) g_fnLayer = FALSE;
+                } else if (isDouble) {
+                    // 350ms 内第二下 → 进入锁定
+                    g_shiftLock = TRUE;
+                    g_shiftOnce = FALSE;
+                    g_sh = TRUE;
+                    if (!keepFn) g_fnLayer = FALSE;
+                } else {
+                    // 单击 → 一次性（下一个键用完自动释放）
+                    g_shiftOnce = TRUE;
+                    g_sh = TRUE;
+                    if (!keepFn) g_fnLayer = FALSE;
+                }
+                InvalidateRect(g_hWnd, 0, TRUE);
+            } else if (g_sh) {
+            // ---- 旧模式：单击即锁定，再点切输入法（保持原行为）----
                 g_sh = FALSE;
                 if (!keepFn) g_fnLayer = FALSE;
                 ToggleImeLang();
@@ -3157,11 +3206,13 @@ static void DoKeyAction(const KeyDef* k) {
         break;
     case K_ARROW:
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
-        g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+        ReleaseShiftOnce();
+        g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_SPACE:
         SendKey(0x20, g_sh, g_ct, g_al, g_winKey);
-        g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+        ReleaseShiftOnce();
+        g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_HIDE: UserHideKeyboard(); break;   // 收起键：临时挡路，遇到输入框仍会回来
     default: break;
@@ -3811,6 +3862,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_NPBTN          24   // 布局 Tab：显示标题栏 123 切换按钮
 #define S_HIT_NPBTN          24   // 布局 Tab：标题栏显示小键盘按钮
 #define S_HIT_SHIFTSYM       19
+#define S_HIT_SHDLOCK       29   // Shift 双击锁定（常规 Tab 子项，紧跟「Shift 符号」）
 #define S_HIT_THEME_DROP     20
 #define S_HIT_URL            30
 #define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
@@ -3926,6 +3978,7 @@ static BOOL SettingsRowHidden(int tab, int index) {
         int closeRow = g_af ? 2 : 1;
         if (index == closeRow + 2) return onlyDefault;   // 功能键行
         if (index == closeRow + 3) return onlyDefault;   // Shift 符号
+        if (index == closeRow + 4) return onlyDefault;   // Shift 双击锁定（从属于 Shift 符号）
         return FALSE;
     }
     // Fn 网页布局两条件任一成立就藏：
@@ -3945,7 +3998,7 @@ static int SettingsRowCtrlDip(int tab, int index) {
     if (tab == 0) {                                 // 常规
         int closeRow = g_af ? 2 : 1;
         if (index == closeRow) return 40;           // 关闭按钮下拉
-        if (index == closeRow + 4) return 40;       // 界面语言下拉
+        if (index == closeRow + 5) return 40;       // 界面语言下拉
         return 26;
     }
     if (tab == 3) {                                 // 布局
@@ -4388,8 +4441,9 @@ static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row) {
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     // 常规 Tab 行序（自动隐藏行仅在自动呼出开启时存在）：
-    //   g_af 开：0=自动呼出 1=自动隐藏 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
-    //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=界面语言
+    //   g_af 开：0=自动呼出 1=自动隐藏 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号
+    //           6=Shift双击锁定 7=界面语言
+    //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=Shift双击锁定 6=界面语言
     // 布局 Tab（「按键图标样式」行已删）：0=键盘布局 1=Fn 网页布局 2=小键盘按钮
     int rowIndex;
     if (hit == S_HIT_AUTO) rowIndex = 0;
@@ -4803,9 +4857,17 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols while Shift is held"),
                               g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
-        }
 
         r = SettingsRowRect(m, closeRow + 4);
+        // 子项样式（不画图标 tile）：与「Shift 符号」从属，标题左对齐
+        DrawSettingRowContent(dc, m, r, -1, NULL,
+                              T(L"Shift 双击锁定", L"Shift Double-Tap Lock"),
+                              T(L"连按两下 Shift 锁定，再点解除", L"Tap twice to lock, tap again to release"),
+                              g_sHov == S_HIT_SHDLOCK, SettingsSwitchTextRight(m, r), FALSE, TRUE);
+        DrawSettingSwitch(dc, m, r, g_shiftDoubleTap, S_HIT_SHDLOCK);
+        }
+
+        r = SettingsRowRect(m, closeRow + 5);
         const wchar_t* gseg[2];
         int gsegn = LangSegItems(gseg);
         RECT gsegR = RowSegRect(m, r, gseg, gsegn);
@@ -5058,9 +5120,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
             r = SettingsRowRect(m, closeRow + 3);
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
+            r = SettingsRowRect(m, closeRow + 4);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHDLOCK;
         }
 
-        r = SettingsRowRect(m, closeRow + 4);
+        r = SettingsRowRect(m, closeRow + 5);
         { const wchar_t* it[2]; int n = LangSegItems(it);
           RECT sr = RowSegRect(m, r, it, n);
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LANG_DROP; }
@@ -5269,7 +5333,8 @@ static void LoadConfig() {
     // 键面固定「图标+文字」：不再提供「仅文字」模式（实机反馈），设置页也没有对应行了。
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
-    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
+    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
+    g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 1) != 0);
     g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
@@ -5427,6 +5492,14 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         BeginSwitchAnimation(hWnd, hit, g_shiftSymbols, !g_shiftSymbols);
         g_shiftSymbols = !g_shiftSymbols;
         IniSetInt(L"General", L"ShiftSymbols", g_shiftSymbols ? 1 : 0);
+        if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
+        break;
+    case S_HIT_SHDLOCK:
+        BeginSwitchAnimation(hWnd, hit, g_shiftDoubleTap, !g_shiftDoubleTap);
+        g_shiftDoubleTap = !g_shiftDoubleTap;
+        // 关掉时清掉锁定/一次性态，否则会残留一个"看不见的锁定"
+        if (!g_shiftDoubleTap) { g_shiftLock = FALSE; g_shiftOnce = FALSE; g_sh = FALSE; }
+        IniSetInt(L"General", L"ShiftDoubleTap", g_shiftDoubleTap ? 1 : 0);
         if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, TRUE);
         break;
     case S_HIT_THEME_DROP: {

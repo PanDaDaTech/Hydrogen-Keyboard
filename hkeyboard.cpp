@@ -875,21 +875,11 @@ HFONT       g_f12 = 0, g_f13 = 0, g_f14 = 0;   // 键面字体（单字重，见
 HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：只给 1u 键塞不下的长标签用（见 FitKeyFont）
 HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
 
-// 导航区（block 1）**专用**的一套字体：字号 = 常规档 × NAV_FONT_SCALE。
-//
-// ⚠ 2026-10-04 用户指定的 B 方案：导航区单独缩一点，数字区一个字都不动。
-//   默认全尺寸 1280×404 实测（MiSans + MakeFont 的 em 换算）：
-//       常规 14pt 档 em=20px，`Pause` 需 60px，而 1u 键宽只有 52px ⇒ 放不下
-//       × 0.85 后  em=17px，`Pause` 需 51px ≤ 52px ⇒ **九键全部停在 14pt 档**
-//   而同宽的 `Num`（3 字母）在常规 14pt 需 48px ≤ 52px，也是 14pt 档
-//   ⇒ **导航区九键与 Num 同档、同号**，且长标签完整不裁。
-//
-// ⚠ 0.85 是**量出来的**，不是拍脑袋。改默认窗口尺寸 / 改键宽后必须重量：
-//   判据 = 「压缩后最长标签宽度 ≤ 组内最小 1u 键宽」。
-HFONT       g_nf14 = 0, g_nf13 = 0, g_nf12 = 0;   // 导航区专用（14/13/12）
-HFONT       g_nf10 = 0, g_nf9  = 0, g_nf8 = 0;    // 导航区专用（10/9/8）
-HFONT       g_nf7  = 0;                           // 导航区专用地板档
-#define NAV_FONT_SCALE 0.85                        // 导航区字号压缩系数
+// ⚠ 2026-10-04 第 25 轮：导航区曾经的专用字体（g_nf14…g_nf7 = 常规档 × 0.85）
+//   已整套删除。它让导航区整体比主区小一号（用户截图：「自适应字体有些大有些小」）。
+//   ⇒ 现在全键盘（主区 / 导航区 / 数字区）**共用同一套 g_f* 阶梯**，
+//     字号只由「该键所在分组的可用宽度」决定，不按区块身份预先打折。
+
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
 static HFONT g_sfSec = 0;                                                          // 14 档大字号（关于页产品名）
@@ -1806,14 +1796,6 @@ static void RecreateFontsAndLayout() {
     if (g_f8)  DeleteObject(g_f8);
     if (g_f7)  DeleteObject(g_f7);
     if (g_f6)  DeleteObject(g_f6);
-    // 导航区专用字体同样要释放，否则**每次改 DPI / 切布局泄漏 7 个 HFONT**
-    if (g_nf14) DeleteObject(g_nf14);
-    if (g_nf13) DeleteObject(g_nf13);
-    if (g_nf12) DeleteObject(g_nf12);
-    if (g_nf10) DeleteObject(g_nf10);
-    if (g_nf9)  DeleteObject(g_nf9);
-    if (g_nf8)  DeleteObject(g_nf8);
-    if (g_nf7)  DeleteObject(g_nf7);
 
     double dpiScale = GetSystemDpiScale();
 
@@ -1861,17 +1843,18 @@ static void RecreateFontsAndLayout() {
     g_f7 = MakeFont((int)(7 * finalFontScale + 0.5));
     g_f6 = MakeFont((int)(6 * finalFontScale + 0.5));
 
-    // 导航区专用：同一档位但字号 × NAV_FONT_SCALE（0.85）。理由见声明处。
-    {
-        const double navFS = finalFontScale * NAV_FONT_SCALE;
-        g_nf14 = MakeFont((int)(14 * navFS + 0.5));
-        g_nf13 = MakeFont((int)(13 * navFS + 0.5));
-        g_nf12 = MakeFont((int)(12 * navFS + 0.5));
-        g_nf10 = MakeFont((int)(10 * navFS + 0.5));
-        g_nf9  = MakeFont((int)( 9 * navFS + 0.5));
-        g_nf8  = MakeFont((int)( 8 * navFS + 0.5));
-        g_nf7  = MakeFont((int)( 7 * navFS + 0.5));
-    }
+    // ⚠⚠ 2026-10-04 第 25 轮：**导航区专用字体（g_nf* / NAV_FONT_SCALE）整套删除**。
+    //
+    //   上一轮的 B 方案给导航区单独乘了 0.85，出发点是「让导航区九键都能停在
+    //   同一档位、长标签不裁」。它确实解决了「导航区内部不齐」，
+    //   **但制造了新的、更大的不齐** —— 导航区整体比主区小一号：
+    //       主区字母 14pt  →  导航区 Ins/Home/PgUp ≈ 12pt
+    //   用户截图一眼就看出来：「自适应字体有些大有些小」。
+    //
+    //   根本判断：**全键盘的键面字号应该只有一套阶梯**。
+    //   「导航区需不需要降档」是**该由可用宽度决定**的事，
+    //   不该由区块身份预先打折 —— 打折等于把这个决定从宽度手里抢走了。
+    //   ⇒ 导航区回到与主区同一套 g_f*，走同一套 FitTierInLadder 判据。
 
     // 「Backspace」在最小字号档（g_f12）下的实际容纳宽，字体一改就重量一次。
     // 退格标签要不要缩写成 Bksp**只能**跟这个实测值比：
@@ -2362,12 +2345,11 @@ void InvalidateFitTier(void) { g_fitTierValid = FALSE; }
 // 且只与**同一区块内同宽**的键比较 —— 避免把退格这种宽键和小键混为一谈。
 // ⚠ 分组单元是「区块」而不是行或列，两轮返工都证明行/列都不对（详见 FitUnifiedTier）。
 // 降档阶梯。档位序号 0 = 最大字号，7 = 地板。
-//   g_f*  常规档（主区 / 数字区）
-//   g_nf* 导航区专用档，字号 = 常规 × NAV_FONT_SCALE（B 方案）
 //
-// ⚠⚠ **量宽与取字体必须用同一套**（2026-10-04 踩过）：
-//   拿 g_f*（常规）去量 g_nf*（压缩后）实际画出来的字，量到的宽度比实际大
-//   1/0.85 ≈ 18% ⇒ 误判「放不下」⇒ 白白降档 ⇒ **压缩等于白做**。
+// ⚠⚠ 2026-10-04 第 25 轮：**原来这里有两套阶梯**（g_f* 常规 / g_nf* 导航区
+//   ×0.85）。导航区那一套已整套删除 —— 它让导航区整体比主区小一号，
+//   用户截图直接看出「自适应字体有些大有些小」。
+//   ⇒ 现在**全键盘只有这一套阶梯**，主区 / 导航区 / 数字区共用。
 struct FontLadder {
     HFONT f[8];
 };
@@ -2376,13 +2358,6 @@ static FontLadder MainLadder() {
     FontLadder L;
     L.f[0]=g_f14; L.f[1]=g_f13; L.f[2]=g_f12; L.f[3]=g_f10;
     L.f[4]=g_f9;  L.f[5]=g_f8;  L.f[6]=g_f7;  L.f[7]=g_f6;
-    return L;
-}
-
-static FontLadder NavLadder() {
-    FontLadder L;
-    L.f[0]=g_nf14; L.f[1]=g_nf13; L.f[2]=g_nf12; L.f[3]=g_nf10;
-    L.f[4]=g_nf9;  L.f[5]=g_nf8;  L.f[6]=g_nf7;  L.f[7]=0;
     return L;
 }
 
@@ -2399,10 +2374,9 @@ static int FitTierForText(HDC dc, const wchar_t* s, int maxW) {
 
 // 取「本键所在同宽键组」统一后的档位。groupW = 组内键宽，maxW = 本键可用宽。
 static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
-    // ⚠ 2026-10-04（B 方案）：导航区（block 1）**必须用 g_nf* 量宽**。
-    //   它的字号是常规档 × 0.85；拿 g_f*（常规）去量，量到的宽度比实际绘制
-    //   大 18% ⇒ 误判「放不下」⇒ 白白降档 ⇒ **压缩就白做了**。
-    const FontLadder L = (self->block == 1) ? NavLadder() : MainLadder();
+    // ⚠ 2026-10-04 第 25 轮：**不再按区块选阶梯** —— 全键盘共用 MainLadder()。
+    //   （导航区专用阶梯已删除，见 FontLadder 处的说明。）
+    const FontLadder L = MainLadder();
     int worst = FitTierInLadder(dc, KeyText(self), selfMaxW, L);
     int gw = self->w;
     // 分组判据 = **区块 + 键宽**（不是坐标，也不是行/列）。
@@ -2448,54 +2422,58 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     // ⇒ 改为「键宽差 ≤ 2px 视为同宽」（覆盖 1px 取整误差；真正的不同宽度键
     //   —— 退格 2u、回车 1.5u、Shift 2.25u —— 差几十 px，不会被误并入）。
     // ⇒ 顺便用**组内最小宽**算可用宽：取整误差下窄的那列才是真正的瓶颈。
+    //
+    // ⚠⚠⚠ 2026-10-04 第 25 轮：**分组把主区（block 0）与导航区（block 1）合并**。
+    //
+    //   上一轮的结论是「按区块分组」，那解决了导航区**内部**不齐；
+    //   但导航区与主区之间仍不齐 —— 用户截图看出「自适应字体有些大有些小」：
+    //       主区字母 q/w/e   → 14pt（单字母，任何键宽都放得下）
+    //       导航区 Ins/Home  → 12pt（Pause/Home 这类 4~5 字母标签放不下 14pt）
+    //
+    //   ⚠ 要认清：这**不是**哪个区块被"打折"，而是 `Pause` 客观上放不下 14pt
+    //     （14pt 需 51px，1u 键可用宽 46px）。只要还按区块分组，
+    //     主区就会停在 14pt、导航区停在 12pt，**永远差一档**。
+    //
+    //   ⇒ 真正的"统一字号"只可能有一种写法：**把主区与导航区的 1u 纯文字键
+    //     放进同一个分组，一起取全组最严档**。代价是主区字母从 14pt 降到 12pt ——
+    //     但换来的是**全键盘键面字号真正一致**，这正是用户要的。
+    //     （要求"主区保持 14pt 且导航区同 14pt"在物理上不成立：
+    //       要么把窗口/键宽做大到 51px 容得下 Pause@14pt，要么给长标签降档。）
+    //
+    //   数字区（block 2）仍**单独退出统一**（见下），用户明确要求不要动它。
+    auto sameGroup = [&](unsigned char b) {
+        return (b == 0 || b == 1);               // 主区 + 导航区 视为同一组
+    };
     int groupW = gw;
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
-        if (k->block != self->block) continue;   // 只看同一区块
-        if (k->block == 2) continue;             // 数字区保持原样（见上）
+        if (!sameGroup(k->block) || !sameGroup(self->block)) continue;
         int dw = k->w - gw; if (dw < 0) dw = -dw;
         if (dw > 2) continue;                    // 键宽差 > 2px ⇒ 不同规格的键
         if (k->w < groupW) groupW = k->w;        // 记住组内最窄的
     }
     //
-    // ⚠⚠⚠ 2026-10-04 用户实机截图：「导航栏还是一样（还是小）！改成 Num 按钮
-    //   同样的字体大小」。**这才是「比 Num 小一号」的真正原因** —— 不是分组，
-    //   而是下面这行**扣掉的 6px 边距**。
+    // ⚠⚠⚠ 2026-10-04 第 25 轮：**取消这里的二次扣边距**。
     //
-    //   `DrawKeyLabel` 传进来的 maxW 是 `k->w - 6*dpiScale`，这里又扣一次。
-    //   1u 键在默认全尺寸（W=1280）下宽 **51px**，扣 6px 只剩 45px；而
-    //   导航区最长的标签是 `Pause`，14pt 下需 **51px**、10pt 下需 39px ——
-    //   于是 `45` 卡在 14pt(51) 与 10pt(39) 之间，取最严就落到 **10pt**。
-    //   而同宽的 `Num` 键（宽 52px）标签只有 3 个字母，14pt 仅需 30px，**照旧 14pt**。
-    //   ⇒ 同一排里 `Num` 是 14pt、`Pause` 只有 10pt，肉眼就是「小一号」。
+    //   调用方（DrawKeys）传进来的 `selfMaxW` 已经是 `k->w - 6*dpiScale`
+    //   —— 它就是 `DrawKeyLabel` 实际绘制时可用的宽度。这里再扣一次 6px
+    //   等于**用两把尺子量同一组键**（量宽时按 40px 判、绘制时按 46px 排），
+    //   结果是明明放得下的标签被误判降档。
     //
-    //   实测各档最长标签宽度（MiSans，em = 17/16/16/13/12/10/9/8px）：
-    //       14pt→Pause 51   13pt→Pause 48   12pt→Pause 48   10pt→Home 40
-    //        9pt→Pause 38    8pt→Pause 31    7pt→Pause 28    6pt→Pause 26
-    //   键宽 51px 时，只有**不扣边距**（avail=51）才够 14pt。
+    //   ⇒ 判据统一为：**可用宽 = 调用方传进来的 selfMaxW（已扣边距）**。
+    //     组内其他键按它们各自的 `k->w` 与 `self->w` 的差值平移，
+    //     这样"组内最窄那一列"依然是瓶颈，且与绘制用同一把尺子。
     //
-    // ⇒ 导航区（block 1）**不扣边距**：横向居中绘制（DrawTextC 走整键矩形居中），
-    //   标签不会贴到键帽边缘，实测 14pt 的 `Pause` 51px 放进 51px 键宽也不溢出。
-    //
-    // ⇒ 数字区（block 2）也**不扣边距**，但**字号一个字都不改**（仍是常规档）：
-    //   数字区在 FitUnifiedTier 的分组循环里被 `if (k->block == 2) continue;`
-    //   排除，它只算**自己**那一键的档位 —— 也就是 `Num`。
-    //   `Num` 标签 3 个字母，14pt 需 **48px**；原先扣 6px 后可用宽只剩 46px
-    //   ⇒ 差 2px 掉到 13pt，于是「导航区 14pt vs Num 13pt」又差一档。
-    //   去掉这 6px 扣减后 48 ≤ 52 ⇒ `Num` 停在 **14pt**，与导航区**完全同档**。
-    //   ⚠ 这**不是**改数字区的字号（用户明确要求数字区不要动），
-    //     只是不再拿边距去卡它 —— 数字区其余键都是单字符、本来就在 14pt，无变化。
-    //
-    //   主区（block 0）保持扣边距不变：它的标签都是单字符/短词，从没因此降档。
-    int edge = (self->block == 0) ? (int)(6 * GetSystemDpiScale()) : 0;
-    int groupMaxW = groupW - edge;
+    //   实现：`delta = selfMaxW - self->w`（负数，即 -6*dpi），
+    //   则组内任一键 k 的可用宽 = `k->w + delta`。
+    int delta = selfMaxW - self->w;
+    int groupMaxW = groupW + delta;
     if (groupMaxW < 1) groupMaxW = groupW;       // 极窄兜底
     // self 的档位也改用组内最小宽重算，避免 self 是最宽那列时定出偏大的档
     worst = FitTierInLadder(dc, KeyText(self), groupMaxW, L);
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
-        if (k->block != self->block) continue;
-        if (k->block == 2) continue;
+        if (!sameGroup(k->block) || !sameGroup(self->block)) continue;
         int dw = k->w - gw; if (dw < 0) dw = -dw;
         if (dw > 2) continue;
         if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
@@ -2508,9 +2486,10 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
 }
 
 static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_t* s, int maxW) {
-    // ⚠ 必须与 FitUnifiedTier 用**同一套**阶梯：那里用 g_nf* 量，这里就取 g_nf*。
-    //   取错会画出与量宽时不同的字号（要么溢出、要么白白偏小）。
-    const FontLadder L = (self && self->block == 1) ? NavLadder() : MainLadder();
+    // ⚠ 2026-10-04 第 25 轮：全键盘只有一套阶梯（导航区专用档已删）。
+    //   量宽（FitUnifiedTier）与取字体（这里）必须是同一套，取错就会画出
+    //   与量宽时不同的字号。
+    const FontLadder L = MainLadder();
     if (!s || !s[0] || maxW <= 0) return L.f[0] ? L.f[0] : g_f14;
     if (!g_fitTierValid) {
         for (int i = 0; i < MAX_KEYS; i++) g_fitTierCache[i] = -1;
@@ -7851,10 +7830,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         DeleteObject(g_f12); DeleteObject(g_f13); DeleteObject(g_f14);
         DeleteObject(g_f10); DeleteObject(g_f9);
         DeleteObject(g_f8); DeleteObject(g_f7); DeleteObject(g_f6);
-        // 导航区专用字体（见 RecreateFontsAndLayout 处的说明）
-        DeleteObject(g_nf14); DeleteObject(g_nf13); DeleteObject(g_nf12);
-        DeleteObject(g_nf10); DeleteObject(g_nf9);
-        DeleteObject(g_nf8);  DeleteObject(g_nf7);
         DeleteObject(g_sfBig); DeleteObject(g_sfRow); DeleteObject(g_sfCtrl);
         DeleteObject(g_sfBase); DeleteObject(g_sfMeta);
         PostQuitMessage(0);

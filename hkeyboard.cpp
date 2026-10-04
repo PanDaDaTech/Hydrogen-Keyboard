@@ -7352,14 +7352,26 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
         if (sl) *(sl + 1) = 0;
         wcscat_s(lp, MAX_PATH, L"afdiag.txt");
         _wfopen_s(&g_afLog, lp, L"w, ccs=UTF-8");
+        if (g_afLog) {
+            fprintf(g_afLog, "=== started with -afdiag, build %s %s ===\n",
+                    __DATE__, __TIME__);
+            fflush(g_afLog);
+        }
     }
 
     BOOL isTouch = IsTouchDevice();
 
     if (tOnly && !isTouch) return 0;
+    if (g_afLog) { fprintf(g_afLog, "--- passed single-instance check, creating window ---\n"); fflush(g_afLog); }
 
     g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 诊断：上次 afdiag.txt 只有 BOM、一行都没有，最可能就是走的这条路 ——
+        // 旧实例还在跑，新进程转发消息后静默退出，日志自然空白。
+        if (g_afLog) {
+            fprintf(g_afLog, "!!! ANOTHER INSTANCE ALREADY RUNNING -> exit now\n");
+            fflush(g_afLog);
+        }
         CloseHandle(g_mutex);
         HWND ew = FindWindowW(L"HKeyboard", 0);
         if (ew) {

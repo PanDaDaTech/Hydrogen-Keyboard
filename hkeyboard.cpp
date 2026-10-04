@@ -628,7 +628,8 @@ static int   g_noInputStreak = 0;
 static DWORD g_noInputSinceTick = 0;
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
-// 实体 NumLock 锁定态（GetAsyncKeyState(VK_NUMLOCK) 的 bit0），全尺寸数字区的 Num 键跟着它高亮
+// 实体 NumLock 锁定态（与 g_npLock 同源，都来自 ReadSystemNumLock），
+// 一起进帧缓存签名 —— 它俩任一变化都要触发重绘。
 BOOL        g_physNum = FALSE;
 // 屏幕键盘的小键盘锁定态（2026-10-04）。**它就是系统真实状态**。
 //
@@ -645,32 +646,42 @@ BOOL        g_physNum = FALSE;
 //   20 轮 单次注入+等待 → ✓
 // ⇒ **三条铁律**：① 唯一真值是系统状态；② 锁存键走 VK 路径（不带 SCANCODE）；
 //   ③ **绝不重复注入**（每注一次翻一次，不是「重试」而是「继续翻」）。
-// ⛔⛔⛔ 读 NumLock 真实锁定态：**必须用 GetAsyncKeyState，不能用 GetKeyState**
+// 读 NumLock 真实锁定态：**用 GetKeyState 的低位，不要用 GetAsyncKeyState**
 //
-//   两者 bit0 语义完全不同（这是本项目返工五轮、第 21 轮才找到的根因）：
+// ⚠⚠⚠ 2026-10-04 在自己机器上实测得出（连错六轮的收尾）。用同一个进程连续
+//   切换 NumLock 两次，同时读两个 API 的低位：
 //
-//   GetKeyState(VK_NUMLOCK) & 1
-//       读的是**调用线程的 key table**。该表的锁存位只在**本线程处理了
-//       WM_KEYDOWN** 时才更新。而 HKeyboard 窗口是
-//       `WS_POPUP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
-//       —— 点它**不会激活它**，前台窗口始终是记事本 / 浏览器 / IDE；
-//       注入的 VK_NUMLOCK 按键消息被送进**前台窗口的线程队列**，
-//       HKeyboard 所在线程**永远收不到 WM_KEYDOWN**
-//       ⇒ 那张表里锁存位永远是进程启动时的初值
-//       ⇒ 无论注入成功与否，读回来的都是**同一个旧值**
-//       ⇒ 界面高亮与真实状态必然不一致，且**纯屏幕键盘点击时永远错**。
+//     时刻            GetKeyState   GetAsyncKeyState   紧接着再读一次 GetAsync
+//     初始                 1               0                   0
+//     切换一次后           0               1                   0
+//     切换两次后           1               1                   0
 //
-//   GetAsyncKeyState(VK_NUMLOCK) & 1
-//       读的是**系统全局 toggle 状态**（由 win32k 维护，与线程无关）。
-//       无论翻转是物理按键还是 SendInput 注入引起的，都会立即反映。
+//   ⇒ GetAsyncKeyState 的低位是「**自上次调用以来按过没有**」的**瞬时标志**，
+//     读一次就被清零 —— **它不是锁定态**。拿它当锁定态用，就会出现：
 //
-// ⇒ **本项目凡是问「NumLock 现在到底开没开」，一律走这个函数。**
+//         before = 0（平时都是 0）
+//         注入 VK_NUMLOCK
+//         now = 1（刚按过）⇒ 判定「翻转成功」⇒ g_npLock = TRUE
+//
+//     ⇒ **每点一次高亮都变成「亮」**，硬件灭了它还亮着；
+//       而那个瞬时位会被别处（本文件 TIMER 里也有一次读取）抢先清掉，
+//       时序一变结果就变 ⇒ 这正是「有时候正常有时候不正常」的来源。
+//
+//   ⇒ GetKeyState(VK_NUMLOCK) 的低位才是**锁定态本身**：低位为 1 = toggled
+//     （MSDN: "If the low-order bit is 1, the key is toggled."），
+//     实测精确跟随 1→0→1，且**重复读取稳定**（不像上面那个瞬时位）。
+//
+// ⚠ 上一轮我断言「GetKeyState 读不到注入的翻转，因为本窗口 WS_EX_NOACTIVATE
+//   收不到 WM_KEYDOWN」—— **那是推断出来的、没有验证，实测证明是错的**：
+//   锁存键的锁定位由 win32k 全局维护，与本线程是否收到按键消息无关。
+//   ⇒ 教训：API 语义有疑问时**先写几十行实测**，别靠文档印象推断。
 static BOOL ReadSystemNumLock() {
-    return (GetAsyncKeyState(VK_NUMLOCK) & 1) != 0;
+    return (GetKeyState(VK_NUMLOCK) & 1) != 0;
 }
 
 static BOOL g_npLock = TRUE;            // TRUE = 数字（小键盘）模式
-static BOOL g_npLockInit = FALSE;       // 首次跟实体灯对齐后置位
+// （原 g_npLockInit「只跟随一次」已删：现在 TIMER 每个 tick 都读回，
+//   高亮始终等于真实锁定态，不需要再区分「首帧」与「之后」）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
 // 自动隐藏：**点击输入框以外的区域时自动收起键盘**（ini: General/AutoHide）。
@@ -3427,8 +3438,9 @@ static void DoKeyAction(const KeyDef* k) {
         //
         //   两态不冲突的原因：`g_npLock` 是**本进程自持**状态（不读目标进程的灯），
         //   而 `SendKey` 翻的是**目标线程**的 NumLock —— 两者由这一次点击同步翻转。
-        //   实体键盘按 NumLock 不会影响 g_npLock（见 TIMER_FOCUS 里 g_npLockInit
-        //   的「只跟随一次」），故两处输入源互不干扰。
+        //   g_npLock 现在由 TIMER_FOCUS **每个 tick 从系统读回**（物理按键、
+        //   本键点击、别的程序切换都会跟上），所以这里点完不必自己维护它 ——
+        //   注入是否生效由系统的真实状态说话。
         if (k->vk == 0x90) {
             // ⚠⚠⚠ 2026-10-04 用户第三次反馈：「还是识别不到 NumLock 键启用，
             //   **我小键盘灯都没亮**，且触发不了小键盘键启用」。
@@ -3491,7 +3503,9 @@ static void DoKeyAction(const KeyDef* k) {
             //     既然第 20 轮改成 VK 路径后已能生效，就不需要重试。
             //   ② 读回要**等够时间**：给系统一个确定的等待窗口，而不是 1ms。
             //     期间反复读，**一旦变化就立刻采用**（不注入、只观察）。
-            BOOL before = ReadSystemNumLock();   // ⚠ 见 ReadSystemNumLock 的说明
+            // 注入一次 VK_NUMLOCK（走 VK 路径、不带 SCANCODE —— 锁存键的
+            // 翻转由键盘布局层按 VK 处理，扫描码路径会被忽略）。
+            // ⚠ **只注一次**：锁存键每收到一次就翻一次，重发不是"重试"而是"继续翻"。
             {
                 INPUT pair[2] = {};
                 pair[0].type = INPUT_KEYBOARD;
@@ -3499,15 +3513,18 @@ static void DoKeyAction(const KeyDef* k) {
                 pair[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;  // ⚠ 刻意无 SCANCODE
                 pair[1] = pair[0];
                 pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
-                SendInput(2, pair, sizeof(INPUT));           // ← 只注一次
+                SendInput(2, pair, sizeof(INPUT));
             }
-            // 等系统真正翻转：最多 200ms，每 10ms 读一次，变了就停。
-            // ⚠ 期间**只读不注入** —— 注入会把状态再翻回去（第 ① 条）。
-            BOOL now = ReadSystemNumLock();
+            // 读回**真实锁定态**（GetKeyState 的低位，见 ReadSystemNumLock 的实测说明）。
+            // 最多等 200ms：给系统一点时间把翻转落到锁定位上，变了就停。
+            // ⚠ 期间**只读不注入**；判据用 `now != before`（翻转语义），
+            //   不能写死 `!= 0` —— 起始可能是"灭"，写死会把状态又翻回去。
+            BOOL before = ReadSystemNumLock();
+            BOOL now = before;
             for (int wait = 0; wait < 20; wait++) {
-                if (now != before) break;                     // 已翻转
                 Sleep(10);
                 now = ReadSystemNumLock();
+                if (now != before) break;                     // 已翻转
             }
             g_npLock = now;                                  // 以系统真实状态为准
             g_physNum = g_npLock;                            // 数字区 Num 键高亮同步
@@ -7684,20 +7701,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                               ((GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0);
                 BOOL pWin   = ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
                               ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
-                // NumLock / CapsLock 是锁存键：GetKeyState 的 bit0 就是「锁定态」本身（与
-                // K_CAPS 分支读法一致），且不受前台窗口提权影响，比 GetAsyncKeyState 稳。
-                // ⚠ 必须用 ReadSystemNumLock（GetAsyncKeyState），
-                //   不能用 GetKeyState —— 本线程收不到 WM_KEYDOWN（WS_EX_NOACTIVATE），
-                //   GetKeyState 的锁存位永远是初值。详见 ReadSystemNumLock。
+                // ⚠⚠ 2026-10-04 第 23 轮：NumLock 改成**每个 tick 都读回真值**。
+                //
+                //   以前写的是「只在启动后跟随实体灯一次，之后只由用户点 Num 键控制」
+                //   —— 那个设计的出发点是「怕两处输入源互相干扰」。但它有个致命后果：
+                //   **一旦哪一次没对上，就再也回不来了**，高亮会一直错到下次点击。
+                //   用户实测的「点一次之后高亮就不对了、开关很多遍也好不了」
+                //   正是这个「错一次就锁死」的机制放大出来的。
+                //
+                //   ⇒ 现在每 tick 无条件读回真实锁定态（ReadSystemNumLock），
+                //     物理按键、屏幕键盘点击、甚至别的程序切 NumLock，
+                //     下一 tick（几十毫秒内）高亮自动纠正 —— **可以自愈**。
+                //     这才是「高亮 = 真实状态」这一条恒等式最直接的写法。
                 BOOL pNum   = ReadSystemNumLock();
                 BOOL pCaps  = (GetKeyState(VK_CAPITAL) & 1) != 0;
-                // 屏幕键盘的小键盘锁定态：**只在启动后跟随实体灯一次**，
-                // 之后完全由用户点小键盘的 NumLock 键自己控制（见 g_npLock）。
-                // 为什么要"只一次"：若持续跟随，用户在实体键盘上按 NumLock 会
-                // 把屏幕键盘的锁定态一起翻掉，两处输入源互相干扰。
-                if (!g_npLockInit) {
+                if (g_npLock != pNum) {          // NumLock 高亮：与真实锁定态对齐
                     g_npLock = pNum;
-                    g_npLockInit = TRUE;
+                    InvalidateRect(hWnd, 0, TRUE);
                 }
                 if (g_physShift != pShift || g_physWin != pWin ||
                     g_physNum != pNum || g_cp != pCaps) {

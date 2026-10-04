@@ -6234,34 +6234,35 @@ static HWND GetFocusedInputControl() {
     DWORD tid = GetWindowThreadProcessId(fg, NULL);
     GUITHREADINFO gi = {sizeof(gi)};
     BOOL haveGuiInfo = GetGUIThreadInfo(tid, &gi);
-
-    // ⚠⚠ 拿不到 GUI 线程信息时**直接放弃**，不做任何跨进程探测。
-    //
-    //   用户实测症状：「刚打开的时候，有时候在没输入状态会触发自动呼出的逻辑，
-    //   之后再呼出键盘就直接卡死。」
-    //
-    //   原因：此时 focus 只能退化成"前台窗口"本身，判断依据从"真正的焦点控件"
-    //   降级为"整个应用窗口" —— 而后者对浏览器 / UWP / Electron 这类大应用
-    //   极易被判定成输入区域，于是**在没有输入框的地方也弹键盘**。
-    //   另外 GetGUIThreadInfo 失败通常意味着目标刚启动 / 正在退出 / 没有 UI
-    //   线程，这些情况下本来也不该呼出。
-    if (!haveGuiInfo) return NULL;
-
-    HWND focus = gi.hwndFocus ? gi.hwndFocus : fg;
-    if (IsInputControl(focus)) {
-        g_detectedInputToken = (ULONG_PTR)focus;
-        return focus;
-    }
-
-    if (gi.hwndCaret || (gi.flags & GUI_CARETBLINKING) != 0) {
-        if (gi.hwndCaret && IsWindow(gi.hwndCaret)) {
-            g_detectedInputToken = (ULONG_PTR)gi.hwndCaret;
-            return gi.hwndCaret;
+    HWND focus = haveGuiInfo && gi.hwndFocus ? gi.hwndFocus : fg;
+    if (haveGuiInfo) {
+        if (IsInputControl(focus)) {
+            g_detectedInputToken = (ULONG_PTR)focus;
+            return focus;
         }
-        g_detectedInputToken = (ULONG_PTR)focus;
-        return focus;
+
+        if (gi.hwndCaret || (gi.flags & GUI_CARETBLINKING) != 0) {
+            if (gi.hwndCaret && IsWindow(gi.hwndCaret)) {
+                g_detectedInputToken = (ULONG_PTR)gi.hwndCaret;
+                return gi.hwndCaret;
+            }
+            g_detectedInputToken = (ULONG_PTR)focus;
+            return focus;
+        }
     }
 
+    // ⚠⚠⚠ 下面这一段是**必需**的兜底路径，不要因为"怕误判"就把它砍掉。
+    //
+    //   拿不到 GUI 线程信息时，focus 会退化成"整个前台窗口"，随后对它做
+    //   accessibility 探测 —— NTQQ / 浏览器 / UWP / Electron 的输入框**本来
+    //   就不在 gi.hwndFocus 里**（焦点落在渲染宿主/组件窗口上），只能靠探测
+    //   整个窗口才认得出。资源管理器的搜索栏也走这条。
+    //
+    //   ⚠ 2026-10-04 踩过：曾经在 `haveGuiInfo` 失败时直接 `return NULL`，
+    //     结果把这些应用的自动呼出**全砍了** —— 用户实测「NTQQ 有时可以有时
+    //     不行、浏览器 / UWP / Electron 无法正常呼出、资源管理器搜索栏也不行」。
+    //     已经回退过了，**别再改回 return NULL**。
+    //     误判问题改用「启动预热期」（AUTOSHOW_WARMUP_MS）解决，那条不影响这里。
     ULONG_PTR token = 0;
     if (IsAccessibleInputWindow(focus, &token) || (focus != fg && IsAccessibleInputWindow(fg, &token))) {
         g_detectedInputToken = token ? token : (ULONG_PTR)focus;

@@ -622,6 +622,15 @@ BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示�
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 // 实体 NumLock 锁定态（GetAsyncKeyState(VK_NUMLOCK) 的 bit0），全尺寸数字区的 Num 键跟着它高亮
 BOOL        g_physNum = FALSE;
+// 屏幕键盘**自己**的小键盘锁定态（2026-10-04）。
+// ⚠ 为什么不能只靠 g_physNum（实体灯）：`SendKey(0x90)` 翻的是**目标线程**的
+//   NumLock，而 g_physNum 读的是**本线程**的 —— 两者会不同步。不同步时就出现
+//   用户实测的问题：「小键盘无法锁定、数字打不进去」（界面显示已锁定，实际
+//   发出去的还是光标键 Ins/Del/Home…）。
+// ⇒ 屏幕键盘自持状态：小键盘数字键按它决定**注入数字键还是光标键**，
+//   NumLock 键只翻它自己、不再发 VK_NUMLOCK 给目标进程。
+static BOOL g_npLock = TRUE;            // TRUE = 数字（小键盘）模式
+static BOOL g_npLockInit = FALSE;       // 首次跟实体灯对齐后置位
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
 // 自动隐藏：**点击输入框以外的区域时自动收起键盘**（ini: General/AutoHide）。
@@ -2522,7 +2531,8 @@ static const wchar_t* KeyText(const KeyDef* k) {
 static BOOL IsActive(const KeyDef* k) {
     if (k->vk == 0x14 && g_cp) return TRUE;
     // NumLock：跟实体键盘的锁定灯走（GetAsyncKeyState(VK_NUMLOCK) 的 bit0）
-    if (k->vk == 0x90 && g_physNum) return TRUE;
+    // NumLock 高亮跟屏幕键盘自己的锁定态（不是实体灯，见 g_npLock 处说明）
+    if (k->vk == 0x90 && g_npLock) return TRUE;
     if ((k->vk == VK_SHIFT || k->vk == VK_LSHIFT || k->vk == VK_RSHIFT) && (g_sh || g_physShift)) return TRUE;
     if (k->vk == 0x11 && g_ct) return TRUE;
     if (k->vk == VK_LWIN && (g_winKey || g_physWin)) return TRUE;   // 锁定(等 Win+快捷键)或实体 Win 按下时高亮
@@ -2599,6 +2609,25 @@ static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs
     }
     // 正常路径：下面那个 SendKey 的分段实现
     SendKey(vk, sh, ct, al, win);
+}
+
+// 小键盘数字键 -> 未锁定时的等价光标键（实体小键盘 NumLock 关掉时的行为）。
+// 布局与实体 104 键盘的数字区一致：
+//   7=Home 8=↑ 9=PgUp   4=← 5=(无) 6=→   1=End 2=↓ 3=PgDn   0=Ins
+// 5 在未锁定时实体键盘**不发任何键**（它只在锁定时是 5）—— 返回 0 表示不发。
+static BYTE NumpadNavKey(BYTE vk) {
+    switch (vk) {
+    case 0x67: return VK_HOME;        // 7
+    case 0x68: return VK_UP;          // 8
+    case 0x69: return VK_PRIOR;       // 9 PgUp
+    case 0x64: return VK_LEFT;        // 4
+    case 0x66: return VK_RIGHT;       // 6
+    case 0x61: return VK_END;         // 1
+    case 0x62: return VK_DOWN;        // 2
+    case 0x63: return VK_NEXT;        // 3 PgDn
+    case 0x60: return VK_INSERT;      // 0 Ins
+    default:   return 0;               // 5：未锁定时不发键
+    }
 }
 
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
@@ -3011,6 +3040,21 @@ static void DoKeyAction(const KeyDef* k) {
                 break;
             }
         }
+        // ---- 小键盘数字键：按屏幕键盘自己的锁定态选键种 ----
+        //   锁定（g_npLock = TRUE）-> 发 VK_NUMPAD0-9（数字）
+        //   未锁定             -> 发对应的光标键（Ins/Home/PgUp… ← 等价于实体
+        //                          小键盘 NumLock 关掉时的行为）
+        // ⚠ 不能依赖目标进程的 NumLock（不同步，见 g_npLock 处说明）。
+        if (k->vk >= 0x60 && k->vk <= 0x69) {
+            if (g_npLock) {
+                SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
+            } else {
+                BYTE nav = NumpadNavKey(k->vk);
+                if (nav) SendKey(nav, g_sh, g_ct, g_al, g_winKey);
+            }
+            g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+            break;
+        }
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
         g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
@@ -3050,9 +3094,21 @@ static void DoKeyAction(const KeyDef* k) {
             InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
-        // NumLock：先本地翻状态，让键面高亮立刻跟上（注入的事件被自己的钩子忽略，
-        // 钩子里的 VK_NUMLOCK 分支只对实体键生效，所以这里必须自己记一笔）。
-        if (k->vk == 0x90) g_physNum = !g_physNum;
+        // NumLock：**只翻屏幕键盘自己的锁定态，不发 VK_NUMLOCK 给目标进程。**
+        //
+        // ⚠ 2026-10-04 用户实测：「小键盘无法锁定、数字打不进去」。
+        //   原因：原来发的是 `SendKey(0x90)`，它翻的是**目标线程**的 NumLock；
+        //   而界面高亮跟的是 `g_physNum`（**本线程**的实体灯）—— 两边不同步，
+        //   于是界面显示"已锁定"、实际发出去的却是 Ins/Del/Home 等光标键。
+        //
+        //   现在小键盘数字键按 `g_npLock` 决定注入**数字键**还是**光标键**，
+        //   不再依赖目标进程的 NumLock 状态 ⇒ 必然一致。
+        if (k->vk == 0x90) {
+            g_npLock = !g_npLock;
+            InvalidateRect(g_hWnd, 0, TRUE);
+            g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+            break;
+        }
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
         g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
@@ -7157,6 +7213,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 // K_CAPS 分支读法一致），且不受前台窗口提权影响，比 GetAsyncKeyState 稳。
                 BOOL pNum   = (GetKeyState(VK_NUMLOCK) & 1) != 0;
                 BOOL pCaps  = (GetKeyState(VK_CAPITAL) & 1) != 0;
+                // 屏幕键盘的小键盘锁定态：**只在启动后跟随实体灯一次**，
+                // 之后完全由用户点小键盘的 NumLock 键自己控制（见 g_npLock）。
+                // 为什么要"只一次"：若持续跟随，用户在实体键盘上按 NumLock 会
+                // 把屏幕键盘的锁定态一起翻掉，两处输入源互相干扰。
+                if (!g_npLockInit) {
+                    g_npLock = pNum;
+                    g_npLockInit = TRUE;
+                }
                 if (g_physShift != pShift || g_physWin != pWin ||
                     g_physNum != pNum || g_cp != pCaps) {
                     g_physShift = pShift;

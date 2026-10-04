@@ -3916,7 +3916,13 @@ static void DrawSettingsRowHover(HDC dc, const SettingsMetrics& m, const RECT& r
 static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& row,
                                   int iconId, const wchar_t* glyph,
                                   const wchar_t* title, const wchar_t* desc,
-                                  BOOL hover, int ctrlLeft, BOOL descWrap = FALSE) {
+                                  BOOL hover, int ctrlLeft, BOOL descWrap = FALSE,
+                                  BOOL noTile = FALSE) {
+    // noTile：把这一行画成**子项**样式（左侧不画图标 tile）。
+    // 文字位置不动 —— 子项标题与父项标题左对齐，视觉上的"内缩"来自少了个图标，
+    // 参考 UU 远程设置页那种「父行带图标 / 子行不带图标」的层级表达。
+    // ⚠ 不能只靠 iconId<0 表示：DrawIconTile 在 iconId<0 且无文字时仍会画一个
+    //   空的圆角 tile（见其实现），所以必须显式跳过调用。
     // ⚠ 隐藏行（SettingsRowHidden 命中）的高度是 0，**不能进来**。
     //   行高 0 时 SettingsRowHeadH 返回 0，tile / 文字块 / 控件全部算出负偏移，
     //   直接糊在上一行上（实机截图：布局页三行文字叠成一团）。
@@ -3931,7 +3937,8 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     // 色相可展开行是例外（头部固定 64 DIP），见 SettingsRowHeadH 的说明。
     int headH = SettingsRowHeadH(m, row);
     int ty = row.top + (headH - m.tileSize) / 2;
-    DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
+    if (!noTile)
+        DrawIconTile(dc, SettingsRowTileX(m), ty, m.tileSize, (int)(17 * m.dpi), iconId, glyph);
 
     int tx = SettingsRowTextX(m);
     int rightLimit = (ctrlLeft > 0) ? ctrlLeft - (int)(12 * m.dpi) : row.right - (int)(20 * m.dpi);
@@ -4544,10 +4551,12 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
 
         if (g_af) {
             RECT ra = SettingsRowRect(m, 1);
-            DrawSettingRowContent(dc, m, ra, HKICON_CLOCK, NULL,
+            // 子项样式：不画图标 tile，标题与「自动呼出」的标题左对齐
+            DrawSettingRowContent(dc, m, ra, -1, NULL,
                                   T(L"自动隐藏", L"Auto Hide"),
                                   T(L"点击输入框以外时自动隐藏键盘", L"Hide the keyboard when clicking outside the input"),
-                                  g_sHov == S_HIT_AUTOHIDE, SettingsSwitchTextRight(m, ra));
+                                  g_sHov == S_HIT_AUTOHIDE, SettingsSwitchTextRight(m, ra),
+                                  FALSE, TRUE);
             DrawSettingSwitch(dc, m, ra, g_afAutoHide, S_HIT_AUTOHIDE);
         }
 

@@ -678,6 +678,19 @@ static int      g_dbgExtraMs = -1;
 static int      g_dbgExtraOk = -1;
 static BOOL     g_dbgExtraDue = FALSE;
 static DWORD    g_dbgExtraLastTick = 0;
+// a11y 焦点诊断：get_accFocus 返回的 VARIANT 类型与最后一个判定过的 role。
+// ⚠ 决定"QQ / 浏览器能不能用 a11y 精判"的关键数据：
+//   fvt = 0(VT_EMPTY)   → a11y 没给出焦点信息（未启用 / 无焦点）
+//   fvt = 3(VT_I4)      → 焦点是子元素 ID（child id）
+//   fvt = 9(VT_DISPATCH)→ 焦点是对象，接着看 role 是否在可编辑白名单里
+//   frole               → 实际拿到的 role（白名单目前只有 0x2A / 0x34）
+static int      g_dbgFocusVt = -1;
+static LONG     g_dbgFocusRole = -1;
+// 诊断：最近一次 EVENT_OBJECT_FOCUS 的时刻与来源（WinEventProc 更新，AfLog 读出）。
+// ⚠ 要验证的假设：「点输入框」会触发 FOCUS 事件、「点空白处」不触发 ——
+//   如果成立，这就是区分两者的天然信号（比轮询 a11y 更可靠）。
+static DWORD    g_lastFocusEvTick = 0;
+static DWORD    g_lastFocusEvHwnd = 0;
 // 键盘窗口的**实际**可见性与矩形。
 // ⚠ 这是用来验证「程序以为显示着、用户却看不到」这个猜想的：
 //   `g_vis` 只是软件标志位，和 `IsWindowVisible` 可能不一致。
@@ -712,12 +725,17 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
     if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
+    DWORD fevNow = g_lastFocusEvTick ? (GetTickCount() - g_lastFocusEvTick) : 0xFFFFFFFFu;
+    // feh：最近一次 FOCUS 事件的来源窗口是否**就是当前前台顶层窗口**
+    // （避免把"其它应用弹窗抢焦点"的噪音误当成"用户聚焦了输入框"）
+    int fehMatch = (g_lastFocusEvHwnd && fgTop &&
+                    (HWND)(ULONG_PTR)g_lastFocusEvHwnd == fgTop) ? 1 : 0;
     char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
                 "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
                 "gui=%d focusCls=%-22s isInput=%d caret=%p "
-                "resp=%d hr=0x%X found=%d | xms=%d xok=%d | "
+                "resp=%d hr=0x%X found=%d | xms=%d xok=%d | fvt=%d frole=0x%X fev=%u feh=%d | "
                 "visWnd=%d rect=%d,%d %dx%d => %s\n",
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
                 AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
@@ -726,6 +744,7 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput,
                 (void*)g_dbgCaret, g_dbgResp, (unsigned)g_dbgAcc, g_dbgAccFound,
                 g_dbgExtraMs, g_dbgExtraOk,
+                g_dbgFocusVt, (unsigned)g_dbgFocusRole, (unsigned)fevNow, fehMatch,
                 g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3],
                 decision);
     AfWriteRaw(buf);
@@ -6249,6 +6268,7 @@ static BOOL AccessibleRoleIsEditable(IAccessible* acc, VARIANT child) {
     ZeroMemory(&role, sizeof(role));
     ZeroMemory(&state, sizeof(state));
     if (FAILED(acc->get_accRole(child, &role)) || role.vt != VT_I4) return FALSE;
+    g_dbgFocusRole = role.lVal;   // 诊断：记录实际 role（见 g_dbgFocusVt 处说明）
 
     const LONG ROLE_SYSTEM_TEXT_LOCAL = 0x2A;
     const LONG ROLE_SYSTEM_SPINBUTTON_LOCAL = 0x34;
@@ -6262,10 +6282,14 @@ static BOOL AccessibleRoleIsEditable(IAccessible* acc, VARIANT child) {
 }
 
 static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* token) {
-    if (!acc || depth > 3) return FALSE;
+    // ⚠ 深度上限 3 → 6（2026-10-04）：Chrome 系的 a11y 树很深
+    //   （窗口 → 文档 → 容器 → 输入框…），3 层可能永远够不到焦点元素。
+    //   放宽后配合 fvt/frole 诊断看实际能走到哪一层。
+    if (!acc || depth > 6) return FALSE;
     VARIANT focus;
     ZeroMemory(&focus, sizeof(focus));
-    if (FAILED(acc->get_accFocus(&focus))) return FALSE;
+    if (FAILED(acc->get_accFocus(&focus))) { g_dbgFocusVt = -2; return FALSE; }
+    g_dbgFocusVt = (int)focus.vt;   // 诊断：记录返回类型（见其定义处说明）
 
     VARIANT self;
     ZeroMemory(&self, sizeof(self));
@@ -6563,19 +6587,33 @@ static void UpdateAutoVisibility() {
         // 防回弹：用户刚在这个输入框里手动收起过，别立刻弹回来。
         // ⚠ token 对不上也先按住，直到超时才放行（原来无条件清标记，
         //   只要有一次对不上防回弹就永久失效 —— 用户看到的"莫名其妙回弹"）。
+        // ⚠ 2026-10-04：**删掉"8 秒超时自动弹回"** —— 用户实测「手动收起后
+        //   过几秒键盘自己弹回来」，日志里三次收起后 3.7 / 7.1 / 8.0 秒全部
+        //   弹回，与 8 秒超时吻合。用户的心智模型是「收起后不自动出现，除非我
+        //   再点输入框 / 按键」。清除路径保留三条：
+        //     · 用户按键（byKey —— 明确要用键盘）
+        //     · token 变化（焦点换到别的输入控件 → 用户明显换了目标）
+        //     · 失焦分支的"真的失焦"（见那里的防抖说明）
         if (g_userHidInInput) {
-            if (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken) return;
-            if (nowTick - g_userHidInTick < 8000) return;
+            BOOL sameInput = (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken);
+            if (sameInput && !byKey) return;
             g_userHidInInput = FALSE;
         }
 
-        // 自动隐藏：用户刚点击了前台窗口以外的区域 -> 立刻收起键盘。
-        //   · 点键盘自己 / 设置窗 / 关闭提示窗 -> 不算"点到了别处"
-        //   · 点在当前前台窗口内 -> 不算（点输入框、点页面都在此列）
-        if (g_afAutoHide && g_vis && recentClick && !clickInFg) {
-            if (g_lastClickTopHwnd && g_lastClickTopHwnd != g_hWnd &&
-                g_lastClickTopHwnd != g_settingsHwnd &&
-                g_lastClickTopHwnd != g_closePromptHwnd) {
+        // 自动隐藏（2026-10-04 收窄，修"键盘自激振荡"）：
+        //   ⚠ 原来接受"点击落点 != 前台窗口"作为"点到别处"的依据，但那个条件
+        //     在真实场景里误报率极高 —— 用户日志实测 click=0x411504 vs
+        //     fgTop=0xA163C 持续不一致（应用多窗口 / NOACTIVATE 窗口 / 激活
+        //     延迟都会造成），于是每一拍评估都触发"隐藏"、下一拍"自动呼出"
+        //     又满足条件 —— 形成周期恰好等于动画时长（220ms / 150ms）的
+        //     **自激振荡**（用户看到的"键盘乱闪"）。
+        //   ⇒ 只在落点**确实是系统外壳表面**（桌面 / 任务栏 / 托盘，由
+        //     IsShellSurfaceClass 识别）时才立即收起。这是唯一能**确定**用户
+        //     在"别处"的信号。应用内的"点空白收起"由失焦逻辑与后续判据修复承担。
+        if (g_afAutoHide && g_vis && recentClick && g_lastClickTopHwnd) {
+            char hitCls[128] = {0};
+            GetClassNameA(g_lastClickTopHwnd, hitCls, 128);
+            if (IsShellSurfaceClass(hitCls)) {
                 ShowKB(FALSE, FALSE);
                 return;
             }
@@ -6627,12 +6665,17 @@ static void UpdateAutoVisibility() {
 }
 
 static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-    (void)hook; (void)hwnd; (void)idChild;
+    (void)hook; (void)idObject;
     (void)dwEventThread; (void)dwmsEventTime;
     if (!g_af || !g_hWnd) return;
+    if (event == EVENT_OBJECT_FOCUS) {
+        g_lastFocusEvTick = GetTickCount();
+        g_lastFocusEvHwnd = (DWORD)(ULONG_PTR)hwnd;
+    }
     if (event == EVENT_OBJECT_FOCUS || event == EVENT_SYSTEM_FOREGROUND ||
         (event == EVENT_OBJECT_SHOW && idObject == OBJID_CARET))
         PostMessage(g_hWnd, WM_FOCUS_EVENT, 0, 0);
+    (void)idChild;
 }
 
 // ===== 全局鼠标监控（WH_MOUSE_LL） =====

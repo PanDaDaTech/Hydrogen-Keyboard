@@ -502,6 +502,9 @@ static void InitWindowSizeForDpi();
 static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
 static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
+// ⚠ 前向声明必需：LastClickHitInputWindow 定义在 WinEventProc / 鼠标钩子那一带
+//   （文件靠后），而 UpdateAutoVisibility 在它之前就要用它判断"点击落点"。
+static BOOL LastClickHitInputWindow(HWND input);
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
@@ -573,6 +576,34 @@ BOOL        g_winKey = FALSE;
 int         g_winCount = 0;           // Win 键状态：0=空闲 1=锁定（等待 Win+组合键）
 DWORD       g_lastWinTick = 0;        // 最近一次 Win 键点击时刻（状态超时复位用）
 HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/Shift/Caps 状态同步显示）
+HHOOK       g_mouseHook = 0;          // 全局鼠标低级钩子（只记录"用户点了哪里"）
+
+// ===== 自动呼出的触发条件（2026-10-04 用户要求重做）=====
+// 用户要的是「**点击输入框**才弹」，而不是「切到有输入框的窗口就弹」——
+// 原话：「有时候我切换窗口的目的又不是为了呼出键盘，而是查看其他内容」。
+//
+// 仅靠 EVENT_OBJECT_FOCUS 区分不出来：切窗口时新窗口的控件同样会获得焦点、
+// 发出完全相同的事件。所以引入"用户操作"作为必要条件：
+//   · 鼠标点击 —— 还要求**落点在输入控件所属的窗口内**。否则点任务栏、
+//     点别的窗口切过去，本身也是一次点击，照样会被算成"操作"而误弹。
+//   · 键盘操作 —— 不校验落点，直接放行（用户明确要求"键盘聚焦到输入框
+//     （Tab / Ctrl+F / 自动聚焦）时也要弹"）。
+#define AUTOSHOW_INPUT_WINDOW_MS 1500
+static DWORD g_lastClickTick = 0;      // 最后一次真实鼠标左键点击
+static POINT g_lastClickPt = {0, 0};   // 它的屏幕坐标
+static DWORD g_lastKeyTick = 0;        // 最后一次真实键盘按键
+
+// 前台窗口的变化时刻 —— 用来区分"切换窗口"与"窗口内的焦点转移"。
+// ⚠ 用户要的是「点输入框 / 键盘聚焦 / **网页自动聚焦搜索框**」都弹，
+//   唯独「仅切换窗口」不弹。而后两者在焦点事件上**完全一样**：
+//   都是"某个控件获得了焦点"。只能靠"前台窗口刚刚变过没有"来区分 ——
+//   变了就要求有用户操作，没变（焦点在同一个窗口内部转移）就放行。
+// ⚠ 用**状态**而不是时间窗：切换窗口后进入"等待用户操作"状态，
+//   **只有"点输入框"或"敲键盘"才解除**。
+//   一开始用时间窗（比如 1.5s 内要求有操作），但那样切窗口 1.5 秒后封锁就过期，
+//   键盘照样会自己弹出来 —— 等于没解决问题。
+static HWND g_lastFg = NULL;
+static BOOL g_fgAwaitUserInput = FALSE;
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 // 实体 NumLock 锁定态（GetAsyncKeyState(VK_NUMLOCK) 的 bit0），全尺寸数字区的 Num 键跟着它高亮
@@ -6302,6 +6333,12 @@ static void UpdateAutoVisibility() {
         return;
     }
 
+    // 前台窗口变了 -> 进入"等待用户操作"状态（见 g_fgAwaitUserInput 的说明）
+    {
+        HWND fgNow = GetForegroundWindow();
+        if (fgNow != g_lastFg) { g_lastFg = fgNow; g_fgAwaitUserInput = TRUE; }
+    }
+
     HWND input = GetFocusedInputControl();
     if (input) {
         g_lastNonInput = 0;
@@ -6312,6 +6349,23 @@ static void UpdateAutoVisibility() {
             g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken)
             return;
         g_userHidInInput = FALSE;
+
+        // ⚠⚠ 只在"用户刚主动操作过"时才呼出（见 g_lastClickTick 处的说明）。
+        //   这样「只是切换窗口看别的东西」不会弹键盘；
+        //   「点输入框」和「用键盘聚焦到输入框」才弹。
+        {
+            DWORD now = GetTickCount();
+            BOOL byMouse = (g_lastClickTick && now - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS &&
+                            LastClickHitInputWindow(input));
+            BOOL byKey   = (g_lastKeyTick && now - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
+            // "点输入框"或"敲键盘"都算用户主动要输入 -> 解除切换窗口后的封锁
+            if (byMouse || byKey) g_fgAwaitUserInput = FALSE;
+            // 仍处于"切换窗口后还没操作过"的状态 -> 不弹
+            // （网页自动聚焦搜索框、同窗口内 Tab 跳转不受影响：那些情况下
+            //   前台窗口没变过，g_fgAwaitUserInput 一直是 FALSE）
+            if (g_fgAwaitUserInput) return;
+        }
+
         if (!g_manualHide && !g_vis) ShowKB(TRUE, FALSE);
         return;
     }
@@ -6344,6 +6398,35 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
         PostMessage(g_hWnd, WM_FOCUS_EVENT, 0, 0);
 }
 
+// ===== 全局鼠标监控（WH_MOUSE_LL） =====
+// 只做一件事：记录"用户刚在哪里点过鼠标"，供自动呼出判断某次焦点变化是不是
+// 用户主动点出来的。**不改变任何鼠标行为**，永远 CallNextHookEx 放行。
+// 只记左键 —— 右键/中键不用于聚焦输入框。
+static LRESULT CALLBACK PhysMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        const MSLLHOOKSTRUCT* m = (const MSLLHOOKSTRUCT*)lParam;
+        if (!(m->flags & LLMHF_INJECTED) && wParam == WM_LBUTTONDOWN) {
+            g_lastClickTick = GetTickCount();
+            g_lastClickPt = m->pt;
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+// 最近那次鼠标点击是否落在"输入控件所属的窗口"里。
+// ⚠ 不能只跟控件本身比：浏览器 / Electron 场景下 GetFocusedInputControl 返回的
+//   是渲染宿主窗口，用户点的是页面里的位置，命中点常常是它的子孙窗口；
+//   所以退一步比顶层窗口是否同一个。
+static BOOL LastClickHitInputWindow(HWND input) {
+    if (!input || !g_lastClickTick) return FALSE;
+    HWND hit = WindowFromPoint(g_lastClickPt);
+    if (!hit) return FALSE;
+    if (hit == input || IsChild(input, hit)) return TRUE;
+    HWND topHit = GetAncestor(hit, GA_ROOT);
+    HWND topInput = GetAncestor(input, GA_ROOT);
+    return (topHit && topInput && topHit == topInput);
+}
+
 // ===== 实体键盘状态监控（WH_KEYBOARD_LL） =====
 // 同步显示：实体 Win/Shift/Caps 键做到哪一步，程序显示就对应哪一步；
 // Fn 预留接口（多数键盘 Fn 不产生按键事件，后续按需扩展 g_physFn）。
@@ -6352,6 +6435,8 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
         const KBDLLHOOKSTRUCT* p = (const KBDLLHOOKSTRUCT*)lParam;
         // 忽略本程序 SendInput 注入的事件，避免与虚拟键逻辑互相干扰
         if (!(p->flags & LLKHF_INJECTED)) {
+            // 真实按键 = 用户主动操作，记一笔供自动呼出判断（见 g_lastKeyTick）
+            g_lastKeyTick = GetTickCount();
             BOOL down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
             BOOL up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
             if (down || up) {
@@ -6503,6 +6588,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         // 实体键盘状态监控：安装低级键盘钩子（只监控 Win/Shift/Caps，Fn 预留接口）
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, PhysKeyHookProc, g_hInst, 0);
+        // 全局鼠标钩子：只记录点击落点，供自动呼出判断"这次是不是用户点出来的"
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, PhysMouseHookProc, g_hInst, 0);
         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;  // 启动时同步 CapsLock 状态
         SetTimer(hWnd, TIMER_FOCUS, 50, 0);
         return 0;
@@ -6744,6 +6831,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (g_winHook) { UnhookWinEvent(g_winHook); g_winHook = 0; }
         if (g_fgHook) { UnhookWinEvent(g_fgHook); g_fgHook = 0; }
         if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = 0; }
+        if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = 0; }
         if (g_tray) {   // 显式删除托盘图标，避免程序退出后图标残留到鼠标悬停才消失
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             g_tray = FALSE;

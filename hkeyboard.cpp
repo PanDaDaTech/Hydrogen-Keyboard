@@ -6658,9 +6658,29 @@ static void UpdateAutoVisibility() {
         //     · 用户按键（byKey —— 明确要用键盘）
         //     · token 变化（焦点换到别的输入控件 → 用户明显换了目标）
         //     · 失焦分支的"真的失焦"（见那里的防抖说明）
+        // 防回弹：用户在这个输入框里手动收起过，别立刻弹回来。
+        //
+        // ⚠⚠⚠ 2026-10-04 第十二轮：**`clickInFg` 必须算作"用户想要键盘"**。
+        //   第十一轮删掉"8 秒超时自动弹回"时，清除条件只剩
+        //   `byKey`（按键）与"token 变化"，**漏了鼠标点击** ——
+        //   于是「手动收起 → 再点同一个输入框」被这条拦住，键盘再也不弹。
+        //
+        //   用户日志实测（Edge，18:53:42.3~46.6 连续 **4.2 秒**）：
+        //       vis=0 rc=1 cif=1 aw=0 hasInput
+        //       └ vis=0        键盘隐藏着
+        //         rc=1         刚点过
+        //         cif=1        点在当前前台窗口内（= 点了地址栏）
+        //         aw=0         没被"切窗口"封锁
+        //         hasInput     有输入焦点
+        //   **条件全部满足，却 4.2 秒不弹** —— 唯一能拦住的就是本段。
+        //
+        //   ⇒ 清除条件补上 `clickInFg`：
+        //       点输入框 / 敲键盘 / 换输入控件 / 真失焦 → 都算"用户改主意了"
         if (g_userHidInInput) {
             BOOL sameInput = (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken);
-            if (sameInput && !byKey) return;
+            // cif=1 = 用户点了当前前台窗口内（对 QQ/Edge/浏览器，
+            // 顶层窗口内点击就意味着点到了地址栏 / 输入框 / 页面）
+            if (sameInput && !byKey && !clickInFg) return;
             g_userHidInInput = FALSE;
         }
 

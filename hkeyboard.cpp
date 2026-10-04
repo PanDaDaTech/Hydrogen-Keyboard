@@ -3467,6 +3467,7 @@ static void DoKeyAction(const KeyDef* k) {
             //     既然第 20 轮改成 VK 路径后已能生效，就不需要重试。
             //   ② 读回要**等够时间**：给系统一个确定的等待窗口，而不是 1ms。
             //     期间反复读，**一旦变化就立刻采用**（不注入、只观察）。
+            BOOL before = (GetKeyState(VK_NUMLOCK) & 1) != 0;
             {
                 INPUT pair[2] = {};
                 pair[0].type = INPUT_KEYBOARD;

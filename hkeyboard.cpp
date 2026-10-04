@@ -6349,9 +6349,25 @@ static BOOL UiaHasTextFocus() {
     g_dbgUiaTp = -2;   // -2 = 本程序不查（避免引入 oleaut32 依赖）
     el->Release();
     if (!hasKf) return FALSE;
-    // UIA_EditControlTypeId(50004) / UIA_DocumentControlTypeId(50030)
-    // —— 文本框与网页富文本区（contenteditable / 页面内输入）
-    if (ct == 50004 || ct == 50030) return TRUE;
+    // ⚠⚠⚠ 2026-10-04 第十轮：**`Document`(50030) 不能当"可编辑"判据** ——
+    //   第九轮把 `50004 || 50030` 都算作可编辑，实测造成「点空白不收」。
+    //
+    //   用户日志 786 次采样的交叉表把话说尽了：
+    //
+    //       uct      hasInput   noInput
+    //       50030 Document   330        56     ← 点空白时照样是 Document！
+    //       50026 Text       155        35     ← 同上
+    //       50004 Edit       116         0     ← 唯一干净的信号
+    //
+    //   原因：浏览器/Chromium 里**整张网页永远有一个 Document 元素持有键盘
+    //   焦点**（body/documentElement），哪怕焦点在空白处也一样。
+    //   所以 `Document` 表达的是"焦点在这个窗口内"，不是"焦点在可编辑区"。
+    //
+    //   ⇒ 只有 **Edit(50004)** 才是真正的"可编辑"信号：
+    //     用户日志里 116 次 hasInput、**0 次 noInput**，区分度 100%。
+    //     传统 Win32 文本框、以及 Chromium 系真输入框（<input>/<textarea>）
+    //     都报这个类型。
+    if (ct == 50004) return TRUE;      // Edit —— 唯一可编辑信号
     return FALSE;
 }
 
@@ -6635,10 +6651,24 @@ static HWND GetFocusedInputControl() {
                 //     · `hr != S_OK`（连根对象都拿不到）   -> 判定为"a11y 不可用"
                 //     · `hr == S_OK` 但没找到            -> **不确定**，
                 //       退回类名兜底（宁可多弹，不要不弹）
-                BOOL hrOk = (g_dbgAcc == 0);
+                // ⚠⚠⚠ 第十轮：判据是 **`uiaOk`**（UIA 能不能用），不是 `hrOk`。
+                //   UIA 一旦创建成功（只有 XP 会失败），`GetFocusedElement`
+                //   就能明确回答"焦点是不是 Edit"。此时答"不是"就是**可信的
+                //   否定答案**（点在空白处），必须尊重 ——
+                //   否则类名兜底又把它放回来，判据等于没生效
+                //   （第八轮那次「输入框反而不弹」的回归就是这么来的）。
+                if (uiaOk) {
+                    g_chromeClassFallback = FALSE;      // UIA 说了算
+                    if (editable) {
+                        g_detectedInputToken = tok ? tok : (ULONG_PTR)focus;
+                        return focus;
+                    }
+                    return NULL;                        // 明确不在 Edit 上
+                }
+                // UIA 不可用（XP / COM 失败）-> 退回 MSAA，最后才用类名兜底
+                g_chromeClassFallback = TRUE;
                 if (editable) {
                     g_detectedInputToken = tok ? tok : (ULONG_PTR)focus;
-                    g_chromeClassFallback = FALSE;
                     return focus;
                 }
                 if (hrOk) {

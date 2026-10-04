@@ -652,6 +652,13 @@ static int      g_dbgHaveGui = -1;
 static int      g_dbgIsInput = -1;
 static unsigned g_dbgFlags = 0;
 static HWND     g_dbgCaret = NULL;
+// accessibility 探测的三段结果：
+//   g_dbgResp    响应性预检是否通过（0 = 被 IsWindowResponsive 挡掉）
+//   g_dbgAcc     AccessibleObjectFromWindow 的 HRESULT（0 = S_OK）
+//   g_dbgAccFound 可编辑焦点是否命中
+static int g_dbgResp = -1;
+static int g_dbgAcc = 0;
+static int g_dbgAccFound = -1;
 
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
 //   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
@@ -680,13 +687,15 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
                 "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
-                "gui=%d focusCls=%-22s isInput=%d flags=0x%X caret=%p => %s\n",
+                "gui=%d focusCls=%-22s isInput=%d caret=%p "
+                "resp=%d hr=0x%X found=%d => %s\n",
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
                 AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
                 (int)recentClick, (int)clickInFg,
                 (int)byKey, (int)await, (void*)input, (int)vis, (int)motion,
-                g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput, g_dbgFlags,
-                (void*)g_dbgCaret, decision);
+                g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput,
+                (void*)g_dbgCaret, g_dbgResp, (unsigned)g_dbgAcc, g_dbgAccFound,
+                decision);
     AfWriteRaw(buf);
 }
 
@@ -6277,10 +6286,12 @@ static BOOL IsWindowResponsive(HWND hw, UINT timeoutMs) {
 }
 
 static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
+    g_dbgResp = 0; g_dbgAcc = -100; g_dbgAccFound = -1;
     // ⚠ 先确认目标还活着，再做跨进程 COM 探测（见 IsWindowResponsive 的说明）。
     //   100ms 是权衡值：正常进程的 WM_NULL 在 1ms 内返回，繁忙进程几十毫秒也够；
     //   真 hung 的会被 SMTO_ABORTIFHUNG 立刻打回。
     if (!IsWindowResponsive(hWnd, 100)) return FALSE;
+    g_dbgResp = 1;
 
     AccessibleObjectFromWindowProc proc = GetAccessibleObjectFromWindow();
     if (!proc || !EnsureAccessibilityCom() || !hWnd) return FALSE;
@@ -6290,6 +6301,7 @@ static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
 #endif
     IAccessible* root = NULL;
     HRESULT hr = proc(hWnd, OBJID_CLIENT, IID_IAccessibleLocal, (void**)&root);
+    g_dbgAcc = (int)hr;
 #ifdef HK_DIAG
     // 记一笔慢探测：即使做了响应性预检，COM 调用仍可能因为树很大而慢。
     // 排查「卡死」时先看 diag.txt 里有没有这行 —— 有就说明元凶在这。
@@ -6306,6 +6318,7 @@ static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
 
     ULONG_PTR detected = 0;
     BOOL result = AccessibleHasEditableFocus(root, 0, &detected);
+    g_dbgAccFound = result ? 1 : 0;
     root->Release();
     if (result && token) *token = detected ? detected : (ULONG_PTR)hWnd;
     return result;

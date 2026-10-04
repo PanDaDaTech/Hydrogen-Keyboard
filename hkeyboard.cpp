@@ -528,6 +528,19 @@ struct WindowMotion {
     BOOL active;
 };
 static WindowMotion g_mainMotion = {};
+
+// 启动预热期：这段时间内不评估自动呼出，也不做任何跨进程焦点探测。
+//
+// ⚠ 用户实测：「刚打开的时候，有时候在没输入状态会触发自动呼出的逻辑，
+//   之后再呼出键盘就直接卡死。」
+//
+//   启动瞬间前台窗口可能正处在切换/初始化中 —— GetGUIThreadInfo 拿不到
+//   焦点信息、大应用尚未响应、桌面/外壳还没就绪 —— 此时任何判断依据都不可靠，
+//   容易在**没有输入框的地方误弹键盘**。而误弹一次就会启动窗口动画，
+//   万一那时又撞上跨进程探测阻塞，状态就卡住了。
+//   预热期一过自然恢复；手动呼出（点托盘 / -show）不受这里影响。
+#define AUTOSHOW_WARMUP_MS 1200
+static DWORD g_appStartTick = 0;
 static WindowMotion g_settingsMotion = {};
 static WindowMotion g_promptMotion = {};
 
@@ -6221,21 +6234,32 @@ static HWND GetFocusedInputControl() {
     DWORD tid = GetWindowThreadProcessId(fg, NULL);
     GUITHREADINFO gi = {sizeof(gi)};
     BOOL haveGuiInfo = GetGUIThreadInfo(tid, &gi);
-    HWND focus = haveGuiInfo && gi.hwndFocus ? gi.hwndFocus : fg;
-    if (haveGuiInfo) {
-        if (IsInputControl(focus)) {
-            g_detectedInputToken = (ULONG_PTR)focus;
-            return focus;
-        }
 
-        if (gi.hwndCaret || (gi.flags & GUI_CARETBLINKING) != 0) {
-            if (gi.hwndCaret && IsWindow(gi.hwndCaret)) {
-                g_detectedInputToken = (ULONG_PTR)gi.hwndCaret;
-                return gi.hwndCaret;
-            }
-            g_detectedInputToken = (ULONG_PTR)focus;
-            return focus;
+    // ⚠⚠ 拿不到 GUI 线程信息时**直接放弃**，不做任何跨进程探测。
+    //
+    //   用户实测症状：「刚打开的时候，有时候在没输入状态会触发自动呼出的逻辑，
+    //   之后再呼出键盘就直接卡死。」
+    //
+    //   原因：此时 focus 只能退化成"前台窗口"本身，判断依据从"真正的焦点控件"
+    //   降级为"整个应用窗口" —— 而后者对浏览器 / UWP / Electron 这类大应用
+    //   极易被判定成输入区域，于是**在没有输入框的地方也弹键盘**。
+    //   另外 GetGUIThreadInfo 失败通常意味着目标刚启动 / 正在退出 / 没有 UI
+    //   线程，这些情况下本来也不该呼出。
+    if (!haveGuiInfo) return NULL;
+
+    HWND focus = gi.hwndFocus ? gi.hwndFocus : fg;
+    if (IsInputControl(focus)) {
+        g_detectedInputToken = (ULONG_PTR)focus;
+        return focus;
+    }
+
+    if (gi.hwndCaret || (gi.flags & GUI_CARETBLINKING) != 0) {
+        if (gi.hwndCaret && IsWindow(gi.hwndCaret)) {
+            g_detectedInputToken = (ULONG_PTR)gi.hwndCaret;
+            return gi.hwndCaret;
         }
+        g_detectedInputToken = (ULONG_PTR)focus;
+        return focus;
     }
 
     ULONG_PTR token = 0;
@@ -6248,6 +6272,9 @@ static HWND GetFocusedInputControl() {
 
 static void UpdateAutoVisibility() {
     if (!g_af || !g_hWnd) return;
+    // 启动预热期内不评估（见 g_appStartTick 的说明）：此刻前台状态还没稳定，
+    // 判断不可靠，容易在没输入框的地方误弹键盘并连带卡住状态。
+    if (g_appStartTick && GetTickCount() - g_appStartTick < AUTOSHOW_WARMUP_MS) return;
     // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
     // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
     if (g_mainMotion.active) {
@@ -7067,6 +7094,8 @@ static void InitTimePeriodApi() {
 
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_hInst = hI;
+    // 启动预热期的起点（见 g_appStartTick 的说明）
+    g_appStartTick = GetTickCount();
 
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {

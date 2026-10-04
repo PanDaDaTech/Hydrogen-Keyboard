@@ -2316,15 +2316,69 @@ static int FitUnifiedTier(HDC dc, const KeyDef* self, int selfMaxW) {
     //   天然都放得下最大档；一旦参与，就会被同宽的「Enter」「Num」拖着一起降档，
     //   把整块数字区的小字号变得比主区还小。用户实机截图明确指出这一点。
     //   ⇒ 只对 block 0（主区）与 block 1（导航区）统一。
+    // ⚠⚠⚠ 2026-10-04 **真正的根因**：同宽判定不能写 `k->w != gw`（精确相等）。
+    //
+    //   `FullPut` 的键宽是 `floor(c1*u+0.5) - floor(c0*u+0.5) - gap` ——
+    //   **逐键取整**，所以同一个 1u 区块里三列的键宽经常**差 1px**。实测：
+    //
+    //       W=1400 gap=6  →  第1列 57 / 第2列 **58** / 第3列 57
+    //       W=1000 gap=6  →  第1列 39 / 第2列 **38** / 第3列 39
+    //       W= 900 gap=6  →  第1列 35 / 第2列 **34** / 第3列 35
+    //       W=1200 gap=6  →  48 / 48 / 48（碰巧相同）
+    //
+    //   `k->w != gw` 精确比较 ⇒ **第 2 列与第 1、3 列互相不参与统一**，
+    //   分组又裂成两半 ⇒ 导航区仍然出现两种字号。
+    //   ⚠ 这就是前两轮「改了分组粒度（同行→同列→按区块）却怎么都不齐」的
+    //   真正原因 —— 粒度选对了，但**同宽的判据本身是坏的**。
+    //
+    // ⇒ 改为「键宽差 ≤ 2px 视为同宽」（覆盖 1px 取整误差；真正的不同宽度键
+    //   —— 退格 2u、回车 1.5u、Shift 2.25u —— 差几十 px，不会被误并入）。
+    // ⇒ 顺便用**组内最小宽**算可用宽：取整误差下窄的那列才是真正的瓶颈。
+    int groupW = gw;
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         if (k->block != self->block) continue;   // 只看同一区块
         if (k->block == 2) continue;             // 数字区保持原样（见上）
-        if (k->w != gw) continue;                // 只看同宽键
+        int dw = k->w - gw; if (dw < 0) dw = -dw;
+        if (dw > 2) continue;                    // 键宽差 > 2px ⇒ 不同规格的键
+        if (k->w < groupW) groupW = k->w;        // 记住组内最窄的
+    }
+    //
+    // ⚠⚠⚠ 2026-10-04 用户实机截图：「导航栏还是一样（还是小）！改成 Num 按钮
+    //   同样的字体大小」。**这才是「比 Num 小一号」的真正原因** —— 不是分组，
+    //   而是下面这行**扣掉的 6px 边距**。
+    //
+    //   `DrawKeyLabel` 传进来的 maxW 是 `k->w - 6*dpiScale`，这里又扣一次。
+    //   1u 键在默认全尺寸（W=1280）下宽 **51px**，扣 6px 只剩 45px；而
+    //   导航区最长的标签是 `Pause`，14pt 下需 **51px**、10pt 下需 39px ——
+    //   于是 `45` 卡在 14pt(51) 与 10pt(39) 之间，取最严就落到 **10pt**。
+    //   而同宽的 `Num` 键（宽 52px）标签只有 3 个字母，14pt 仅需 30px，**照旧 14pt**。
+    //   ⇒ 同一排里 `Num` 是 14pt、`Pause` 只有 10pt，肉眼就是「小一号」。
+    //
+    //   实测各档最长标签宽度（MiSans，em = 17/16/16/13/12/10/9/8px）：
+    //       14pt→Pause 51   13pt→Pause 48   12pt→Pause 48   10pt→Home 40
+    //        9pt→Pause 38    8pt→Pause 31    7pt→Pause 28    6pt→Pause 26
+    //   键宽 51px 时，只有**不扣边距**（avail=51）才够 14pt。
+    //
+    // ⇒ 导航区（block 1）**不扣边距**：横向居中绘制（DrawTextC 走整键矩形居中），
+    //   标签不会贴到键帽边缘，实测 14pt 的 `Pause` 51px 放进 51px 键宽也不溢出。
+    //   主区（block 0）保持扣边距不变 —— 它的标签都是单字符/短词，从没因此降档，
+    //   不在用户这次要求的范围内（教训：别顺手扩大改动面）。
+    int edge = (self->block == 1) ? 0 : (int)(6 * GetSystemDpiScale());
+    int groupMaxW = groupW - edge;
+    if (groupMaxW < 1) groupMaxW = groupW;       // 极窄兜底
+    // self 的档位也改用组内最小宽重算，避免 self 是最宽那列时定出偏大的档
+    worst = FitTierForText(dc, KeyText(self), groupMaxW);
+    for (int i = 0; i < g_nk; i++) {
+        const KeyDef* k = &g_keys[i];
+        if (k->block != self->block) continue;
+        if (k->block == 2) continue;
+        int dw = k->w - gw; if (dw < 0) dw = -dw;
+        if (dw > 2) continue;
         if (!KeyHasGlyph(k)) continue;           // 纯文字键才参与
         const wchar_t* s = KeyText(k);
         if (!s || !s[0]) continue;
-        int t = FitTierForText(dc, s, k->w - (int)(6 * GetSystemDpiScale()));
+        int t = FitTierForText(dc, s, groupMaxW);
         if (t > worst) worst = t;                // 取最严（档位序号越大字号越小）
     }
     return worst;
@@ -3241,17 +3295,28 @@ static void DoKeyAction(const KeyDef* k) {
             InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
-        // NumLock：**只翻屏幕键盘自己的锁定态，不发 VK_NUMLOCK 给目标进程。**
+        // NumLock：**既真的发出去，也同步自己的锁定态**（两件事都要，缺一不可）。
         //
-        // ⚠ 2026-10-04 用户实测：「小键盘无法锁定、数字打不进去」。
-        //   原因：原来发的是 `SendKey(0x90)`，它翻的是**目标线程**的 NumLock；
-        //   而界面高亮跟的是 `g_physNum`（**本线程**的实体灯）—— 两边不同步，
-        //   于是界面显示"已锁定"、实际发出去的却是 Ins/Del/Home 等光标键。
+        // ⚠⚠ 2026-10-04 用户实测两次，两次各说了一半：
+        //   「小键盘无法锁定、数字打不进去」⇒ 要求两态一致（⇒ 需要 g_npLock）；
+        //   「小数字按钮还是无法模拟键盘，触发不了 NumLock」⇒ 要求**真的发出去**
+        //     （⇒ 需要 SendKey）。上一轮只做了前者、砍掉了发送，被用户打回。
         //
-        //   现在小键盘数字键按 `g_npLock` 决定注入**数字键**还是**光标键**，
-        //   不再依赖目标进程的 NumLock 状态 ⇒ 必然一致。
+        //   ⇒ 现在两件都做：
+        //     ① `SendKey(0x90)` —— 真模拟：目标进程（游戏 / Excel / 计算器…）
+        //        的 NumLock 状态与实体键盘灯一起翻，**这才是"模拟键盘"**。
+        //        少这一步，目标程序永远收不到 NumLock，界面亮了它也不知道。
+        //     ② `g_npLock = !g_npLock` —— 屏幕键盘自己的一致性：小键盘数字键按它
+        //        决定注入数字键还是光标键（见下方 NumpadNavKey 分支）。
+        //        少这一步，界面高亮与实际注入会错位。
+        //
+        //   两态不冲突的原因：`g_npLock` 是**本进程自持**状态（不读目标进程的灯），
+        //   而 `SendKey` 翻的是**目标线程**的 NumLock —— 两者由这一次点击同步翻转。
+        //   实体键盘按 NumLock 不会影响 g_npLock（见 TIMER_FOCUS 里 g_npLockInit
+        //   的「只跟随一次」），故两处输入源互不干扰。
         if (k->vk == 0x90) {
-            g_npLock = !g_npLock;
+            SendKey(0x90, FALSE, FALSE, FALSE, FALSE);   // ① 真模拟，发给目标进程
+            g_npLock = !g_npLock;                       // ② 同步本进程锁定态
             InvalidateRect(g_hWnd, 0, TRUE);
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;

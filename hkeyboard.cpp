@@ -674,9 +674,12 @@ BOOL        g_physNum = FALSE;
 //
 // ⇒ 谁写它：点小键盘的 Num 键时，注入 VK_NUMLOCK 后**从系统读回**
 //   （`ReadSystemNumLock()` = `GetAsyncKeyState`），见 OnKeyDown 的 0x90 分支。
-// ⇒ 它决定两件事：
-//   ① 数字区 Num 键的高亮（IsActive 读它）
-//   ② 小键盘数字键注入数字键（VK_NUMPAD0-9）还是光标键（NumpadNavKey）
+// ⇒ 它现在只决定**一件事**：数字区 Num 键的高亮（IsActive 读它）。
+//   ⚠ 2026-10-10 改：以前它还决定「小键盘数字键发数字键还是发光标键」，
+//     那条已经删掉 —— 平板 / 轻薄本的系统 NumLock 默认是**关**的，数字键于是
+//     静默变成方向键（用户报「小键盘功能没作用了、输入不了数字」）。
+//     现在数字键**一律发 VK_NUMPAD0-9**，与系统灯无关（本机实测：NumLock=0 时
+//     注入 VK_NUMPAD1..4，原生 EDIT 控件仍然得到 "1234"）。
 //
 // ⚠ 血泪史（第 17~20 轮，四轮返工），**别再改回去**：
 //   17 轮 只翻不发      → 目标程序收不到 NumLock
@@ -949,19 +952,36 @@ static const DWORD SHIFT_DOUBLE_MS = 350;   // 双击间隔上限
 BOOL        g_shiftDoubleTap = FALSE;   // 设置项：启用 Shift 双击锁定（ini: General/ShiftDoubleTap）
 
 // 用掉一次"一次性 Shift"：双击锁定模式下，单击 Shift 只对下一个键生效。
-// 锁定态（g_shiftLock）下不动 —— 那是用户明确要连续输入的。
+// 锁定态（g_shiftLock）下**不释放** —— 那是用户明确要连续输入的。
+// ⚠⚠ 2026-10-10 修：这里原先两个分支都无条件 `g_sh = FALSE`，而 g_shiftLock 没人清：
+//   双击锁定 → 敲第一个键 → g_sh 被灭、g_shiftLock 仍是 TRUE
+//   ⇒ 高亮立即灭掉、后续按键不再带 Shift（**等于锁定只对第一个键生效**），
+//     而状态机自己还以为处在锁定态 ⇒ 用户报「Shift 双击锁定不能用了」。
+//   ⇒ 锁定态必须原样返回，不碰 g_sh。
 static void ReleaseShiftOnce(void) {
-    if (g_shiftDoubleTap && g_shiftOnce && !g_shiftLock) {
-        g_shiftOnce = FALSE;
-        g_sh = FALSE;
-    } else {
-        g_sh = FALSE;
-    }
+    if (g_shiftDoubleTap && g_shiftLock) return;   // 锁定态：Shift 要一直带下去
+    if (g_shiftDoubleTap && g_shiftOnce) g_shiftOnce = FALSE;
+    g_sh = FALSE;
 }
 
 int         g_keyIconStyle = 2;        // 键面始终「图标+文字」；「仅文字」模式已按实机反馈下线
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
+// 「按下去」的视觉反馈（2026-10-10 用户要求：「按键能不能做个键被按下去的反应，
+//   就知道有没有真的按了」）。
+//
+// 为什么不能只靠 g_pk：`OnLDown` 里 `g_pk = ki` 之后紧接着就是 `DoKeyAction`，
+// 而它开头会 `WaitForLeftButtonUp()` **一直泵消息等到用户松手**（最多 250ms，
+// 见那里的说明）。于是「按下」这一帧根本没机会上屏 —— 等重绘时 WM_LBUTTONUP
+// 早就被泵消息派发过、OnLUp 已经把 g_pk 清掉了。用户看到的就是「按下去毫无反应」。
+//
+// ⇒ 两手：
+//   ① OnLDown 在 DoKeyAction **之前**就 Invalidate + UpdateWindow，把按下帧画出来；
+//   ② 松手后再保留 g_pkFlash 一小会儿（HK_PK_FLASH_MS），保证「快速点一下」
+//      也一定能看到反馈（否则短按可能一帧都来不及画）。由 TIMER_FOCUS 收尾。
+static int   g_pkFlash = -1;          // 刚松开、还在闪光期的那一格
+static DWORD g_pkFlashUntil = 0;
+#define HK_PK_FLASH_MS 130
 static int  g_hdrHov = -1;            // 标题栏按钮悬停（HDR_*，-1=无）
 int         g_repeatKeyIdx = -1;
 BOOL        g_tracking = FALSE;
@@ -2301,7 +2321,10 @@ static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWOR
     else                     DrawTextR(dc, x, k->y, w, k->h, s, f, c);
 }
 
-// 双符号键绘制：上=副符号（Shift 未触发时灰色，触发后白色），下=主字符（始终正常显示）
+// 双符号键绘制：上=副符号（灰色），下=主字符（正常色，通常黑）。
+// ⚠ 唯一调用点在 DrawKeys 里，副符号固定传 C_DIM —— 用户 2026-10-10 明确：
+//   「符号应该是灰色部分而不是黑色部分」，所以符号**永远**是灰色（含 Shift 按下时，
+//   那时走的是"只显示符号"的单字路径，同样传 C_DIM）。别再改回"按 Shift 变亮/变白"。
 static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
                         wchar_t baseCh, wchar_t shiftCh,
                         HFONT fBase, HFONT fShift, DWORD baseC, DWORD shiftC) {
@@ -3056,6 +3079,10 @@ static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs
 // 布局与实体 104 键盘的数字区一致：
 //   7=Home 8=↑ 9=PgUp   4=← 5=(无) 6=→   1=End 2=↓ 3=PgDn   0=Ins
 // 5 在未锁定时实体键盘**不发任何键**（它只在锁定时是 5）—— 返回 0 表示不发。
+//
+// ⚠ 2026-10-10：**当前没有被调用** —— 屏幕小键盘的数字键已改为"一律发数字"
+//   （原因见 DoKeyAction 的 K_NORMAL 段）。这张映射表保留备查：万一以后要恢复
+//   "跟随系统 NumLock 的导航模式"，用它就行（静态函数未引用在 /W1 下不告警）。
 static BYTE NumpadNavKey(BYTE vk) {
     switch (vk) {
     case 0x67: return VK_HOME;        // 7
@@ -3476,24 +3503,30 @@ static void DoKeyAction(const KeyDef* k) {
             if (fn) {
                 SendKey((BYTE)(0x6F + fn), g_sh, g_ct, g_al, g_winKey);  // VK_F1=0x70
                 g_fnLayer = FALSE;
-                g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+                ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
                 InvalidateRect(g_hWnd, 0, TRUE);
                 break;
             }
         }
-        // ---- 小键盘数字键：按屏幕键盘自己的锁定态选键种 ----
-        //   锁定（g_npLock = TRUE）-> 发 VK_NUMPAD0-9（数字）
-        //   未锁定             -> 发对应的光标键（Ins/Home/PgUp… ← 等价于实体
-        //                          小键盘 NumLock 关掉时的行为）
-        // ⚠ 不能依赖目标进程的 NumLock（不同步，见 g_npLock 处说明）。
+        // ---- 小键盘数字键：**始终发数字键**（2026-10-10 改）----
+        //
+        // ⚠⚠ 为什么不看 NumLock 了（用户报「小键盘没作用了 / 小键盘布局也输入不了数字」）：
+        //   旧写法是「g_npLock 为真发 VK_NUMPAD0-9，否则发 NumpadNavKey（Ins/Home/PgUp…）」，
+        //   而 g_npLock 由 TIMER **每 tick 从系统读回**。平板 / 轻薄本上系统 NumLock
+        //   默认是**关**的（本机实测 GetKeyState(VK_NUMLOCK)&1 == 0）⇒ 屏幕小键盘 50ms 内
+        //   就变成"导航模式"，点数字键只会发 Ins/Home/方向键 ⇒ **一个字都打不进去**；
+        //   而独立小键盘布局里**根本没有 Num 键**，用户连打开数字模式的入口都没有。
+        //
+        //   本机实测（原生 Win32 EDIT 控件 + 注入，NumLock 明确为 0）：
+        //       NumLock 关 → 注入 VK_NUMPAD1..4 → 文本框得到 "1234" ✓
+        //   ⇒ 只要**直接注入 VK_NUMPAD0-9**，目标程序一定能得到数字，与系统 NumLock 无关
+        //     （NumLock 影响的是"扫描码→VK"那一步，我们跳过扫描码直接给 VK）。
+        //   ⇒ 屏幕小键盘的职责就是"打数字"，不该被系统灯的状态悄悄改成方向键。
+        //   Num 键（0x90）仍然照旧真的发出去，只为让实体灯 / 目标程序的 NumLock 跟着翻，
+        //   不再参与决定这里发什么键。
         if (k->vk >= 0x60 && k->vk <= 0x69) {
-            if (g_npLock) {
-                SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
-            } else {
-                BYTE nav = NumpadNavKey(k->vk);
-                if (nav) SendKey(nav, g_sh, g_ct, g_al, g_winKey);
-            }
-            g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+            SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
+            ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;
         }
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
@@ -3535,114 +3568,49 @@ static void DoKeyAction(const KeyDef* k) {
             InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
-        // NumLock：**既真的发出去，也同步自己的锁定态**（两件事都要，缺一不可）。
+        // NumLock：**只做一件事 —— 真的把 VK_NUMLOCK 发出去**。
         //
-        // ⚠⚠ 2026-10-04 用户实测两次，两次各说了一半：
-        //   「小键盘无法锁定、数字打不进去」⇒ 要求两态一致（⇒ 需要 g_npLock）；
-        //   「小数字按钮还是无法模拟键盘，触发不了 NumLock」⇒ 要求**真的发出去**
-        //     （⇒ 需要 SendKey）。上一轮只做了前者、砍掉了发送，被用户打回。
+        // ⚠⚠ 2026-10-10 大改（用户报「Num Lock 又不能点击了 / 小键盘输入不了数字」）。
+        //   历史包袱很长（下面留着第 20~24 轮的结论），但根子是一件事：
+        //   这里**既想真发出去、又想自己维护一份锁定态**，两份状态就会打架。
         //
-        //   ⇒ 现在两件都做：
-        //     ① `SendKey(0x90)` —— 真模拟：目标进程（游戏 / Excel / 计算器…）
-        //        的 NumLock 状态与实体键盘灯一起翻，**这才是"模拟键盘"**。
-        //        少这一步，目标程序永远收不到 NumLock，界面亮了它也不知道。
-        //     ② `g_npLock = !g_npLock` —— 屏幕键盘自己的一致性：小键盘数字键按它
-        //        决定注入数字键还是光标键（见下方 NumpadNavKey 分支）。
-        //        少这一步，界面高亮与实际注入会错位。
+        //   本轮的处置是把两者彻底分开：
+        //     ① 本键只负责"真发"：注入一次 VK_NUMLOCK，让目标程序与实体灯真的翻转。
+        //     ② **不再自己维护任何锁定态**（去掉 `g_npLock = !before` 那句乐观赋值）
+        //        —— 高亮完全由 TIMER_FOCUS 每 50ms 从系统读回的真实值驱动。
+        //        ⇒ 界面永远不会撒谎（注入失败就是"没亮"，而不是"亮了但假的"），
+        //          也不会出现"点一下先亮、50ms 后被打回"的闪烁。
+        //     ③ 屏幕小键盘的数字键**不再看 NumLock**（见 K_NORMAL 里那段说明）：
+        //        平板/轻薄本系统 NumLock 默认是关的，旧写法会让数字键变成方向键。
+        //        ⇒ 系统灯关着也能打数字，本键就纯粹是"给目标程序/实体灯用的开关"。
+        //   ⇒ 于是「点不动」不再是一个致命的可用性问题：即使这台机器上注入没被接受，
+        //     小键盘照样能输数字（这条是本机实测过的，见 K_NORMAL 处的数据）。
         //
-        //   两态不冲突的原因：`g_npLock` 是**本进程自持**状态（不读目标进程的灯），
-        //   而 `SendKey` 翻的是**目标线程**的 NumLock —— 两者由这一次点击同步翻转。
-        //   g_npLock 现在由 TIMER_FOCUS **每个 tick 从系统读回**（物理按键、
-        //   本键点击、别的程序切换都会跟上），所以这里点完不必自己维护它 ——
-        //   注入是否生效由系统的真实状态说话。
+        // --- 以下是第 20~24 轮留下的结论，仍然成立，保留备查 ---
+        //   ① 注入**只发一次**，走 **VK 路径**（`wVk = VK_NUMLOCK`、不带 SCANCODE）
+        //      —— 锁存键的翻转由键盘布局层按 VK 处理，扫描码路径会被忽略（第 21 轮实测：
+        //      加 SCANCODE 灯不亮）。⚠ 重复注入不是"重试"而是"继续翻转"：
+        //      锁存键每收到一次就翻一次，注入 N 次 = 翻 N 次 —— 第 20 轮的"重试"
+        //      正是「关>开、开>关、有时候却正常」的来源。
+        //   ② **不在点击里等读回**（第 24 轮）：曾经在这里死等最多 200ms 读结果，
+        //      把 WndProc 堵住 ⇒ 掉帧、点键手感停顿（用户说"卡卡的"）。
+        //      TIMER_FOCUS 每 50ms 读回真实锁定态并对齐高亮，可以自愈。
+        //   ③ 只用 `KEYEVENTF_EXTENDEDKEY`。本机（Win11）实测三种写法都能翻：
+        //      EXTENDEDKEY ✓ / 无 flag ✓ / 再 EXTENDEDKEY ✓（`SendInput` 返回 2）。
         if (k->vk == 0x90) {
-            // ⚠⚠⚠ 2026-10-04 用户第三次反馈：「还是识别不到 NumLock 键启用，
-            //   **我小键盘灯都没亮**，且触发不了小键盘键启用」。
-            //
-            //   **根因：`g_npLock = !g_npLock` 是「自己取反」，不是读回真值。**
-            //
-            //   `SendKey` 只是把 VK_NUMLOCK 塞进输入队列，**系统有没有真的翻转
-            //   NumLock 状态它不知道**。而锁存键有个坑：注入的 down/up 对
-            //   锁存键**不一定被目标线程接受**（尤其带 `KEYEVENTF_SCANCODE` 时，
-            //   见 SendKey 第 2 段；锁存键走的是 TSF/键盘布局层的特殊路径，
-            //   不是普通字符键那条）。于是实际发生的是：
-            //
-            //       目标进程：NumLock 没翻 ⇒ 灯不亮、小键盘仍发导航键 ⇒ 完全无效
-            //       本进程：g_npLock 自己翻了 ⇒ 界面高亮「亮着」⇒ 假象
-            //
-            //   ⇒ 界面显示"已锁定"、实际没生效，就是这个自取反造成的假象。
-            //   这也是为什么用户连报三轮都指向同一件事。
-            //
-            // ⇒ 改法与同文件里**已正常工作**的 `K_CAPS` 完全一致：
-            //     发送后**从系统读回真实锁定态**，而不是自己取反。
-            //
-            //     case K_CAPS:
-            //         SendKey(0x14, ...);
-            //         g_cp = (GetKeyState(VK_CAPITAL) & 1) != 0;   ← 读回真值
-            //
-            //   `GetKeyState` 对锁存键读的是 bit0 = 锁定态本身，
-            //   **由系统维护、反映真实状态**（与本文件 7495 行读实体灯同法）。
-            //   同一次点击里 SendKey 投递完、随即读回 ⇒ 拿到的是系统的真实结果。
-            //
-            // ⇒ 若读回后仍是原值（注入没被接受），还会**补发两次**再读：
-            //   锁存键对孤立的一次注入有时不响应，成对快速注入的翻转率明显更高。
-            //   最多试 3 次，仍不变就以系统值为准（宁可界面显示"未锁定"，
-            //   也不能假装锁定 —— 假象比失败更难排查）。
-            //
-            // ⚠⚠ **重试的判据必须是「与起始值不同」，不能写死 `!= 0`**。
-            //   NumLock 起始可能是**灭**的（本进程开机就在锁定态），
-            //   此时若判据写成「读到亮就停」，翻转成功后条件仍不成立 ⇒
-            //   继续重发 ⇒ **状态被又翻回去**，等于按一次却翻了奇数次。
-            //   这正是「灯不亮 / 触发不了」这类症状的另一种来源。
-            // ⇒ 先记起始值，判据用 `now != before`（翻转语义），与起始态无关。
-            // ⚠⚠⚠ 2026-10-04 第 20 轮用户反馈：「关>开、开>关，有时候却正常」——
-            //   **这是我上一版的重试逻辑在反复翻转**。
-            //
-            //   上一版：注入 → `Sleep(KEY_INJECT_GAP_MS)`（**只有 1ms**）→ 读回。
-            //   锁存键的翻转由系统**异步**处理，1ms 内未必生效 ⇒ 读到旧值 ⇒
-            //   判定「没翻转」⇒ **再注入一次** …… 最多 3 次。
-            //
-            //   离线复算（attempt × 系统延迟）证明这是个**双重 bug**：
-            //     系统 1ms 内生效 → 第 1 次就读到翻转 → 1 次注入，恰好对
-            //     系统 40ms 才生效 → 3 次都读到旧值 → **注入了 3 次**
-            //                     （翻转 3 次 = 奇数次，真实态确实翻了）
-            //                     但 g_npLock 取的是**最后一次那个旧读数**
-            //                     ⇒ **界面显示与真实状态相反**
-            //   ⇒ 这就是「有时候正常有时候不正常」的来源：**取决于系统延迟
-            //     与 1ms 的赛跑结果**，所以时好时坏。
-            //
-            // ⇒ 修法与最终形态（第 21~24 轮的结论汇总）：
-            //   ① 注入**只发一次**，走 **VK 路径**（`wVk = VK_NUMLOCK`、
-            //      不带 `KEYEVENTF_SCANCODE`）—— 锁存键的翻转由键盘布局层
-            //      按 VK 处理，扫描码路径会被忽略（第 21 轮实测：加 SCANCODE 灯不亮）。
-            //      ⚠ 重复注入不是"重试"而是"继续翻转"：锁存键每收到一次就翻一次，
-            //      注入 N 次 = 翻 N 次。第 20 轮的重试逻辑正是「时好时坏」的来源。
-            //   ② **不在点击里等读回**（第 24 轮）：上一版在这里死等最多 200ms，
-            //      把 WndProc 堵住 ⇒ 掉帧、点键手感停顿，就是用户说的"卡卡的"。
-            //      翻转结果不需要当场知道 —— TIMER_FOCUS 每 50ms 无条件读回
-            //      真实锁定态并对齐高亮（见 WM_TIMER 里那段），可以自愈。
-            //   ③ `before` **必须在注入之前读**：注入到锁定位更新是异步的，
-            //      若读完再注入，某次系统落实得快时 `!before` 会算反。
-            //      先读旧值 ⇒ `!before` 严格等于「预期翻转结果」。
-            //   ④ 高亮立刻按预期值画出来（视觉上跟手），只失效 Num 那一格。
-            BOOL before = ReadSystemNumLock();
-            {
-                INPUT pair[2] = {};
-                pair[0].type = INPUT_KEYBOARD;
-                pair[0].ki.wVk = VK_NUMLOCK;                 // wScan 留 0
-                pair[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;  // ⚠ 刻意无 SCANCODE
-                pair[1] = pair[0];
-                pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
-                SendInput(2, pair, sizeof(INPUT));
-            }
-            g_npLock = !before;                              // 预期值，TIMER 会校正
-            g_physNum = g_npLock;                            // 数字区 Num 键高亮同步
-            InvalidateKeyByVk(g_hWnd, VK_NUMLOCK);           // 只重画 Num 那格
+            INPUT pair[2] = {};
+            pair[0].type = INPUT_KEYBOARD;
+            pair[0].ki.wVk = VK_NUMLOCK;                 // wScan 留 0
+            pair[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;  // ⚠ 刻意无 SCANCODE
+            pair[1] = pair[0];
+            pair[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+            SendInput(2, pair, sizeof(INPUT));
+            // 不写 g_npLock / g_physNum：真值由 TIMER_FOCUS 下一拍读回并驱动高亮。
             g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;
         }
         SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
-        g_sh = FALSE; g_ct = FALSE; g_al = FALSE; ClearWinLock();
+        ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_SYM:
         // 网页层符号键：键面画什么就发什么。symShift=1 的格子（! @ # …）内部自动带 Shift，
@@ -3935,7 +3903,7 @@ static void DrawKeys(HDC dc) {
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         BOOL active = IsActive(k);
-        BOOL pressed = (i == g_pk);
+        BOOL pressed = (i == g_pk || i == g_pkFlash);   // g_pkFlash = 松手后的短暂反馈
         BOOL hover = (i == g_hk);
 
         BOOL isDomain = (k->vk >= 0x200 && k->vk <= 0x205);   // 网址后缀键
@@ -4012,8 +3980,15 @@ static void DrawKeys(HDC dc) {
         if (dual) {
             // 双符号键在三态下都是文字：主字符 + 副符号本身就是两个信息，图标化会毁数据
             if (shiftOn) {
+                // Shift 按下：**只显示特殊符号，而且用灰色**（= Shift 未按下时那个副符号的颜色）。
+                // ⚠⚠ 2026-10-10 用户要求（附全尺寸截图对比）：
+                //   「Shift 点击显示特殊符号应该是灰色部分而不是黑色部分」。
+                //   原实现是把符号**提升成主字符**画（大号 + textC 黑色），用户否掉了：
+                //   数字行的符号应该永远保持"副符号"的灰色观感，不要变成大黑字。
+                //   ⇒ 只有 g_shiftSymbols 打开时才是"只显示符号"；关闭时仍按原样显示主字符（黑）。
                 wchar_t single[2] = { g_shiftSymbols ? shiftCh : baseCh, 0 };
-                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);
+                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f,
+                          g_shiftSymbols ? C_DIM : textC);
             } else {
                 DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
             }
@@ -4087,7 +4062,7 @@ static int       g_kbCacheRow = 0;
 static int       g_kbCacheW = 0, g_kbCacheH = 0;
 
 struct KbFrameSig {
-    int w, h, hk, pk, hdrHov, layoutMode, nk, hue, keyIconStyle;
+    int w, h, hk, pk, pkFlash, hdrHov, layoutMode, nk, hue, keyIconStyle;
     DWORD themeBg;
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, physNum, fnLayer, showFKeys,
@@ -4140,7 +4115,7 @@ static void EnsureKbFrameCache(HWND hWnd) {
     // 留着不确定值会让缓存永远打不中（每帧都全量重绘）。
     KbFrameSig sig = {};
     sig.w = g_ww; sig.h = g_wh;
-    sig.hk = g_hk; sig.pk = g_pk; sig.hdrHov = g_hdrHov;
+    sig.hk = g_hk; sig.pk = g_pk; sig.pkFlash = g_pkFlash; sig.hdrHov = g_hdrHov;
     sig.layoutMode = g_layoutMode; sig.nk = g_nk;
     sig.themeBg = g_themeBuf.pageBg;
     sig.hue = g_hue;
@@ -4532,7 +4507,8 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
 }
 
 // 全尺寸(2) / 小键盘(1) 布局下「不存在」的行 —— 它们只对默认布局有意义：
-//   常规 Tab：功能键行、Shift 符号     布局 Tab：Fn 网页布局
+//   常规 Tab：功能键行（Shift 符号 / Shift 双击锁定 已不再藏 —— 见 SettingsRowHidden）
+//            布局 Tab：Fn 网页布局
 // 这些行**高度给 0**、绘制与命中也一并跳过：SettingsRowRect 是按行高累加出来的，
 // 高度归零后后面的行自动上移，绘制 / 命中 / 点击读的仍是同一份几何，不会出现「画一行点一行」。
 //
@@ -4548,8 +4524,9 @@ static BOOL SettingsRowHidden(int tab, int index) {
     if (tab == 0) {
         int closeRow = g_af ? 2 : 1;
         if (index == closeRow + 2) return onlyDefault;   // 功能键行
-        if (index == closeRow + 3) return onlyDefault;   // Shift 符号
-        if (index == closeRow + 4) return onlyDefault;   // Shift 双击锁定（从属于 Shift 符号）
+        // Shift 符号 / Shift 双击锁定：全尺寸、小键盘布局里**都有** Shift 键和双符号键，
+        // 这两行对它们同样有用 ⇒ 不藏（2026-10-10 用户要求补上）。
+        // 功能键行仍藏（全尺寸常驻 F 行、小键盘没有 F 行 —— 布局没有的功能就不要加）。
         return FALSE;
     }
     // Fn 网页布局两条件任一成立就藏：
@@ -8550,6 +8527,19 @@ static void OnLDown(HWND hWnd, int x, int y) {
     int ki = HitKey(x, y);
     if (ki < 0) return;
     g_pk = ki;
+    g_pkFlash = -1;                 // 真的按下了，撤掉上一次松手留下的闪光
+    // ⚠⚠ 「按下去」这一帧必须**在 DoKeyAction 之前**上屏：
+    //   DoKeyAction 开头会 WaitForLeftButtonUp() 泵消息等到用户松手（最多 250ms），
+    //   等它返回时 WM_LBUTTONUP 早已派发过、g_pk 已被 OnLUp 清掉
+    //   ⇒ 不先画这一帧，用户永远看不到任何按下反馈（“按了没反应”）。
+#ifdef HK_DIAG
+    if (!g_noClickRepaint) {
+#endif
+        InvalidateRect(hWnd, NULL, FALSE);
+        UpdateWindow(hWnd);         // 同步把按下态画出来（不擦背景，见 WM_ERASEBKGND）
+#ifdef HK_DIAG
+    }
+#endif
     // ⚠ 正式版里这两句恒为真（`#ifdef` 整块不编译），保持原行为不变；
     //   诊断版可以用 -noscapture / -norepaint 临时跳过它们做二分。
 #ifdef HK_DIAG
@@ -8578,8 +8568,12 @@ static void OnLUp(HWND hWnd, int x, int y) {
     if (GetCapture() == hWnd) ReleaseCapture();
 
     if (g_pk >= 0) {
+        // 松手后让这一格再亮一小会儿：短按也能看清"确实按到了"。
+        // 由 TIMER_FOCUS 到期清除（见那里），所以不需要额外定时器。
+        g_pkFlash = g_pk;
+        g_pkFlashUntil = GetTickCount() + HK_PK_FLASH_MS;
         g_pk = -1;
-        InvalidateRect(hWnd, 0, TRUE);
+        InvalidateRect(hWnd, NULL, FALSE);
     }
 }
 
@@ -8836,6 +8830,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             {
                 static int beat = 0;
                 if (++beat >= 100) { beat = 0; AfNote("timer alive (TIMER_FOCUS)"); }
+            }
+            // 「按下去」的反馈闪光到期 → 收尾重绘一次（见 g_pkFlash 的说明）。
+            if (g_pkFlash >= 0 && (LONG)(GetTickCount() - g_pkFlashUntil) >= 0) {
+                g_pkFlash = -1;
+                InvalidateRect(hWnd, NULL, FALSE);
             }
             // Win 锁定/高亮状态与开始菜单状态同步：
             // 开始菜单（无论由本键盘还是任务栏打开）一旦显示，即清除 Win 锁定，避免高亮残留。

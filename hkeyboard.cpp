@@ -530,6 +530,8 @@ static BOOL IsTouchDevice();          // 定义在窗口过程附近；自动呼
 // 用户通过托盘 / 热键**主动**把键盘叫出来时，作废"精判收起"备忘（见其定义处）。
 // 前向声明在这里是因为 ShowKB 定义在那套 UIA 状态之前。
 static void ForgetVerdictHide();
+// 导出诊断日志（实现在那套 UIA 状态之后）：托盘右键与设置页「关于」Tab 都调它
+static void ExportDiagLog();
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
@@ -4420,6 +4422,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_THEME_DROP     20
 #define S_HIT_URL            30
 #define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
+#define S_HIT_DIAG           33   // 关于 Tab：诊断日志行的「导出」按钮
 #define S_HIT_CLOSE_DROP     70
 #define S_HIT_LANG_DROP      50
 #define S_HIT_HL_DROP        60
@@ -5186,21 +5189,23 @@ static int AboutLinksCardH(const SettingsMetrics& m) {
     return AboutPadY(m) * 2 + AboutRowH(m, FALSE);
 }
 
-// 许可行：上 12 + 按钮 32 + 下 2；卡高 = 上下 10 + 行。
+// 许可 / 诊断行：上 12 + 按钮 32 + 下 2。
+// 卡高 = 上下 padY + **两行** + 中间 1px 分隔线（第 2 行是「诊断日志 / 导出」）。
 static int AboutLicenceRowH(const SettingsMetrics& m) {
     return m.rowPadY + (int)(32 * m.dpi) + (int)(2 * m.dpi);
 }
 static int AboutLicenceCardH(const SettingsMetrics& m) {
-    return AboutPadY(m) * 2 + AboutLicenceRowH(m);
+    return AboutPadY(m) * 2 + AboutLicenceRowH(m) * 2 + 1;
 }
 
-static RECT AboutLicenceRowRect(const SettingsMetrics& m, const RECT& card) {
-    RECT r = {card.left, card.top + AboutPadY(m), card.right,
-              card.top + AboutPadY(m) + AboutLicenceRowH(m)};
+// index：0 = 开源许可，1 = 诊断日志
+static RECT AboutLicenceRowRect(const SettingsMetrics& m, const RECT& card, int index) {
+    int top = card.top + AboutPadY(m) + (index == 0 ? 0 : AboutLicenceRowH(m) + 1);
+    RECT r = {card.left, top, card.right, top + AboutLicenceRowH(m)};
     return r;
 }
 
-// 「查看」按钮：高 32 / 圆角 8 / 左右内边距各 14（制作工具的 .btn-sm）。
+// 「查看」/「导出」按钮：高 32 / 圆角 8 / 左右内边距各 14（制作工具的 .btn-sm）。
 // 宽度按文字**推进宽**算（容纳宽度两侧各含约 0.2em 的绘制余量，当内边距用会凭空宽 10px），
 // 绘制与命中读同一份 —— 量宽用 GetDC(0)，与 SegmentedWidth 同法。
 static int AboutBtnW(const wchar_t* label, double dpi) {
@@ -5211,8 +5216,8 @@ static int AboutBtnW(const wchar_t* label, double dpi) {
     return adv + (int)(28 * dpi);
 }
 
-static RECT AboutLicenceBtnRect(const SettingsMetrics& m, int rowTop) {
-    int w = AboutBtnW(T(L"查看", L"View"), m.dpi);
+static RECT AboutLicenceBtnRect(const SettingsMetrics& m, int rowTop, const wchar_t* label) {
+    int w = AboutBtnW(label, m.dpi);
     int h = (int)(32 * m.dpi);
     int x = m.contentX + m.contentW - AboutPadX(m) - w;
     int y = rowTop + ((AboutLicenceRowH(m) - h) / 2);
@@ -5321,21 +5326,25 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
 // 许可行：「许可协议」标签列（110 DIP，与制作工具 widgets::field 的标签列同宽）+ 主色值
 // + 右侧 32 DIP「查看」按钮。标签与值分两列而不是连成一句：MIT 是**值**，颜色交回主色，
 // 扫一行就知道许可是什么；按钮才是动作。
-static void DrawAboutLicenceRow(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL hover) {
+// 「标签 + 值 + 右侧动作按钮」行。许可行与诊断行共用同一套画法：
+//   许可行：开源许可 / MIT / [查看]
+//   诊断行：诊断日志 / 自动呼出问题排查 / [导出]
+static void DrawAboutActionRow(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL hover,
+                               const wchar_t* label, const wchar_t* value, const wchar_t* btnLabel) {
     int labelW = (int)(110 * m.dpi);
     int lx = row.left + AboutPadX(m);
-    RECT btn = AboutLicenceBtnRect(m, row.top);
+    RECT btn = AboutLicenceBtnRect(m, row.top, btnLabel);
     int bw = btn.right - btn.left, bh = btn.bottom - btn.top;
 
     DrawRoundRect(dc, btn.left, btn.top, bw, bh, hover ? C_REGULAR_HOV : C_REGULAR,
                   hover ? C_REGULAR_HOV : C_REGULAR, (int)(8 * m.dpi));
-    DrawTextC(dc, btn.left, btn.top, bw, bh, T(L"查看", L"View"), g_sfCtrl, C_BTN_CONTENT);
+    DrawTextC(dc, btn.left, btn.top, bw, bh, btnLabel, g_sfCtrl, C_BTN_CONTENT);
 
     DrawTextL(dc, lx, row.top, labelW, row.bottom - row.top,
-              T(L"开源许可", L"Licence"), g_sfCtrl, C_WHITE);
+              label, g_sfCtrl, C_WHITE);
     int vx = lx + labelW + (int)(18 * m.dpi);
     DrawTextL(dc, vx, row.top, btn.left - (int)(12 * m.dpi) - vx, row.bottom - row.top,
-              L"MIT", g_sfCtrl, C_HOT);
+              value, g_sfCtrl, C_HOT);
 }
 
 static void SettingsDraw(HDC dc, HWND hWnd) {
@@ -5637,7 +5646,14 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawRoundRect(dc, al.card3.left, al.card3.top,
                       al.card3.right - al.card3.left, al.card3.bottom - al.card3.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
-        DrawAboutLicenceRow(dc, m, AboutLicenceRowRect(m, al.card3), g_sHov == S_HIT_LICENSE);
+        DrawAboutActionRow(dc, m, AboutLicenceRowRect(m, al.card3, 0), g_sHov == S_HIT_LICENSE,
+                           T(L"开源许可", L"Licence"), L"MIT", T(L"查看", L"View"));
+        // 诊断行：把「导出诊断日志」放到设置页里（托盘右键也有一份）。
+        // 自动呼出出问题时用它导出最近约 3 分钟的运行记录 + 环境/UIA 快照。
+        DrawAboutActionRow(dc, m, AboutLicenceRowRect(m, al.card3, 1), g_sHov == S_HIT_DIAG,
+                           T(L"诊断日志", L"Diagnostics"),
+                           T(L"自动呼出与 UIA 状态排查", L"Auto pop-up / UIA troubleshooting"),
+                           T(L"导出", L"Export"));
 
         // 版权行：文字逐字保留（含 2026 与结尾句点），9px C_DIM 居中，放在最后一张卡下方
         DrawTextC(dc, m.contentX, al.card3.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
@@ -5744,12 +5760,16 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         }
     } else {
         // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）；
-        // 许可行的热区只有「查看」按钮本身 —— 行内的「许可协议 / MIT」是读数，不是动作
+        // 许可 / 诊断行的热区只有右侧按钮本身 —— 行内的文字是读数，不是动作
         AboutLayout al = GetAboutLayout(m);
         RECT r0 = AboutRowRect(m, al.card2, 0);
         if (x >= r0.left && x < r0.right && y >= r0.top && y < r0.bottom) return S_HIT_URL;
-        RECT rb = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3).top);
+        RECT rb = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3, 0).top,
+                                      T(L"查看", L"View"));
         if (x >= rb.left && x < rb.right && y >= rb.top && y < rb.bottom) return S_HIT_LICENSE;
+        RECT rd = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3, 1).top,
+                                      T(L"导出", L"Export"));
+        if (x >= rd.left && x < rd.right && y >= rd.top && y < rd.bottom) return S_HIT_DIAG;
     }
     return S_HIT_NONE;
 }
@@ -6150,6 +6170,12 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
     case S_HIT_LICENSE:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/blob/main/LICENSE", NULL, NULL, SW_SHOWNORMAL);
         break;
+    case S_HIT_DIAG: {
+        // 关于 Tab / 托盘右键都有这个入口：导出最近约 3 分钟的运行记录，
+        // 外加环境快照与 UIA 自检结果（见 ExportDiagLog）。
+        ExportDiagLog();
+        break;
+    }
     default: return;
     }
     if (themeChanged) {
@@ -6309,7 +6335,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ScreenToClient(hWnd, &pt);
         if (g_sTab == 2) {
             int hv = SettingsHitTest(hWnd, pt.x, pt.y);
-            if (hv == S_HIT_URL || hv == S_HIT_LICENSE) {
+            if (hv == S_HIT_URL || hv == S_HIT_LICENSE || hv == S_HIT_DIAG) {
                 SetCursor(LoadCursor(NULL, IDC_HAND));
                 return TRUE;
             }
@@ -6874,9 +6900,6 @@ static void OpenClosePrompt() {
         SetForegroundWindow(g_closePromptHwnd);
     }
 }
-
-// 托盘菜单用的诊断导出（定义在那套 UIA/自动呼出状态之后，故此处前置声明）
-static void ExportDiagLog();
 
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
@@ -7562,6 +7585,177 @@ static void DiagWrite(HANDLE h, const char* s) {
     WriteFile(h, s, (DWORD)strlen(s), &wr, NULL);
 }
 
+// ===== 导出内容之二：环境 + UIA 自检（换机 / 虚拟机排查用）=====
+// ⚠ 这一段是给"我拿不到现场"用的：把「钩子装没装上」「UIA 能不能用」
+//   「焦点元素到底是什么」「系统触摸键盘长什么样」一次性写进文件。
+static BOOL IsInputControl(HWND hw);      // 定义在后面（此处需要用）
+
+// 列一个触摸键盘候选窗口（classe 匹配 + 进程名 + 可见性 + DWM cloak + 矩形）
+static BOOL CALLBACK DiagTipEnumProc(HWND h, LPARAM lp) {
+    HANDLE f = (HANDLE)lp;
+    if (!IsWindowVisible(h)) return TRUE;
+    char cls[128] = {0};
+    GetClassNameA(h, cls, 128);
+    if (!strstr(cls, "Windows.UI.Core.CoreWindow") &&
+        !strstr(cls, "InputSite") && !strstr(cls, "TextInputHost") &&
+        !strstr(cls, "IPTip")) return TRUE;
+    wchar_t exe[64] = {0};
+    WindowProcessName(h, exe, 64);
+    char exeA[64] = {0};
+    WideCharToMultiByte(CP_ACP, 0, exe, -1, exeA, sizeof(exeA), NULL, NULL);
+    DWORD cloaked = 0;
+    DwmGetWindowAttributeProc getAttr = GetDwmGetWindowAttribute();
+    if (getAttr) {
+        const DWORD DWMWA_CLOAKED_VALUE = 14;
+        getAttr(h, DWMWA_CLOAKED_VALUE, &cloaked, sizeof(cloaked));
+    }
+    RECT r = {0, 0, 0, 0};
+    GetWindowRect(h, &r);
+    char line[320];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "  %-20s cls=[%s] vis=1 cloaked=%lu rect=%ld,%ld %ldx%ld\r\n",
+                exeA, cls, (unsigned long)cloaked,
+                (long)r.left, (long)r.top, (long)(r.right - r.left), (long)(r.bottom - r.top));
+    DiagWrite(f, line);
+    return TRUE;
+}
+
+static void DiagAppendProbe(HANDLE h) {
+    char line[640];
+    HWND fg = GetForegroundWindow();
+
+    // ── 钩子是否装上：装不上 = 自动呼出必然失效（权限 / 杀软常见）
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    BOOL elevated = FALSE;
+    {
+        HANDLE tok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+            // TokenElevation = 20（Vista+）。本项目目标是 XP，不引它的枚举名/结构名，
+            // 直接按 DWORD 读（TOKEN_ELEVATION 就一个 DWORD）。
+            DWORD elev = 0, cb = 0;
+            if (GetTokenInformation(tok, (TOKEN_INFORMATION_CLASS)20, &elev, sizeof(elev), &cb))
+                elevated = (elev != 0) ? TRUE : FALSE;
+            CloseHandle(tok);
+        }
+    }
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "--- hooks / process ---\r\n"
+        "mouseHook=%p kbHook=%p winHook=%p fgEvHook=%p   (0/NULL = 装不上)\r\n"
+        "elevated=%d  pid=%lu  iniPathSee:exe dir\r\n",
+        (void*)g_mouseHook, (void*)g_kbHook, (void*)g_winHook, (void*)g_fgHook,
+        (int)elevated, (unsigned long)GetCurrentProcessId());
+    DiagWrite(h, line);
+
+    // ── UIA 可用性 + 自检
+    HRESULT hrCreate = E_FAIL;
+    if (g_uia) {
+        hrCreate = S_OK;
+    } else if (EnsureAccessibilityCom()) {
+        hrCreate = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER,
+                                    __uuidof(IUIAutomation), (void**)&g_uia);
+        if (FAILED(hrCreate)) g_uia = NULL;
+    }
+    HMODULE uiaDll = LoadLibraryW(L"uiautomationcore.dll");
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "--- UIA ---\r\n"
+        "uiautomationcore.dll = %s\r\n"
+        "CoCreateInstance(CUIAutomation) hr=0x%08X  -> %s\r\n"
+        "foreground responsive = %d  (0 = 目标进程无响应，判据一律不做决定)\r\n",
+        uiaDll ? "found" : "MISSING",
+        (unsigned)hrCreate, g_uia ? "OK" : "UIA 不可用 —— 自动收起功能将整体降级为旧行为",
+        (int)IsWindowResponsive(fg, 200));
+    if (uiaDll) FreeLibrary(uiaDll);
+    DiagWrite(h, line);
+
+    if (g_uia) {
+        IUIAutomationElement* el = NULL;
+        HRESULT hr = g_uia->GetFocusedElement(&el);
+        if (SUCCEEDED(hr) && el) {
+            UIA_HWND raw = NULL;
+            el->get_CurrentNativeWindowHandle(&raw);
+            CONTROLTYPEID ct = 0;
+            el->get_CurrentControlType(&ct);
+            BOOL kf = FALSE, hf = FALSE, off = FALSE;
+            el->get_CurrentIsKeyboardFocusable(&kf);
+            el->get_CurrentHasKeyboardFocus(&hf);
+            el->get_CurrentIsOffscreen(&off);
+            // 模式探测：TextPattern(10014) / ValuePattern(10002) / TextPattern2(10024)
+            // ⚠ GetCurrentPattern 出参是 IUnknown*，**不碰 VARIANT**（不拉 oleaut32）
+            BOOL hasT1 = FALSE, hasV = FALSE, hasT2 = FALSE;
+            IUnknown* pat = NULL;
+            if (SUCCEEDED(el->GetCurrentPattern(10014, &pat)) && pat) { hasT1 = TRUE; pat->Release(); pat = NULL; }
+            if (SUCCEEDED(el->GetCurrentPattern(10002, &pat)) && pat) { hasV = TRUE; pat->Release(); pat = NULL; }
+            if (SUCCEEDED(el->GetCurrentPattern(10024, &pat)) && pat) { hasT2 = TRUE; pat->Release(); pat = NULL; }
+            HWND elHwnd = (HWND)raw;
+            HWND elTop = elHwnd ? GetAncestor(elHwnd, GA_ROOT) : NULL;
+            HWND fgTop = fg ? GetAncestor(fg, GA_ROOT) : NULL;
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "GetFocusedElement hr=0x%08X ct=%lu  (50004=Edit / 50030=Document / 50026=Group)\r\n"
+                "  nativeHwnd=%p root=%p  fgRoot=%p  belongsToForeground=%d\r\n"
+                "  kbdFocusable=%d hasKbdFocus=%d offscreen=%d  TextPat=%d ValuePat=%d TextPat2=%d\r\n",
+                (unsigned)hr, (unsigned long)ct, (void*)elHwnd, (void*)elTop, (void*)fgTop,
+                (int)(elTop && fgTop && elTop == fgTop),
+                (int)kf, (int)hf, (int)off, (int)hasT1, (int)hasV, (int)hasT2);
+            el->Release();
+        } else {
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "GetFocusedElement hr=0x%08X el=%p  -> 取不到焦点元素\r\n",
+                        (unsigned)hr, (void*)el);
+        }
+        DiagWrite(h, line);
+
+        POINT cp = {0, 0};
+        GetCursorPos(&cp);
+        int pv = UiaPointEditable(cp);
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "ElementFromPoint(光标 %ld,%ld) = %d  ct=%d  (1=Edit 0=非Edit -1=查不出)\r\n",
+            (long)cp.x, (long)cp.y, pv, g_dbgUiaPtCt);
+        DiagWrite(h, line);
+    }
+
+    // ── 前台窗口粗判（与 IsInputControl 逐项一致）
+    {
+        char cls[128] = {0};
+        if (fg) GetClassNameA(fg, cls, 128);
+        wchar_t exe[64] = {0};
+        WindowProcessName(fg, exe, 64);
+        char exeA[64] = {0};
+        WideCharToMultiByte(CP_ACP, 0, exe, -1, exeA, sizeof(exeA), NULL, NULL);
+        DWORD tid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+        GUITHREADINFO gi = {sizeof(gi)};
+        BOOL haveGi = fg ? GetGUIThreadInfo(tid, &gi) : FALSE;
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "--- foreground ---\r\n"
+            "class=[%s] process=[%s]\r\n"
+            "shellSurface=%d systemTouchKeyboard=%d\r\n"
+            "giOk=%d hwndFocus=%p caret=%p flags=0x%X\r\n"
+            "IsInputControl(fg)=%d   coarseChromiumClass=%d\r\n",
+            cls, exeA,
+            (int)IsShellSurfaceClass(cls), (int)IsSystemTouchKeyboard(fg),
+            (int)haveGi, (void*)(haveGi ? gi.hwndFocus : NULL),
+            (void*)(haveGi ? gi.hwndCaret : NULL),
+            (unsigned)(haveGi ? gi.flags : 0),
+            (int)IsInputControl(fg), (int)g_detectedByChromiumClass);
+        DiagWrite(h, line);
+    }
+
+    // ── 系统触摸键盘（Win10 = TabTip.exe / Win11 = TextInputHost.exe）
+    {
+        HWND t = FindWindowW(L"IPTip_Main_Window", NULL);
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "--- touch keyboard ---\r\n"
+            "IPTip_Main_Window hwnd=%p visible=%d\r\n"
+            "SystemTouchKeyboardVisible()=%d\r\n"
+            "候选窗口（可见的）:\r\n",
+            (void*)t, (int)(t && IsWindowVisible(t)), (int)SystemTouchKeyboardVisible());
+        DiagWrite(h, line);
+        EnumWindows(DiagTipEnumProc, (LPARAM)h);
+    }
+
+    DiagWrite(h, "------------------------------------------------------------\r\n");
+}
+
 // 读注册表里的 Windows 版本（GetVersionEx 在没有清单时会撒谎，这里取真值）。
 // ⚠ 本项目目标是 XP（_WIN32_WINNT=0x0501），**不能用 `RegGetValueA`**（Vista+ 才声明）
 //   —— 用 RegOpenKeyExW + RegQueryValueExW，与文件里其它读注册表的地方一致。
@@ -7656,6 +7850,9 @@ static void ExportDiagLog() {
         (int)SystemTouchKeyboardVisible(),
         g_ringCount);
     DiagWrite(h, head);
+
+    // 环境 + UIA 自检（换机 / 虚拟机排查用；见 DiagAppendProbe）
+    DiagAppendProbe(h);
 
     // 环形缓冲按时间顺序输出
     int start = (g_ringCount < HKRING_N) ? 0 : g_ringHead;

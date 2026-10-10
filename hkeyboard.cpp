@@ -5413,7 +5413,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
         RECT r;
-        // 功能键行 / Shift 符号：全尺寸与小键盘布局下不存在（见 SettingsRowHidden）
+        // ⚠ 守卫**只包住功能键行**。Shift 两行必须留在守卫外面 —— 它们在全尺寸布局下照常显示，
+        //   一旦被包进来，全尺寸里「功能键行被藏」就会连带把这两行也跳过：绘制跳过但行高还在，
+        //   结果就是两个空白格子（实机截图症状）。
         if (!SettingsRowHidden(0, closeRow + 2)) {
         r = SettingsRowRect(m, closeRow + 2);
         DrawSettingRowContent(dc, m, r, -1, L"F",   // 功能键行保留手绘 F
@@ -5421,6 +5423,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               T(L"在键盘顶部显示 F1~F12 和 Del", L"Show F1~F12 and Del above the keyboard"),
                               g_sHov == S_HIT_FKEYS, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_showFKeys, S_HIT_FKEYS);
+        }
 
         r = SettingsRowRect(m, closeRow + 3);
         DrawSettingRowContent(dc, m, r, HKICON_SHIFT, NULL,
@@ -5436,8 +5439,6 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               T(L"连按两下 Shift 锁定，再点解除", L"Tap twice to lock, tap again to release"),
                               g_sHov == S_HIT_SHDLOCK, SettingsSwitchTextRight(m, r), FALSE, TRUE);
         DrawSettingSwitch(dc, m, r, g_shiftDoubleTap, S_HIT_SHDLOCK);
-
-        }
 
         r = SettingsRowRect(m, closeRow + 5);
         const wchar_t* gseg[2];

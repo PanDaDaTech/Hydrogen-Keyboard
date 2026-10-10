@@ -8195,6 +8195,9 @@ static void UpdateAutoVisibility() {
     //     ③ 判据的缓存/保持期**按窗口分组**，并且校验焦点元素的归属窗口 ——
     //        否则"上一个窗口"的结论会被当成"这个窗口"的（实测把 QQ 锁死的正是这条）。
     HWND inputForLog = input;       // 判定会把 input 置空（精判收起），日志要看判定前的值
+    // ⚠ g_vis 也要留判定前的值：日志现在打在函数出口（判定/动作之后），
+    //   直接读 g_vis 会记成"动作之后"的值，跟 ShowKB 那行的语义就对不上了。
+    BOOL visForLog = g_vis;
     int chromiumVerdict = -1;       // 焦点判据：1=可编辑 0=明确不是 -1=未知
     if (input && g_afChromiumPrecise && g_detectedByChromiumClass) {
         if (g_vis) {
@@ -8413,7 +8416,7 @@ done:
         g_dbgRc[2] = (int)(wr.right - wr.left);
         g_dbgRc[3] = (int)(wr.bottom - wr.top);
         AfLog("eval", fgNow, fgTop, inputForLog, recentClick, clickInFg, byKey,
-              g_fgAwaitUserInput, g_vis, g_mainMotion.active, st);
+              g_fgAwaitUserInput, visForLog, g_mainMotion.active, st);
     }
     return;
 }

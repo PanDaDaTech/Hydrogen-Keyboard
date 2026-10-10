@@ -225,6 +225,7 @@ BOOL g_noClickRepaint = FALSE;
 #define ID_MENU_ABOUT  10008
 #define ID_MENU_EXIT   10009
 #define ID_MENU_SETTINGS 10010
+#define ID_MENU_DIAG   10011
 
 // 布局 Tab 命中码（S_HIT_TAB0=常规 TAB1=主题 TAB2=关于，视觉顺序：常规/布局/主题/关于）
 #define S_HIT_TABL 5
@@ -526,6 +527,9 @@ static void InvalidateKeyByVk(HWND hWnd, short vk);
 static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
 static BOOL IsTouchDevice();          // 定义在窗口过程附近；自动呼出要按它决定是否启用触屏兜底
+// 用户通过托盘 / 热键**主动**把键盘叫出来时，作废"精判收起"备忘（见其定义处）。
+// 前向声明在这里是因为 ShowKB 定义在那套 UIA 状态之前。
+static void ForgetVerdictHide();
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
@@ -747,6 +751,30 @@ static wchar_t g_afLogPath[MAX_PATH] = {0};
 static int     g_afLogLines = 0;      // 已写行数（够多就停，别把磁盘写爆）
 #define AFLOG_MAX_LINES 4000
 
+// ===== 常驻诊断环形缓冲（供托盘菜单「导出诊断日志」用）=====
+//   ⚠ 与 -afdiag **无关**：这段始终在跑（默认每 ~200ms 一条 eval + 所有事件），
+//     于是用户**不需要带参数启动、也不需要重现前先做准备** ——
+//     出了问题直接在托盘右键「导出诊断日志」，把最近几分钟原样交出来即可。
+//   只占内存、不碰磁盘：1000 条 × 320B ≈ 320KB（未初始化，进 BSS，exe 不增大）。
+#define HKRING_N   1000
+#define HKRING_LEN 320
+static char g_ring[HKRING_N][HKRING_LEN];
+static int  g_ringHead = 0;           // 下一个写入位置
+static int  g_ringCount = 0;          // 已累积条数（满后恒为 HKRING_N）
+// 仅诊断用（命令行 `-dginj`）：让鼠标/键盘钩子**接受注入事件**。
+//   ⚠ 存在的唯一理由：本机没编译器，只能靠 CI 出包再回来验；
+//     而"点击输入框"这条路必须能自己驱动（`SendInput` 注入的事件默认被钩子放过，
+//     于是自测时 rc/cif 永远是 0，等于没测）。正式使用**绝不要**开这个开关。
+static BOOL g_dbgAcceptInjected = FALSE;
+static void DiagRingPush(const char* line) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    _snprintf_s(g_ring[g_ringHead], HKRING_LEN, _TRUNCATE, "%02d:%02d:%02d.%03d %s",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+    g_ringHead = (g_ringHead + 1) % HKRING_N;
+    if (g_ringCount < HKRING_N) g_ringCount++;
+}
+
 static const char* AfClsName(HWND h) {
     static char buf[80];
     buf[0] = 0;
@@ -830,7 +858,13 @@ static void AfWriteRaw(const char* line) {
 static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                   BOOL recentClick, BOOL clickInFg, BOOL byKey,
                   BOOL await, BOOL vis, BOOL motion, const char* decision) {
-    if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
+    // ⚠ 环形缓冲**始终在跑**（托盘菜单能随时导出）；抽稀到每 4 拍一条（≈200ms），
+    //   1000 条 ≈ 3.3 分钟，足够覆盖"用户操作 → 出问题"的完整过程。
+    //   事件（AfNote / ShowKB）不抽稀，全部保留。
+    static int ringTick = 0;
+    BOOL wantRing = ((++ringTick & 3) == 0);
+    BOOL wantFile = (g_afLogPath[0] && g_afLogLines < AFLOG_MAX_LINES);
+    if (!wantRing && !wantFile) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
     DWORD fevNow = g_lastFocusEvTick ? (GetTickCount() - g_lastFocusEvTick) : 0xFFFFFFFFu;
@@ -854,11 +888,17 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                 g_dbgFocusVt, (unsigned)g_dbgFocusRole, (unsigned)fevNow, fehMatch,
                 g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3],
                 decision);
-    AfWriteRaw(buf);
+    if (wantRing) DiagRingPush(buf);
+    if (wantFile) AfWriteRaw(buf);
 }
 
 // 直接写一行（不带那些字段，用于阶段标记）
 static void AfNote(const char* text) {
+    {
+        char rb[256];
+        _snprintf_s(rb, sizeof(rb), _TRUNCATE, "--- %s", text);
+        DiagRingPush(rb);
+    }
     if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -4208,6 +4248,7 @@ static void ShowKB(BOOL show, BOOL isManual) {
             g_manualShow = TRUE;
             g_manualHide = FALSE;
             g_userHidInInput = FALSE;   // 手动重新显示后恢复常规自动呼出逻辑
+            ForgetVerdictHide();        // 用户明确要键盘 → 撤掉上一轮的精判收起备忘
         }
         if (g_vis) {
             StopWindowMotion(&g_mainMotion);
@@ -6834,6 +6875,9 @@ static void OpenClosePrompt() {
     }
 }
 
+// 托盘菜单用的诊断导出（定义在那套 UIA/自动呼出状态之后，故此处前置声明）
+static void ExportDiagLog();
+
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
@@ -6848,6 +6892,8 @@ static void ShowMenu(HWND hWnd) {
 
     AppendMenuW(m, MF_STRING, ID_MENU_SETTINGS, T(L"\x8BBE\x7F6E", L"Settings"));
 
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_MENU_DIAG, T(L"\x5BFC\x51FA\x8BCA\x65AD\x65E5\x5FD7", L"Export Diagnostics"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_MENU_ABOUT, T(L"\x5173\x4E8E", L"About"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -6866,6 +6912,8 @@ static void ShowMenu(HWND hWnd) {
         InvalidateRect(hWnd, 0, TRUE);
     } else if (id == ID_MENU_SETTINGS) {
         OpenSettings();
+    } else if (id == ID_MENU_DIAG) {
+        ExportDiagLog();
     } else if (id == ID_MENU_ABOUT) {
         OpenSettingsTab(2);   // 跳转到设置“关于”Tab
     } else if (id == ID_MENU_EXIT) {
@@ -7105,7 +7153,7 @@ static BOOL IsShellSurfaceClass(const char* cls) {
            strstr(cls, "TopLevelWindowForOverflowXamlIsland");
 }
 
-// ===== Windows 自带触摸键盘（Win10/11：TabTip.exe 的 IPTip_Main_Window）=====
+// ===== Windows 自带触摸键盘（Win10 与 Win11 形态不同）=====
 // 它在本项目里有特殊地位：点输入框时系统会把它弹出来，而**它一旦成为前台窗口**，
 // 自动呼出的两个判断会同时被它带偏，结果是「HKey 完全不弹、只剩系统键盘」：
 //   ① UpdateAutoVisibility 里「前台变了 → 进入等待用户操作」（g_fgAwaitUserInput）
@@ -7114,12 +7162,57 @@ static BOOL IsShellSurfaceClass(const char* cls) {
 //      → 走「没有输入焦点」分支，把键盘收掉。
 // ⇒ 判定时一律**跳过它**，改用「上一个真正的前台窗口」（RealForegroundWindow）。
 // ⚠ 只做判定上的忽略，**不主动关掉系统键盘**（用户明确要求不动它）。
-// ⚠ 只认这一个窗口类：osk.exe 的 OSKMainClass 是用户主动开的辅助键盘，不该被忽略。
+// ⚠ osk.exe 的 `OSKMainClass` 是用户主动开的辅助键盘，不该被忽略。
+//
+// ⚠⚠ 两个平台的形态**不一样**（实测本机 Win11 得到的事实）：
+//   Win10：`TabTip.exe` 的窗口类 `IPTip_Main_Window`
+//   Win11：`TextInputHost.exe`（进程）承载，窗口类 `Windows.UI.Core.CoreWindow`
+//          —— 这类名被大量 UWP 宿主复用（本机 explorer.exe / SystemSettings.exe
+//             都各有一个），**所以必须再按进程名确认**，只看类名会误伤。
+// ⚠ 本项目目标是 XP（_WIN32_WINNT=0x0501）⇒ `QueryFullProcessImageNameW`
+//   （Vista+）在头文件里**没有声明**，按本项目惯例**动态取**（同 DwmSetWindowAttribute）。
+typedef BOOL (WINAPI *QueryFullProcessImageNameWProc)(HANDLE, DWORD, LPWSTR, PDWORD);
+static BOOL WindowProcessName(HWND h, wchar_t* out, int cch) {
+    if (out) out[0] = 0;
+    if (!h || !IsWindow(h) || !out || cch < 2) return FALSE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid) return FALSE;
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return FALSE;
+    static QueryFullProcessImageNameWProc proc = NULL;
+    static BOOL tried = FALSE;
+    if (!tried) {
+        tried = TRUE;
+        proc = (QueryFullProcessImageNameWProc)GetProcAddress(
+                   GetModuleHandleW(L"kernel32.dll"), "QueryFullProcessImageNameW");
+    }
+    BOOL ok = FALSE;
+    if (proc) { DWORD n = (DWORD)cch; ok = proc(p, 0, out, &n); }
+    CloseHandle(p);
+    if (!ok) { out[0] = 0; return FALSE; }
+    wchar_t* sl = wcsrchr(out, L'\\');
+    if (sl) memmove(out, sl + 1, (wcslen(sl + 1) + 1) * sizeof(wchar_t));
+    return TRUE;
+}
+
 static BOOL IsSystemTouchKeyboard(HWND h) {
     if (!h || !IsWindow(h)) return FALSE;
     char cls[128] = {0};
     GetClassNameA(h, cls, 128);
-    return strstr(cls, "IPTip_Main_Window") != NULL;
+    if (strstr(cls, "IPTip_Main_Window")) return TRUE;          // Win10
+    if (strstr(cls, "Windows.UI.Core.CoreWindow") ||
+        strstr(cls, "InputSite") || strstr(cls, "TextInputHost")) {
+        wchar_t exe[64] = {0};
+        if (WindowProcessName(h, exe, 64)) {
+            if (_wcsicmp(exe, L"TextInputHost.exe") == 0) return TRUE;   // Win11
+            if (_wcsicmp(exe, L"TabTip.exe") == 0) return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 // 上一个「真正的」前台窗口（跳过系统触摸键盘）。
@@ -7234,25 +7327,25 @@ static BOOL UserInputAfterForegroundChange() {
 // ⚠ 还留了 ini 开关 General/ChromiumPrecise（默认 1）—— 万一它带来新问题，
 //   关掉一个开关就回到旧行为，不必动主逻辑（这是当年那条教训的直接落实）。
 #define HK_UIA_CT_EDIT 50004    // UIA_EditControlTypeId
+#define HK_UIA_CT_DOC  50030    // UIA_DocumentControlTypeId（诊断用）
 
 static IUIAutomation* g_uia = NULL;
 
-// 「这个窗口上的精判可信吗」—— 只有在那里**见过 Edit** 才算可信。
-// ⚠ 必须的护栏：contenteditable 型输入框报不出 Edit（实测 QQ 的 ProseMirror
-//   报 GroupControl，整个窗口 EditControl 数为 0）。没有这道门，
-//   那类应用会被判成"永远不在输入框"⇒ 自动呼出直接失效（第十一轮的翻车形态）。
+// 「这个窗口上的精判可信吗」—— 只有在那里**见过可编辑元素**才算可信。
+// ⚠ 必须的护栏：contenteditable 型输入框报不出 Edit —— 实测 QQ NT 主窗口里
+//   只有搜索框是 EditControl（1 个），聊天输入框是 ProseMirror，报
+//   GroupControl / DocumentControl。没有这道门，那类应用会被判成
+//   "永远不在输入框" ⇒ 自动呼出直接失效（第十一轮的翻车形态）。
+//   没见过 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
 static HWND g_chromiumTrustFg = NULL;
 
-// 精判驱动的自动收起状态（详见 UpdateAutoVisibility 的 show 分支）。
-//   ⚠ 存在的意义是**同时**解决两件事：收起后不被粗判立刻弹回（防振荡），
-//     又不把弹出永久堵死（用户点输入框就能回来）。
-static BOOL g_verdictHide = FALSE;       // 这次收起是精判造成的
-static HWND g_verdictHidFg = NULL;       // 收起时所在的前台窗口
-// 连续几次"点了但落点判不出是输入框"。到 3 次就放弃压制，把键盘放回来 ——
-// 兜的是"落点判据在某个输入框上不成立"（例如可信应用里的 contenteditable 页面输入框）：
-// 宁可偶尔多弹一次，也不能让用户点了输入框还叫不出键盘。
-static int  g_verdictHidMisses = 0;
+// 精判驱动的自动收起状态（详见 UpdateAutoVisibility 的判定段）。
+//   ⚠ 它只是一句备忘："当前这个窗口正处于精判收起态"。
+//     **不是封锁** —— 能不能再弹回来由"正面证据"回答（见判定段）。
+static BOOL g_verdictHide = FALSE;
+static HWND g_verdictHidFg = NULL;
 static int  g_dbgUiaPt = -1;             // 诊断：最近一次落点查询结果
+static int  g_dbgUiaPtCt = -1;           // 诊断：落点元素的 ControlType
 
 static BOOL EnsureUia() {
     if (g_uia) return TRUE;
@@ -7266,22 +7359,37 @@ static BOOL EnsureUia() {
     return SUCCEEDED(hr) && g_uia != NULL;
 }
 
-// 返回值：1 = 焦点在可编辑输入框里；0 = 明确不在；-1 = 查不出来
-static int UiaFocusEditable() {
+// 焦点元素判定。
+// ⚠⚠ **必须校验"这个元素属于哪个顶层窗口"** —— `GetFocusedElement` 是全局的，
+//   在窗口切换的瞬间可能还停留在**上一个窗口**；不校验就会把"信任门"设到错误的
+//   窗口上。用户实测的后果很典型：在 WorkBuddy 里精判正常（见过 Edit），
+//   切到 QQ 后那 400ms 保持期把 1 带过去、信任门被设成 **QQ 的窗口**，
+//   于是 QQ 的"不在输入框"（ProseMirror 只报 Group）开始生效 ⇒ **QQ 再也弹不出来**。
+// 返回值：1 = 焦点在可编辑输入框里；0 = 明确不在；-1 = 查不出来 / 不属于该窗口
+static int UiaFocusEditable(HWND fgExpect) {
     g_dbgUiaCt = -1;
     if (!EnsureUia()) return -1;
     // 跨进程调用前先做响应性预检，与 IsAccessibleInputWindow 同一纪律：
     //   SMTO_ABORTIFHUNG 把"无限期阻塞"压成"有界的最多 50ms"。
     //   ⚠ 本函数在 UI 线程上跑，没有这道闸，目标进程一卡死，
-    //     键盘自己的界面会跟着僵住。预检不过就返回 -1（= 当作仍在输入框里，不收起）。
+    //     键盘自己的界面会跟着僵住。预检不过就返回 -1（= 不做决定）。
     if (!IsWindowResponsive(GetForegroundWindow(), 50)) return -1;
     IUIAutomationElement* el = NULL;
     HRESULT hr = g_uia->GetFocusedElement(&el);
     if (FAILED(hr) || !el) return -1;
+    // get_CurrentNativeWindowHandle 是**强类型 getter**，不用 VARIANT
+    // （走 GetCurrentPropertyValue 会拉进 oleaut32，arm64 上链接失败过）。
+    HWND elHwnd = NULL;
+    el->get_CurrentNativeWindowHandle(&elHwnd);
     CONTROLTYPEID ct = 0;
     hr = el->get_CurrentControlType(&ct);
     el->Release();          // 只管当场取值，不留跨帧的 COM 指针（会过期）
     if (FAILED(hr)) return -1;
+    if (fgExpect && elHwnd) {
+        HWND elTop = GetAncestor(elHwnd, GA_ROOT);
+        HWND fgTop = GetAncestor(fgExpect, GA_ROOT);
+        if (elTop && fgTop && elTop != fgTop) return -1;   // 这不是本窗口的焦点
+    }
     g_dbgUiaCt = (int)ct;
     return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
 }
@@ -7289,44 +7397,55 @@ static int UiaFocusEditable() {
 // 带缓存的版本：UIA 是跨进程 COM，别每 50ms 调一次。
 //   TTL 250ms —— 比 tick（50ms）粗得多，又比"人手离开输入框"快得多。
 //   ⚠ 缓存的是**判定结果**，不是元素指针。
-// ⚠⚠ -1（查不出来）**必须原样保留**，绝不能折成 1。上一版就是把它当成"是输入框"，
-//   同时又拿它去设信任门 ⇒ 之后隐藏态返回一次冻结的"非 Edit"，键盘被永久收掉，
-//   用户点输入框也回不来（实测「WorkBuddy 的输入框又不行了」）。
-//   现在的语义：**只有明确查出来才做决定**，-1 一律不做决定（不收起、不设信任）。
-static int UiaFocusEditableCached() {
-    static int   cached = -1;
-    static DWORD cachedTick = 0;
+// ⚠⚠ 缓存**按前台窗口分组**。原来是一个全局 static —— 全局缓存会让
+//   "上一个窗口"的结论被当成"这个窗口"的结论（见 UiaFocusEditable 的说明）。
+// ⚠⚠ -1（查不出来）**必须原样保留**，绝不能折成 1。曾经把它当成"是输入框"、
+//   又拿它去设信任门 ⇒ 后面一次无效值就把键盘永久收掉，用户点输入框也回不来。
+//   语义：**只有明确查出来才做决定**，-1 一律不做决定。
+static HWND  g_uiaCacheFg = NULL;
+static int   g_uiaCacheVal = -1;
+static DWORD g_uiaCacheTick = 0;
+static int UiaFocusEditableCached(HWND fg) {
     DWORD now = GetTickCount();
-    if (cachedTick && now - cachedTick < 250) return cached;
-    cached = UiaFocusEditable();
-    cachedTick = now;
-    return cached;
+    if (g_uiaCacheFg == fg && g_uiaCacheTick && now - g_uiaCacheTick < 250)
+        return g_uiaCacheVal;
+    g_uiaCacheFg = fg;
+    g_uiaCacheVal = UiaFocusEditable(fg);
+    g_uiaCacheTick = now;
+    return g_uiaCacheVal;
 }
+
+// 用户刚点过鼠标 / 敲过键时调用：缓存的那一拍**必然已经过期**。
+//   ⚠ 不加这个，点进输入框之后的前 250ms 还会拿"点在空白"时的旧结论去收起
+//     —— 表现就是"点一下输入框，键盘闪一下又没了"。
+static void InvalidateUiaCache() { g_uiaCacheTick = 0; }
 
 // 在缓存之上再加一层"保持期"：**刚见过 Edit 的一小段时间内一律按"在输入框"处理**。
 // 挡的是单次误报 —— Chromium 的焦点上报偶有瞬时非 Edit。
 // 保持期比缓存粗一档，让一次坏采样翻不动结论。
+// ⚠ 同样**按窗口分组**（理由同上）。
 // 代价：离开输入框后收起会晚 400ms，可接受。
-static DWORD g_uiaHoldEditTick = 0;
-static int UiaFocusEditableHeld() {
+static HWND  g_uiaHoldFg = NULL;
+static DWORD g_uiaHoldTick = 0;
+static int UiaFocusEditableHeld(HWND fg) {
     DWORD now = GetTickCount();
-    int v = UiaFocusEditableCached();
-    if (v == 1) g_uiaHoldEditTick = now;
-    if (g_uiaHoldEditTick && now - g_uiaHoldEditTick < 400) return 1;
+    int v = UiaFocusEditableCached(fg);
+    if (v == 1) { g_uiaHoldFg = fg; g_uiaHoldTick = now; }
+    if (g_uiaHoldFg == fg && g_uiaHoldTick && now - g_uiaHoldTick < 400) return 1;
     return v;               // ⚠ 可能是 -1（未知）—— 调用方必须当成"不做决定"
 }
 
 // ===== 落点查询：这个屏幕点上是可编辑输入框吗？（UIA ElementFromPoint）=====
 //
-// ⚠⚠ 为什么"要再弹"这件事必须用**落点**而不是**焦点**：
-//   实测（本机，-hide 启动的实例）：HKeyboard 隐藏期间 `GetFocusedElement()`
-//   给出的是**冻结值** —— 129 拍全是 `ButtonControl`，而同刻 Python 侧按同一 API
-//   查到的是 `EditControl`（真实焦点确实在输入框里）。可见状态下它又完全正确
-//   （167 拍 `50004` / 182 拍 `50030`，与真值一致）。
-//   ⇒ 焦点查询在隐藏态不可信；**落点查询不依赖焦点跟踪，隐藏态也始终正确**
+// ⚠⚠ 为什么"要再弹"这件事用**落点**而不是**焦点**：
+//   焦点查询在**隐藏期间**给过无效值 —— 实测（-hide 启动的实例）连续 129 拍
+//   恒为 `ButtonControl`，而同刻 Python 侧按同一 API 查到的是 `EditControl`。
+//   可见状态下它又完全正确（167 拍 `50004` / 182 拍 `50030`，与真值一致）。
+//   ⇒ 隐藏态不拿它做决定；**落点查询不依赖焦点跟踪**，两个状态都稳
 //     （实测：输入框上 = `EditControl`，同窗口空白 = `DocumentControl`）。
 // 返回值：1 = 是输入框；0 = 不是；-1 = 查不出来
 static int UiaPointEditable(POINT pt) {
+    g_dbgUiaPtCt = -1;
     if (!EnsureUia()) return -1;
     IUIAutomationElement* el = NULL;
     if (FAILED(g_uia->ElementFromPoint(pt, &el)) || !el) return -1;
@@ -7334,17 +7453,227 @@ static int UiaPointEditable(POINT pt) {
     HRESULT hr = el->get_CurrentControlType(&ct);
     el->Release();
     if (FAILED(hr)) return -1;
+    g_dbgUiaPtCt = (int)ct;
     return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
 }
 
-// 系统触摸键盘（Win10/11 的 TabTip）此刻是否可见。
-//   触屏上这是**系统给出的可信信号**：只有点了文本输入框它才会被唤起 ——
-//   而触屏的"点了哪儿"我们看不见（触控不产生鼠标消息，拿不到落点），正好用它补上。
-//   ⚠ 只在"精判刚收过"的分支里调（频率极低），别搬进每 50ms 的主路径。
-static BOOL SystemTouchKeyboardVisible() {
-    HWND h = FindWindowW(L"IPTip_Main_Window", NULL);
-    return (h != NULL) && IsWindowVisible(h);
+// dwmapi 的 DwmGetWindowAttribute —— 与上面 DwmSetWindowAttribute 一样**动态取**，
+//   不新增链接依赖（本机没有编译器，arm64 job 上链新的 lib 有翻车史）。
+typedef HRESULT (WINAPI *DwmGetWindowAttributeProc)(HWND, DWORD, PVOID, DWORD);
+static DwmGetWindowAttributeProc GetDwmGetWindowAttribute() {
+    static DwmGetWindowAttributeProc proc = NULL;
+    static BOOL tried = FALSE;
+    if (!tried) {
+        tried = TRUE;
+        HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+        if (dwm) proc = (DwmGetWindowAttributeProc)GetProcAddress(dwm, "DwmGetWindowAttribute");
+    }
+    return proc;
 }
+
+// 系统触摸键盘此刻是否**真的显示着**。
+//   Win10：`TabTip.exe` 的 `IPTip_Main_Window`，直接按类名找 + IsWindowVisible 就够。
+//   Win11：由 `TextInputHost.exe` 承载，窗口类 `Windows.UI.Core.CoreWindow`。
+//     ⚠⚠ 实测（本机 Win11）：**这个宿主窗口常年 IsWindowVisible=TRUE**
+//        （rect 就是整屏 1463x914，标题「Windows 输入体验」）——
+//        只看 IsWindowVisible 会永远判成"键盘在显示"。
+//        真正没显示时它被 **DWM cloak**（实测 `DWMWA_CLOAKED=2` = DWM_CLOAKED_SHELL）。
+//        ⇒ 所以补一道 cloaked 判定：visible 且 **未** cloak 才算显示。
+//   （该窗口类被大量 UWP 宿主复用 —— 本机 explorer.exe / SystemSettings.exe 各有一个
+//     —— 所以必须再按**进程名**确认，只看类名会误伤。）
+// ⚠ 只在"精判刚收过"的分支里调（频率极低），并有 100ms 缓存，不进每 50ms 主路径。
+struct TipEnumCtx { BOOL found; };
+static BOOL CALLBACK TipEnumProc(HWND h, LPARAM lp) {
+    TipEnumCtx* c = (TipEnumCtx*)lp;
+    if (!IsWindowVisible(h)) return TRUE;
+    char cls[128] = {0};
+    GetClassNameA(h, cls, 128);
+    if (!strstr(cls, "Windows.UI.Core.CoreWindow") &&
+        !strstr(cls, "InputSite") && !strstr(cls, "TextInputHost"))
+        return TRUE;
+    wchar_t exe[64] = {0};
+    if (!WindowProcessName(h, exe, 64)) return TRUE;
+    if (_wcsicmp(exe, L"TextInputHost.exe") != 0 && _wcsicmp(exe, L"TabTip.exe") != 0)
+        return TRUE;
+    DWORD cloaked = 0;
+    DwmGetWindowAttributeProc getAttr = GetDwmGetWindowAttribute();
+    if (getAttr) {
+        const DWORD DWMWA_CLOAKED_VALUE = 14;
+        if (SUCCEEDED(getAttr(h, DWMWA_CLOAKED_VALUE, &cloaked, sizeof(cloaked))) && cloaked)
+            return TRUE;        // 被 DWM 遮住 ⇒ 没在显示
+    }
+    c->found = TRUE;
+    return FALSE;               // 找到了，停
+}
+
+static BOOL g_tipVisible = FALSE;
+static DWORD g_tipCheckTick = 0;
+static BOOL SystemTouchKeyboardVisible() {
+    DWORD now = GetTickCount();
+    if (g_tipCheckTick && now - g_tipCheckTick < 100) return g_tipVisible;
+    g_tipCheckTick = now;
+    BOOL vis = FALSE;
+    HWND t = FindWindowW(L"IPTip_Main_Window", NULL);
+    if (t && IsWindowVisible(t)) vis = TRUE;
+    if (!vis) {
+        TipEnumCtx ctx = { FALSE };
+        EnumWindows(TipEnumProc, (LPARAM)&ctx);
+        vis = ctx.found;
+    }
+    g_tipVisible = vis;
+    return vis;
+}
+
+// 触屏专用证据：**刚才有过一次焦点变化**（WinEvent 全局钩子，out-of-context）。
+// 触屏上"点了哪儿"我们拿不到（Chromium 系注册了指针输入，触控不会被提升成鼠标消息，
+// WH_MOUSE_LL 收不到），但"点了输入框"一定伴随一次焦点转移（Document → Edit）。
+//   · 原来焦点在空白 → 点输入框：焦点转移 → 有事件 ⇒ 放行 ✓
+//   · 原来焦点就在空白 → 再点空白：焦点没变 → 没事件 ⇒ 保持收起 ✓（不会闪）
+//   · 原来焦点在输入框 → 点空白：焦点转移 → 会弹，然后精判立刻收（这一种才闪）
+// ⚠ 只对触屏启用：桌面机上点空白同样产生焦点事件，那会退化成"点哪儿都弹"。
+static BOOL TouchFocusEvidence() {
+    if (!IsTouchDevice()) return FALSE;
+    if (!g_lastFocusEvTick) return FALSE;
+    if (GetTickCount() - g_lastFocusEvTick > 1200) return FALSE;
+    HWND fg = RealForegroundWindow();
+    HWND fgTop = fg ? GetAncestor(fg, GA_ROOT) : NULL;
+    if (!g_lastFocusEvHwnd || !fgTop) return FALSE;
+    return GetAncestor(g_lastFocusEvHwnd, GA_ROOT) == fgTop;
+}
+
+// 用户**主动**把键盘叫出来（托盘单击/菜单、热键）时作废"精判收起"备忘。
+//   理由：那是明确的"我要键盘"信号，不该被上一轮的收起状态挡着；
+//   也让"某一轮判据出错把键盘锁住"有一个用户可自救的出口。
+static void ForgetVerdictHide() {
+    g_verdictHide = FALSE;
+    g_verdictHidFg = NULL;
+    g_uiaCacheTick = 0;
+}
+
+// ===== 导出诊断日志（托盘右键菜单）=====
+// 把常驻环形缓冲 + 一份环境快照写成文件，用户直接把这个文件发出来即可。
+// ⚠ 不需要带 -afdiag 启动、也不需要"重现前先做准备工作" —— 缓冲一直在跑，
+//   出问题时再导出，最近约 3 分钟的过程都在里面。
+static void DiagWrite(HANDLE h, const char* s) {
+    DWORD wr = 0;
+    WriteFile(h, s, (DWORD)strlen(s), &wr, NULL);
+}
+
+// 读注册表里的 Windows 版本（GetVersionEx 在没有清单时会撒谎，这里取真值）。
+// ⚠ 本项目目标是 XP（_WIN32_WINNT=0x0501），**不能用 `RegGetValueA`**（Vista+ 才声明）
+//   —— 用 RegOpenKeyExW + RegQueryValueExW，与文件里其它读注册表的地方一致。
+static void DiagOsVersion(char* out, int cch) {
+    out[0] = 0;
+    char product[96] = "?", dv[32] = "?", build[32] = "?", ubr[32] = "";
+    HKEY k = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                      0, KEY_READ, &k) == ERROR_SUCCESS) {
+        struct { const wchar_t* name; char* dst; DWORD cch; } items[] = {
+            { L"ProductName",    product, sizeof(product) },
+            { L"DisplayVersion", dv,      sizeof(dv) },
+            { L"CurrentBuild",   build,   sizeof(build) },
+        };
+        for (int i = 0; i < 3; i++) {
+            wchar_t wv[128] = {0};
+            DWORD cb = sizeof(wv), type = 0;
+            if (RegQueryValueExW(k, items[i].name, NULL, &type,
+                                 (LPBYTE)wv, &cb) == ERROR_SUCCESS &&
+                (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                WideCharToMultiByte(CP_ACP, 0, wv, -1, items[i].dst,
+                                    (int)items[i].cch, NULL, NULL);
+            }
+        }
+        DWORD ubrVal = 0, cb2 = sizeof(ubrVal), type2 = 0;
+        if (RegQueryValueExW(k, L"UBR", NULL, &type2, (LPBYTE)&ubrVal,
+                             &cb2) == ERROR_SUCCESS && type2 == REG_DWORD)
+            _snprintf_s(ubr, sizeof(ubr), _TRUNCATE, "%lu", (unsigned long)ubrVal);
+        RegCloseKey(k);
+    }
+    _snprintf_s(out, cch, _TRUNCATE, "%s %s build %s.%s", product, dv, build, ubr);
+}
+
+static void ExportDiagLog() {
+    wchar_t self[MAX_PATH * 2] = {0};
+    GetModuleFileNameW(NULL, self, MAX_PATH * 2);
+    wchar_t* sl = wcsrchr(self, L'\\');
+    if (sl) *(sl + 1) = 0;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t path[MAX_PATH * 2] = {0};
+    _snwprintf_s(path, MAX_PATH * 2, _TRUNCATE,
+                 L"%sHKeyboard_diag_%04d%02d%02d_%02d%02d%02d.txt",
+                 self, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        MessageBoxW(g_hWnd, L"无法写入日志文件（目录不可写）。", L"导出诊断日志",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    char osv[192] = {0};
+    DiagOsVersion(osv, sizeof(osv));
+    char selfA[MAX_PATH * 2] = {0};
+    WideCharToMultiByte(CP_ACP, 0, self, -1, selfA, sizeof(selfA), NULL, NULL);
+
+    char head[2048];
+    _snprintf_s(head, sizeof(head), _TRUNCATE,
+        "HKeyboard diagnostic dump\r\n"
+        "build          : %s %s\r\n"
+        "exported at    : %04d-%02d-%02d %02d:%02d:%02d\r\n"
+        "exe dir        : %s\r\n"
+        "pid            : %lu\r\n"
+        "OS             : %s\r\n"
+        "DPI scale      : %.3f\r\n"
+        // ⚠ 这三个 SM_* 常量在 _WIN32_WINNT=0x0501 下没有声明（Vista+ 才进 winuser.h），
+        //   所以按数值写 —— 与 IsTouchDevice 里的 94/95 同一处理。
+        "touch device   : %d (maxTouches=%d, digitizer=0x%X, tabletPC=%d)\r\n"
+        "ini AutoPopup  : %d\r\n"
+        "ini AutoHide   : %d\r\n"
+        "ini ChromPrec  : %d\r\n"
+        "layout mode    : %d\r\n"
+        "now state      : vis=%d visWnd=%d manualHide=%d manualShow=%d await=%d\r\n"
+        "                 verdictHide=%d verdictFg=%p trustFg=%p tabStopVisible=%d\r\n"
+        "ring entries   : %d (oldest -> newest)\r\n"
+        "------------------------------------------------------------\r\n",
+        __DATE__, __TIME__,
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+        selfA, (unsigned long)GetCurrentProcessId(), osv,
+        GetSystemDpiScale(),
+        (int)IsTouchDevice(), (int)GetSystemMetrics(95),
+        (unsigned)GetSystemMetrics(94), (int)GetSystemMetrics(86),
+        (int)g_af, (int)g_afAutoHide, (int)g_afChromiumPrecise,
+        g_layoutMode,
+        (int)g_vis, (int)g_dbgVisWnd, (int)g_manualHide, (int)g_manualShow,
+        (int)g_fgAwaitUserInput,
+        (int)g_verdictHide, (void*)g_verdictHidFg, (void*)g_chromiumTrustFg,
+        (int)SystemTouchKeyboardVisible(),
+        g_ringCount);
+    DiagWrite(h, head);
+
+    // 环形缓冲按时间顺序输出
+    int start = (g_ringCount < HKRING_N) ? 0 : g_ringHead;
+    for (int i = 0; i < g_ringCount; i++) {
+        const char* line = g_ring[(start + i) % HKRING_N];
+        DWORD wr = 0;
+        WriteFile(h, line, (DWORD)strlen(line), &wr, NULL);
+    }
+    CloseHandle(h);
+
+    // 打开资源管理器并选中该文件
+    wchar_t arg[MAX_PATH * 2 + 32] = {0};
+    _snwprintf_s(arg, MAX_PATH * 2 + 32, _TRUNCATE, L"/select,\"%s\"", path);
+    ShellExecuteW(NULL, L"open", L"explorer.exe", arg, NULL, SW_SHOWNORMAL);
+
+    wchar_t msg[MAX_PATH * 3] = {0};
+    _snwprintf_s(msg, MAX_PATH * 3, _TRUNCATE,
+                 L"诊断日志已导出：\n%s\n\n请把该文件发送给开发者。", path);
+    MessageBoxW(g_hWnd, msg, L"导出诊断日志", MB_OK | MB_ICONINFORMATION);
+}
+
 
 // ⚠ 取**上升沿**：TabTip 一旦出现会持续可见（电平），直接用会变成
 //   "清标记 → 弹出 → 精判又收起 → 还在可见 → 再清 → …" 的振荡。
@@ -7565,74 +7894,73 @@ static void UpdateAutoVisibility() {
     g_dbgExtraDue = (g_afLogPath[0] && (recentClick || byKey)) ? TRUE : FALSE;
     HWND input = GetFocusedInputControl();
 
-    // ★ Chromium 系精判（2026-10-10）：粗判只说明"前台是 Chromium 窗口"，
-    //   说明不了"光标在输入框里" —— 于是 Chromium 系一在前台就永远不收起。
-    //   补一次 UIA 焦点元素的 ControlType：
-    //     Edit(50004) → 确实在输入框里（保持显示，走下面的原逻辑）
-    //     其它        → 视为"没有输入焦点了"，落进下面的失焦分支触发自动收起
+    // ★ Chromium 系精判（2026-10-10，第 34 轮重写）
     //
-    // ⚠⚠⚠ 这条判据必须**对称地管两个方向**，否则就是自激振荡。
-    //   第一版我给它加了「只在键盘已显示时查」（想省跨进程 COM 的代价），
-    //   用户的日志当场证伪，周期约 2 秒：
-    //       隐藏 → 跳过精判 → 粗判说"有输入" → ShowKB(TRUE)
-    //       → 已显示，精判跑起来、说"不在输入框" → ShowKB(FALSE)
-    //       → 隐藏 → 又跳过精判 → 又弹 …… 无限循环
-    //   那一拍的日志特征很好认：`vis=0 ... => hasInput uiact=-1`
-    //   （**uiact=-1 = 这一拍没查**，于是粗判独自做了决定）。
-    //   ⇒ **绝不能按 g_vis 跳过查询**：隐藏状态下同样要知道"光标在不在输入框里"，
-    //     否则"该不该弹"就退化成粗判 —— 而粗判对 Chromium 恒为真。
+    //   粗判（IsInputControl 的类名分支）只能说明"前台是 Chromium 窗口"，
+    //   说明不了"光标在不在可编辑输入框里" —— 于是 Chromium 系一在前台就永远不收起。
     //
-    // ⚠⚠ 两道护栏（都为了不重蹈第十一轮"输入框不弹"的覆辙）：
-    //   ① **信任门**（g_chromiumTrustFg）：只有当我们**在这个窗口上见过 Edit**
-    //      才采信它的"不在输入框"。原因：contenteditable 型输入框在 UIA 里
-    //      根本报不出 Edit —— 实测 QQ 的聊天输入框是 ProseMirror，
-    //      报 `GroupControl`（整个 QQ 窗口里 EditControl 数量为 **0**）。
-    //      没有这道门，那类应用会被判成"永远不在输入框"⇒ 自动呼出直接失效。
-    //      没见过 Edit 的窗口 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
-    //   ② **正在输入时不收**（typing）：实体键或刚按过屏幕键盘的键。
-    BOOL chromiumVerdict = -1;      // 1=在输入框 0=不在 -1=没查/未知
-    // ⚠⚠ 只在**键盘已显示**时查焦点判据 —— 这一条不是为省开销，是必需的：
-    //   实测（-hide 启动的实例）**隐藏期间 `GetFocusedElement()` 给的是冻结值** ——
-    //   129 拍恒为 `ButtonControl`，而同刻同一 API 在 Python 侧查到的是 `EditControl`
-    //   （真实焦点确实在输入框里）；可见状态下它又完全正确（167 拍 50004 / 182 拍 50030）。
-    //   ⇒ 隐藏态**不消费**这个判据，否则"该不该弹"会被冻结值决定，键盘从此弹不出来
-    //     （用户实测「WorkBuddy 的输入框又不行了」）。
-    //   "要再弹"这件事改由**落点查询**回答（见下面 show 分支的 g_verdictHide）。
-    if (input && g_vis && g_afChromiumPrecise && g_detectedByChromiumClass) {
-        BOOL typing = byKey || (g_lastOwnKeyTick && (nowTick - g_lastOwnKeyTick) <= 1200);
-        if (!typing) chromiumVerdict = UiaFocusEditableHeld();
-    } else {
-        g_dbgUiaCt = -1;            // 本 tick 没查 —— 别在日志里留上一次的残值
+    //   ⚠⚠ 前几版反复翻车的根因只有一条：**"该不该弹"和"该不该收"用了两个
+    //     不对称的判据**。粗判对 Chromium 恒为真，所以只要"收"由精判定、
+    //     "弹"由粗判定，两者必然互相打架 ⇒ 周期约 2 秒的自激振荡
+    //     （日志特征：`vis=0 ... => hasInput uiact=-1`，即那一拍没查）。
+    //
+    //   ⇒ 本轮把两个方向都用**同一个判据**回答，而且都要求**正面证据**：
+    //       已显示 → 问焦点（此刻可信，实测 233/233 连续 14 秒零跳变）；
+    //                明确"不在可编辑元素里"才收。
+    //       隐藏中 → 必须有"用户刚点了可编辑元素"的正面证据才允许弹；
+    //                没有证据就保持隐藏 —— **"保持隐藏"本身即稳定态**，
+    //                所以不需要任何额外的压制标记去兜（前几版的锁死都出自那里）。
+    //
+    //   护栏（都是为了不重蹈第十一轮"输入框不弹"的覆辙）：
+    //     ① **信任门**（g_chromiumTrustFg）：只有在这个窗口上**见过可编辑元素**
+    //        才采信它的"不在输入框"。contenteditable 型输入框报不出 Edit ——
+    //        实测 QQ NT 主窗口里 EditControl 只有搜索框一个，聊天输入框
+    //        （ProseMirror）报 GroupControl。没这道门那类应用会被判成
+    //        "永远不在输入框" ⇒ 自动呼出直接失效。
+    //        没见过 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
+    //     ② **正在输入时不收**（typing）：实体键或刚按过屏幕键盘的键。
+    //     ③ 判据的缓存/保持期**按窗口分组**，并且校验焦点元素的归属窗口 ——
+    //        否则"上一个窗口"的结论会被当成"这个窗口"的（实测把 QQ 锁死的正是这条）。
+    int chromiumVerdict = -1;       // 焦点判据：1=可编辑 0=明确不是 -1=未知
+    if (input && g_afChromiumPrecise && g_detectedByChromiumClass) {
+        if (g_vis) {
+            // ⚠ 只在**已显示**时用焦点判据：隐藏期间它给过无效值
+            //   （实测 -hide 启动的实例连续 129 拍恒为 ButtonControl，
+            //     而同刻同 API 在 Python 侧查到的是 EditControl）。
+            BOOL typing = byKey || (g_lastOwnKeyTick && (nowTick - g_lastOwnKeyTick) <= 1200);
+            if (!typing) chromiumVerdict = UiaFocusEditableHeld(fgNow);
+        } else {
+            g_dbgUiaCt = -1;        // 本 tick 没查 —— 别在日志里留上一次的残值
+        }
     }
-    // 信任门：**只有真正见到 Edit 才设**。-1（未知）绝不算 —— 上一版把它折成"是输入框"
-    // 又拿它设门，后面一次冻结的非 Edit 就把键盘永久收掉了。
+    // 信任门：**只有真正见到可编辑元素才设**。-1（未知）绝不算。
     if (chromiumVerdict == 1) g_chromiumTrustFg = fgNow;
     if (input && chromiumVerdict == 0 &&
         g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) {
-        // 精判说"光标不在输入框里" ⇒ 收起，并记下"这一次是精判收的"。
-        // 这个标记有两个作用：
-        //   ① 让收起**不会立刻被粗判弹回来**（那正是自激振荡）；
-        //   ② 同时**不阻断弹出** —— 用户一点输入框就能回来（见 show 分支）。
+        // 精判说"光标不在可编辑元素里" ⇒ 收起，并记下"这一次是精判收的"。
         g_verdictHide = TRUE;
         g_verdictHidFg = fgNow;
-        g_verdictHidMisses = 0;
         input = NULL;
     }
+    // 换了前台窗口 ⇒ 这条备忘作废（新窗口要重新攒证据）。
+    if (g_verdictHide && g_verdictHidFg != fgNow) g_verdictHide = FALSE;
 
-    // 诊断（-afdiag）：记录这次评估的全部输入量
+    // 诊断（-afdiag / 日志导出）：记录这次评估的全部输入量
     {
-        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时才查）：
+        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时查）：
         // 结果既进日志，也供下面的 show 分支决定要不要放行 —— 一拍只查一次。
         g_dbgUiaPt = -1;
-        if (g_verdictHide && g_verdictHidFg == fgNow && recentClick && g_afChromiumPrecise)
+        g_dbgUiaPtCt = -1;
+        if (g_verdictHide && g_verdictHidFg == fgNow && recentClick &&
+            g_afChromiumPrecise && g_detectedByChromiumClass)
             g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
-        char st[96];
-        // uiact：这次拿到的焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
-        // inFg ：触屏兜底的"用户在本窗口里操作过"是否成立（见 UserInputAfterForegroundChange）
-        // pt   ：点击落点查询结果（1=落在输入框 0=落在空白 -1=没查）
-        _snprintf_s(st, sizeof(st), _TRUNCATE, "%s uiact=%d inFg=%d pt=%d hid=%d",
-                    input ? "hasInput" : "noInput", g_dbgUiaCt, (int)byUserInFg,
-                    g_dbgUiaPt, (int)g_verdictHide);
+        char st[112];
+        // uiact：本次焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
+        // pt/ptc：点击落点查询结果与落点元素 ControlType（-1=没查/查不出）
+        // inFg ：触屏兜底的"用户在本窗口里操作过"是否成立
+        _snprintf_s(st, sizeof(st), _TRUNCATE, "%s uiact=%d pt=%d ptc=%d inFg=%d hid=%d",
+                    input ? "hasInput" : "noInput", g_dbgUiaCt,
+                    g_dbgUiaPt, g_dbgUiaPtCt, (int)byUserInFg, (int)g_verdictHide);
         g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;
         RECT wr = {0, 0, 0, 0};
         if (g_hWnd) GetWindowRect(g_hWnd, &wr);
@@ -7643,39 +7971,38 @@ static void UpdateAutoVisibility() {
               g_fgAwaitUserInput, g_vis, g_mainMotion.active, st);
     }
     if (input) {
-        // ★ 精判驱动的自动收起：要再弹回来，必须有"用户点了输入框"的证据。
+        // ★ Chromium 系精判驱动的自动收起：要再弹回来，必须**重新攒到正面证据**。
         //
         // ⚠ 不能用"点了窗口内任何地方"当证据 —— 那样点空白也会弹一下再收（闪一下），
         //   而用户点空白本来就是要它收着。⇒ 用 UIA **落点查询**（ElementFromPoint）
         //   问"这一下点在什么上面"：
-        //     点在 Edit 上       → 用户要打字 → 放行，弹回来；
-        //     点在空白/Document 上 → 保持收起（**不发 ShowKB**，所以不会闪）；
-        //     查不出来(-1)        → 不做决定，按原逻辑走（安全侧：不干扰既有行为）。
-        //   落点查询不依赖 UIA 的焦点跟踪，隐藏态也可靠（见 UiaPointEditable 的实测说明）。
+        //     点在可编辑元素上   → 用户要打字 → 放行，弹回来；
+        //     点在空白 / Document → 保持收起（**不发 ShowKB**，所以不会闪）；
+        //     查不出来(-1)        → 保守放行（判据失效时宁可多弹一次，
+        //                           也不能让用户点了输入框叫不出键盘）。
+        //   ⚠ 只有**信任门已开**（这个窗口见过可编辑元素）时才采信"不是输入框"；
+        //     否则落点判据在此不可用（contenteditable 应用）⇒ 保守放行。
         //
-        // 触发放行的其它路径：敲了实体键、触屏上操作过、换了前台窗口
-        // （用户随时都能把键盘叫回来，不会被这个标记锁死）。
+        // ⚠⚠ 第 33 轮的"连点 3 次判不出就放回来"是错的，已删：`pt==0` 是
+        //   **判出来了、就是空白**，不是判定失败。拿它当"失败"去放行，
+        //   结果正是用户看到的「离开输入框时乱跳一次」—— 日志特征：连着 3 拍
+        //   `hid=1 pt=0` 之后紧跟一个 ShowKB，然后再收。
+        //
+        // 其它放行路径：敲了实体键、换了前台窗口、系统触摸键盘刚出现（触屏）。
         if (g_verdictHide) {
             if (g_verdictHidFg != fgNow || byKey) {
-                g_verdictHide = FALSE;      // 换了前台窗口 / 敲了实体键 → 重新开始
-                g_verdictHidMisses = 0;
+                g_verdictHide = FALSE;      // 换了前台窗口 / 敲了实体键 → 重新攒证据
             } else if (recentClick) {
                 // 落点查询结果在诊断块里已经算好（g_dbgUiaPt），一拍只查一次
-                if (g_dbgUiaPt == 1) {
-                    g_verdictHide = FALSE;  // 点在输入框上 → 弹回来
-                    g_verdictHidMisses = 0;
-                } else if (g_dbgUiaPt == 0 && ++g_verdictHidMisses < 3) {
-                    return;                 // 点在空白上 → 保持收起，且不要弹一下再收
-                } else {
-                    // 连点 3 次都判不出输入框 ⇒ 不再压制，放回来（判据在这个应用上
-                    // 不可用时的兜底 —— 宁可多弹一次，也不能让用户叫不出键盘）
-                    g_verdictHide = FALSE;
-                    g_verdictHidMisses = 0;
+                if (g_dbgUiaPt == 0 && g_chromiumTrustFg == fgNow) {
+                    return;                 // 明确点过空白 → 保持收起，且不要弹一下再收
                 }
-            } else if (SysTipJustAppeared()) {
-                // 触屏：系统触摸键盘刚弹出来 = 用户刚点了文本输入框（见其定义处说明）
+                g_verdictHide = FALSE;      // 点在可编辑元素上 / 判据不可用 → 放行
+            } else if (SysTipJustAppeared() || TouchFocusEvidence()) {
+                // 触屏（拿不到落点，所以这两条是触屏的替代证据）：
+                //   · 系统触摸键盘刚弹出来 = 用户刚点了文本输入框；
+                //   · 或者刚才那次焦点变化发生在当前前台窗口里（见 TouchFocusEvidence）。
                 g_verdictHide = FALSE;
-                g_verdictHidMisses = 0;
             } else {
                 // 没有新的用户动作 → 保持收起。
                 // ⚠ 这里**刻意不用 byUserInFg** —— 它是电平式的（一次触控后一直为真
@@ -7809,12 +8136,15 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
 static LRESULT CALLBACK PhysMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         const MSLLHOOKSTRUCT* m = (const MSLLHOOKSTRUCT*)lParam;
-        if (!(m->flags & LLMHF_INJECTED) && wParam == WM_LBUTTONDOWN) {
+        if ((!(m->flags & LLMHF_INJECTED) || g_dbgAcceptInjected) && wParam == WM_LBUTTONDOWN) {
             g_lastClickTick = GetTickCount();
             g_lastClickPt = m->pt;
             // 当场记下落点的顶层窗口（供 UpdateAutoVisibility 判断"点的是不是当前前台窗口"）
             HWND h = WindowFromPoint(m->pt);
             g_lastClickTopHwnd = h ? GetAncestor(h, GA_ROOT) : NULL;
+            // 点击之后焦点必然变了 ⇒ 作废 UIA 判定缓存，
+            // 否则点进输入框后的前 250ms 还在用"点在空白"时的旧结论去收起（会闪）。
+            InvalidateUiaCache();
         }
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
@@ -7827,9 +8157,10 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode == HC_ACTION) {
         const KBDLLHOOKSTRUCT* p = (const KBDLLHOOKSTRUCT*)lParam;
         // 忽略本程序 SendInput 注入的事件，避免与虚拟键逻辑互相干扰
-        if (!(p->flags & LLKHF_INJECTED)) {
+        if (!(p->flags & LLKHF_INJECTED) || g_dbgAcceptInjected) {
             // 真实按键 = 用户主动操作，记一笔供自动呼出判断（见 g_lastKeyTick）
             g_lastKeyTick = GetTickCount();
+            InvalidateUiaCache();   // 按键后焦点可能已变（Tab / 方向键）
             BOOL down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
             BOOL up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
             if (down || up) {
@@ -8755,6 +9086,8 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     // ⚠ -afdiag 必须放在 #endif **外面** —— 它要能在正式版里工作。
     //   自动呼出诊断日志（临时，定位完删）
+    // -dginj：让钩子接受注入事件（**仅供自测**，见 g_dbgAcceptInjected 的说明）
+    g_dbgAcceptInjected = HasArg(cmd, "-dginj") ? TRUE : FALSE;
     if (HasArg(cmd, "-afdiag")) {
         wchar_t lp[MAX_PATH] = {0};
         GetModuleFileNameW(NULL, lp, MAX_PATH);

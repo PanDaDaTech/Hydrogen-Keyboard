@@ -7240,6 +7240,17 @@ static IUIAutomation* g_uia = NULL;
 //   那类应用会被判成"永远不在输入框"⇒ 自动呼出直接失效（第十一轮的翻车形态）。
 static HWND g_chromiumTrustFg = NULL;
 
+// 精判驱动的自动收起状态（详见 UpdateAutoVisibility 的 show 分支）。
+//   ⚠ 存在的意义是**同时**解决两件事：收起后不被粗判立刻弹回（防振荡），
+//     又不把弹出永久堵死（用户点输入框就能回来）。
+static BOOL g_verdictHide = FALSE;       // 这次收起是精判造成的
+static HWND g_verdictHidFg = NULL;       // 收起时所在的前台窗口
+// 连续几次"点了但落点判不出是输入框"。到 3 次就放弃压制，把键盘放回来 ——
+// 兜的是"落点判据在某个输入框上不成立"（例如可信应用里的 contenteditable 页面输入框）：
+// 宁可偶尔多弹一次，也不能让用户点了输入框还叫不出键盘。
+static int  g_verdictHidMisses = 0;
+static int  g_dbgUiaPt = -1;             // 诊断：最近一次落点查询结果
+
 static BOOL EnsureUia() {
     if (g_uia) return TRUE;
     // 复用已有的 COM 初始化（oleacc 那条路也是它）—— 重复 CoInitializeEx 会拿到
@@ -7275,21 +7286,23 @@ static int UiaFocusEditable() {
 // 带缓存的版本：UIA 是跨进程 COM，别每 50ms 调一次。
 //   TTL 250ms —— 比 tick（50ms）粗得多，又比"人手离开输入框"快得多。
 //   ⚠ 缓存的是**判定结果**，不是元素指针。
-//   查不出来（-1）按"是输入框"处理 ⇒ 不收起，落在安全侧。
+// ⚠⚠ -1（查不出来）**必须原样保留**，绝不能折成 1。上一版就是把它当成"是输入框"，
+//   同时又拿它去设信任门 ⇒ 之后隐藏态返回一次冻结的"非 Edit"，键盘被永久收掉，
+//   用户点输入框也回不来（实测「WorkBuddy 的输入框又不行了」）。
+//   现在的语义：**只有明确查出来才做决定**，-1 一律不做决定（不收起、不设信任）。
 static int UiaFocusEditableCached() {
-    static int   cached = 1;
+    static int   cached = -1;
     static DWORD cachedTick = 0;
     DWORD now = GetTickCount();
     if (cachedTick && now - cachedTick < 250) return cached;
-    int v = UiaFocusEditable();
-    cached = (v < 0) ? 1 : v;
+    cached = UiaFocusEditable();
     cachedTick = now;
     return cached;
 }
 
 // 在缓存之上再加一层"保持期"：**刚见过 Edit 的一小段时间内一律按"在输入框"处理**。
-// 挡的是单次误报 —— Chromium 的焦点上报偶有瞬时非 Edit（尤其刚显示/隐藏之后，
-// 缓存里可能还留着上一拍的值）。保持期比缓存粗一档，让一次坏采样翻不动结论。
+// 挡的是单次误报 —— Chromium 的焦点上报偶有瞬时非 Edit。
+// 保持期比缓存粗一档，让一次坏采样翻不动结论。
 // 代价：离开输入框后收起会晚 400ms，可接受。
 static DWORD g_uiaHoldEditTick = 0;
 static int UiaFocusEditableHeld() {
@@ -7297,7 +7310,47 @@ static int UiaFocusEditableHeld() {
     int v = UiaFocusEditableCached();
     if (v == 1) g_uiaHoldEditTick = now;
     if (g_uiaHoldEditTick && now - g_uiaHoldEditTick < 400) return 1;
-    return v;
+    return v;               // ⚠ 可能是 -1（未知）—— 调用方必须当成"不做决定"
+}
+
+// ===== 落点查询：这个屏幕点上是可编辑输入框吗？（UIA ElementFromPoint）=====
+//
+// ⚠⚠ 为什么"要再弹"这件事必须用**落点**而不是**焦点**：
+//   实测（本机，-hide 启动的实例）：HKeyboard 隐藏期间 `GetFocusedElement()`
+//   给出的是**冻结值** —— 129 拍全是 `ButtonControl`，而同刻 Python 侧按同一 API
+//   查到的是 `EditControl`（真实焦点确实在输入框里）。可见状态下它又完全正确
+//   （167 拍 `50004` / 182 拍 `50030`，与真值一致）。
+//   ⇒ 焦点查询在隐藏态不可信；**落点查询不依赖焦点跟踪，隐藏态也始终正确**
+//     （实测：输入框上 = `EditControl`，同窗口空白 = `DocumentControl`）。
+// 返回值：1 = 是输入框；0 = 不是；-1 = 查不出来
+static int UiaPointEditable(POINT pt) {
+    if (!EnsureUia()) return -1;
+    IUIAutomationElement* el = NULL;
+    if (FAILED(g_uia->ElementFromPoint(pt, &el)) || !el) return -1;
+    CONTROLTYPEID ct = 0;
+    HRESULT hr = el->get_CurrentControlType(&ct);
+    el->Release();
+    if (FAILED(hr)) return -1;
+    return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
+}
+
+// 系统触摸键盘（Win10/11 的 TabTip）此刻是否可见。
+//   触屏上这是**系统给出的可信信号**：只有点了文本输入框它才会被唤起 ——
+//   而触屏的"点了哪儿"我们看不见（触控不产生鼠标消息，拿不到落点），正好用它补上。
+//   ⚠ 只在"精判刚收过"的分支里调（频率极低），别搬进每 50ms 的主路径。
+static BOOL SystemTouchKeyboardVisible() {
+    HWND h = FindWindowW(L"IPTip_Main_Window", NULL);
+    return (h != NULL) && IsWindowVisible(h);
+}
+
+// ⚠ 取**上升沿**：TabTip 一旦出现会持续可见（电平），直接用会变成
+//   "清标记 → 弹出 → 精判又收起 → 还在可见 → 再清 → …" 的振荡。
+static BOOL g_sysTipPrev = FALSE;
+static BOOL SysTipJustAppeared() {
+    BOOL tip = SystemTouchKeyboardVisible();
+    BOOL edge = (tip && !g_sysTipPrev);
+    g_sysTipPrev = tip;
+    return edge;
 }
 
 static BOOL IsInputControl(HWND hw) {
@@ -7534,26 +7587,49 @@ static void UpdateAutoVisibility() {
     //      没有这道门，那类应用会被判成"永远不在输入框"⇒ 自动呼出直接失效。
     //      没见过 Edit 的窗口 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
     //   ② **正在输入时不收**（typing）：实体键或刚按过屏幕键盘的键。
-    BOOL chromiumVerdict = -1;      // 1=在输入框 0=不在 -1=没查
-    if (input && g_afChromiumPrecise && g_detectedByChromiumClass) {
+    BOOL chromiumVerdict = -1;      // 1=在输入框 0=不在 -1=没查/未知
+    // ⚠⚠ 只在**键盘已显示**时查焦点判据 —— 这一条不是为省开销，是必需的：
+    //   实测（-hide 启动的实例）**隐藏期间 `GetFocusedElement()` 给的是冻结值** ——
+    //   129 拍恒为 `ButtonControl`，而同刻同一 API 在 Python 侧查到的是 `EditControl`
+    //   （真实焦点确实在输入框里）；可见状态下它又完全正确（167 拍 50004 / 182 拍 50030）。
+    //   ⇒ 隐藏态**不消费**这个判据，否则"该不该弹"会被冻结值决定，键盘从此弹不出来
+    //     （用户实测「WorkBuddy 的输入框又不行了」）。
+    //   "要再弹"这件事改由**落点查询**回答（见下面 show 分支的 g_verdictHide）。
+    if (input && g_vis && g_afChromiumPrecise && g_detectedByChromiumClass) {
         BOOL typing = byKey || (g_lastOwnKeyTick && (nowTick - g_lastOwnKeyTick) <= 1200);
         if (!typing) chromiumVerdict = UiaFocusEditableHeld();
     } else {
         g_dbgUiaCt = -1;            // 本 tick 没查 —— 别在日志里留上一次的残值
     }
-    if (chromiumVerdict == 1) g_chromiumTrustFg = fgNow;   // 这个窗口上有真实 Edit 元素
+    // 信任门：**只有真正见到 Edit 才设**。-1（未知）绝不算 —— 上一版把它折成"是输入框"
+    // 又拿它设门，后面一次冻结的非 Edit 就把键盘永久收掉了。
+    if (chromiumVerdict == 1) g_chromiumTrustFg = fgNow;
     if (input && chromiumVerdict == 0 &&
         g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) {
-        input = NULL;               // 只在可信窗口上才让精判说话
+        // 精判说"光标不在输入框里" ⇒ 收起，并记下"这一次是精判收的"。
+        // 这个标记有两个作用：
+        //   ① 让收起**不会立刻被粗判弹回来**（那正是自激振荡）；
+        //   ② 同时**不阻断弹出** —— 用户一点输入框就能回来（见 show 分支）。
+        g_verdictHide = TRUE;
+        g_verdictHidFg = fgNow;
+        g_verdictHidMisses = 0;
+        input = NULL;
     }
 
     // 诊断（-afdiag）：记录这次评估的全部输入量
     {
+        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时才查）：
+        // 结果既进日志，也供下面的 show 分支决定要不要放行 —— 一拍只查一次。
+        g_dbgUiaPt = -1;
+        if (g_verdictHide && g_verdictHidFg == fgNow && recentClick && g_afChromiumPrecise)
+            g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
         char st[96];
         // uiact：这次拿到的焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
         // inFg ：触屏兜底的"用户在本窗口里操作过"是否成立（见 UserInputAfterForegroundChange）
-        _snprintf_s(st, sizeof(st), _TRUNCATE, "%s uiact=%d inFg=%d",
-                    input ? "hasInput" : "noInput", g_dbgUiaCt, (int)byUserInFg);
+        // pt   ：点击落点查询结果（1=落在输入框 0=落在空白 -1=没查）
+        _snprintf_s(st, sizeof(st), _TRUNCATE, "%s uiact=%d inFg=%d pt=%d hid=%d",
+                    input ? "hasInput" : "noInput", g_dbgUiaCt, (int)byUserInFg,
+                    g_dbgUiaPt, (int)g_verdictHide);
         g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;
         RECT wr = {0, 0, 0, 0};
         if (g_hWnd) GetWindowRect(g_hWnd, &wr);
@@ -7564,6 +7640,46 @@ static void UpdateAutoVisibility() {
               g_fgAwaitUserInput, g_vis, g_mainMotion.active, st);
     }
     if (input) {
+        // ★ 精判驱动的自动收起：要再弹回来，必须有"用户点了输入框"的证据。
+        //
+        // ⚠ 不能用"点了窗口内任何地方"当证据 —— 那样点空白也会弹一下再收（闪一下），
+        //   而用户点空白本来就是要它收着。⇒ 用 UIA **落点查询**（ElementFromPoint）
+        //   问"这一下点在什么上面"：
+        //     点在 Edit 上       → 用户要打字 → 放行，弹回来；
+        //     点在空白/Document 上 → 保持收起（**不发 ShowKB**，所以不会闪）；
+        //     查不出来(-1)        → 不做决定，按原逻辑走（安全侧：不干扰既有行为）。
+        //   落点查询不依赖 UIA 的焦点跟踪，隐藏态也可靠（见 UiaPointEditable 的实测说明）。
+        //
+        // 触发放行的其它路径：敲了实体键、触屏上操作过、换了前台窗口
+        // （用户随时都能把键盘叫回来，不会被这个标记锁死）。
+        if (g_verdictHide) {
+            if (g_verdictHidFg != fgNow || byKey) {
+                g_verdictHide = FALSE;      // 换了前台窗口 / 敲了实体键 → 重新开始
+                g_verdictHidMisses = 0;
+            } else if (recentClick) {
+                // 落点查询结果在诊断块里已经算好（g_dbgUiaPt），一拍只查一次
+                if (g_dbgUiaPt == 1) {
+                    g_verdictHide = FALSE;  // 点在输入框上 → 弹回来
+                    g_verdictHidMisses = 0;
+                } else if (g_dbgUiaPt == 0 && ++g_verdictHidMisses < 3) {
+                    return;                 // 点在空白上 → 保持收起，且不要弹一下再收
+                } else {
+                    // 连点 3 次都判不出输入框 ⇒ 不再压制，放回来（判据在这个应用上
+                    // 不可用时的兜底 —— 宁可多弹一次，也不能让用户叫不出键盘）
+                    g_verdictHide = FALSE;
+                    g_verdictHidMisses = 0;
+                }
+            } else if (SysTipJustAppeared()) {
+                // 触屏：系统触摸键盘刚弹出来 = 用户刚点了文本输入框（见其定义处说明）
+                g_verdictHide = FALSE;
+                g_verdictHidMisses = 0;
+            } else {
+                // 没有新的用户动作 → 保持收起。
+                // ⚠ 这里**刻意不用 byUserInFg** —— 它是电平式的（一次触控后一直为真
+                //   直到换前台），拿它当"用户刚动过"会立刻变成新的振荡。
+                return;
+            }
+        }
         g_lastNonInput = 0;
         g_noInputStreak = 0;
         g_noInputSinceTick = 0;   // 输入焦点恢复，失焦计时清零（见失焦分支防抖说明）

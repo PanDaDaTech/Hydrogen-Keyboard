@@ -8,6 +8,11 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <oleacc.h>
+// ⚠ 只用到纯 getter（CoCreateInstance / GetFocusedElement / get_CurrentControlType），
+//   **不要碰 GetCurrentPropertyValue** —— 它要 VARIANT，会引入 oleaut32 依赖，
+//   而本项目的链接行只有 Comctl32 Shell32 Gdi32 User32 Advapi32 Imm32
+//   （arm64 job 上 `__imp_VariantClear` 链接失败过，见 19b0aa2）。
+#include <uiautomation.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -520,6 +525,7 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win = FALSE);
 static void InvalidateKeyByVk(HWND hWnd, short vk);
 static HWND GetFocusedInputControl();
 static void UpdateAutoVisibility();
+static BOOL IsTouchDevice();          // 定义在窗口过程附近；自动呼出要按它决定是否启用触屏兜底
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
@@ -581,6 +587,10 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
 ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
+// 本次识别是不是**只靠 Chromium 系类名粗判**命中的（Chrome_WidgetWin / RenderWidgetHost）。
+// 粗判的含义只是"前台是 Chromium 窗口"，不含"光标在输入框里"这层信息 ——
+// 只有这种命中才需要 UIA 精判去补（见 UpdateAutoVisibility 的用法）。
+BOOL        g_detectedByChromiumClass = FALSE;
 int         g_hideDelayMs = 300;       // 失焦后的自动隐藏延迟（用户实测 1 秒太慢，收到 300ms）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
 
@@ -612,6 +622,9 @@ HHOOK       g_mouseHook = 0;          // 全局鼠标低级钩子（只记录"�
 static DWORD g_lastClickTick = 0;      // 最后一次真实鼠标左键点击
 static POINT g_lastClickPt = {0, 0};   // 它的屏幕坐标
 static DWORD g_lastKeyTick = 0;        // 最后一次真实键盘按键
+// 最后一次**按下屏幕键盘上的键**的时刻（实体键钩子看不到注入事件，所以单独记）。
+// 用途见 UpdateAutoVisibility 的 Chromium 精判：正在输入时不收起。
+static DWORD g_lastOwnKeyTick = 0;
 
 // 前台窗口的变化时刻 —— 用来区分"切换窗口"与"窗口内的焦点转移"。
 // ⚠ 用户要的是「点输入框 / 键盘聚焦 / **网页自动聚焦搜索框**」都弹，
@@ -624,6 +637,10 @@ static DWORD g_lastKeyTick = 0;        // 最后一次真实键盘按键
 //   键盘照样会自己弹出来 —— 等于没解决问题。
 static HWND g_lastFg = NULL;
 static BOOL g_fgAwaitUserInput = FALSE;
+// g_lastFg 被更新的时刻。配合 GetLastInputInfo 判「用户在这个前台窗口里操作过没有」：
+//   最后一次输入发生在这次前台变化**之后** ⇒ 用户确实操作过。
+//   触屏上这条是必需的 —— 点输入框不会产生鼠标消息，see UpdateAutoVisibility 里的说明。
+static DWORD g_lastFgSetTick = 0;
 // 最近一次点击**落点所属的顶层窗口**。在鼠标钩子里当场算好 ——
 // ⚠ 不要等到 UpdateAutoVisibility 里再 WindowFromPoint：那时窗口可能已经变了，
 //   而且判断"点的是不是输入控件"若依赖 GetFocusedInputControl 的返回值，
@@ -701,6 +718,11 @@ static BOOL g_npLock = TRUE;            // TRUE = 数字（小键盘）模式
 //   高亮始终等于真实锁定态，不需要再区分「首帧」与「之后」）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
+// Chromium 系的「精判收起」开关（ini: General/ChromiumPrecise，默认 1 = 开）。
+// 只影响**收起**，不影响呼出（见 UpdateAutoVisibility 里的用法与论证）。
+// 留着这个开关是因为历史上有过三轮翻车 —— 万一它带来新问题，
+// 关掉这一个开关就能回到旧行为，不必动主逻辑。
+BOOL        g_afChromiumPrecise = TRUE;
 // 自动隐藏：**点击输入框以外的区域时自动收起键盘**（ini: General/AutoHide）。
 // ⚠ 2026-10-04 语义变更：这个开关原来控制的是"收起后在同一输入框内不自动回弹"
 //   （防回弹），名不副实 —— 用户实测「键盘不会自动隐藏，只能手动最小化」。
@@ -782,6 +804,11 @@ static int g_dbgRc[4] = {0, 0, 0, 0};
 //   「有东西在反复启动第二个实例，触发了 WM_SHOW_KEYBOARD 转发」。
 //   这个标记能直接指出是谁调的。
 static const char* g_dbgShowFrom = "(startup)";
+// 诊断（-afdiag）：最近一次 UIA 焦点元素判定的 ControlType。
+//   50004 = Edit（焦点在可编辑输入框里）50030 = Document（不在）
+//   -1    = 本 tick 没查 / 查失败
+// 用途：验证「Chromium 系要不要收起」这条新判据在真机上到底看到了什么。
+static int g_dbgUiaCt = -1;
 
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
 //   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
@@ -5798,6 +5825,7 @@ static void EnsureConfigFile() {
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"AutoPopup", 1);
     IniSetInt(L"General", L"AutoHide", 1);
+    IniSetInt(L"General", L"ChromiumPrecise", 1);   // Chromium 系精判收起（新增，见该开关的说明）
     IniSetInt(L"General", L"ConfigVersion", 6);
 }
 
@@ -5835,6 +5863,9 @@ static void LoadConfig() {
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
     g_afAutoHide = (IniGetInt(L"General", L"AutoHide", 1) != 0);
+    // Chromium 系「精判收起」开关（默认开）。关掉就回到"Chromium 一在前台就不收"的旧行为。
+    // ⚠ 只影响收起，不影响呼出 —— 见 g_afChromiumPrecise 的说明。
+    g_afChromiumPrecise = (IniGetInt(L"General", L"ChromiumPrecise", 1) != 0);
 }
 
 // 持久化“× 关闭行为”选择
@@ -7116,6 +7147,131 @@ static HWND RealForegroundWindow() {
     return fg;
 }
 
+// ===== 会话级「用户操作过」判定（触屏必需，2026-10-10）=====
+//
+// 触屏上「点输入框」这件事，HKeyboard 现在是**看不见**的：
+//   Chromium 系窗口注册了指针输入，触控只走 WM_POINTER / WM_TOUCH，
+//   **不会被系统提升成鼠标消息** ⇒ WH_MOUSE_LL 一次都不触发。
+//   而 UpdateAutoVisibility 里"用户操作过"只有两个来源：byKey（实体按键）与
+//   clickInFg（鼠标落点）—— 触屏上一个都不成立，于是那道
+//   「刚切窗口先别弹」的封锁（g_fgAwaitUserInput）**永远解不开**，
+//   自动呼出在这台机器上等于完全失效（用户实测：只能从托盘手动打开）。
+//   火狐没做这个注册，触控照常提升成鼠标消息 —— 所以火狐一直是正常的。
+//
+// ⇒ 用 GetLastInputInfo 兜底：它统计**会话级最后一次输入**（鼠标 / 键盘 /
+//   触控 / 笔都算），不区分来源，但足够回答"用户刚才动过没有"。
+//
+// ⚠ 判据是「最后一次输入发生在**这次前台变化之后**」，不是"最近有输入"：
+//   切窗口这个动作本身也是输入（点任务栏、点另一个窗口），它发生在
+//   g_lastFgSetTick **之前**，于是不会被误判成"在新窗口里操作过"。
+//   只有"切过去之后又动了"才算 —— 正是要的语义。
+//
+// ⚠ 只在触屏设备上启用（见调用点的 IsTouchDevice）。桌面机上鼠标随便一晃就满足，
+//   那会退化成"切窗口就弹"，把这道封锁的意义抹掉。
+//
+// ⚠⚠ 再加一道过滤：**"仅鼠标移动"不算操作**。
+//   GetLastInputInfo 连鼠标移动也计入，而触屏笔记本 + 鼠标是最常见的组合 ——
+//   没有这道过滤，晃一下鼠标就会解锁，等于把上面的触屏限定架空。
+//   判据用"光标位置有没有变"：触控（Chromium 系不提升成鼠标）**不会移动光标**，
+//   鼠标移动 / 点任务栏都会把光标挪到别处。
+//   于是：
+//     触控点输入框  → 光标没动 + 有输入 ⇒ 算操作 ✓
+//     只是晃鼠标    → 光标动了           ⇒ 不算   ✓
+//     鼠标点本窗口  → 光标可能没动，但那是 clickInFg 的活，两条路都通 ✓
+static POINT g_lastFgCursor = {0, 0};   // g_lastFg 被更新时记录的光标位置
+
+static BOOL UserInputAfterForegroundChange() {
+    LASTINPUTINFO li = {sizeof(li)};
+    if (!GetLastInputInfo(&li)) return FALSE;
+    // dwTime 与 GetTickCount 同一时基（32 位 tick）；用有符号差处理 49 天回绕
+    if ((LONG)(li.dwTime - g_lastFgSetTick) <= 0) return FALSE;   // 输入发生在切窗口之前
+    POINT p = {0, 0};
+    if (!GetCursorPos(&p)) return FALSE;
+    return (p.x == g_lastFgCursor.x && p.y == g_lastFgCursor.y);
+}
+
+// ===== Chromium 系「光标到底在不在输入框里」的精判（UI Automation）=====
+//
+// 背景：IsInputControl() 对 Chromium 系是**粗判**（见那里的长注释）——
+//   它能回答"前台是不是一个 Chromium 窗口"，回答不了"光标在不在输入框里"。
+//   于是 Chromium 系一旦到了前台，input 恒非空 ⇒ **永远不收起**。
+//
+// 判据（2026-10-10 本机实测，WorkBuddy/Electron，真实鼠标点击驱动）：
+//   点进输入框   → GetFocusedElement().ControlType == EditControl(50004)，rect 就是输入框  3/3
+//   点同窗口空白 → DocumentControl(50030)                                              4/4
+//   点回输入框   → EditControl(50004)                                                  3/3
+//   ⇒ **ControlType 是不是 Edit，就等于"焦点在不在可编辑输入框里"。**
+//
+// ⚠⚠ 与历史结论的关系（必读，别再重复回退）：
+//   第七~十轮引入过 UIA 精判，第十一轮整体回退，理由是
+//   「整张网页永远有一个 Document(50030) 持有键盘焦点」。
+//   **本次实测与该结论不符** —— 输入框焦点稳定报 EditControl。
+//   翻当年那几笔提交，失败的可查原因是**管道接错**，不是判据不可用：
+//     · `修 VT_I4 分支不下钻` · `UIA 接入的两个编译错误`
+//     · `Document 不能当「可编辑」判据`（说明当时确实把 Document 当成了可编辑）
+//   当年还把它们用在了**显示**上，所以判错就是"输入框不弹"。
+//
+// ⚠⚠⚠ 但这次**绝不重蹈覆辙**：这个判据**只用来触发收起**，显示仍走粗判
+//   （见 UpdateAutoVisibility 的调用点）。因此：
+//     · 判据假阳性（说不是输入框，其实在输入）→ 该收没收 = 现状，不更差；
+//     · 判据假阴性（说是输入框，其实不是）→ 显示走不到这里，不受影响。
+//   **它没有任何路径能把"自动呼出"弄坏** —— 而当年那三轮翻车全部发生在显示上。
+//
+// ⚠ 只在**键盘已显示**时查（调用点负责）：没显示就没有"要不要收"的问题，
+//   不该为它付跨进程 COM 的代价。
+// ⚠ 还留了 ini 开关 General/ChromiumPrecise（默认 1）—— 万一它带来新问题，
+//   关掉一个开关就回到旧行为，不必动主逻辑（这是当年那条教训的直接落实）。
+#define HK_UIA_CT_EDIT 50004    // UIA_EditControlTypeId
+
+static IUIAutomation* g_uia = NULL;
+
+static BOOL EnsureUia() {
+    if (g_uia) return TRUE;
+    // 复用已有的 COM 初始化（oleacc 那条路也是它）—— 重复 CoInitializeEx 会拿到
+    // RPC_E_CHANGED_MODE，虽然无害，但没必要。
+    if (!EnsureAccessibilityCom()) return FALSE;
+    // ⚠ CLSID_CUIAutomation / IID_IUIAutomation 走 __uuidof —— 只取 GUID 常量，
+    //   不需要 import lib（不要改成 GetCurrentPropertyValue，那会拉进 oleaut32）。
+    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IUIAutomation), (void**)&g_uia);
+    return SUCCEEDED(hr) && g_uia != NULL;
+}
+
+// 返回值：1 = 焦点在可编辑输入框里；0 = 明确不在；-1 = 查不出来
+static int UiaFocusEditable() {
+    g_dbgUiaCt = -1;
+    if (!EnsureUia()) return -1;
+    // 跨进程调用前先做响应性预检，与 IsAccessibleInputWindow 同一纪律：
+    //   SMTO_ABORTIFHUNG 把"无限期阻塞"压成"有界的最多 50ms"。
+    //   ⚠ 本函数在 UI 线程上跑，没有这道闸，目标进程一卡死，
+    //     键盘自己的界面会跟着僵住。预检不过就返回 -1（= 当作仍在输入框里，不收起）。
+    if (!IsWindowResponsive(GetForegroundWindow(), 50)) return -1;
+    IUIAutomationElement* el = NULL;
+    HRESULT hr = g_uia->GetFocusedElement(&el);
+    if (FAILED(hr) || !el) return -1;
+    CONTROLTYPEID ct = 0;
+    hr = el->get_CurrentControlType(&ct);
+    el->Release();          // 只管当场取值，不留跨帧的 COM 指针（会过期）
+    if (FAILED(hr)) return -1;
+    g_dbgUiaCt = (int)ct;
+    return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
+}
+
+// 带缓存的版本：UIA 是跨进程 COM，别每 50ms 调一次。
+//   TTL 250ms —— 比 tick（50ms）粗得多，又比"人手离开输入框"快得多。
+//   ⚠ 缓存的是**判定结果**，不是元素指针。
+//   查不出来（-1）按"是输入框"处理 ⇒ 不收起，落在安全侧。
+static int UiaFocusEditableCached() {
+    static int   cached = 1;
+    static DWORD cachedTick = 0;
+    DWORD now = GetTickCount();
+    if (cachedTick && now - cachedTick < 250) return cached;
+    int v = UiaFocusEditable();
+    cached = (v < 0) ? 1 : v;
+    cachedTick = now;
+    return cached;
+}
+
 static BOOL IsInputControl(HWND hw) {
     if (!hw || !IsWindow(hw)) return FALSE;
     char buf[128] = {0};
@@ -7137,8 +7293,13 @@ static BOOL IsInputControl(HWND hw) {
     //   UIA 又把 Document 元素（整张网页永远持有焦点）误当成可编辑。
     //   **在没有可靠判据之前，粗判是唯一稳定的行为** ——
     //   「点空白就收」是附加功能，自动呼出是主功能，冲突时保后者。
-    if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin"))
+    if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin")) {
+        // ⚠ 这是**粗判**：只说明"前台是 Chromium 窗口"，不含"光标在输入框里"这层信息。
+        //   把"本次是粗判命中的"记下来 —— 只有这种命中才需要补一次 UIA 精判，
+        //   而且那个精判**只用来决定要不要收起**（见 UpdateAutoVisibility 的论证）。
+        g_detectedByChromiumClass = TRUE;
         return TRUE;
+    }
 
     return FALSE;
 }
@@ -7154,6 +7315,7 @@ static BOOL IsOwnForegroundWindow(HWND fg) {
 // 一概视为输入框，避免焦点离开文本区域后键盘仍持续显示。
 static HWND GetFocusedInputControl() {
     g_detectedInputToken = 0;
+    g_detectedByChromiumClass = FALSE;   // 由 IsInputControl 的 Chromium 分支置位（见那里）
     // ⚠ 用 RealForegroundWindow 而不是 GetForegroundWindow：Windows 自带触摸键盘
     //   弹出时会成为前台窗口，直接拿它去探测必然判不出输入框（见 RealForegroundWindow）。
     HWND fg = RealForegroundWindow();
@@ -7272,7 +7434,12 @@ static void UpdateAutoVisibility() {
     // 前台窗口变了 -> 进入"等待用户操作"状态（见 g_fgAwaitUserInput 的说明）
     {
         HWND fgNow = RealForegroundWindow();   // 跳过系统触摸键盘：它弹出来不算"用户切了窗口"
-        if (fgNow != g_lastFg) { g_lastFg = fgNow; g_fgAwaitUserInput = TRUE; }
+        if (fgNow != g_lastFg) {
+            g_lastFg = fgNow;
+            g_fgAwaitUserInput = TRUE;
+            g_lastFgSetTick = GetTickCount();   // 供 UserInputAfterForegroundChange 判定
+            GetCursorPos(&g_lastFgCursor);      // 同上：记下切换瞬间的光标位置
+        }
     }
 
     DWORD nowTick = GetTickCount();
@@ -7285,7 +7452,12 @@ static void UpdateAutoVisibility() {
     HWND fgTop = fgNow ? GetAncestor(fgNow, GA_ROOT) : NULL;
 
     // 前台窗口变了 -> 进入"等待用户操作"状态
-    if (fgNow != g_lastFg) { g_lastFg = fgNow; g_fgAwaitUserInput = TRUE; }
+    if (fgNow != g_lastFg) {
+        g_lastFg = fgNow;
+        g_fgAwaitUserInput = TRUE;
+        g_lastFgSetTick = nowTick;          // 供 UserInputAfterForegroundChange 判定
+        GetCursorPos(&g_lastFgCursor);      // 同上：记下切换瞬间的光标位置
+    }
 
     BOOL recentClick = (g_lastClickTick && nowTick - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS);
     BOOL byKey       = (g_lastKeyTick && nowTick - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
@@ -7293,8 +7465,14 @@ static void UpdateAutoVisibility() {
     BOOL clickInFg   = (recentClick && g_lastClickTopHwnd && fgTop &&
                         g_lastClickTopHwnd == fgTop);
 
-    // 用户主动操作（点在前台窗口内 / 敲键盘）-> 解除"切换窗口"的封锁
-    if (byKey || clickInFg) g_fgAwaitUserInput = FALSE;
+    // 用户主动操作（点在前台窗口内 / 敲键盘）-> 解除"切换窗口"的封锁。
+    //
+    // ⚠⚠ byUserInFg 是**触屏专用兜底**（见 UserInputAfterForegroundChange 的完整论证）：
+    //   触控在 Chromium 系上不会被提升成鼠标消息 ⇒ clickInFg 永远为假 ⇒
+    //   这道封锁永远解不开 ⇒ 自动呼出彻底失效（用户实测：只能从托盘手动打开）。
+    //   只对触屏设备启用，桌面机行为保持原样。
+    BOOL byUserInFg = (IsTouchDevice() && UserInputAfterForegroundChange());
+    if (byKey || clickInFg || byUserInFg) g_fgAwaitUserInput = FALSE;
 
     // 诊断：本 tick 默认无补查；用户操作窗口内才安排（须在 GetFocusedInputControl
     // 之前清/置，否则会把补查刚写入的结果清掉）
@@ -7302,18 +7480,48 @@ static void UpdateAutoVisibility() {
     g_dbgExtraOk = -1;
     g_dbgExtraDue = (g_afLogPath[0] && (recentClick || byKey)) ? TRUE : FALSE;
     HWND input = GetFocusedInputControl();
+
+    // ★ Chromium 系精判（2026-10-10）：粗判只说明"前台是 Chromium 窗口"，
+    //   说明不了"光标在输入框里" —— 于是 Chromium 系一在前台就永远不收起。
+    //   键盘**已显示**时补一次 UIA 焦点元素的 ControlType：
+    //     Edit(50004) → 确实在输入框里（保持显示，走下面的原逻辑）
+    //     其它        → 视为"没有输入焦点了"，落进下面的失焦分支触发自动收起
+    //
+    // ⚠⚠ 三个约束缺一不可 —— 这是第十一轮整体回退的直接解药：
+    //   ① 只在 g_vis 为真时查：没显示就没有"要不要收"的问题，
+    //      也就不必付跨进程 COM 的代价（UIA 查询有 250ms 缓存）；
+    //   ② 只在**粗判命中**时查（g_detectedByChromiumClass）：靠光标 / 原生控件
+    //      命中的输入框有更硬的证据，不要用软判据去推翻它；
+    //   ③ 只用来**置空 input（触发收起）**，**从不参与显示** ——
+    //      所以判错最坏只是"该收没收"（= 现在的行为），不可能"该弹不弹"。
+    //      当年那三轮翻车全部发生在**显示**上，这一条从结构上排除了它。
+    if (input && g_vis && g_afChromiumPrecise && g_detectedByChromiumClass) {
+        // 附加保护：用户**正在输入**时不收起（实体键，或刚按过屏幕键盘上的键）。
+        //   判据万一是错的（例如某个富文本编辑器把输入框报成 Document），
+        //   这几百毫秒里也不会把键盘从正在打字的人手里抽走。
+        //   代价：正在输入的那几拍不查 UIA（日志里 uiact 会是 -1）。
+        BOOL typing = byKey || (g_lastOwnKeyTick && (nowTick - g_lastOwnKeyTick) <= 1200);
+        if (!typing && UiaFocusEditableCached() == 0) input = NULL;
+    } else {
+        g_dbgUiaCt = -1;   // 本 tick 没查 —— 别在日志里留上一次的残值
+    }
+
     // 诊断（-afdiag）：记录这次评估的全部输入量
     {
+        char st[96];
+        // uiact：这次拿到的焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
+        // inFg ：触屏兜底的"用户在本窗口里操作过"是否成立（见 UserInputAfterForegroundChange）
+        _snprintf_s(st, sizeof(st), _TRUNCATE, "%s uiact=%d inFg=%d",
+                    input ? "hasInput" : "noInput", g_dbgUiaCt, (int)byUserInFg);
         g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;
         RECT wr = {0, 0, 0, 0};
         if (g_hWnd) GetWindowRect(g_hWnd, &wr);
         g_dbgRc[0] = (int)wr.left;  g_dbgRc[1] = (int)wr.top;
         g_dbgRc[2] = (int)(wr.right - wr.left);
         g_dbgRc[3] = (int)(wr.bottom - wr.top);
+        AfLog("eval", fgNow, fgTop, input, recentClick, clickInFg, byKey,
+              g_fgAwaitUserInput, g_vis, g_mainMotion.active, st);
     }
-    AfLog("eval", fgNow, fgTop, input, recentClick, clickInFg, byKey,
-          g_fgAwaitUserInput, g_vis, g_mainMotion.active,
-          input ? "hasInput" : "noInput");
     if (input) {
         g_lastNonInput = 0;
         g_noInputStreak = 0;
@@ -7352,7 +7560,7 @@ static void UpdateAutoVisibility() {
             BOOL sameInput = (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken);
             // cif=1 = 用户点了当前前台窗口内（对 QQ/Edge/浏览器，
             // 顶层窗口内点击就意味着点到了地址栏 / 输入框 / 页面）
-            if (sameInput && !byKey && !clickInFg) return;
+            if (sameInput && !byKey && !clickInFg && !byUserInFg) return;
             g_userHidInInput = FALSE;
         }
 
@@ -7552,6 +7760,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
 #endif
     SetCapture(hWnd);   // 捕获鼠标，防止开始菜单等出现时抢走鼠标抬起消息导致键一直高亮
     const KeyDef* k = &g_keys[ki];
+    g_lastOwnKeyTick = GetTickCount();   // 用户在用屏幕键盘 —— 供"正在输入不收起"用
     DoKeyAction(k);
 
     if (k->vk == 0x08 || k->vk == 0x2E || k->vk == 0x20 || k->type == K_ARROW) {

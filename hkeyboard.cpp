@@ -643,10 +643,9 @@ static DWORD g_lastOwnKeyTick = 0;
 //   键盘照样会自己弹出来 —— 等于没解决问题。
 static HWND g_lastFg = NULL;
 static BOOL g_fgAwaitUserInput = FALSE;
-// g_lastFg 被更新的时刻。配合 GetLastInputInfo 判「用户在这个前台窗口里操作过没有」：
-//   最后一次输入发生在这次前台变化**之后** ⇒ 用户确实操作过。
-//   触屏上这条是必需的 —— 点输入框不会产生鼠标消息，see UpdateAutoVisibility 里的说明。
-static DWORD g_lastFgSetTick = 0;
+// （原 g_lastFgSetTick「g_lastFg 被更新的时刻」已删：触屏兜底改成"刚刚有过一次
+//   触控式点击"（见 TouchInputTick），不再绑定某一次前台变化 —— 绑定前台变化时，
+//   中途任意一次光标移动都会让它**永久为假**，平板上等于自动呼出彻底失效。）
 // 最近一次点击**落点所属的顶层窗口**。在鼠标钩子里当场算好 ——
 // ⚠ 不要等到 UpdateAutoVisibility 里再 WindowFromPoint：那时窗口可能已经变了，
 //   而且判断"点的是不是输入控件"若依赖 GetFocusedInputControl 的返回值，
@@ -757,9 +756,11 @@ static int     g_afLogLines = 0;      // 已写行数（够多就停，别把磁
 //   ⚠ 与 -afdiag **无关**：这段始终在跑（默认每 ~200ms 一条 eval + 所有事件），
 //     于是用户**不需要带参数启动、也不需要重现前先做准备** ——
 //     出了问题直接在托盘右键「导出诊断日志」，把最近几分钟原样交出来即可。
-//   只占内存、不碰磁盘：1000 条 × 320B ≈ 320KB（未初始化，进 BSS，exe 不增大）。
+//   只占内存、不碰磁盘：1000 条 × 576B ≈ 576KB（未初始化，进 BSS，exe 不增大）。
+//   ⚠ 每条必须放得下一条完整的 eval 行 —— 上一版是 320，而 eval 行有 330~360 字符，
+//     用户的导出里 614/640 条被截断、决定性字段全丢。改 576 之后留足余量。
 #define HKRING_N   1000
-#define HKRING_LEN 320
+#define HKRING_LEN 576
 static char g_ring[HKRING_N][HKRING_LEN];
 static int  g_ringHead = 0;           // 下一个写入位置
 static int  g_ringCount = 0;          // 已累积条数（满后恒为 HKRING_N）
@@ -839,6 +840,14 @@ static const char* g_dbgShowFrom = "(startup)";
 //   -1    = 本 tick 没查 / 查失败
 // 用途：验证「Chromium 系要不要收起」这条新判据在真机上到底看到了什么。
 static int g_dbgUiaCt = -1;
+// 诊断：本 tick **为什么这么判**（分支名）。每拍在 UpdateAutoVisibility 里重设。
+//   ⚠ 这一栏是"自动呼出为什么没弹"的唯一直接答案 —— 之前只有一堆输入量，
+//     要人自己反推是哪一条 return 拦住的。平板用户那台机器上自动呼出完全不工作，
+//     但旧日志里看不出拦在哪一条，所以补上它。
+static const char* g_dbgWhy = "-";
+// 诊断：两个触屏证据源的即时值（见 TouchFocusEvidence / SysTipJustAppeared）
+static int g_dbgEvFoc = 0;
+static int g_dbgEvTip = 0;
 
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
 //   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
@@ -874,22 +883,27 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
     // （避免把"其它应用弹窗抢焦点"的噪音误当成"用户聚焦了输入框"）
     int fehMatch = (g_lastFocusEvHwnd && fgTop && g_lastFocusEvHwnd == fgTop) ? 1 : 0;
     char buf[512];
+    // ⚠⚠ 字段顺序是**按重要性排的**：decision（含 uiact/pt/hid/why）紧跟 tag。
+    //   原因：这条线常年 300~360 字符，而环形缓冲每条有长度上限 ——
+    //   上一版把 decision 放在**最末尾**，用户导出的 640 条里 **614 条被截断**，
+    //   `uiact/pt/hid` 全部丢失 ⇒ 那份日志对"为什么没弹"完全没用。
+    //   后面的 `fvt/frole/fev/xms/xok/gui/focusCls` 是早期 a11y 探索留下的量，
+    //   现在只作参考，丢了不致命。
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "%02d:%02d:%02d.%03d %-7s fg=%-22s fgTop=%p click=%p "
-                "rc=%d cif=%d key=%d await=%d input=%p vis=%d mot=%d | "
-                "gui=%d focusCls=%-22s isInput=%d caret=%p "
+                "%02d:%02d:%02d.%03d %-7s => %s | rc=%d cif=%d key=%d await=%d vis=%d mot=%d | "
+                "input=%p fg=%-20s fgTop=%p click=%p | "
+                "gui=%d focusCls=%-20s isInput=%d caret=%p "
                 "resp=%d hr=0x%X found=%d | xms=%d xok=%d | fvt=%d frole=0x%X fev=%u feh=%d | "
-                "visWnd=%d rect=%d,%d %dx%d => %s\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag,
-                AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
+                "visWnd=%d rect=%d,%d %dx%d\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag, decision,
                 (int)recentClick, (int)clickInFg,
-                (int)byKey, (int)await, (void*)input, (int)vis, (int)motion,
+                (int)byKey, (int)await, (int)vis, (int)motion,
+                (void*)input, AfClsName(fg), (void*)fgTop, (void*)g_lastClickTopHwnd,
                 g_dbgHaveGui, g_dbgFocusCls, g_dbgIsInput,
                 (void*)g_dbgCaret, g_dbgResp, (unsigned)g_dbgAcc, g_dbgAccFound,
                 g_dbgExtraMs, g_dbgExtraOk,
                 g_dbgFocusVt, (unsigned)g_dbgFocusRole, (unsigned)fevNow, fehMatch,
-                g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3],
-                decision);
+                g_dbgVisWnd, g_dbgRc[0], g_dbgRc[1], g_dbgRc[2], g_dbgRc[3]);
     if (wantRing) DiagRingPush(buf);
     if (wantFile) AfWriteRaw(buf);
 }
@@ -7280,10 +7294,15 @@ static HWND RealForegroundWindow() {
 // ⇒ 用 GetLastInputInfo 兜底：它统计**会话级最后一次输入**（鼠标 / 键盘 /
 //   触控 / 笔都算），不区分来源，但足够回答"用户刚才动过没有"。
 //
-// ⚠ 判据是「最后一次输入发生在**这次前台变化之后**」，不是"最近有输入"：
-//   切窗口这个动作本身也是输入（点任务栏、点另一个窗口），它发生在
-//   g_lastFgSetTick **之前**，于是不会被误判成"在新窗口里操作过"。
-//   只有"切过去之后又动了"才算 —— 正是要的语义。
+// ⚠ 判据是「**刚刚**有过一次输入」，不绑定"这一次前台变化"。
+//   ⚠⚠ 上一版是"输入发生在前台变化之后 **且** 光标自那次切换起没动过" ——
+//      那个写法有个致命缺陷：**只要中途有任何一次移动光标**（平板最典型：
+//      手指点了任务栏、外接鼠标被碰一下、或别的程序 SetCursorPos），
+//      第二个条件就**永久为假**，直到下一次前台变化 ⇒ 封锁 g_fgAwaitUserInput
+//      再也解不开 ⇒ **自动呼出在该机器上完全失效**。
+//      平板用户的诊断日志里 `await=1` 占 48%，正是这个。
+//      （旧函数 `UserInputAfterForegroundChange` + `g_lastFgSetTick` /
+//        `g_lastFgCursor` 已按此删除。）
 //
 // ⚠ 只在触屏设备上启用（见调用点的 IsTouchDevice）。桌面机上鼠标随便一晃就满足，
 //   那会退化成"切窗口就弹"，把这道封锁的意义抹掉。
@@ -7291,22 +7310,51 @@ static HWND RealForegroundWindow() {
 // ⚠⚠ 再加一道过滤：**"仅鼠标移动"不算操作**。
 //   GetLastInputInfo 连鼠标移动也计入，而触屏笔记本 + 鼠标是最常见的组合 ——
 //   没有这道过滤，晃一下鼠标就会解锁，等于把上面的触屏限定架空。
-//   判据用"光标位置有没有变"：触控（Chromium 系不提升成鼠标）**不会移动光标**，
-//   鼠标移动 / 点任务栏都会把光标挪到别处。
-//   于是：
-//     触控点输入框  → 光标没动 + 有输入 ⇒ 算操作 ✓
-//     只是晃鼠标    → 光标动了           ⇒ 不算   ✓
-//     鼠标点本窗口  → 光标可能没动，但那是 clickInFg 的活，两条路都通 ✓
-static POINT g_lastFgCursor = {0, 0};   // g_lastFg 被更新时记录的光标位置
+//   判据用"**这次采样之间**光标位置有没有变"：触控投在 Chromium 系窗口上
+//   不会移动光标（见上面的论证），鼠标移动 / 点任务栏都会把光标挪到别处。
+//   ⚠ 注意是"和上一次采样比"，不是"和切窗口那一刻比" —— 这正是上一版的病根。
+static DWORD g_touchTapTick = 0;         // 最近一次"触控式点击"（有输入且光标未动）
+static DWORD g_touchInputTick = 0;       // 上一次采样到的 GetLastInputInfo.dwTime
+static POINT g_touchCursor = {0, 0};
+static BOOL  g_touchCursorInit = FALSE;
 
-static BOOL UserInputAfterForegroundChange() {
+// 每 tick 调一次。检测到"触控式点击"就刷时间戳；byUserInFg 用它回答"用户刚动过没有"。
+static void TouchInputTick() {
+    if (!IsTouchDevice()) return;
     LASTINPUTINFO li = {sizeof(li)};
-    if (!GetLastInputInfo(&li)) return FALSE;
-    // dwTime 与 GetTickCount 同一时基（32 位 tick）；用有符号差处理 49 天回绕
-    if ((LONG)(li.dwTime - g_lastFgSetTick) <= 0) return FALSE;   // 输入发生在切窗口之前
+    if (!GetLastInputInfo(&li)) return;
     POINT p = {0, 0};
-    if (!GetCursorPos(&p)) return FALSE;
-    return (p.x == g_lastFgCursor.x && p.y == g_lastFgCursor.y);
+    if (!GetCursorPos(&p)) return;
+    if (g_touchCursorInit) {
+        BOOL newInput  = (li.dwTime != g_touchInputTick);   // 又有输入了
+        BOOL cursorStill = (p.x == g_touchCursor.x && p.y == g_touchCursor.y);
+        if (newInput && cursorStill) g_touchTapTick = GetTickCount();
+    }
+    g_touchCursorInit = TRUE;
+    g_touchInputTick = li.dwTime;
+    g_touchCursor = p;
+}
+
+// 「用户刚在这台机器上点了一下（触控/笔）」—— 只对触屏设备可能为真。
+//   1500ms 的窗口：够人手从"点一下"到"看键盘有没有出来"。
+static BOOL TouchTappedRecently() {
+    if (!IsTouchDevice() || !g_touchTapTick) return FALSE;
+    return (DWORD)(GetTickCount() - g_touchTapTick) <= 1500;
+}
+
+// 触屏**一次性**证据：刚刚那次触控式点击，**每次只放行一拍**。
+//   ⚠ 为什么需要它：触屏拿不到落点（没有鼠标消息），触屏的两条强证据
+//     （系统触摸键盘出现 / 前台窗口里有焦点事件）都可能在用户的机器上不成立 ——
+//     那样"隐藏态要弹必须攒证据"就变成了**永远弹不出来**（平板用户报的正是这个）。
+//     这条是兜底：用户确实点了一下（有输入且光标没动），就放行一次。
+//   ⚠ 为什么不会振荡：**一次性**（消费掉就没了）。放行 → 弹出 → 精判若说
+//     "不在可编辑元素里" → 立刻收起并重新进压制态；下一拍没有新证据 ⇒ 保持收起。
+//     代价：在压制态下点空白会闪一下（一次点击闪一次）—— 比"叫不出键盘"好得多。
+static DWORD g_touchTapConsumed = 0;
+static BOOL TouchTapEdgeConsume() {
+    if (!g_touchTapTick || g_touchTapTick == g_touchTapConsumed) return FALSE;
+    g_touchTapConsumed = g_touchTapTick;
+    return TRUE;
 }
 
 // ===== Chromium 系「光标到底在不在输入框里」的精判（UI Automation）=====
@@ -7564,7 +7612,17 @@ static BOOL TouchFocusEvidence() {
     HWND fg = RealForegroundWindow();
     HWND fgTop = fg ? GetAncestor(fg, GA_ROOT) : NULL;
     if (!g_lastFocusEvHwnd || !fgTop) return FALSE;
-    return GetAncestor(g_lastFocusEvHwnd, GA_ROOT) == fgTop;
+    HWND evTop = GetAncestor(g_lastFocusEvHwnd, GA_ROOT);
+    if (evTop && evTop == fgTop) return TRUE;
+    // ⚠ 放宽一档：**同进程**也算。
+    //   Chromium 系有多个顶层窗口（主窗口 / 各种隐藏宿主），焦点事件有时报在
+    //   另一个顶层窗口上；只看"顶层窗口必须相同"会漏掉那种情况（平板用户的
+    //   诊断日志里自动呼出完全不工作，而焦点事件是触屏唯一可靠的证据来源之一）。
+    //   代价：同进程的无关焦点事件会放行一次 —— 真放行了也会有精判把它收回去。
+    DWORD pidEv = 0, pidFg = 0;
+    GetWindowThreadProcessId(g_lastFocusEvHwnd, &pidEv);
+    GetWindowThreadProcessId(fg, &pidFg);
+    return (pidEv != 0 && pidEv == pidFg);
 }
 
 // 用户**主动**把键盘叫出来（托盘单击/菜单、热键）时作废"精判收起"备忘。
@@ -7834,6 +7892,7 @@ static void ExportDiagLog() {
         "layout mode    : %d\r\n"
         "now state      : vis=%d visWnd=%d manualHide=%d manualShow=%d await=%d\r\n"
         "                 verdictHide=%d verdictFg=%p trustFg=%p tabStopVisible=%d\r\n"
+        "                 touchTapAgo=%ldms (触屏\"刚点过一下\"距今；-1=本次运行还没点过)\r\n"
         "ring entries   : %d (oldest -> newest)\r\n"
         "------------------------------------------------------------\r\n",
         __DATE__, __TIME__,
@@ -7848,18 +7907,23 @@ static void ExportDiagLog() {
         (int)g_fgAwaitUserInput,
         (int)g_verdictHide, (void*)g_verdictHidFg, (void*)g_chromiumTrustFg,
         (int)SystemTouchKeyboardVisible(),
+        g_touchTapTick ? (long)(GetTickCount() - g_touchTapTick) : -1L,
         g_ringCount);
     DiagWrite(h, head);
 
     // 环境 + UIA 自检（换机 / 虚拟机排查用；见 DiagAppendProbe）
     DiagAppendProbe(h);
 
-    // 环形缓冲按时间顺序输出
+    // 环形缓冲按时间顺序输出（每行一条）
+    //   ⚠ 兜底补换行：即使某条被 _TRUNCATE 截掉了结尾的 '\n'，也要保证一行一条
+    //     —— 上一版没补，用户导出后整段 640 条**挤成一行**，根本没法看。
     int start = (g_ringCount < HKRING_N) ? 0 : g_ringHead;
     for (int i = 0; i < g_ringCount; i++) {
         const char* line = g_ring[(start + i) % HKRING_N];
         DWORD wr = 0;
-        WriteFile(h, line, (DWORD)strlen(line), &wr, NULL);
+        size_t n = strlen(line);
+        WriteFile(h, line, (DWORD)n, &wr, NULL);
+        if (n == 0 || line[n - 1] != '\n') WriteFile(h, "\r\n", 2, &wr, NULL);
     }
     CloseHandle(h);
 
@@ -8015,9 +8079,13 @@ static HWND GetFocusedInputControl() {
 
 static void UpdateAutoVisibility() {
     if (!g_af || !g_hWnd) return;
+    // why：本拍为什么这么判（进日志）。每拍重设，任何 return 之前都要写。
+    g_dbgWhy = "?";
+    g_dbgEvFoc = -1;    // -1 = 本拍没评估
+    g_dbgEvTip = -1;
     // 启动预热期内不评估（见 g_appStartTick 的说明）：此刻前台状态还没稳定，
     // 判断不可靠，容易在没输入框的地方误弹键盘并连带卡住状态。
-    if (g_appStartTick && GetTickCount() - g_appStartTick < AUTOSHOW_WARMUP_MS) return;
+    if (g_appStartTick && GetTickCount() - g_appStartTick < AUTOSHOW_WARMUP_MS) { g_dbgWhy = "warmup"; return; }
     // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
     // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
     if (g_mainMotion.active) {
@@ -8041,6 +8109,7 @@ static void UpdateAutoVisibility() {
                 else if (f == MOTION_DESTROY) DestroyWindow(mh);
             }
         }
+        g_dbgWhy = "anim";
         return;
     }
 
@@ -8050,8 +8119,6 @@ static void UpdateAutoVisibility() {
         if (fgNow != g_lastFg) {
             g_lastFg = fgNow;
             g_fgAwaitUserInput = TRUE;
-            g_lastFgSetTick = GetTickCount();   // 供 UserInputAfterForegroundChange 判定
-            GetCursorPos(&g_lastFgCursor);      // 同上：记下切换瞬间的光标位置
         }
     }
 
@@ -8068,9 +8135,10 @@ static void UpdateAutoVisibility() {
     if (fgNow != g_lastFg) {
         g_lastFg = fgNow;
         g_fgAwaitUserInput = TRUE;
-        g_lastFgSetTick = nowTick;          // 供 UserInputAfterForegroundChange 判定
-        GetCursorPos(&g_lastFgCursor);      // 同上：记下切换瞬间的光标位置
     }
+
+    // 触屏："用户刚点了一下"的边沿检测（每 tick 采一次，见 TouchInputTick）
+    TouchInputTick();
 
     BOOL recentClick = (g_lastClickTick && nowTick - g_lastClickTick <= AUTOSHOW_INPUT_WINDOW_MS);
     BOOL byKey       = (g_lastKeyTick && nowTick - g_lastKeyTick <= AUTOSHOW_INPUT_WINDOW_MS);
@@ -8078,13 +8146,14 @@ static void UpdateAutoVisibility() {
     BOOL clickInFg   = (recentClick && g_lastClickTopHwnd && fgTop &&
                         g_lastClickTopHwnd == fgTop);
 
-    // 用户主动操作（点在前台窗口内 / 敲键盘）-> 解除"切换窗口"的封锁。
+    // 用户主动操作（点在前台窗口内 / 敲键盘 / 触屏点过）-> 解除"切换窗口"的封锁。
     //
-    // ⚠⚠ byUserInFg 是**触屏专用兜底**（见 UserInputAfterForegroundChange 的完整论证）：
+    // ⚠⚠ byUserInFg 是**触屏专用兜底**（见 TouchInputTick 的完整论证）：
     //   触控在 Chromium 系上不会被提升成鼠标消息 ⇒ clickInFg 永远为假 ⇒
-    //   这道封锁永远解不开 ⇒ 自动呼出彻底失效（用户实测：只能从托盘手动打开）。
+    //   这道封锁永远解不开 ⇒ 自动呼出彻底失效（用户实测：只能从托盘手动打开、
+    //   平板触屏环境下自动呼出完全不工作）。
     //   只对触屏设备启用，桌面机行为保持原样。
-    BOOL byUserInFg = (IsTouchDevice() && UserInputAfterForegroundChange());
+    BOOL byUserInFg = TouchTappedRecently();
     if (byKey || clickInFg || byUserInFg) g_fgAwaitUserInput = FALSE;
 
     // 诊断：本 tick 默认无补查；用户操作窗口内才安排（须在 GetFocusedInputControl
@@ -8092,6 +8161,10 @@ static void UpdateAutoVisibility() {
     g_dbgExtraMs = -1;
     g_dbgExtraOk = -1;
     g_dbgExtraDue = (g_afLogPath[0] && (recentClick || byKey)) ? TRUE : FALSE;
+    // ⚠ 这一句必须放在 `if (input)` 判定段**之前**：那段里有 `goto done`，而 done 在
+    //   函数末尾 —— 若在 goto 之后才声明带初始化的 `fg`，C++ 会判「跳过初始化」
+    //   （MSVC C2362）。声明提前到这儿就消除了这个坑。
+    HWND fg = RealForegroundWindow();   // 别让系统触摸键盘被当成"别的程序"而误收键盘
     HWND input = GetFocusedInputControl();
 
     // ★ Chromium 系精判（2026-10-10，第 34 轮重写）
@@ -8121,6 +8194,7 @@ static void UpdateAutoVisibility() {
     //     ② **正在输入时不收**（typing）：实体键或刚按过屏幕键盘的键。
     //     ③ 判据的缓存/保持期**按窗口分组**，并且校验焦点元素的归属窗口 ——
     //        否则"上一个窗口"的结论会被当成"这个窗口"的（实测把 QQ 锁死的正是这条）。
+    HWND inputForLog = input;       // 判定会把 input 置空（精判收起），日志要看判定前的值
     int chromiumVerdict = -1;       // 焦点判据：1=可编辑 0=明确不是 -1=未知
     if (input && g_afChromiumPrecise && g_detectedByChromiumClass) {
         if (g_vis) {
@@ -8141,35 +8215,11 @@ static void UpdateAutoVisibility() {
         g_verdictHide = TRUE;
         g_verdictHidFg = fgNow;
         input = NULL;
+        g_dbgWhy = "verdict-hide";
     }
     // 换了前台窗口 ⇒ 这条备忘作废（新窗口要重新攒证据）。
     if (g_verdictHide && g_verdictHidFg != fgNow) g_verdictHide = FALSE;
 
-    // 诊断（-afdiag / 日志导出）：记录这次评估的全部输入量
-    {
-        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时查）：
-        // 结果既进日志，也供下面的 show 分支决定要不要放行 —— 一拍只查一次。
-        g_dbgUiaPt = -1;
-        g_dbgUiaPtCt = -1;
-        if (g_verdictHide && g_verdictHidFg == fgNow && recentClick &&
-            g_afChromiumPrecise && g_detectedByChromiumClass)
-            g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
-        char st[112];
-        // uiact：本次焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
-        // pt/ptc：点击落点查询结果与落点元素 ControlType（-1=没查/查不出）
-        // inFg ：触屏兜底的"用户在本窗口里操作过"是否成立
-        _snprintf_s(st, sizeof(st), _TRUNCATE, "%s uiact=%d pt=%d ptc=%d inFg=%d hid=%d",
-                    input ? "hasInput" : "noInput", g_dbgUiaCt,
-                    g_dbgUiaPt, g_dbgUiaPtCt, (int)byUserInFg, (int)g_verdictHide);
-        g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;
-        RECT wr = {0, 0, 0, 0};
-        if (g_hWnd) GetWindowRect(g_hWnd, &wr);
-        g_dbgRc[0] = (int)wr.left;  g_dbgRc[1] = (int)wr.top;
-        g_dbgRc[2] = (int)(wr.right - wr.left);
-        g_dbgRc[3] = (int)(wr.bottom - wr.top);
-        AfLog("eval", fgNow, fgTop, input, recentClick, clickInFg, byKey,
-              g_fgAwaitUserInput, g_vis, g_mainMotion.active, st);
-    }
     if (input) {
         // ★ Chromium 系精判驱动的自动收起：要再弹回来，必须**重新攒到正面证据**。
         //
@@ -8192,22 +8242,36 @@ static void UpdateAutoVisibility() {
         if (g_verdictHide) {
             if (g_verdictHidFg != fgNow || byKey) {
                 g_verdictHide = FALSE;      // 换了前台窗口 / 敲了实体键 → 重新攒证据
+                g_dbgWhy = "vhid-reset";
             } else if (recentClick) {
                 // 落点查询结果在诊断块里已经算好（g_dbgUiaPt），一拍只查一次
                 if (g_dbgUiaPt == 0 && g_chromiumTrustFg == fgNow) {
-                    return;                 // 明确点过空白 → 保持收起，且不要弹一下再收
+                    g_dbgWhy = "vhid-blank";    // 明确点过空白 → 保持收起，不要弹一下再收
+                    goto done;
                 }
                 g_verdictHide = FALSE;      // 点在可编辑元素上 / 判据不可用 → 放行
-            } else if (SysTipJustAppeared() || TouchFocusEvidence()) {
+                g_dbgWhy = "vhid-click-ok";
+            } else {
                 // 触屏（拿不到落点，所以这两条是触屏的替代证据）：
                 //   · 系统触摸键盘刚弹出来 = 用户刚点了文本输入框；
                 //   · 或者刚才那次焦点变化发生在当前前台窗口里（见 TouchFocusEvidence）。
-                g_verdictHide = FALSE;
-            } else {
-                // 没有新的用户动作 → 保持收起。
-                // ⚠ 这里**刻意不用 byUserInFg** —— 它是电平式的（一次触控后一直为真
-                //   直到换前台），拿它当"用户刚动过"会立刻变成新的振荡。
-                return;
+                // ⚠ SysTipJustAppeared 有副作用（更新上升沿），每拍**只能调一次** ——
+                //   所以不像原来那样写成 `A || B`（短路会让 B 有时不执行，日志也看不全）。
+                BOOL evTip = SysTipJustAppeared();
+                BOOL evFoc = evTip ? FALSE : TouchFocusEvidence();
+                BOOL evTap = (evTip || evFoc) ? FALSE : TouchTapEdgeConsume();
+                g_dbgEvTip = (int)evTip;
+                g_dbgEvFoc = (int)evFoc;
+                if (evTip || evFoc || evTap) {
+                    g_verdictHide = FALSE;
+                    g_dbgWhy = evTap ? "vhid-tap-ok" : "vhid-touch-ok";
+                } else {
+                    // 没有新的用户动作 → 保持收起。
+                    // ⚠ 这里**刻意不用 byUserInFg** —— 它是电平式的（一次触控后一直为真
+                    //   直到换前台），拿它当"用户刚动过"会立刻变成新的振荡。
+                    g_dbgWhy = "vhid-hold";     // ← 触屏上"点了输入框也不弹"时最常停在这里
+                    goto done;
+                }
             }
         }
         g_lastNonInput = 0;
@@ -8247,7 +8311,7 @@ static void UpdateAutoVisibility() {
             BOOL sameInput = (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken);
             // cif=1 = 用户点了当前前台窗口内（对 QQ/Edge/浏览器，
             // 顶层窗口内点击就意味着点到了地址栏 / 输入框 / 页面）
-            if (sameInput && !byKey && !clickInFg && !byUserInFg) return;
+            if (sameInput && !byKey && !clickInFg && !byUserInFg) { g_dbgWhy = "userHid"; goto done; }
             g_userHidInInput = FALSE;
         }
 
@@ -8266,26 +8330,28 @@ static void UpdateAutoVisibility() {
             GetClassNameA(g_lastClickTopHwnd, hitCls, 128);
             if (IsShellSurfaceClass(hitCls)) {
                 ShowKB(FALSE, FALSE);
-                return;
+                g_dbgWhy = "shell-hide";
+                goto done;
             }
         }
 
         // 仍处于"切换窗口后还没操作过"的状态 -> 不弹
         // （网页自动聚焦搜索框、同窗口内 Tab 跳转不受影响：那些情况下
         //   前台窗口没变过，g_fgAwaitUserInput 一直是 FALSE）
-        if (g_fgAwaitUserInput) return;
-        if (!g_manualHide && !g_vis) ShowKB(TRUE, FALSE);
-        return;
+        if (g_fgAwaitUserInput) { g_dbgWhy = "await"; goto done; }
+        if (!g_manualHide && !g_vis) { ShowKB(TRUE, FALSE); g_dbgWhy = "show"; goto done; }
+        g_dbgWhy = g_vis ? "shown" : "manualHide";
+        goto done;
     }
 
-    HWND fg = RealForegroundWindow();   // 同上：别让系统触摸键盘被当成"别的程序"而误收键盘
-    if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return;
+
+    if (fg == g_settingsHwnd || fg == g_closePromptHwnd) { g_dbgWhy = "own-window"; goto done; }
 
     // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量），
     //   只凭一次就拿去隐藏会让键盘闪烁 —— 用户看到的"莫名其妙回弹"。
     //   连续 4 次（约 200ms，叠加下面的 hideDelay 已足够）都没焦点才继续。
     g_noInputStreak++;
-    if (g_noInputStreak < 4) return;
+    if (g_noInputStreak < 4) { g_dbgWhy = "noInput-streak"; goto done; }
     if (g_noInputSinceTick == 0) g_noInputSinceTick = nowTick;
 
     // ⚠⚠ 防抖（2026-10-04 用户日志实测，修的是「手动收起后过几秒键盘自己弹回来」）：
@@ -8306,13 +8372,50 @@ static void UpdateAutoVisibility() {
         if (!(g_mainMotion.active && g_mainMotion.finish == MOTION_HIDE) &&
             IsWindowVisible(g_hWnd))
             ShowWindow(g_hWnd, SW_HIDE);
-        return;
+        g_dbgWhy = "hidden-nop";
+        goto done;
     }
-    if (g_manualHide) return;
-    if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) return;
-    if (g_manualShow) return;
+    if (g_manualHide)     { g_dbgWhy = "manualHide-nop"; goto done; }
+    if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) { g_dbgWhy = "noInput-delay"; goto done; }
+    if (g_manualShow)     { g_dbgWhy = "manualShow-nop"; goto done; }
 
     ShowKB(FALSE, FALSE);
+    g_dbgWhy = "auto-hide";
+
+done:
+    // 诊断（-afdiag / 日志导出）：记录这次评估的全部输入量
+    {
+        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时查）：
+        // 结果既进日志，也供下面的 show 分支决定要不要放行 —— 一拍只查一次。
+        g_dbgUiaPt = -1;
+        g_dbgUiaPtCt = -1;
+        if (g_verdictHide && g_verdictHidFg == fgNow && recentClick &&
+            g_afChromiumPrecise && g_detectedByChromiumClass)
+            g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
+        char st[160];
+        // 顺序即重要性（见 AfLog 里的说明）：
+        //   why   ：本拍为什么这么判（分支名）——"自动呼出没弹"的直接答案
+        //   uiact ：焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
+        //   pt/ptc：点击落点查询结果与落点元素 ControlType（-1=没查/查不出）
+        //   inFg  ：触屏"刚点过一下"（TouchTappedRecently）
+        //   tip/foc：触屏的两个证据源（系统触摸键盘刚出现 / 前台窗口里有焦点事件）
+        //   mh/uhi：manualHide / userHidInInput（"手动收起"的两道封锁）
+        //   ns    ：连续无输入焦点的拍数（要 >=4 才开始算失焦）
+        _snprintf_s(st, sizeof(st), _TRUNCATE,
+                    "why=%s uiact=%d pt=%d ptc=%d inFg=%d tip=%d foc=%d mh=%d uhi=%d ns=%d hid=%d",
+                    g_dbgWhy, g_dbgUiaCt, g_dbgUiaPt, g_dbgUiaPtCt, (int)byUserInFg,
+                    g_dbgEvTip, g_dbgEvFoc, (int)g_manualHide, (int)g_userHidInInput,
+                    g_noInputStreak, (int)g_verdictHide);
+        g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;
+        RECT wr = {0, 0, 0, 0};
+        if (g_hWnd) GetWindowRect(g_hWnd, &wr);
+        g_dbgRc[0] = (int)wr.left;  g_dbgRc[1] = (int)wr.top;
+        g_dbgRc[2] = (int)(wr.right - wr.left);
+        g_dbgRc[3] = (int)(wr.bottom - wr.top);
+        AfLog("eval", fgNow, fgTop, inputForLog, recentClick, clickInFg, byKey,
+              g_fgAwaitUserInput, g_vis, g_mainMotion.active, st);
+    }
+    return;
 }
 
 static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {

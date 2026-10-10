@@ -636,7 +636,14 @@ static int   g_noInputStreak = 0;
 // 失焦开始的时刻（首次越过"连续确认"门槛时记录，输入焦点恢复时清零）。
 // 与 AUTOSHOW_INPUT_GRACE_MS 配合，滤掉爆发式抖动 —— 见其定义处说明。
 static DWORD g_noInputSinceTick = 0;
-BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（仅显示同步，不影响虚拟键逻辑）
+BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（左右任一；仅显示同步，不影响虚拟键逻辑）
+// ⚠ 2026-10-10：左右 Shift 必须**分开**记。
+//   原来只有一个 g_physShift，按住一边再按另一边、或先松一边时，
+//   这个标志表达不出「另一边还按着」—— 高亮就会和实体键对不上
+//   （用户报的「按物理 Shift 后高亮不灭 / 亮灭与实体键对不上」）。
+//   g_physShift 保留为两者的或，供 KeyTextInto 的大写判定与双符号键显示使用。
+BOOL        g_physLShift = FALSE;     // 实体左 Shift 按住
+BOOL        g_physRShift = FALSE;     // 实体右 Shift 按住
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
 // 实体 NumLock 锁定态（与 g_npLock 同源，都来自 ReadSystemNumLock），
 // 一起进帧缓存签名 —— 它俩任一变化都要触发重绘。
@@ -2874,7 +2881,14 @@ static BOOL IsActive(const KeyDef* k) {
     // ⚠ 不要再改成「跟实体灯走」或「自己取反」：第 17~20 轮在这上面反复翻车
     //   （假亮、不同步、反复翻转）。**唯一真值是系统状态。**
     if (k->vk == 0x90 && g_npLock) return TRUE;
-    if ((k->vk == VK_SHIFT || k->vk == VK_LSHIFT || k->vk == VK_RSHIFT) && (g_sh || g_physShift)) return TRUE;
+    // Shift 高亮分两路（2026-10-10 改）：
+    //   · 屏幕键盘 Shift 锁定（g_sh）—— 左右两格一起亮，这是点击屏幕 Shift 的既有行为，不动；
+    //   · 实体 Shift —— **左右各管各的**，按哪边亮哪边，松开即灭。
+    // 原来三者的判定是一条 `(vk==SHIFT||LSHIFT||RSHIFT) && (g_sh||g_physShift)`，
+    // 一个共用标志同时驱动两格 ⇒ 只按左边时右边也亮、先松一边时亮灭对不上。
+    if (k->vk == VK_LSHIFT) return (g_sh || g_physLShift);
+    if (k->vk == VK_RSHIFT) return (g_sh || g_physRShift);
+    if (k->vk == VK_SHIFT && (g_sh || g_physShift)) return TRUE;   // 通用 VK_SHIFT：现有布局未用到，留着防以后加键
     if (k->vk == 0x11 && g_ct) return TRUE;
     if (k->vk == VK_LWIN && (g_winKey || g_physWin)) return TRUE;   // 锁定(等 Win+快捷键)或实体 Win 按下时高亮
     if (k->vk == 0x12 && g_al) return TRUE;
@@ -3951,8 +3965,10 @@ static int HitKey(int x, int y) {
 //   （要连绘制量一起省，得把键帽状态从签名里拆出来做单键重画；
 //     收益有限、改动面大，本轮不做。）
 //
-// vk 的匹配容错：物理态按 **左右成对** 上报（pShift 是 L/R 的或），
-// 因此传 VK_LSHIFT 时也要把 RSHIFT 那格一起失效；VK_LWIN 同理。
+// vk 的匹配容错：传 VK_LSHIFT 时把 RSHIFT 那格一起失效；VK_LWIN 同理。
+//   · 屏幕键盘的 Shift 锁定（g_sh）本来就让左右两格同时亮 / 同时灭 ⇒ 两格都必须重画；
+//   · 实体 Shift 现在按左右分开记（g_physLShift / g_physRShift），只变一边时
+//     多失效另一格只是多贴一格，代价可忽略 —— 换来的是这段不做特判、逻辑简单。
 // 找不到任何匹配键时什么都不做：该键不在当前布局里（例如数字区已收起），
 // 状态值已经存进 g_* 变量，下次切回该布局会按新状态重画，不会留下错误高亮。
 static void InvalidateKeyByVk(HWND hWnd, short vk) {
@@ -3990,6 +4006,9 @@ struct KbFrameSig {
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, physNum, fnLayer, showFKeys,
          fnWebLayout, shiftSymbols, lang;
+    // ⚠ 左右 Shift 分开进签名（2026-10-10）：physShift 只是两者的「或」，
+    //   从「按住左」变成「按住右」时或值不变 —— 不分开就会漏重绘。
+    BOOL physLShift, physRShift;
     // 数字区显隐（生效值）：之前没进签名，靠「17 个键消失 → nk 变」侥幸触发重绘；
     // 窄屏自动收起与手动收起是两条路径，显式纳入才不依赖这个巧合。
     BOOL npHidden;
@@ -4043,6 +4062,7 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.dpi = (float)GetSystemDpiScale();
     sig.sh = g_sh; sig.ct = g_ct; sig.al = g_al; sig.cp = g_cp;
     sig.winKey = g_winKey; sig.physShift = g_physShift; sig.physWin = g_physWin;
+    sig.physLShift = g_physLShift; sig.physRShift = g_physRShift;   // 左右分开（见 KbFrameSig 的说明）
     sig.physNum = g_physNum;             // 实体 NumLock 灯变 → 数字区 Num 键高亮要跟上
     sig.fnLayer = g_fnLayer; sig.showFKeys = g_showFKeys; sig.fnWebLayout = g_fnWebLayout;
     sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
@@ -7051,6 +7071,51 @@ static BOOL IsShellSurfaceClass(const char* cls) {
            strstr(cls, "TopLevelWindowForOverflowXamlIsland");
 }
 
+// ===== Windows 自带触摸键盘（Win10/11：TabTip.exe 的 IPTip_Main_Window）=====
+// 它在本项目里有特殊地位：点输入框时系统会把它弹出来，而**它一旦成为前台窗口**，
+// 自动呼出的两个判断会同时被它带偏，结果是「HKey 完全不弹、只剩系统键盘」：
+//   ① UpdateAutoVisibility 里「前台变了 → 进入等待用户操作」（g_fgAwaitUserInput）
+//      —— 这个封锁会一直拦住自动弹出，要等用户再点一次输入框 / 按键才解；
+//   ② GetFocusedInputControl 会把 fg 认成它，探测不出输入框 → 返回 NULL
+//      → 走「没有输入焦点」分支，把键盘收掉。
+// ⇒ 判定时一律**跳过它**，改用「上一个真正的前台窗口」（RealForegroundWindow）。
+// ⚠ 只做判定上的忽略，**不主动关掉系统键盘**（用户明确要求不动它）。
+// ⚠ 只认这一个窗口类：osk.exe 的 OSKMainClass 是用户主动开的辅助键盘，不该被忽略。
+static BOOL IsSystemTouchKeyboard(HWND h) {
+    if (!h || !IsWindow(h)) return FALSE;
+    char cls[128] = {0};
+    GetClassNameA(h, cls, 128);
+    return strstr(cls, "IPTip_Main_Window") != NULL;
+}
+
+// 上一个「真正的」前台窗口（跳过系统触摸键盘）。
+// 触摸键盘抢前台时不更新它，于是自动呼出的判定继续对着底下那个应用。
+static HWND g_lastRealFg = NULL;
+// 诊断（-afdiag）：前台窗口类变化时记一笔。
+// 万一用户机器上的系统触摸键盘不是 IPTip_Main_Window（不同 Win10 版本可能不同），
+// 日志里能直接看到真实类名，不用再猜 —— 只有带 -afdiag 时会写。
+static char g_dbgLastFgCls[64] = {0};
+static HWND RealForegroundWindow() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return NULL;
+
+    if (g_afLogPath[0]) {
+        char cls[64] = {0};
+        GetClassNameA(fg, cls, 64);
+        if (strcmp(cls, g_dbgLastFgCls) != 0) {
+            strncpy_s(g_dbgLastFgCls, sizeof(g_dbgLastFgCls), cls, _TRUNCATE);
+            char buf[112];
+            _snprintf_s(buf, 112, _TRUNCATE, "fg class -> %s", cls);
+            AfNote(buf);
+        }
+    }
+
+    if (IsSystemTouchKeyboard(fg))
+        return (g_lastRealFg && IsWindow(g_lastRealFg)) ? g_lastRealFg : fg;
+    g_lastRealFg = fg;
+    return fg;
+}
+
 static BOOL IsInputControl(HWND hw) {
     if (!hw || !IsWindow(hw)) return FALSE;
     char buf[128] = {0};
@@ -7089,7 +7154,9 @@ static BOOL IsOwnForegroundWindow(HWND fg) {
 // 一概视为输入框，避免焦点离开文本区域后键盘仍持续显示。
 static HWND GetFocusedInputControl() {
     g_detectedInputToken = 0;
-    HWND fg = GetForegroundWindow();
+    // ⚠ 用 RealForegroundWindow 而不是 GetForegroundWindow：Windows 自带触摸键盘
+    //   弹出时会成为前台窗口，直接拿它去探测必然判不出输入框（见 RealForegroundWindow）。
+    HWND fg = RealForegroundWindow();
     if (!fg || IsOwnForegroundWindow(fg)) return NULL;
 
     // 系统外壳界面（桌面/任务栏/开始菜单/托盘弹窗等）直接跳过，
@@ -7204,7 +7271,7 @@ static void UpdateAutoVisibility() {
 
     // 前台窗口变了 -> 进入"等待用户操作"状态（见 g_fgAwaitUserInput 的说明）
     {
-        HWND fgNow = GetForegroundWindow();
+        HWND fgNow = RealForegroundWindow();   // 跳过系统触摸键盘：它弹出来不算"用户切了窗口"
         if (fgNow != g_lastFg) { g_lastFg = fgNow; g_fgAwaitUserInput = TRUE; }
     }
 
@@ -7214,7 +7281,7 @@ static void UpdateAutoVisibility() {
     //   滞后于焦点转移，用它做"点击落点"比较会误判 —— 用户实测
     //   「点了输入框反而被收掉 / 再点也不弹」就是这条）。
     //   改用「点击落点所属顶层窗口 == 当前前台窗口」这个稳定得多的判据。
-    HWND fgNow = GetForegroundWindow();
+    HWND fgNow = RealForegroundWindow();   // 跳过系统触摸键盘（见 RealForegroundWindow）
     HWND fgTop = fgNow ? GetAncestor(fgNow, GA_ROOT) : NULL;
 
     // 前台窗口变了 -> 进入"等待用户操作"状态
@@ -7316,7 +7383,7 @@ static void UpdateAutoVisibility() {
         return;
     }
 
-    HWND fg = GetForegroundWindow();
+    HWND fg = RealForegroundWindow();   // 同上：别让系统触摸键盘被当成"别的程序"而误收键盘
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) return;
 
     // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量），
@@ -7400,9 +7467,21 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
             if (down || up) {
                 BOOL changed = FALSE;
                 switch (p->vkCode) {
-                case VK_LSHIFT: case VK_RSHIFT:
-                    if (g_physShift != down) { g_physShift = down; changed = TRUE; }
+                // 左右 Shift **分开**记录（见 g_physLShift 的说明）。
+                // ⚠ 实体 Shift 按下时顺手解除屏幕键盘上的 Shift 锁定（g_sh / g_shiftLock /
+                //   g_shiftOnce）：那个锁定会让高亮一直被钉住，实体键松开也灭不掉 ——
+                //   用户报的「按物理 Shift 后高亮无法隐藏」就是它。
+                //   按下实体键 = 用户明确要用实体键，此时让实体状态接管高亮。
+                case VK_LSHIFT: case VK_RSHIFT: {
+                    BOOL& side = (p->vkCode == VK_LSHIFT) ? g_physLShift : g_physRShift;
+                    if (side != down) { side = down; changed = TRUE; }
+                    g_physShift = (g_physLShift || g_physRShift);
+                    if (down && (g_sh || g_shiftLock || g_shiftOnce)) {
+                        g_sh = FALSE; g_shiftLock = FALSE; g_shiftOnce = FALSE;
+                        changed = TRUE;
+                    }
                     break;
+                }
                 case VK_LWIN: case VK_RWIN:
                     if (g_physWin != down) { g_physWin = down; changed = TRUE; }
                     if (down) {
@@ -7768,8 +7847,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
             // 实体键状态自校正：钩子偶尔漏掉 keyup/keydown 时，按物理键实际状态修正显示，避免高亮残留
             {
-                BOOL pShift = ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0) ||
-                              ((GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0);
+                // ⚠ 左右 Shift 分开读（2026-10-10）：与 g_physLShift / g_physRShift 一一对应。
+                //   之前只读一个或值，自校正时会把「另一边还按着」的状态覆盖掉。
+                BOOL pLShift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
+                BOOL pRShift = (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
                 BOOL pWin   = ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
                               ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
                 // ⚠⚠ 2026-10-04 第 23 轮：NumLock 改成**每个 tick 都读回真值**。
@@ -7813,13 +7894,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 BOOL pNum   = ReadSystemNumLock();
                 BOOL pCaps  = (GetKeyState(VK_CAPITAL) & 1) != 0;
                 BOOL dLock  = (g_npLock != pNum);        // 高亮依据变了
-                BOOL dShift = (g_physShift != pShift);
+                BOOL dLShift = (g_physLShift != pLShift);
+                BOOL dRShift = (g_physRShift != pRShift);
+                BOOL dShift  = (dLShift || dRShift);
                 BOOL dWin   = (g_physWin != pWin);
                 BOOL dNum   = (g_physNum != pNum);
                 BOOL dCaps  = (g_cp != pCaps);
                 if (dLock) g_npLock = pNum;              // 与真实锁定态对齐
                 if (dShift || dWin || dNum || dCaps || dLock) {
-                    g_physShift = pShift;
+                    g_physLShift = pLShift;
+                    g_physRShift = pRShift;
+                    g_physShift = (pLShift || pRShift);
                     g_physWin = pWin;
                     g_physNum = pNum;
                     g_cp = pCaps;

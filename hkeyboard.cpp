@@ -7379,8 +7379,11 @@ static int UiaFocusEditable(HWND fgExpect) {
     if (FAILED(hr) || !el) return -1;
     // get_CurrentNativeWindowHandle 是**强类型 getter**，不用 VARIANT
     // （走 GetCurrentPropertyValue 会拉进 oleaut32，arm64 上链接失败过）。
-    HWND elHwnd = NULL;
-    el->get_CurrentNativeWindowHandle(&elHwnd);
+    // ⚠ 它的出参类型是 `UIA_HWND*`（= `void*`），**不是 `HWND*`** —— 直接传 HWND*
+    //   会 C2664。
+    UIA_HWND elHwndRaw = NULL;
+    el->get_CurrentNativeWindowHandle(&elHwndRaw);
+    HWND elHwnd = (HWND)elHwndRaw;
     CONTROLTYPEID ct = 0;
     hr = el->get_CurrentControlType(&ct);
     el->Release();          // 只管当场取值，不留跨帧的 COM 指针（会过期）

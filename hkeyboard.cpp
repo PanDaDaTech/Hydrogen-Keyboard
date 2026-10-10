@@ -8068,6 +8068,17 @@ static void UpdateAutoVisibility() {
     // 启动预热期内不评估（见 g_appStartTick 的说明）：此刻前台状态还没稳定，
     // 判断不可靠，容易在没输入框的地方误弹键盘并连带卡住状态。
     if (g_appStartTick && GetTickCount() - g_appStartTick < AUTOSHOW_WARMUP_MS) { g_dbgWhy = "warmup"; return; }
+
+    // ⚠ 设置窗（或关闭提示窗）开着时**挂起自动显隐**：用户此刻在配置，不是在打字。
+    //   否则焦点一进一出就走一遍「弹出 → 精判说不在输入框 → 又收」，
+    //   在用户眼里就是设置页在乱跳（实机反馈：打开设置页 + 点编辑框再离开 → 乱跳）。
+    //   注意是**挂起**不是禁用：这是静止态，窗口关掉后下一个轮询周期照常评估，
+    //   所以不需要任何额外的"锁死"标记（那条路历史上翻过车，见 g_verdictHide 的说明）。
+    if ((g_settingsHwnd && IsWindow(g_settingsHwnd) && IsWindowVisible(g_settingsHwnd)) ||
+        (g_closePromptHwnd && IsWindow(g_closePromptHwnd) && IsWindowVisible(g_closePromptHwnd))) {
+        g_dbgWhy = "settings-open";
+        return;
+    }
     // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
     // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
     if (g_mainMotion.active) {

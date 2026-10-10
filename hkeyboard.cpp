@@ -7211,19 +7211,34 @@ static BOOL UserInputAfterForegroundChange() {
 //     · `Document 不能当「可编辑」判据`（说明当时确实把 Document 当成了可编辑）
 //   当年还把它们用在了**显示**上，所以判错就是"输入框不弹"。
 //
-// ⚠⚠⚠ 但这次**绝不重蹈覆辙**：这个判据**只用来触发收起**，显示仍走粗判
-//   （见 UpdateAutoVisibility 的调用点）。因此：
-//     · 判据假阳性（说不是输入框，其实在输入）→ 该收没收 = 现状，不更差；
-//     · 判据假阴性（说是输入框，其实不是）→ 显示走不到这里，不受影响。
-//   **它没有任何路径能把"自动呼出"弄坏** —— 而当年那三轮翻车全部发生在显示上。
+// ⚠⚠⚠ 但用法必须**对称** —— 判据要同时回答"该不该弹"和"该不该收"。
+//   这是被实测逼出来的：第一版只想让它管收起（显示仍走粗判），
+//   结果直接变成自激振荡（用户日志周期约 2 秒，见 UpdateAutoVisibility 的完整记录）。
+//   道理很简单：粗判对 Chromium 恒为真，只要"收起"由精判决定、
+//   而"弹出"由粗判决定，两者就一定互相打架。
 //
-// ⚠ 只在**键盘已显示**时查（调用点负责）：没显示就没有"要不要收"的问题，
+//   对称使用就要求判据本身够硬，于是配了两道护栏（都在 UpdateAutoVisibility 侧）：
+//     · **信任门**：只有在这个窗口上**见过 Edit** 才采信它的"不在输入框"——
+//       contenteditable 型输入框报不出 Edit（实测 QQ 的 ProseMirror 报 GroupControl，
+//       整个窗口 EditControl 数为 **0**），没这道门那类应用会变成再也不弹；
+//     · **保持期 400ms**：刚见过 Edit 的一小段时间内一律按"在输入框"处理。
+//
+//   判据本身的稳定性有实测背书：WorkBuddy 在前台、光标在输入框里、**全程不碰任何东西**
+//   → EditControl **233/233 连续 14 秒无一次跳变**（脚本 `.workbuddy/uia_stability2.py`）。
+//   用户日志里那个"50004/50030 成块交替"是**上面那个振荡带出来的**，不是判据不稳。
+//// ⚠ 只在**键盘已显示**时查（调用点负责）：没显示就没有"要不要收"的问题，
 //   不该为它付跨进程 COM 的代价。
 // ⚠ 还留了 ini 开关 General/ChromiumPrecise（默认 1）—— 万一它带来新问题，
 //   关掉一个开关就回到旧行为，不必动主逻辑（这是当年那条教训的直接落实）。
 #define HK_UIA_CT_EDIT 50004    // UIA_EditControlTypeId
 
 static IUIAutomation* g_uia = NULL;
+
+// 「这个窗口上的精判可信吗」—— 只有在那里**见过 Edit** 才算可信。
+// ⚠ 必须的护栏：contenteditable 型输入框报不出 Edit（实测 QQ 的 ProseMirror
+//   报 GroupControl，整个窗口 EditControl 数为 0）。没有这道门，
+//   那类应用会被判成"永远不在输入框"⇒ 自动呼出直接失效（第十一轮的翻车形态）。
+static HWND g_chromiumTrustFg = NULL;
 
 static BOOL EnsureUia() {
     if (g_uia) return TRUE;
@@ -7270,6 +7285,19 @@ static int UiaFocusEditableCached() {
     cached = (v < 0) ? 1 : v;
     cachedTick = now;
     return cached;
+}
+
+// 在缓存之上再加一层"保持期"：**刚见过 Edit 的一小段时间内一律按"在输入框"处理**。
+// 挡的是单次误报 —— Chromium 的焦点上报偶有瞬时非 Edit（尤其刚显示/隐藏之后，
+// 缓存里可能还留着上一拍的值）。保持期比缓存粗一档，让一次坏采样翻不动结论。
+// 代价：离开输入框后收起会晚 400ms，可接受。
+static DWORD g_uiaHoldEditTick = 0;
+static int UiaFocusEditableHeld() {
+    DWORD now = GetTickCount();
+    int v = UiaFocusEditableCached();
+    if (v == 1) g_uiaHoldEditTick = now;
+    if (g_uiaHoldEditTick && now - g_uiaHoldEditTick < 400) return 1;
+    return v;
 }
 
 static BOOL IsInputControl(HWND hw) {
@@ -7483,27 +7511,40 @@ static void UpdateAutoVisibility() {
 
     // ★ Chromium 系精判（2026-10-10）：粗判只说明"前台是 Chromium 窗口"，
     //   说明不了"光标在输入框里" —— 于是 Chromium 系一在前台就永远不收起。
-    //   键盘**已显示**时补一次 UIA 焦点元素的 ControlType：
+    //   补一次 UIA 焦点元素的 ControlType：
     //     Edit(50004) → 确实在输入框里（保持显示，走下面的原逻辑）
     //     其它        → 视为"没有输入焦点了"，落进下面的失焦分支触发自动收起
     //
-    // ⚠⚠ 三个约束缺一不可 —— 这是第十一轮整体回退的直接解药：
-    //   ① 只在 g_vis 为真时查：没显示就没有"要不要收"的问题，
-    //      也就不必付跨进程 COM 的代价（UIA 查询有 250ms 缓存）；
-    //   ② 只在**粗判命中**时查（g_detectedByChromiumClass）：靠光标 / 原生控件
-    //      命中的输入框有更硬的证据，不要用软判据去推翻它；
-    //   ③ 只用来**置空 input（触发收起）**，**从不参与显示** ——
-    //      所以判错最坏只是"该收没收"（= 现在的行为），不可能"该弹不弹"。
-    //      当年那三轮翻车全部发生在**显示**上，这一条从结构上排除了它。
-    if (input && g_vis && g_afChromiumPrecise && g_detectedByChromiumClass) {
-        // 附加保护：用户**正在输入**时不收起（实体键，或刚按过屏幕键盘上的键）。
-        //   判据万一是错的（例如某个富文本编辑器把输入框报成 Document），
-        //   这几百毫秒里也不会把键盘从正在打字的人手里抽走。
-        //   代价：正在输入的那几拍不查 UIA（日志里 uiact 会是 -1）。
+    // ⚠⚠⚠ 这条判据必须**对称地管两个方向**，否则就是自激振荡。
+    //   第一版我给它加了「只在键盘已显示时查」（想省跨进程 COM 的代价），
+    //   用户的日志当场证伪，周期约 2 秒：
+    //       隐藏 → 跳过精判 → 粗判说"有输入" → ShowKB(TRUE)
+    //       → 已显示，精判跑起来、说"不在输入框" → ShowKB(FALSE)
+    //       → 隐藏 → 又跳过精判 → 又弹 …… 无限循环
+    //   那一拍的日志特征很好认：`vis=0 ... => hasInput uiact=-1`
+    //   （**uiact=-1 = 这一拍没查**，于是粗判独自做了决定）。
+    //   ⇒ **绝不能按 g_vis 跳过查询**：隐藏状态下同样要知道"光标在不在输入框里"，
+    //     否则"该不该弹"就退化成粗判 —— 而粗判对 Chromium 恒为真。
+    //
+    // ⚠⚠ 两道护栏（都为了不重蹈第十一轮"输入框不弹"的覆辙）：
+    //   ① **信任门**（g_chromiumTrustFg）：只有当我们**在这个窗口上见过 Edit**
+    //      才采信它的"不在输入框"。原因：contenteditable 型输入框在 UIA 里
+    //      根本报不出 Edit —— 实测 QQ 的聊天输入框是 ProseMirror，
+    //      报 `GroupControl`（整个 QQ 窗口里 EditControl 数量为 **0**）。
+    //      没有这道门，那类应用会被判成"永远不在输入框"⇒ 自动呼出直接失效。
+    //      没见过 Edit 的窗口 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
+    //   ② **正在输入时不收**（typing）：实体键或刚按过屏幕键盘的键。
+    BOOL chromiumVerdict = -1;      // 1=在输入框 0=不在 -1=没查
+    if (input && g_afChromiumPrecise && g_detectedByChromiumClass) {
         BOOL typing = byKey || (g_lastOwnKeyTick && (nowTick - g_lastOwnKeyTick) <= 1200);
-        if (!typing && UiaFocusEditableCached() == 0) input = NULL;
+        if (!typing) chromiumVerdict = UiaFocusEditableHeld();
     } else {
-        g_dbgUiaCt = -1;   // 本 tick 没查 —— 别在日志里留上一次的残值
+        g_dbgUiaCt = -1;            // 本 tick 没查 —— 别在日志里留上一次的残值
+    }
+    if (chromiumVerdict == 1) g_chromiumTrustFg = fgNow;   // 这个窗口上有真实 Edit 元素
+    if (input && chromiumVerdict == 0 &&
+        g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) {
+        input = NULL;               // 只在可信窗口上才让精判说话
     }
 
     // 诊断（-afdiag）：记录这次评估的全部输入量

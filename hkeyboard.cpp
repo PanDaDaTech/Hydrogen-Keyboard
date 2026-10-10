@@ -929,6 +929,9 @@ static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 
 static HANDLE g_fontReg = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
+// 托盘图标点击去抖（见 WM_TRAY 的说明）：一次"双击"会送来三条消息，
+// 不去抖就会连切三次 —— 净结果纯属奇偶侥幸，某些外壳只送两条时直接变成"没反应"。
+static DWORD g_lastTrayToggleTick = 0;
 
 // ===== GDI+ 平滑绘图（抗锯齿圆形，避免 GDI Ellipse 锯齿） =====
 static ULONG_PTR g_gdiplusToken = 0;
@@ -8300,8 +8303,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_TRAY:
+        // ⚠ 托盘图标的一次**双击**会送来三条消息：UP / DBLCLK / UP ——
+        //   原来这三条都调 ToggleKB()，等于"显示→隐藏→显示"切三次：
+        //   净结果看着对纯属**奇偶侥幸**，中间还闪两下；一旦外壳只送两条（UP / DBLCLK），
+        //   就变成"点了托盘没反应"。⇒ 加 400ms 去抖：一次用户动作只切换一次。
         if (l == WM_LBUTTONUP || l == WM_LBUTTONDBLCLK) {
-            g_dbgShowFrom = "tray-click"; ToggleKB();
+            DWORD tn = GetTickCount();
+            if (tn - g_lastTrayToggleTick >= 400) {
+                g_lastTrayToggleTick = tn;
+                g_dbgShowFrom = "tray-click"; ToggleKB();
+            }
         } else if (l == WM_RBUTTONUP) {
             ShowMenu(hWnd);
         }

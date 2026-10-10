@@ -935,7 +935,7 @@ BOOL        g_npHidden = FALSE;        // 完整布局：数字区隐藏（标�
 BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动隐藏数字区（不持久化）
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
-BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时显示特殊符号（否则显示数字）
+BOOL        g_shiftSymbols = FALSE;    // 键面是否上下并列显示两个符号（默认关：平时主字符，按 Shift 显示副符号）
 
 // ===== Shift 双击锁定（2026-10-04 新增）=====
 // 需求：「设置里加个选项：Shift 键能快速按两下锁定」。
@@ -3525,7 +3525,14 @@ static void DoKeyAction(const KeyDef* k) {
         //   Num 键（0x90）仍然照旧真的发出去，只为让实体灯 / 目标程序的 NumLock 跟着翻，
         //   不再参与决定这里发什么键。
         if (k->vk >= 0x60 && k->vk <= 0x69) {
-            SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
+            // 布局不同、语义不同（用户 2026-10-10）：
+            //   独立小键盘（1）：**始终发 VK_NUMPAD0-9**。它没有 Num 键，职责就是打数字，
+            //     不能被系统灯悄悄改成方向键（旧写法就是这么翻车的，见上）。
+            //   全尺寸（2）：这里是**真键盘的数字区**，必须跟 NumLock 走 —— 灯灭时发导航键
+            //     （Ins/Home/PgUp/←/→/End/↓/PgDn/Del），与实体键盘完全一致。
+            //   ⇒ NumpadNavKey 这张表正是为此保留的（见其定义处的说明）。
+            SendKey((g_layoutMode == 2 && !g_npLock) ? NumpadNavKey(k->vk) : k->vk,
+                    g_sh, g_ct, g_al, g_winKey);
             ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
             break;
         }
@@ -3978,19 +3985,17 @@ static void DrawKeys(HDC dc) {
         // 「图形 + 名字」（Win 徽标由 DrawKeyGlyph 矢量特绘 —— 字体里没有那个字形）。
         // 图标样式选「文字」时 DrawKeyLabel 返回 FALSE，两者自然落回纯文字。
         if (dual) {
-            // 双符号键在三态下都是文字：主字符 + 副符号本身就是两个信息，图标化会毁数据
-            if (shiftOn) {
-                // Shift 按下：**只显示特殊符号，而且用灰色**（= Shift 未按下时那个副符号的颜色）。
-                // ⚠⚠ 2026-10-10 用户要求（附全尺寸截图对比）：
-                //   「Shift 点击显示特殊符号应该是灰色部分而不是黑色部分」。
-                //   原实现是把符号**提升成主字符**画（大号 + textC 黑色），用户否掉了：
-                //   数字行的符号应该永远保持"副符号"的灰色观感，不要变成大黑字。
-                //   ⇒ 只有 g_shiftSymbols 打开时才是"只显示符号"；关闭时仍按原样显示主字符（黑）。
-                wchar_t single[2] = { g_shiftSymbols ? shiftCh : baseCh, 0 };
-                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f,
-                          g_shiftSymbols ? C_DIM : textC);
-            } else {
+            // 两条路，由「显示双符号」开关决定（g_shiftSymbols，**默认关**）：
+            //   关（默认）：键面只显示**一个**字符 —— 平时是主字符（黑），按住 Shift 换成副符号（灰）。
+            //              用户 2026-10-10 要求：默认不要上下并列两个符号，一眼只读一个。
+            //   开：上下并列显示两个（主字符 + 灰色副符号），即原来的双符号外观。
+            // ⚠ 符号**永远是灰色**（含 Shift 按下时）—— 见 DrawKeyDual 上方那条纪律，
+            //   别再改回「按 Shift 把符号提成大黑字」。
+            if (g_shiftSymbols) {
                 DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
+            } else {
+                wchar_t single[2] = { shiftOn ? shiftCh : baseCh, 0 };
+                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, shiftOn ? C_DIM : textC);
             }
         } else if (!DrawKeyLabel(dc, k, f, txt, textC)) {
             DrawTextKey(dc, k, txt, f, textC);
@@ -5424,8 +5429,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
 
         r = SettingsRowRect(m, closeRow + 3);
         DrawSettingRowContent(dc, m, r, HKICON_SHIFT, NULL,
-                              T(L"Shift 符号", L"Shift Symbols"),
-                              T(L"按下 Shift 后数字键仅显示特殊符号", L"Show only symbols while Shift is held"),
+                              T(L"显示双符号", L"Show Both Symbols"),
+                              T(L"开：键面上下并列显示主符号与副符号；关：只显示一个，按住 Shift 换成副符号",
+                                L"On: stack both symbols on the key face. Off: show one, swap to the other while Shift is held"),
                               g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
 
@@ -5881,7 +5887,7 @@ static void EnsureConfigFile() {
     IniSetInt(L"Keyboard", L"FKeys", 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", 0);
     IniSetInt(L"Keyboard", L"KeyIconStyle", 2);
-    IniSetInt(L"General", L"ShiftSymbols", 1);
+    IniSetInt(L"General", L"ShiftSymbols", 0);
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"AutoPopup", 1);
     IniSetInt(L"General", L"AutoHide", 1);
@@ -5916,7 +5922,7 @@ static void LoadConfig() {
     // 键面固定「图标+文字」：不再提供「仅文字」模式（实机反馈），设置页也没有对应行了。
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
-    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
+    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 0) != 0);   // 默认关：键面只显示一个字符
     g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 0) != 0);
     g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);

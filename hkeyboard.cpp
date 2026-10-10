@@ -4523,10 +4523,15 @@ static BOOL SettingsRowHidden(int tab, int index) {
     BOOL onlyDefault = (g_layoutMode != 0);
     if (tab == 0) {
         int closeRow = g_af ? 2 : 1;
-        if (index == closeRow + 2) return onlyDefault;   // 功能键行
-        // Shift 符号 / Shift 双击锁定：全尺寸、小键盘布局里**都有** Shift 键和双符号键，
-        // 这两行对它们同样有用 ⇒ 不藏（2026-10-10 用户要求补上）。
-        // 功能键行仍藏（全尺寸常驻 F 行、小键盘没有 F 行 —— 布局没有的功能就不要加）。
+        // 小键盘布局（1）：功能键行 / Shift 符号 / Shift 双击锁定 **三行都藏**
+        //   —— 小键盘没有 F 行、也没有 Shift 键与双符号键，留着就是三个摆设
+        //     （2026-10-10 用户要求：小键盘布局不要加这两行）。
+        if (g_layoutMode == 1)
+            return (index == closeRow + 2 || index == closeRow + 3 || index == closeRow + 4);
+        // 功能键行：全尺寸也藏（全尺寸常驻 F 行，开关没有意义）
+        if (index == closeRow + 2) return onlyDefault;
+        // Shift 两行：全尺寸布局**有** Shift 键和双符号键，保留（不影响它才是有用的设置）
+        //   —— 这也是「隐藏入口」而不是「禁用功能」：只藏 UI 行，不动配置值。
         return FALSE;
     }
     // Fn 网页布局两条件任一成立就藏：

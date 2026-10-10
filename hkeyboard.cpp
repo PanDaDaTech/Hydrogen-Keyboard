@@ -935,7 +935,7 @@ BOOL        g_npHidden = FALSE;        // 完整布局：数字区隐藏（标�
 BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动隐藏数字区（不持久化）
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
-BOOL        g_shiftSymbols = FALSE;    // 键面是否上下并列显示两个符号（默认关：平时主字符，按 Shift 显示副符号）
+BOOL        g_shiftSymbols = TRUE;     // 是否显示双符号（默认开：键面并列显示主/副两个符号，按住 Shift 换成副符号）
 
 // ===== Shift 双击锁定（2026-10-04 新增）=====
 // 需求：「设置里加个选项：Shift 键能快速按两下锁定」。
@@ -3985,17 +3985,21 @@ static void DrawKeys(HDC dc) {
         // 「图形 + 名字」（Win 徽标由 DrawKeyGlyph 矢量特绘 —— 字体里没有那个字形）。
         // 图标样式选「文字」时 DrawKeyLabel 返回 FALSE，两者自然落回纯文字。
         if (dual) {
-            // 两条路，由「显示双符号」开关决定（g_shiftSymbols，**默认关**）：
-            //   关（默认）：键面只显示**一个**字符 —— 平时是主字符（黑），按住 Shift 换成副符号（灰）。
-            //              用户 2026-10-10 要求：默认不要上下并列两个符号，一眼只读一个。
-            //   开：上下并列显示两个（主字符 + 灰色副符号），即原来的双符号外观。
+            // 双符号键（用户 2026-10-11 明确）：
+            //   默认（g_shiftSymbols 开）：键面**上下并列**显示主字符 + 灰色副符号，
+            //     按住 Shift 时**换成副符号单独显示**（灰色）—— 这就是"能切换副符号"。
+            //   关：始终只显示主字符（黑），按 Shift 也换面（同样换成副符号），
+            //     区别只是"平时要不要同时看到两个"。
             // ⚠ 符号**永远是灰色**（含 Shift 按下时）—— 见 DrawKeyDual 上方那条纪律，
             //   别再改回「按 Shift 把符号提成大黑字」。
-            if (g_shiftSymbols) {
+            if (shiftOn) {
+                wchar_t single[2] = { shiftCh, 0 };
+                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, C_DIM);
+            } else if (g_shiftSymbols) {
                 DrawKeyDual(dc, k->x, k->y, k->w, k->h, baseCh, shiftCh, f, g_f12, textC, C_DIM);
             } else {
-                wchar_t single[2] = { shiftOn ? shiftCh : baseCh, 0 };
-                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, shiftOn ? C_DIM : textC);
+                wchar_t single[2] = { baseCh, 0 };
+                DrawTextC(dc, k->x, k->y, k->w, k->h, single, f, textC);
             }
         } else if (!DrawKeyLabel(dc, k, f, txt, textC)) {
             DrawTextKey(dc, k, txt, f, textC);
@@ -4412,7 +4416,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_NPBTN          24   // 布局 Tab：显示标题栏 123 切换按钮
 #define S_HIT_NPBTN          24   // 布局 Tab：标题栏显示小键盘按钮
 #define S_HIT_SHIFTSYM       19
-#define S_HIT_SHDLOCK       29   // Shift 双击锁定（常规 Tab 子项，紧跟「Shift 符号」）
+#define S_HIT_SHDLOCK       29   // Shift 双击锁定（**布局 Tab** 子项，紧跟「Shift 符号」，2026-10-11 从常规搬来）
 #define S_HIT_THEME_DROP     20
 #define S_HIT_URL            30
 #define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
@@ -4528,26 +4532,18 @@ static BOOL SettingsRowHidden(int tab, int index) {
     BOOL onlyDefault = (g_layoutMode != 0);
     if (tab == 0) {
         int closeRow = g_af ? 2 : 1;
-        // 小键盘布局（1）：功能键行 / Shift 符号 / Shift 双击锁定 **三行都藏**
-        //   —— 小键盘没有 F 行、也没有 Shift 键与双符号键，留着就是三个摆设
-        //     （2026-10-10 用户要求：小键盘布局不要加这两行）。
-        if (g_layoutMode == 1)
-            return (index == closeRow + 2 || index == closeRow + 3 || index == closeRow + 4);
         // 功能键行：全尺寸也藏（全尺寸常驻 F 行，开关没有意义）
         if (index == closeRow + 2) return onlyDefault;
-        // Shift 两行：全尺寸布局**有** Shift 键和双符号键，保留（不影响它才是有用的设置）
-        //   —— 这也是「隐藏入口」而不是「禁用功能」：只藏 UI 行，不动配置值。
         return FALSE;
     }
-    // Fn 网页布局两条件任一成立就藏：
-    //  a) 非默认布局 —— 小键盘 / 全尺寸布局压根没有 Fn 层
-    //  b) 开了功能键行 —— 此时底排走 kDefRow4NoFn，**Fn 键被移除**、空出的 1u 并进空格
-    //     （5.5 → 6.5u，见 BuildDefaultKeys）。键都没了，留着这行开关纯属摆设。
-    //
-    // ⚠ 只藏 UI 行，**不改 g_fnWebLayout 的持久化值**：用户关掉功能键行后，
-    //   原来的网页布局设置立刻原样恢复，不用重新开一次。这是「隐藏入口」不是「禁用功能」。
-    //   （反过来若在这里顺手把 g_fnWebLayout 置 FALSE，就成了静默改用户配置。）
-    if (tab == 3) return (onlyDefault || g_showFKeys) && index == 1;
+    // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮 3=Shift 符号 4=Shift 双击锁定
+    if (tab == 3) {
+        // Fn 网页布局：非默认布局没有 Fn 层；开了功能键行时 Fn 键被移除
+        if (index == 1) return (onlyDefault || g_showFKeys);
+        // Shift 两行（2026-10-11 从常规 Tab 搬来）：小键盘布局没有 Shift 键与双符号键 ⇒ 藏
+        if (g_layoutMode == 1) return (index == 3 || index == 4);
+        return FALSE;
+    }
     return FALSE;
 }
 
@@ -4556,7 +4552,7 @@ static int SettingsRowCtrlDip(int tab, int index) {
     if (tab == 0) {                                 // 常规
         int closeRow = g_af ? 2 : 1;
         if (index == closeRow) return 40;           // 关闭按钮下拉
-        if (index == closeRow + 5) return 40;       // 界面语言下拉
+        if (index == closeRow + 3) return 40;       // 界面语言下拉
         return 26;
     }
     if (tab == 3) {                                 // 布局
@@ -4634,8 +4630,8 @@ static int SettingsRowCount(int tab) {
     //   即索引 0..7 共 **8** 行；关时用到 closeRow+5 = 6，共 **7** 行。
     //   少算一行 ⇒ SettingsCardRect 的 bottom 少一行高，SettingsDesiredHeight
     //   算出的窗口就偏矮 ⇒ **「界面语言」那一行被裁在窗口外**（用户实机截图）。
-    if (tab == 0) return g_af ? 8 : 7;
-    if (tab == 3) return 3;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
+    if (tab == 0) return g_af ? 6 : 5;
+    if (tab == 3) return 5;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
     if (tab == 1) return 3;
     return 0;
 }
@@ -5015,13 +5011,11 @@ static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     else if (hit == S_HIT_NPBTN) rowIndex = 2;
     else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
     else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
-    // ⚠⚠ 2026-10-04 修：原来 S_HIT_SHDLOCK 落到最后的 else，被当成「Shift 符号」
-    //   （g_af 开时 rowIndex 5 / 关时 4）。而它的真实行号是 closeRow+4
-    //   （开时 6 / 关时 5）⇒ **动画重绘到了上面那一行**，
-    //   用户看到的是「点 Shift 双击锁定，动画却跑到 Shift 符号上」。
-    else if (hit == S_HIT_SHIFTSYM) rowIndex = g_af ? 5 : 4;
-    else if (hit == S_HIT_SHDLOCK)  rowIndex = g_af ? 6 : 5;
-    else if (hit == S_HIT_LANG_DROP) rowIndex = g_af ? 7 : 6;
+    // 2026-10-11：Shift 符号 / Shift 双击锁定 从常规 Tab 搬到**布局 Tab**（行号 3 / 4）。
+    // 原来的 2026-10-04 那条注释（"+4 落到 else"）随搬迁作废，别再按老行号推。
+    else if (hit == S_HIT_SHIFTSYM) rowIndex = 3;
+    else if (hit == S_HIT_SHDLOCK)  rowIndex = 4;
+    else if (hit == S_HIT_LANG_DROP) rowIndex = g_af ? 5 : 4;
     else rowIndex = g_af ? 5 : 4;
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(120 * m.dpi);
@@ -5427,24 +5421,9 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               g_sHov == S_HIT_FKEYS, SettingsSwitchTextRight(m, r));
         DrawSettingSwitch(dc, m, r, g_showFKeys, S_HIT_FKEYS);
 
-        r = SettingsRowRect(m, closeRow + 3);
-        DrawSettingRowContent(dc, m, r, HKICON_SHIFT, NULL,
-                              T(L"显示双符号", L"Show Both Symbols"),
-                              T(L"开：键面上下并列显示主符号与副符号；关：只显示一个，按住 Shift 换成副符号",
-                                L"On: stack both symbols on the key face. Off: show one, swap to the other while Shift is held"),
-                              g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
-        DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
-
-        r = SettingsRowRect(m, closeRow + 4);
-        // 子项样式（不画图标 tile）：与「Shift 符号」从属，标题左对齐
-        DrawSettingRowContent(dc, m, r, -1, NULL,
-                              T(L"Shift 双击锁定", L"Shift Double-Tap Lock"),
-                              T(L"连按两下 Shift 锁定，再点解除", L"Tap twice to lock, tap again to release"),
-                              g_sHov == S_HIT_SHDLOCK, SettingsSwitchTextRight(m, r), FALSE, TRUE);
-        DrawSettingSwitch(dc, m, r, g_shiftDoubleTap, S_HIT_SHDLOCK);
         }
 
-        r = SettingsRowRect(m, closeRow + 5);
+        r = SettingsRowRect(m, closeRow + 3);
         const wchar_t* gseg[2];
         int gsegn = LangSegItems(gseg);
         RECT gsegR = RowSegRect(m, r, gseg, gsegn);
@@ -5484,6 +5463,22 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               g_sHov == S_HIT_NPBTN, SettingsSwitchTextRight(m, r),
                               SettingsRowDescTwoLines(m, 3, 2));
         DrawSettingSwitch(dc, m, r, g_showNumBtn, S_HIT_NPBTN);
+
+        r = SettingsRowRect(m, 3);
+        DrawSettingRowContent(dc, m, r, HKICON_SHIFT, NULL,
+                              T(L"显示双符号", L"Show Both Symbols"),
+                              T(L"开：键面上下并列显示主符号与副符号；关：只显示一个，按住 Shift 换成副符号",
+                                L"On: stack both symbols on the key face. Off: show one, swap to the other while Shift is held"),
+                              g_sHov == S_HIT_SHIFTSYM, SettingsSwitchTextRight(m, r));
+        DrawSettingSwitch(dc, m, r, g_shiftSymbols, S_HIT_SHIFTSYM);
+
+        r = SettingsRowRect(m, 4);
+        // 子项样式（不画图标 tile）：与「Shift 符号」从属，标题左对齐
+        DrawSettingRowContent(dc, m, r, -1, NULL,
+                              T(L"Shift 双击锁定", L"Shift Double-Tap Lock"),
+                              T(L"连按两下 Shift 锁定，再点解除", L"Tap twice to lock, tap again to release"),
+                              g_sHov == S_HIT_SHDLOCK, SettingsSwitchTextRight(m, r), FALSE, TRUE);
+        DrawSettingSwitch(dc, m, r, g_shiftDoubleTap, S_HIT_SHDLOCK);
     } else if (g_sTab == 1) {
         RECT r = SettingsRowRect(m, 0);
         const wchar_t* tseg[3];
@@ -5699,16 +5694,12 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         r = SettingsRowRect(m, closeRow + 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_REMEMBER;
 
-        if (!SettingsRowHidden(0, closeRow + 2)) {       // 全尺寸 / 小键盘下这两行不存在
+        if (!SettingsRowHidden(0, closeRow + 2)) {       // 全尺寸 / 小键盘下这行不存在
             r = SettingsRowRect(m, closeRow + 2);
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_FKEYS;
-            r = SettingsRowRect(m, closeRow + 3);
-            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
-            r = SettingsRowRect(m, closeRow + 4);
-            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHDLOCK;
         }
 
-        r = SettingsRowRect(m, closeRow + 5);
+        r = SettingsRowRect(m, closeRow + 3);
         { const wchar_t* it[2]; int n = LangSegItems(it);
           RECT sr = RowSegRect(m, r, it, n);
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LANG_DROP; }
@@ -5729,6 +5720,13 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
         r = SettingsRowRect(m, 2);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_NPBTN;
+
+        if (!SettingsRowHidden(3, 3)) {
+            r = SettingsRowRect(m, 3);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHIFTSYM;
+            r = SettingsRowRect(m, 4);
+            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHDLOCK;
+        }
     } else if (g_sTab == 1) {
         RECT r;
         r = SettingsRowRect(m, 0);
@@ -5887,7 +5885,7 @@ static void EnsureConfigFile() {
     IniSetInt(L"Keyboard", L"FKeys", 0);
     IniSetInt(L"Keyboard", L"FnWebLayout", 0);
     IniSetInt(L"Keyboard", L"KeyIconStyle", 2);
-    IniSetInt(L"General", L"ShiftSymbols", 0);
+    IniSetInt(L"General", L"ShiftSymbols", 1);
     IniSetInt(L"General", L"Language", 0);
     IniSetInt(L"General", L"AutoPopup", 1);
     IniSetInt(L"General", L"AutoHide", 1);
@@ -5922,7 +5920,7 @@ static void LoadConfig() {
     // 键面固定「图标+文字」：不再提供「仅文字」模式（实机反馈），设置页也没有对应行了。
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
-    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 0) != 0);   // 默认关：键面只显示一个字符
+    g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);   // 默认开：键面并列显示两个符号
     g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 0) != 0);
     g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);

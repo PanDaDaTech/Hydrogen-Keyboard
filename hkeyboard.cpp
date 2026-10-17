@@ -141,6 +141,7 @@ int g_keyHeight = 46;
 #ifdef HK_DIAG
 // -envtest 专用：驱动"注入→退出"两个阶段（说明见 EnvTestInject）
 #define TIMER_ENVTEST   8833
+#define TIMER_CARET     8834   // 设置页 HEX 输入框的光标闪烁
 // ⚠ 前向声明是必需的：WM_TIMER 的处理在主 WndProc 里（文件靠前）
 BOOL g_envTest = FALSE;
 int  g_envTestStage = 0;
@@ -367,35 +368,43 @@ static DWORD ArgbToBgr(DWORD val) {
 }
 
 static DWORD GetWallpaperAccentBgr() {
+    // 读**壁纸本身**求主色调：缩到 16×16 取平均。
+    // 原来只读注册表（DWM\AccentColor 等），Win11 上那是"系统强调色"，
+    // 换壁纸不变，所以"跟随壁纸"永远取不到壁纸的颜色。
+    wchar_t path[MAX_PATH] = {0};
+    if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, path, 0) && path[0]) {
+        Gdiplus::Bitmap src(path, FALSE);
+        if (src.GetLastStatus() == Gdiplus::Ok && src.GetWidth() > 0) {
+            Gdiplus::Bitmap small(16, 16, PixelFormat32bppARGB);
+            {
+                Gdiplus::Graphics g(&small);
+                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+                g.DrawImage(&src, 0, 0, 16, 16);
+            }
+            double r = 0, gg = 0, b = 0, n = 0;
+            for (int y = 0; y < 16; y++) {
+                for (int x = 0; x < 16; x++) {
+                    Gdiplus::Color c;
+                    if (small.GetPixel(x, y, &c) != Gdiplus::Ok) continue;
+                    if (c.GetA() < 128) continue;
+                    r += c.GetR(); gg += c.GetG(); b += c.GetB(); n += 1;
+                }
+            }
+            if (n > 0) {
+                int R = (int)(r / n), G = (int)(gg / n), B = (int)(b / n);
+                if ((R | G | B) != 0) return RGB(R, G, B);
+            }
+        }
+    }
+    // 兜底：纯色壁纸（SPI 返回空）或图片读不了时，退回注册表里的系统强调色。
     HKEY hKey;
     DWORD val = 0, sz = sizeof(val);
-
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\DWM",
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegQueryValueExW(hKey, L"AccentColor", NULL, NULL, (LPBYTE)&val, &sz);
         RegCloseKey(hKey);
     }
     if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
-
-    val = 0; sz = sizeof(val);
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent",
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegQueryValueExW(hKey, L"AccentColorMenu", NULL, NULL, (LPBYTE)&val, &sz);
-        RegCloseKey(hKey);
-    }
-    if ((val & 0xFFFFFF) != 0) return AbgrToBgr(val);
-
-    // 备用：ColorizationColor（Win7 起即存在，ARGB 布局；Win7 无 AccentColor 系列键，壁纸派生强调色由此获得）
-    val = 0; sz = sizeof(val);
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\DWM",
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegQueryValueExW(hKey, L"ColorizationColor", NULL, NULL, (LPBYTE)&val, &sz);
-        RegCloseKey(hKey);
-    }
-    if ((val & 0xFFFFFF) != 0) return ArgbToBgr(val);
     return 0;
 }
 
@@ -422,13 +431,16 @@ static HWND g_closePromptHwnd = 0;
 static void RefreshThemeAndRepaint(HWND hWnd) {
     HkbTokens before = g_themeBuf;
     ApplyTheme();
-    if (memcmp(&before, &g_themeBuf, sizeof(HkbTokens)) != 0) {
-        InvalidateRect(hWnd, 0, TRUE);
-        if (g_settingsHwnd && IsWindow(g_settingsHwnd))
-            RedrawWindow(g_settingsHwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
-        if (g_closePromptHwnd && IsWindow(g_closePromptHwnd))
-            RedrawWindow(g_closePromptHwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
+    if (memcmp(&before, &g_themeBuf, sizeof(HkbTokens)) == 0) return;
+    // ⚠ 之前只失效了传进来的那个窗口（调用方传的是设置窗），**主键盘根本没被失效** ——
+    //   它只能等下一次别的重绘（鼠标划过、敲键）把新配色带出来，表现就是「切风格要等一会儿才变」。
+    //   现在三处一起失效并立即上屏（UPDATENOW），切完就是新的。
+    HWND wins[3] = { g_hWnd, g_settingsHwnd, g_closePromptHwnd };
+    for (int i = 0; i < 3; i++) {
+        if (wins[i] && IsWindow(wins[i]))
+            RedrawWindow(wins[i], NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     }
+    (void)hWnd;
 }
 
 // Convenience macros to access current theme tokens
@@ -733,6 +745,8 @@ BOOL        g_npHidden = FALSE;        // 完整布局：数字区隐藏（标�
 BOOL        g_npHiddenAuto = FALSE;    // 完整布局：窗口过窄时自动隐藏数字区（不持久化）
 BOOL        g_fnWebLayout = FALSE;     // 按 Fn 切换到上网常用布局（否则为数字行 F1~F12 层）
 BOOL        g_showFKeys = FALSE;       // 顶部显示 F1~F12 键
+// 窗口大小档位：0=默认 1=2/3 2=一半 3=最小。按各布局自己的基准等比缩放。
+static int  g_windowSize = 0;
 BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时数字键只显示特殊符号（原义，常规 Tab）
 BOOL        g_dualSymbols = TRUE;      // 键面是否**上下并列**显示主/副两个符号（布局 Tab，默认开）
 
@@ -827,6 +841,14 @@ static void InitWindowSizeForDpi() {
     } else {                        // 默认布局
         g_ww = (int)(980 * dpiScale);
         g_wh = (int)((320 + (g_showFKeys ? 53 : 0)) * dpiScale);
+    }
+    // 窗口大小档位：按各布局自己的基准缩放（小键盘 430×320、全尺寸 1280×404 各算各的）
+    if (g_windowSize > 0) {
+        double f = (g_windowSize == 1) ? (2.0 / 3.0) : (g_windowSize == 2) ? 0.5 : 0.35;
+        g_ww = (int)(g_ww * f);
+        g_wh = (int)(g_wh * f);
+        if (g_ww < 300) g_ww = 300;
+        if (g_wh < 120) g_wh = 120;
     }
 }
 
@@ -3384,6 +3406,7 @@ struct KbFrameSig {
     // 标题栏「布局」胶囊的显隐：设置页里一拨开关，签名不变就不会重绘
     // 表现为「要拿鼠标碰一下标题栏才刷新」（用户实机反馈）。
     BOOL showNumBtn;
+    int  themeStyle;
     BOOL operator!=(const KbFrameSig& o) const { return memcmp(this, &o, sizeof(*this)) != 0; }
 };
 static KbFrameSig g_kbSig = {};
@@ -3442,6 +3465,7 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
     sig.npHidden = NumpadHidden();
     sig.showNumBtn = g_showNumBtn;
+    sig.themeStyle = g_themeStyle;
     if (g_kbCacheBmp && g_kbCacheW == g_ww && g_kbCacheH == g_wh && !(sig != g_kbSig)) return;
 
     HDC dc = GetDC(hWnd);
@@ -4740,6 +4764,13 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             BOOL showHint = g_hlEditFocus && shown[0] == 0;
             DrawTextL(dc, input.left + (int)(12 * m.dpi), input.top, inputW - (int)(20 * m.dpi), inputH,
                       showHint ? L"RRGGBB" : shown, g_sfBase, showHint ? C_DIM : C_WHITE);
+            // 输入光标：自绘输入框没有系统 caret，得自己画（530ms 亮灭，跟系统一致）
+            if (g_hlEditFocus && ((GetTickCount() / 530) & 1) == 0) {
+                int cx = input.left + (int)(12 * m.dpi) + MeasureTextAdvW(dc, shown, g_sfBase);
+                int ch = inputH / 2;
+                if (cx > input.right - (int)(8 * m.dpi)) cx = input.right - (int)(8 * m.dpi);
+                Fill(dc, cx, input.top + (inputH - ch) / 2, 1, ch, C_HOT);
+            }
         }
         // 界面风格（B1）：现代 / 经典
         r = SettingsRowRect(m, 3);
@@ -5064,6 +5095,9 @@ static void LoadConfig() {
     g_showNumBtn = IniGetInt(L"Keyboard", L"ShowNumBtn", 1) != 0;
     g_npHidden = IniGetInt(L"Keyboard", L"NpHidden", 0) != 0;
     g_showFKeys = (IniGetInt(L"Keyboard", L"FKeys", 0) != 0);
+    g_windowSize = IniGetInt(L"Keyboard", L"WindowSize", 0);
+    if (g_windowSize < 0) g_windowSize = 0;
+    if (g_windowSize > 3) g_windowSize = 3;
     g_fnWebLayout = (IniGetInt(L"Keyboard", L"FnWebLayout", 0) != 0);
     // 键面固定「图标+文字」：不再提供「仅文字」模式（实机反馈），设置页也没有对应行了。
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
@@ -5140,6 +5174,7 @@ static void TryApplyHexEdit(HWND hWnd) {
     (void)hWnd;
 }
 static void CommitHexEdit(HWND hWnd) {
+    KillTimer(hWnd, TIMER_CARET);
     TryApplyHexEdit(hWnd);   // 合法则应用，非法则保留原色
     g_hlEditFocus = FALSE;
     InvalidateRect(hWnd, NULL, TRUE);
@@ -5307,6 +5342,7 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
                 g_hlEditFocus = TRUE;
                 HexFromBgr(HueAccentBgr(g_hue), g_hlEditBuf);
                 SetFocus(hWnd);
+                SetTimer(hWnd, TIMER_CARET, 530, NULL);   // 光标闪烁
             }
         }
         break;

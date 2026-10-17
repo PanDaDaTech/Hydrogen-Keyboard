@@ -6444,6 +6444,14 @@ static IUIAutomation* g_uia = NULL;
 
 // ⚠ 必须的护栏：contenteditable 型输入框报不出 Edit —— 实测 QQ NT 主窗口里
 static HWND g_chromiumTrustFg = NULL;
+// 信任门按**进程**记：WorkBuddy / Edge 这类有多个同进程顶层窗口，按 HWND 记的话
+// 在 A 窗口见过 Edit、切到 B 窗口就又不算数了 ⇒ 「不在输入框」永远不被采信 ⇒ 收不起来。
+static DWORD g_chromiumTrustPid = 0;
+static DWORD PidOfWindow(HWND h) {
+    DWORD pid = 0;
+    if (h) GetWindowThreadProcessId(h, &pid);
+    return pid;
+}
 
 //   ⚠ 它只是一句备忘："当前这个窗口正处于精判收起态"。
 static BOOL g_verdictHide = FALSE;
@@ -7149,9 +7157,9 @@ static void UpdateAutoVisibility() {
     //   最近 10 次里 ≥7 次是 Edit 才算"在输入框"，≤3 次才算"不在"，中间维持上一次结论。
     static unsigned g_uiaHist = 0;      // bit0 最新，1 = Edit
     static int      g_uiaSamples = 0;
-    static HWND     g_uiaHistFg = NULL;
-    if (g_uiaHistFg != fgNow) {         // 换窗口：上一个窗口的样本不能带过来
-        g_uiaHistFg = fgNow;
+    static DWORD    g_uiaHistPid = 0;
+    if (g_uiaHistPid != PidOfWindow(fgNow)) {   // 按进程分组
+        g_uiaHistPid = PidOfWindow(fgNow);
         g_uiaHist = 0;
         g_uiaSamples = 0;
     }
@@ -7168,9 +7176,10 @@ static void UpdateAutoVisibility() {
     }
 
     // 信任门：**只有真正见到可编辑元素才设**。-1（未知）绝不算。
-    if (uiaStable == 1) g_chromiumTrustFg = fgNow;
-    if (input && uiaStable == 0 &&
-        g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) {
+    if (uiaStable == 1) { g_chromiumTrustFg = fgNow; g_chromiumTrustPid = PidOfWindow(fgNow); }
+    BOOL trustHere = (g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) ||
+                     (g_chromiumTrustPid != 0 && g_chromiumTrustPid == PidOfWindow(fgNow));
+    if (input && uiaStable == 0 && trustHere) {
         // 精判说"光标不在可编辑元素里" ⇒ 收起，并记下"这一次是精判收的"。
         g_verdictHide = TRUE;
         g_verdictHidFg = fgNow;

@@ -1101,9 +1101,12 @@ static void InitWindowSizeForDpi() {
         // 1280×404：宽高比接近常见全尺寸板，键帽不会被横向拉扁
         g_ww = (int)(1280 * dpiScale);
         g_wh = (int)(404 * dpiScale);
-    } else {                        // 全尺寸
+    } else {                        // 默认布局
         g_ww = (int)(980 * dpiScale);
-        g_wh = (int)(320 * dpiScale);
+        // 「功能键行」会多出一整行：高度必须跟着长，否则 6 行被塞进 5 行的高度，
+        // 键帽高度从 ~49 掉到 ~40，整块键盘看着扁（用户报「开了这个比例怪怪的」）。
+        // 53 = 一行键高 + 行距，正好让键高保持在 49 左右。
+        g_wh = (int)((320 + (g_showFKeys ? 53 : 0)) * dpiScale);
     }
 }
 
@@ -2813,8 +2816,8 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
     // 尺寸一律**按键高**取值（原来写死 15/20 DIP）：窗口缩小、键帽变矮时，固定尺寸的图标
     // 会挤掉同排文字，[图标 + 文字] 放不下就只能退成纯图标 —— 即缩小窗口后的图标显示异常。
     // 用键高做基准，DPI 与窗口缩放天然同步（48 DIP 键 ≈ 原来的 15/20 DIP）。
-    int iconInline = k->h * 31 / 100;
-    int iconOnly   = k->h * 42 / 100;
+    int iconInline = k->h * 36 / 100;
+    int iconOnly   = k->h * 52 / 100;
     int gap        = k->h * 8 / 100;
     int edge       = k->h * 12 / 100;   // 「图标+文字」整组两侧的呼吸边距
 
@@ -3537,7 +3540,19 @@ static void DoKeyAction(const KeyDef* k) {
             SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
             ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         } else {
-            BOOL us = g_sh ? !(GetKeyState(VK_CAPITAL) & 1) : FALSE;
+            // 大小写：**要发出去的 Shift 不等于屏幕上的 Shift**。
+            // 目标程序最终显示什么，取决于「CapsLock 与送达的 Shift 的异或」；
+            // 而屏幕键盘的键面是 `大写 = g_cp 异或 g_sh`（见 KeyTextInto）。
+            // 所以要按「键面显示的那个大小写」反推该不该带 Shift：
+            //     想要大写 → 送 Shift = !Caps；想要小写 → 送 Shift = Caps
+            //
+            // ⚠⚠ 2026-10-17 修（用户报「双击 Shift 锁定后按 Caps，键面变小写但打出来还是大写」）：
+            //   上一版写的是 `us = g_sh ? !Caps : FALSE`，只在「Caps 开 + Shift 开」这一种组合上错：
+            //   Caps=1、Shift=1 → 键面算的是小写（1 异或 1 = 0），上一版却送 us=FALSE
+            //   ⇒ 系统按 Caps=1 又把它变成大写 ⇒ 键面与输入相反。
+            //   其他三种组合恰好都对，所以这个问题只在「锁定 Shift 之后再按 Caps」复现。
+            BOOL wantUpper = (g_cp != g_sh);
+            BOOL us = wantUpper ? !(GetKeyState(VK_CAPITAL) & 1) : ((GetKeyState(VK_CAPITAL) & 1) != 0);
             SendKey(k->vk, us, FALSE, FALSE);
             ReleaseShiftOnce();
             ClearWinLock();   // 普通键也退出 Win 锁定/切换状态
@@ -3731,6 +3746,12 @@ static void DoKeyAction(const KeyDef* k) {
             g_ct = !g_ct;
         } else if (k->vk == 0x12) {
             g_al = !g_al;
+        } else {
+            // Menu（VK_APPS = 0x5D）：以前它被归成 K_MOD，而这里只认 Shift/Ctrl/Alt
+            // ⇒ 点下去什么都不发，右键菜单永远出不来（用户报「菜单键点击无效」）。
+            // 它不是修饰键，直接发一次即可，由系统按前台窗口弹出上下文菜单。
+            SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
+            ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         }
         break;
     case K_CAPS:
@@ -4283,6 +4304,9 @@ struct KbFrameSig {
     // 数字区显隐（生效值）：之前没进签名，靠「17 个键消失 → nk 变」侥幸触发重绘；
     // 窄屏自动收起与手动收起是两条路径，显式纳入才不依赖这个巧合。
     BOOL npHidden;
+    // 标题栏「布局」胶囊的显隐：设置页里一拨开关，签名不变就不会重绘，
+    // 表现为「要拿鼠标碰一下标题栏才刷新」（用户实机反馈）。
+    BOOL showNumBtn;
     BOOL operator!=(const KbFrameSig& o) const { return memcmp(this, &o, sizeof(*this)) != 0; }
 };
 static KbFrameSig g_kbSig = {};
@@ -4340,6 +4364,7 @@ static void EnsureKbFrameCache(HWND hWnd) {
     sig.fnLayer = g_fnLayer; sig.showFKeys = g_showFKeys; sig.fnWebLayout = g_fnWebLayout;
     sig.shiftSymbols = g_shiftSymbols; sig.lang = g_lang;
     sig.npHidden = NumpadHidden();
+    sig.showNumBtn = g_showNumBtn;
     if (g_kbCacheBmp && g_kbCacheW == g_ww && g_kbCacheH == g_wh && !(sig != g_kbSig)) return;
 
     HDC dc = GetDC(hWnd);
@@ -6301,7 +6326,8 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
     case S_HIT_FKEYS:
         BeginSwitchAnimation(hWnd, hit, g_showFKeys, !g_showFKeys);
         g_showFKeys = !g_showFKeys;
-        keyRowsChanged = TRUE;
+        IniSetInt(L"Keyboard", L"FKeys", g_showFKeys ? 1 : 0);
+        layoutChanged = TRUE;   // 多/少一行 ⇒ 窗口高度要跟着变（见 InitWindowSizeForDpi）
         break;
     case S_HIT_FNWEB:
         BeginSwitchAnimation(hWnd, hit, g_fnWebLayout, !g_fnWebLayout);
@@ -6560,6 +6586,20 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
+        // 兜底：内容比客户区高就先长高再重绘。
+        // 行数会随「布局 / 功能键行 / 双符号」等开关变化，只靠点击后收一次边，
+        // 任一路径漏掉就会出现「最后一行被窗口裁掉」（用户视频里的现象）。
+        {
+            RECT cr; GetClientRect(hWnd, &cr);
+            int want = SettingsDesiredHeight(hWnd);
+            if (want > cr.bottom + 2) {
+                RECT wr; GetWindowRect(hWnd, &wr);
+                SetWindowPos(hWnd, NULL, 0, 0, wr.right - wr.left, want,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                ValidateRect(hWnd, NULL);
+                return 0;
+            }
+        }
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
@@ -6567,6 +6607,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ClearWindowBackBuffer(surface.dc, hWnd, rc.right, rc.bottom);
         SettingsDraw(surface.dc, hWnd);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, surface.dc, 0, 0, SRCCOPY);
+        // 注：内容高于客户区时的自动长高在 WM_PAINT 开头处理（见 SettingsFitHeight 的说明）
         EndWindowPaintSurface(&surface);
         EndPaint(hWnd, &ps);
         return 0;

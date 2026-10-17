@@ -324,6 +324,11 @@ static DWORD HueAccentBgr(int hue) {
 
 // 由色相派生全部令牌。轮廓与分隔线一律预混成实色：
 // GDI+ 往 32bpp BI_RGB DIB 里画半透明形状时 alpha 语义不可靠，实色还能让 XP 与 Win11 字节级一致。
+// 界面风格（方案 §4.1 B1）：与明暗 / 色相正交的第二维。
+// 0=现代（默认，带色相）1=经典（中性灰，忽略色相，只做浅色）
+// ⚠ 必须定义在 HkbTokensBuild 之前 —— 令牌函数要读它（上一版放到后面，先用后定义直接编译错）
+static int  g_themeStyle = 0;
+
 static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
     double h = (double)hue;
     out->primary   = dark ? OklchToBgr(0.75, 0.140, h) : OklchToBgr(0.70, 0.140, h);
@@ -349,6 +354,25 @@ static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
     out->titleActive     = dark ? OklchToBgr(0.75, 0.100, h) : OklchToBgr(0.60, 0.100, h);
     // Enter / 确认键：浅色底压深字（5.7:1），深色底用黑 70% 混主色（5.4:1）
     out->primaryFg       = dark ? BlendColor(out->primary, RGB(0, 0, 0), 0.70) : out->text;
+
+    // 经典风格（方案 §4.2 的实机取色）：中性灰、忽略色相。深色下不套用 ——
+    // #D6D6D6 描边在深色上不可用（§4.4.3），经典只做浅色。
+    if (g_themeStyle == 1 && !dark) {
+        out->pageBg             = RGB(243, 243, 243);
+        out->cardBg             = RGB(255, 255, 255);
+        out->btnRegularBg       = RGB(232, 232, 232);
+        out->btnRegularBgHover  = RGB(224, 224, 224);
+        out->btnRegularBgActive = RGB(216, 216, 216);
+        out->btnCardBgHover     = RGB(247, 247, 247);
+        out->btnPlainBgHover    = RGB(240, 240, 240);
+        out->keyOutline         = RGB(214, 214, 214);
+        out->keyOutlineHover    = RGB(190, 190, 190);
+        out->text               = RGB(26, 26, 26);
+        out->textMuted          = RGB(102, 102, 102);
+        out->btnContent         = RGB(26, 26, 26);
+        out->lineDivider        = RGB(230, 230, 230);
+        out->metaDivider        = RGB(214, 214, 214);
+    }
 }
 
 // Theme mode: 0 = follow system, 1 = force dark, 2 = force light
@@ -4037,7 +4061,7 @@ static void DrawKeys(HDC dc) {
             else       { bg = C_KEY;   outline = C_KEY_BORDER;   textC = C_WHITE; }
         }
 
-        DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, outline, 8);
+        DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, outline, g_themeStyle == 1 ? 4 : 8);
 
         // ---- 按**本键所在区块**取统一档 ----
         // 主区 / 导航区 / 数字区各自成组、各算一档（见 FitUnifiedTier）；
@@ -4528,6 +4552,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_HL_PAL0        80
 #define S_HIT_REMEMBER       95
 #define S_HIT_OPACITY_DROP   96
+#define S_HIT_STYLE          97   // 主题 Tab：界面风格（现代 / 经典）
 
 static int  g_sTab = 0;        // 0=常规 1=布局 2=主题 3=关于（见 k_settingsTabHits 的映射）
 static int  g_sHov = -1;       // 悬停元素，-1=无
@@ -4731,7 +4756,7 @@ static int SettingsRowCount(int tab) {
     //   算出的窗口就偏矮 ⇒ **「界面语言」那一行被裁在窗口外**（用户实机截图）。
     if (tab == 0) return g_af ? 8 : 7;
     if (tab == 3) return 4;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
-    if (tab == 1) return 3;
+    if (tab == 1) return 4;
     return 0;
 }
 
@@ -5041,6 +5066,12 @@ static int LangSegItems(const wchar_t** out) {
 static int LayoutSegItems(const wchar_t** out) {
     for (int i = 0; i < 3; i++) out[i] = g_lang ? g_layoutNamesEn[i] : g_layoutNames[i];
     return 3;
+}
+static int StyleSegItems(const wchar_t** out) {
+    static const wchar_t* zh[2] = { L"\u73B0\u4EE3", L"\u7ECF\u5178" };   // 现代 / 经典
+    static const wchar_t* en[2] = { L"Modern", L"Classic" };
+    for (int i = 0; i < 2; i++) out[i] = g_lang ? en[i] : zh[i];
+    return 2;
 }
 static int ThemeSegItems(const wchar_t** out) {
     for (int i = 0; i < 3; i++) out[i] = g_lang ? g_themeNamesEn[i] : g_themeNames[i];
@@ -5679,6 +5710,16 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
             DrawTextL(dc, input.left + (int)(12 * m.dpi), input.top, inputW - (int)(20 * m.dpi), inputH,
                       showHint ? L"RRGGBB" : shown, g_sfBase, showHint ? C_DIM : C_WHITE);
         }
+        // 界面风格（B1）：现代 / 经典
+        r = SettingsRowRect(m, 3);
+        { const wchar_t* st[2]; int stn = StyleSegItems(st);
+          RECT stR = RowSegRect(m, r, st, stn);
+          DrawSettingRowContent(dc, m, r, HKICON_CONTRAST, NULL,
+                                T(L"界面风格", L"Interface Style"),
+                                T(L"经典：中性灰 + 4px 圆角（忽略色相）", L"Classic: neutral grey, 4px corners (hue ignored)"),
+                                g_sHov == S_HIT_STYLE, stR.left);
+          DrawSegmented(dc, m, stR, st, stn, g_themeStyle); }
+
     } else {
         // 关于 tab：身份卡 → 链接卡（项目地址）→ 「开源许可」→ 许可卡，版权行在最下方居中。
         // 语法整体照制作工具（PanDa PE）的关于页：身份卡是「方块 + 产品名 + 版本」，
@@ -5871,6 +5912,11 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
             if (x >= slider.left && x < slider.right && y >= slider.top - pad && y < slider.bottom + pad)
                 return S_HIT_HL_HUE;
         }
+        r = SettingsRowRect(m, 3);
+        { const wchar_t* st[2]; int stn = StyleSegItems(st);
+          RECT sr = RowSegRect(m, r, st, stn);
+          if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_STYLE; }
+
     } else {
         // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）；
         // 许可 / 诊断行的热区只有右侧按钮本身 —— 行内的文字是读数，不是动作
@@ -6035,7 +6081,8 @@ static void LoadConfig() {
     // 这里仍然读一次 ini 只为了让老配置不残留（值一律归一到 2）。
     g_keyIconStyle = 2;                          // 老配置里残留的 0 / 1 一并归一
     g_shiftSymbols = (IniGetInt(L"General", L"ShiftSymbols", 1) != 0);
-    g_dualSymbols = (IniGetInt(L"General", L"DualSymbols", 1) != 0);   // 默认开：键面并列显示两个符号
+    g_dualSymbols = (IniGetInt(L"General", L"DualSymbols", 1) != 0);
+    g_themeStyle = IniGetInt(L"Theme", L"Style", 0);   // 0=现代 1=经典（B1）   // 默认开：键面并列显示两个符号
     g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 0) != 0);
     g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);
@@ -6384,6 +6431,19 @@ static void SettingsOnClick(HWND hWnd, int x, int y) {
         g_hlSliderDrag = hit;
         SetCapture(hWnd);
         UpdateHueSlider(hWnd, x);
+        return;
+    }
+    if (hit == S_HIT_STYLE) {
+        SettingsMetrics sm = GetSettingsMetrics(hWnd);
+        RECT r3 = SettingsRowRect(sm, 3);
+        const wchar_t* st[2]; int stn = StyleSegItems(st);
+        RECT sr = RowSegRect(sm, r3, st, stn);
+        int idx = SegmentedHitIndex(sm, sr, st, stn, x);
+        if (idx >= 0 && idx != g_themeStyle) {
+            g_themeStyle = idx;
+            IniSetInt(L"Theme", L"Style", g_themeStyle);
+            RefreshThemeAndRepaint(hWnd);   // 主键盘 / 设置页 / 关闭提示窗一起刷
+        }
         return;
     }
     if (hit == S_HIT_CLOSE) { SendMessageW(hWnd, WM_CLOSE, 0, 0); return; }

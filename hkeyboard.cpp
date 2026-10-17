@@ -8,10 +8,7 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <oleacc.h>
-// ⚠ 只用到纯 getter（CoCreateInstance / GetFocusedElement / get_CurrentControlType），
-//   **不要碰 GetCurrentPropertyValue** —— 它要 VARIANT，会引入 oleaut32 依赖，
-//   而本项目的链接行只有 Comctl32 Shell32 Gdi32 User32 Advapi32 Imm32
-//   （arm64 job 上 `__imp_VariantClear` 链接失败过，见 19b0aa2）。
+// ⚠ 只用到纯 getter（CoCreateInstance / GetFocusedElement / get_CurrentControlType）
 #include <uiautomation.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -52,39 +49,10 @@ static const wchar_t* ArchName() {
 }
 
 // ==========================================================================
-// 诊断开关
-// --------------------------------------------------------------------------
-// 定义 HK_DIAG 时才会编译下面那些**排查专用**的代码：
-//   -sendtest    注入方式对照实验（裸进程，4 种注入方式）
-//   -envtest     在完整环境里只做纯注入，二分定位环境干扰
-//   -noscapture  跳过 OnLDown 里的 SetCapture
-//   -norepaint   跳过点击后的重绘
-//   -diag        记录每次按键注入前后的系统状态到 diag.txt
-//   -fontdiag    把全键盘「每个键的标签 / 键宽 / 分组宽 / 最终档位」dump 到 fontdiag.txt
-//                （用来定位「同一区块字号不统一」，见 FontDiagDump）
-//
+// -----------------------------------------------------------------------
 // ⚠ **正式发布版一律不定义这个宏** —— 上面这些参数与代码一行都不会
-//   编进 exe，命令行只保留正式参数（-show / -hide / -dark / -help ...）。
-//   需要排查时在编译命令里加 /DHK_DIAG 单独构建一份诊断版即可。
-//
-// 保留它们的原因：issue #3（Win10 微软拼音打不出中文）就是靠这一整套
-// 逐层二分才定位到的 —— 先 -sendtest 排除注入代码，再 -envtest 排除运行
-// 环境，最后 -diag 记录"注入那一刻的系统状态"才抓到真正的差异
-// （鼠标左键按下期间微软拼音拒绝处理注入的按键）。丢了下次还得重写。
-// 排查方法见仓库根目录的 ISSUE3_ANALYSIS.md。
-// ==========================================================================
 
-// 关于页显示的版本串 = "<VER_FILEVERSION_STR>_<构建日期>"，如 "2.0_20261002"。
-//
 // ⚠ 只有日期、不带时分 —— 这是**正式版**该有的样子：用户只需要知道
-//   "哪一天发布的"。精确到分秒的构建戳只在排查时需要，走 `-sendtest`
-//   那条诊断路径输出（见 BuildStampText），不往正式 UI 里塞。
-//
-// 日期为什么要在源码里做时区换算：
-//   __DATE__ / __TIME__ 是**编译器本地时间**，而 CI（GitHub Actions runner）的宿主时区是 UTC，
-//   用户在 UTC+8。直接印 __DATE__ 会在「北京时间 00:00~08:00」这段把日期显示成前一天。
-//   所以这里把 __DATE__/__TIME__ 当 UTC 处理，+8 小时后再取日期，并处理跨日/跨月/跨年。
-//   注意本机没有 C/C++ 编译器，实际构建都在 CI 上。
 static const wchar_t* BuildDateBeijing() {
     static wchar_t buf[16];
     if (buf[0]) return buf;                     // 只算一次（静态缓存）
@@ -113,9 +81,6 @@ static const wchar_t* BuildDateBeijing() {
 
 #ifdef HK_DIAG
 
-// 精确构建时刻（"20261003.2314"），**只给诊断路径用**，不进正式 exe。
-// 存在的理由：同一天会为排查构建很多次，只看到 "20261003" 无法分辨
-// 手里那个 exe 是哪一次构建的产物 —— 排查时这会白白浪费好几轮。
 static const wchar_t* BuildStampText() {
     static wchar_t buf[24];
     if (buf[0]) return buf;
@@ -145,10 +110,6 @@ static const wchar_t* BuildStampText() {
 
 #endif  // HK_DIAG  —— 正式版里 BuildStampText 整个不存在，也不留空壳
 
-// 日期取值入口。换构建环境（本地编译、或想钉死某个日期）时用
-// -DHK_BUILD_DATE=L"20261002" 覆盖即可，不必改上面的换算。
-// 摆在函数定义之后：#define 的宏体会引用 BuildDateBeijing()，虽然宏只在调用点展开，
-// 但把 #define 放在定义之前会让「先用后定义」的静态检查报 WARN。
 #ifndef HK_BUILD_DATE
 #define HK_BUILD_DATE BuildDateBeijing()
 #endif
@@ -180,34 +141,16 @@ int g_keyHeight = 46;
 #ifdef HK_DIAG
 // -envtest 专用：驱动"注入→退出"两个阶段（说明见 EnvTestInject）
 #define TIMER_ENVTEST   8833
-// -envtest 的运行标志与前向声明。
-// ⚠ 前向声明是必需的：WM_TIMER 的处理在主 WndProc 里（文件靠前），
-//   而 EnvTestInject 定义在 WinMain 附近（文件靠后）。
+// ⚠ 前向声明是必需的：WM_TIMER 的处理在主 WndProc 里（文件靠前）
 BOOL g_envTest = FALSE;
 int  g_envTestStage = 0;
 static void EnvTestInject();
 
-// -fontdiag：键面字号诊断。
-// ⚠ 前向声明的理由同 EnvTestInject：调用点在 RecreateFontsAndLayout（文件中部），
-//   而实现必须放在 FitUnifiedTier / KeyText 之后（它要用这两个函数）。
+// ⚠ 前向声明的理由同 EnvTestInject：调用点在 RecreateFontsAndLayout（文件中部）
 BOOL g_fontDiag = FALSE;
 static void FontDiagDump();
 
-// ---- 排查开关：二分「点击按键」时究竟是哪个动作破坏了 IME 组字 ----
-//
-// 已确认的事实（2026-10-04）：
-//   · 点击**标题栏**（真实鼠标）→ 无害，IME 正常
-//   · 点击**按键**（真实鼠标）  → 微软拼音不组字（出英文）
-//   · `-envtest` 里用**注入**的鼠标点击按键 → 正常
-//   ⇒ 问题出在「真实鼠标点中按键」才会走到的那几行里。
-//
-// 而 `OnLDown` 中点标题栏不会执行、点按键才会执行的只有三件事：
-//   SetCapture(hWnd) / DoKeyAction(k) / InvalidateRect(...)
-// 其中 DoKeyAction → SendKey 已被 -envtest 证明等价于纯注入（能出中文），
-// 所以嫌疑集中在**另两个系统级副作用**上。这两个开关用来把它们分开：
-//
-//   -noscapture  跳过 OnLDown 里的 SetCapture（会改变系统鼠标捕获状态）
-//   -norepaint   跳过点击相关的 InvalidateRect（会触发一次全键盘重绘）
+// ---- 排查开关：二分「点击按键」时究竟是哪个动作破坏了 IME 组字 -
 BOOL g_noSetCapture = FALSE;
 BOOL g_noClickRepaint = FALSE;
 #endif  // HK_DIAG
@@ -232,8 +175,6 @@ BOOL g_noClickRepaint = FALSE;
 #define S_HIT_AUTOHIDE 110   // 注意：97~102 已被透明度下拉占用
 
 // ========== Ethereal 主题令牌（单一色相驱动） ==========
-// 取自 Halo Ethereal：所有中性色都挂在同一个色相角上，换主题＝换一个 --hue；
-// 层级感只靠「面板底略深 + 键帽/卡片纯白」的明度差建立，不用描边也不用阴影。
 
 struct HkbTokens {
     DWORD pageBg;            // 窗口 / 键盘面板底（page-bg）
@@ -322,13 +263,7 @@ static DWORD HueAccentBgr(int hue) {
     return OklchToBgr(0.70, 0.14, (double)hue);
 }
 
-// 由色相派生全部令牌。轮廓与分隔线一律预混成实色：
-// GDI+ 往 32bpp BI_RGB DIB 里画半透明形状时 alpha 语义不可靠，实色还能让 XP 与 Win11 字节级一致。
-// 界面风格（方案 §4.1 B1）：与明暗 / 色相正交的第二维。
-// 0=现代（默认，色相贯穿面板与按键）1=经典（灰色键面 + **高亮仍用色相**，只做浅色）
 // ⚠ 「经典」不等于「去掉颜色」：v1.1 就是灰键面 + 强调色实底（见 DrawKeys 的高亮分支）。
-//   把色相也一起抹掉，按下 / 锁定的格子就和修饰键常态分不出来（上一版的实际后果）。
-// ⚠ 必须定义在 HkbTokensBuild 之前 —— 令牌函数要读它（上一版放到后面，先用后定义直接编译错）
 static int  g_themeStyle = 0;
 
 static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
@@ -357,11 +292,6 @@ static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
     // Enter / 确认键：浅色底压深字（5.7:1），深色底用黑 70% 混主色（5.4:1）
     out->primaryFg       = dark ? BlendColor(out->primary, RGB(0, 0, 0), 0.70) : out->text;
 
-    // 经典风格（方案 §4.2 的实机取色）：**只把"壳"中性化** —— 面板、键面、修饰键、
-    // 描边、正文全走 v1.1 实测值；`primary` / `primaryFg` / `titleActive` **故意不覆盖**，
-    // 它们继续跟着色相走，专供「高亮」使用（按下 / 锁定 / 菜单选中 / 开关）。
-    // 深色用 v1.1 当年那张深色表：面板 #1F1F1F / 键面 #2C2C2C / 修饰键 #242424 /
-    // 描边 #3A3A3A / 悬停 #383838 / 正文 #F5F5F5 / 弱化 #A0A0A0。
     if (g_themeStyle == 1) {
         if (!dark) {
             out->pageBg             = RGB(243, 243, 243);
@@ -427,12 +357,6 @@ static BOOL IsDarkThemeActive() {
     return IsSystemDarkMode();
 }
 
-// 读取系统 DWM 强调色并转为 GDI COLORREF (BGR)。
-// 注册表值为 ABGR (0xAABBGGRR) 布局，注意与 COLORREF (0x00BBGGRR) 的字节序转换。
-// 优先级（Win11 实测）：
-//   1. HKCU\...\DWM\AccentColor        —— Win11 22H2+ 当前强调色（与 AccentColorMenu 一致）
-//   2. HKCU\...\Explorer\Accent\AccentColorMenu —— 资源管理器强调色备用源
-//   3. HKCU\...\DWM\ColorizationColor  —— 旧系统回退（可能残留旧主题色）
 static DWORD AbgrToBgr(DWORD val) {
     return (((val >> 16) & 0xFF) << 16) | (val & 0xFF00) | (val & 0xFF);
 }
@@ -531,26 +455,12 @@ static void RefreshThemeAndRepaint(HWND hWnd) {
 enum KeyType {
     K_NORMAL, K_LETTER, K_MOD, K_CAPS,
     K_SPECIAL, K_ARROW, K_SPACE, K_HIDE, K_DOCK, K_MIN, K_CLOSE,
-    // 网页层的符号键：键面固定画**一个**符号（主符号或副符号，由 symShift 决定），
-    // 点击直接输出那个字符，不依赖 Shift。数字行那 10 个格子在网页层里要的
-    // 就是 ! @ # $ % ^ & * ( )，而普通键必须「先按 Shift 再按数字」，所以单独一类。
     K_SYM
 };
 
-// 键面标签的水平对齐：只对「宽键」有意义。
-// 默认布局里左列的 Esc / Tab / Caps / Shift 贴左，右列的 Backspace / Del / Enter /
-// Shift 贴右 —— 参考图里这些键的名字都贴着各自那一侧的边缘，而不是飘在键的正中。
 enum KeyAlign { KA_CENTER = 0, KA_LEFT = 1, KA_RIGHT = 2 };
 
-// symShift：仅 K_SYM 有效 —— TRUE 取键盘布局的副（Shift）符号，FALSE 取主符号。
-// 网页层同时要 `[ ] \ ; '`（主符号格）与 `{ } | : "`（副符号格），一个 bool 就能分开。
-// align：键面标签的对齐（见 KeyAlign），由布局表给出，绘制时落在 DrawTextKey。
-// block = 这个键属于键盘的哪个区块（全尺寸布局才有区分）：
-//   0 = 主区 / 其它布局（默认、小键盘 —— 它们本来就是一整块）
-//   1 = 导航区（PrtSc/ScrLk/Pause…那 3 列）
-//   2 = 数字区（Num//*−…那 4 列）
 // ⚠ 2026-10-04 新增：键面标签的字号要**按区块统一**，需要知道每个键属于哪一块。
-//   判据不能靠 x 坐标猜 —— 导航区与数字区紧邻，列中心距只有键宽的 1.1 倍。
 struct KeyDef { int x, y, w, h; short vk; KeyType type; unsigned char symShift;
                 unsigned char align; unsigned char block; };
 
@@ -607,22 +517,13 @@ struct WindowMotion {
 };
 static WindowMotion g_mainMotion = {};
 
-// 启动预热期：这段时间内不评估自动呼出，也不做任何跨进程焦点探测。
-//
-// ⚠ 用户实测：「刚打开的时候，有时候在没输入状态会触发自动呼出的逻辑，
-//   之后再呼出键盘就直接卡死。」
-//
-//   启动瞬间前台窗口可能正处在切换/初始化中 —— GetGUIThreadInfo 拿不到
-//   焦点信息、大应用尚未响应、桌面/外壳还没就绪 —— 此时任何判断依据都不可靠，
-//   容易在**没有输入框的地方误弹键盘**。而误弹一次就会启动窗口动画，
-//   万一那时又撞上跨进程探测阻塞，状态就卡住了。
-//   预热期一过自然恢复；手动呼出（点托盘 / -show）不受这里影响。
+// ⚠ 用户实测：「刚打开的时候，有时候在没输入状态会触发自动呼出的逻辑
 #define AUTOSHOW_WARMUP_MS 1200
 static DWORD g_appStartTick = 0;
 static WindowMotion g_settingsMotion = {};
 static WindowMotion g_promptMotion = {};
 
-// 高精度毫秒时钟：动画进度改用 QueryPerformanceCounter 计算，
+// 高精度毫秒时钟：动画进度改用 QueryPerformanceCounter 计算
 // 避免 GetTickCount() 约 15.6ms 的粗粒度让位移一顿一顿。
 static LONGLONG QpcNowMs() {
     static LONGLONG freq = 0;
@@ -641,9 +542,6 @@ BOOL        g_vis = FALSE;
 BOOL        g_manualShow = FALSE;
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
 ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
-// 本次识别是不是**只靠 Chromium 系类名粗判**命中的（Chrome_WidgetWin / RenderWidgetHost）。
-// 粗判的含义只是"前台是 Chromium 窗口"，不含"光标在输入框里"这层信息 ——
-// 只有这种命中才需要 UIA 精判去补（见 UpdateAutoVisibility 的用法）。
 BOOL        g_detectedByChromiumClass = FALSE;
 int         g_hideDelayMs = 300;       // 失焦后的自动隐藏延迟（用户实测 1 秒太慢，收到 300ms）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
@@ -658,20 +556,7 @@ HHOOK       g_kbHook = 0;             // 实体键盘低级钩子（监控 Win/S
 HHOOK       g_mouseHook = 0;          // 全局鼠标低级钩子（只记录"用户点了哪里"）
 
 // ===== 自动呼出的触发条件（2026-10-04 用户要求重做）=====
-// 用户要的是「**点击输入框**才弹」，而不是「切到有输入框的窗口就弹」——
-// 原话：「有时候我切换窗口的目的又不是为了呼出键盘，而是查看其他内容」。
-//
-// 仅靠 EVENT_OBJECT_FOCUS 区分不出来：切窗口时新窗口的控件同样会获得焦点、
-// 发出完全相同的事件。所以引入"用户操作"作为必要条件：
-//   · 鼠标点击 —— 还要求**落点在输入控件所属的窗口内**。否则点任务栏、
-//     点别的窗口切过去，本身也是一次点击，照样会被算成"操作"而误弹。
-//   · 键盘操作 —— 不校验落点，直接放行（用户明确要求"键盘聚焦到输入框
-//     （Tab / Ctrl+F / 自动聚焦）时也要弹"）。
 #define AUTOSHOW_INPUT_WINDOW_MS 1500
-// 失焦"防抖"窗口：焦点探测会**爆发式**失败（用户日志实测：80ms 内连续 6 条
-// noInput，fg 为空 —— GetForegroundWindow 瞬时返回 NULL）。失焦必须**持续**
-// 超过这个时长才算真的失焦，否则会把 g_userHidInInput（手动收起标记）误清，
-// 用户看到的是「手动收起后过几秒键盘自己弹回来」。
 #define AUTOSHOW_INPUT_GRACE_MS 500
 static DWORD g_lastClickTick = 0;      // 最后一次真实鼠标左键点击
 static POINT g_lastClickPt = {0, 0};   // 它的屏幕坐标
@@ -680,145 +565,54 @@ static DWORD g_lastKeyTick = 0;        // 最后一次真实键盘按键
 // 用途见 UpdateAutoVisibility 的 Chromium 精判：正在输入时不收起。
 static DWORD g_lastOwnKeyTick = 0;
 
-// 前台窗口的变化时刻 —— 用来区分"切换窗口"与"窗口内的焦点转移"。
-// ⚠ 用户要的是「点输入框 / 键盘聚焦 / **网页自动聚焦搜索框**」都弹，
-//   唯独「仅切换窗口」不弹。而后两者在焦点事件上**完全一样**：
-//   都是"某个控件获得了焦点"。只能靠"前台窗口刚刚变过没有"来区分 ——
-//   变了就要求有用户操作，没变（焦点在同一个窗口内部转移）就放行。
-// ⚠ 用**状态**而不是时间窗：切换窗口后进入"等待用户操作"状态，
-//   **只有"点输入框"或"敲键盘"才解除**。
-//   一开始用时间窗（比如 1.5s 内要求有操作），但那样切窗口 1.5 秒后封锁就过期，
-//   键盘照样会自己弹出来 —— 等于没解决问题。
+// ⚠ 用户要的是「点输入框 / 键盘聚焦 / **网页自动聚焦搜索框**」都弹
 static HWND g_lastFg = NULL;
 static BOOL g_fgAwaitUserInput = FALSE;
-// （原 g_lastFgSetTick「g_lastFg 被更新的时刻」已删：触屏兜底改成"刚刚有过一次
-//   触控式点击"（见 TouchInputTick），不再绑定某一次前台变化 —— 绑定前台变化时，
-//   中途任意一次光标移动都会让它**永久为假**，平板上等于自动呼出彻底失效。）
-// 最近一次点击**落点所属的顶层窗口**。在鼠标钩子里当场算好 ——
-// ⚠ 不要等到 UpdateAutoVisibility 里再 WindowFromPoint：那时窗口可能已经变了，
-//   而且判断"点的是不是输入控件"若依赖 GetFocusedInputControl 的返回值，
-//   会因为**焦点转移滞后**而误判（用户实测的「点输入框反而被收掉/不弹」）。
+// ⚠ 不要等到 UpdateAutoVisibility 里再 WindowFromPoint：那时窗口可能已经变了
 static HWND  g_lastClickTopHwnd = NULL;
-// 连续"没有输入焦点"的评估次数。焦点探测（GetGUIThreadInfo / hwndCaret）
-// 会间歇性返回 NULL，直接据此隐藏会让键盘闪烁（用户看到的"莫名其妙回弹"）。
-// 连续几次都拿不到才认为真的失焦。
 static int   g_noInputStreak = 0;
 // 失焦开始的时刻（首次越过"连续确认"门槛时记录，输入焦点恢复时清零）。
 // 与 AUTOSHOW_INPUT_GRACE_MS 配合，滤掉爆发式抖动 —— 见其定义处说明。
 static DWORD g_noInputSinceTick = 0;
 BOOL        g_physShift = FALSE;      // 实体 Shift 是否按住（左右任一；仅显示同步，不影响虚拟键逻辑）
 // ⚠ 2026-10-10：左右 Shift 必须**分开**记。
-//   原来只有一个 g_physShift，按住一边再按另一边、或先松一边时，
-//   这个标志表达不出「另一边还按着」—— 高亮就会和实体键对不上
-//   （用户报的「按物理 Shift 后高亮不灭 / 亮灭与实体键对不上」）。
-//   g_physShift 保留为两者的或，供 KeyTextInto 的大写判定与双符号键显示使用。
 BOOL        g_physLShift = FALSE;     // 实体左 Shift 按住
 BOOL        g_physRShift = FALSE;     // 实体右 Shift 按住
 BOOL        g_physWin = FALSE;        // 实体 Win 是否按住（仅显示同步）
-// 实体 NumLock 锁定态（与 g_npLock 同源，都来自 ReadSystemNumLock），
+// 实体 NumLock 锁定态（与 g_npLock 同源，都来自 ReadSystemNumLock）
 // 一起进帧缓存签名 —— 它俩任一变化都要触发重绘。
 BOOL        g_physNum = FALSE;
-// 屏幕键盘的小键盘锁定态（2026-10-04）。**它就是系统真实状态**。
-//
-// ⇒ 谁写它：点小键盘的 Num 键时，注入 VK_NUMLOCK 后**从系统读回**
-//   （`ReadSystemNumLock()` = `GetAsyncKeyState`），见 OnKeyDown 的 0x90 分支。
-// ⇒ 它现在只决定**一件事**：数字区 Num 键的高亮（IsActive 读它）。
-//   ⚠ 2026-10-10 改：以前它还决定「小键盘数字键发数字键还是发光标键」，
-//     那条已经删掉 —— 平板 / 轻薄本的系统 NumLock 默认是**关**的，数字键于是
-//     静默变成方向键（用户报「小键盘功能没作用了、输入不了数字」）。
-//     现在数字键**一律发 VK_NUMPAD0-9**，与系统灯无关（本机实测：NumLock=0 时
-//     注入 VK_NUMPAD1..4，原生 EDIT 控件仍然得到 "1234"）。
-//
-// ⚠ 血泪史（第 17~20 轮，四轮返工），**别再改回去**：
-//   17 轮 只翻不发      → 目标程序收不到 NumLock
-//   18 轮 加发但自取反  → 界面假亮、与真实状态相反
-//   19 轮 读回但重试 3 次 → 重复注入 = 反复翻转，「时好时坏」
-//   20 轮 单次注入+等待 → ✓
-// ⇒ **三条铁律**：① 唯一真值是系统状态；② 锁存键走 VK 路径（不带 SCANCODE）；
-//   ③ **绝不重复注入**（每注一次翻一次，不是「重试」而是「继续翻」）。
-// 读 NumLock 真实锁定态：**用 GetKeyState 的低位，不要用 GetAsyncKeyState**
-//
-// ⚠⚠⚠ 2026-10-04 在自己机器上实测得出（连错六轮的收尾）。用同一个进程连续
-//   切换 NumLock 两次，同时读两个 API 的低位：
-//
-//     时刻            GetKeyState   GetAsyncKeyState   紧接着再读一次 GetAsync
-//     初始                 1               0                   0
-//     切换一次后           0               1                   0
-//     切换两次后           1               1                   0
-//
-//   ⇒ GetAsyncKeyState 的低位是「**自上次调用以来按过没有**」的**瞬时标志**，
-//     读一次就被清零 —— **它不是锁定态**。拿它当锁定态用，就会出现：
-//
-//         before = 0（平时都是 0）
-//         注入 VK_NUMLOCK
-//         now = 1（刚按过）⇒ 判定「翻转成功」⇒ g_npLock = TRUE
-//
-//     ⇒ **每点一次高亮都变成「亮」**，硬件灭了它还亮着；
-//       而那个瞬时位会被别处（本文件 TIMER 里也有一次读取）抢先清掉，
-//       时序一变结果就变 ⇒ 这正是「有时候正常有时候不正常」的来源。
-//
-//   ⇒ GetKeyState(VK_NUMLOCK) 的低位才是**锁定态本身**：低位为 1 = toggled
-//     （MSDN: "If the low-order bit is 1, the key is toggled."），
-//     实测精确跟随 1→0→1，且**重复读取稳定**（不像上面那个瞬时位）。
-//
-// ⚠ 上一轮我断言「GetKeyState 读不到注入的翻转，因为本窗口 WS_EX_NOACTIVATE
-//   收不到 WM_KEYDOWN」—— **那是推断出来的、没有验证，实测证明是错的**：
-//   锁存键的锁定位由 win32k 全局维护，与本线程是否收到按键消息无关。
-//   ⇒ 教训：API 语义有疑问时**先写几十行实测**，别靠文档印象推断。
+//   ⚠ 2026-10-10 改：以前它还决定「小键盘数字键发数字键还是发光标键」
 static BOOL ReadSystemNumLock() {
     return (GetKeyState(VK_NUMLOCK) & 1) != 0;
 }
 
 static BOOL g_npLock = TRUE;            // TRUE = 数字（小键盘）模式
-// （原 g_npLockInit「只跟随一次」已删：现在 TIMER 每个 tick 都读回，
+// （原 g_npLockInit「只跟随一次」已删：现在 TIMER 每个 tick 都读回
 //   高亮始终等于真实锁定态，不需要再区分「首帧」与「之后」）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
-// Chromium 系的「精判收起」开关（ini: General/ChromiumPrecise，默认 1 = 开）。
-// 只影响**收起**，不影响呼出（见 UpdateAutoVisibility 里的用法与论证）。
-// 留着这个开关是因为历史上有过三轮翻车 —— 万一它带来新问题，
-// 关掉这一个开关就能回到旧行为，不必动主逻辑。
 BOOL        g_afChromiumPrecise = TRUE;
-// 自动隐藏：**点击输入框以外的区域时自动收起键盘**（ini: General/AutoHide）。
 // ⚠ 2026-10-04 语义变更：这个开关原来控制的是"收起后在同一输入框内不自动回弹"
-//   （防回弹），名不副实 —— 用户实测「键盘不会自动隐藏，只能手动最小化」。
-//   现在它管的是**真正的自动隐藏**；防回弹改为**无条件生效**（见 UserHideKeyboard
-//   与 UpdateAutoVisibility 里的说明：它是必要条件，没有它手动收起会立刻被弹回）。
-//   ini 键名沿用 AutoHide，老配置继续可用。
 BOOL        g_afAutoHide = TRUE;
 static BOOL g_userHidInInput = FALSE;  // 用户刚在输入状态下手动收起（自动收起开启时不回弹）
 static ULONG_PTR g_hiddenInputToken = 0; // 手动收起时所在的输入控件标识
 static DWORD     g_userHidInTick = 0;    // 手动收起的时刻（防回弹的超时兜底用）
 
 // ===== 临时诊断（-afdiag，定位自动呼出问题用）=====
-//   ⚠ 只有带 `-afdiag` 参数启动时才真正工作（此时 g_afLogPath 非空）；
-//     正常启动时 AfLog / AfNote 第一行就 return，g_dbg* 只是被赋值不被读取，
-//     **正式版零开销**（不做文件 IO、不留日志字符串）。定位结束后可整块删除。
-// ⚠ 用**路径**而不是常驻 FILE*：日志改用"每次追加打开、写完即关"。
-//   原因：原来用 `L"w"` 常驻打开，只要有一次重复启动（脚本杀进程的间隙、
-//   手动又点了一次 exe），新实例就会**把已有内容整个截断** ——
-//   表现就是 afdiag.txt 只剩一个 BOM、一行都没有。
-//   改成追加后，多实例、中途被杀都不会丢内容。
+//   ⚠ 只有带 `-afdiag` 参数启动时才真正工作（此时 g_afLogPath 非空）
 static wchar_t g_afLogPath[MAX_PATH] = {0};
 static int     g_afLogLines = 0;      // 已写行数（够多就停，别把磁盘写爆）
 #define AFLOG_MAX_LINES 4000
 
 // ===== 常驻诊断环形缓冲（供托盘菜单「导出诊断日志」用）=====
-//   ⚠ 与 -afdiag **无关**：这段始终在跑（默认每 ~200ms 一条 eval + 所有事件），
-//     于是用户**不需要带参数启动、也不需要重现前先做准备** ——
-//     出了问题直接在托盘右键「导出诊断日志」，把最近几分钟原样交出来即可。
-//   只占内存、不碰磁盘：1000 条 × 576B ≈ 576KB（未初始化，进 BSS，exe 不增大）。
-//   ⚠ 每条必须放得下一条完整的 eval 行 —— 上一版是 320，而 eval 行有 330~360 字符，
-//     用户的导出里 614/640 条被截断、决定性字段全丢。改 576 之后留足余量。
+//   ⚠ 与 -afdiag **无关**：这段始终在跑（默认每 ~200ms 一条 eval + 所有事件）
 #define HKRING_N   1000
 #define HKRING_LEN 576
 static char g_ring[HKRING_N][HKRING_LEN];
 static int  g_ringHead = 0;           // 下一个写入位置
 static int  g_ringCount = 0;          // 已累积条数（满后恒为 HKRING_N）
-// 仅诊断用（命令行 `-dginj`）：让鼠标/键盘钩子**接受注入事件**。
-//   ⚠ 存在的唯一理由：本机没编译器，只能靠 CI 出包再回来验；
-//     而"点击输入框"这条路必须能自己驱动（`SendInput` 注入的事件默认被钩子放过，
-//     于是自测时 rc/cif 永远是 0，等于没测）。正式使用**绝不要**开这个开关。
+//   ⚠ 存在的唯一理由：本机没编译器，只能靠 CI 出包再回来验
 static BOOL g_dbgAcceptInjected = FALSE;
 static void DiagRingPush(const char* line) {
     SYSTEMTIME st;
@@ -842,69 +636,32 @@ static int      g_dbgHaveGui = -1;
 static int      g_dbgIsInput = -1;
 static unsigned g_dbgFlags = 0;
 static HWND     g_dbgCaret = NULL;
-// accessibility 探测的三段结果：
-//   g_dbgResp    响应性预检是否通过（0 = 被 IsWindowResponsive 挡掉）
-//   g_dbgAcc     AccessibleObjectFromWindow 的 HRESULT（0 = S_OK）
-//   g_dbgAccFound 可编辑焦点是否命中
 static int g_dbgResp = -1;
 static int g_dbgAcc = 0;
 static int g_dbgAccFound = -1;
-// 类名快速路径的**补查**（诊断专用）：类名命中后（QQ / 浏览器 / Electron 走这条路）
-// 再补一次 accessibility 查询，验证"a11y 能否分辨『焦点在输入框』与『焦点在
-// 空白处』" —— 这两者光看窗口类名分辨不出来，而它正是"点空白自动隐藏"的关键。
-//   g_dbgExtraMs       补查耗时 ms（-1 = 本 tick 没跑）
-//   g_dbgExtraOk       补查结果（-1 = 没跑 / 0 = 未找到可编辑焦点 / 1 = 找到）
-//   g_dbgExtraDue      本 tick 是否安排补查（UpdateAutoVisibility 在用户操作窗口内置位）
-//   g_dbgExtraLastTick 上次补查时刻（降频用；跨进程 COM 有成本）
 static int      g_dbgExtraMs = -1;
 static int      g_dbgExtraOk = -1;
 static BOOL     g_dbgExtraDue = FALSE;
 static DWORD    g_dbgExtraLastTick = 0;
-// a11y 焦点诊断：get_accFocus 返回的 VARIANT 类型与最后一个判定过的 role。
-// ⚠ 决定"QQ / 浏览器能不能用 a11y 精判"的关键数据：
-//   fvt = 0(VT_EMPTY)   → a11y 没给出焦点信息（未启用 / 无焦点）
-//   fvt = 3(VT_I4)      → 焦点是子元素 ID（child id）
-//   fvt = 9(VT_DISPATCH)→ 焦点是对象，接着看 role 是否在可编辑白名单里
-//   frole               → 实际拿到的 role（白名单目前只有 0x2A / 0x34）
+// ⚠ 决定"QQ / 浏览器能不能用 a11y 精判"的关键数据
 static int      g_dbgFocusVt = -1;
 static LONG     g_dbgFocusRole = -1;
-// 「该前台窗口（Chrome/Electron 系）是否**没有可用的 a11y 通道**」——
-// 由 GetFocusedInputControl 在每次探测后更新，驱动 IsInputControl 里
-// Chrome_WidgetWin 的类名兜底是否生效。详见该函数内的说明。
-// 诊断：最近一次 EVENT_OBJECT_FOCUS 的时刻与来源（WinEventProc 更新，AfLog 读出）。
-// ⚠ 要验证的假设：「点输入框」会触发 FOCUS 事件、「点空白处」不触发 ——
-//   如果成立，这就是区分两者的天然信号（比轮询 a11y 更可靠）。
+// ⚠ 要验证的假设：「点输入框」会触发 FOCUS 事件、「点空白处」不触发
 static DWORD    g_lastFocusEvTick = 0;
 static HWND     g_lastFocusEvHwnd = NULL;   // ⚠ 必须是 HWND（x64 下 64 位，DWORD 会截断）
-// 键盘窗口的**实际**可见性与矩形。
-// ⚠ 这是用来验证「程序以为显示着、用户却看不到」这个猜想的：
-//   `g_vis` 只是软件标志位，和 `IsWindowVisible` 可能不一致。
+// ⚠ 这是用来验证「程序以为显示着、用户却看不到」这个猜想的
 static int g_dbgVisWnd = -1;
 static int g_dbgRc[4] = {0, 0, 0, 0};
-// 诊断：ShowKB 的调用来源（调用点自己设，ShowKB 里读出）。
 // ⚠ 用户日志里 SHOW/HIDE 成对交替、且都是 isManual=TRUE —— 最像
-//   「有东西在反复启动第二个实例，触发了 WM_SHOW_KEYBOARD 转发」。
-//   这个标记能直接指出是谁调的。
 static const char* g_dbgShowFrom = "(startup)";
-// 诊断（-afdiag）：最近一次 UIA 焦点元素判定的 ControlType。
-//   50004 = Edit（焦点在可编辑输入框里）50030 = Document（不在）
-//   -1    = 本 tick 没查 / 查失败
-// 用途：验证「Chromium 系要不要收起」这条新判据在真机上到底看到了什么。
 static int g_dbgUiaCt = -1;
-// 诊断：本 tick **为什么这么判**（分支名）。每拍在 UpdateAutoVisibility 里重设。
-//   ⚠ 这一栏是"自动呼出为什么没弹"的唯一直接答案 —— 之前只有一堆输入量，
-//     要人自己反推是哪一条 return 拦住的。平板用户那台机器上自动呼出完全不工作，
-//     但旧日志里看不出拦在哪一条，所以补上它。
+//   ⚠ 这一栏是"自动呼出为什么没弹"的唯一直接答案 —— 之前只有一堆输入量
 static const char* g_dbgWhy = "-";
 // 诊断：两个触屏证据源的即时值（见 TouchFocusEvidence / SysTipJustAppeared）
 static int g_dbgEvFoc = 0;
 static int g_dbgEvTip = 0;
 
 // ⚠⚠ 用 Win32 API（CreateFileW / WriteFile）写日志，**不用 CRT 流**。
-//   原因：`_wfopen_s(..., L"a, ccs=UTF-8")` 在这里无论如何都写不出内容 ——
-//   文件被创建（BOM 在），但 fprintf 一个字都没落盘，实测三次都是空文件。
-//   与其继续跟 CRT 的 `ccs` 转码较劲，直接拿内核 API 追加，行为完全可控。
-//   日志内容全是 ASCII，也不需要任何编码转换。
 static void AfWriteRaw(const char* line) {
     if (!g_afLogPath[0] || g_afLogLines >= AFLOG_MAX_LINES) return;
     HANDLE h = CreateFileW(g_afLogPath, FILE_APPEND_DATA,
@@ -920,9 +677,7 @@ static void AfWriteRaw(const char* line) {
 static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
                   BOOL recentClick, BOOL clickInFg, BOOL byKey,
                   BOOL await, BOOL vis, BOOL motion, const char* decision) {
-    // ⚠ 环形缓冲**始终在跑**（托盘菜单能随时导出）；抽稀到每 4 拍一条（≈200ms），
-    //   1000 条 ≈ 3.3 分钟，足够覆盖"用户操作 → 出问题"的完整过程。
-    //   事件（AfNote / ShowKB）不抽稀，全部保留。
+    // ⚠ 环形缓冲**始终在跑**（托盘菜单能随时导出）；抽稀到每 4 拍一条（≈200ms）
     static int ringTick = 0;
     BOOL wantRing = ((++ringTick & 3) == 0);
     BOOL wantFile = (g_afLogPath[0] && g_afLogLines < AFLOG_MAX_LINES);
@@ -935,11 +690,6 @@ static void AfLog(const char* tag, HWND fg, HWND fgTop, HWND input,
     int fehMatch = (g_lastFocusEvHwnd && fgTop && g_lastFocusEvHwnd == fgTop) ? 1 : 0;
     char buf[512];
     // ⚠⚠ 字段顺序是**按重要性排的**：decision（含 uiact/pt/hid/why）紧跟 tag。
-    //   原因：这条线常年 300~360 字符，而环形缓冲每条有长度上限 ——
-    //   上一版把 decision 放在**最末尾**，用户导出的 640 条里 **614 条被截断**，
-    //   `uiact/pt/hid` 全部丢失 ⇒ 那份日志对"为什么没弹"完全没用。
-    //   后面的 `fvt/frole/fev/xms/xok/gui/focusCls` 是早期 a11y 探索留下的量，
-    //   现在只作参考，丢了不致命。
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                 "%02d:%02d:%02d.%03d %-7s => %s | rc=%d cif=%d key=%d await=%d vis=%d mot=%d | "
                 "input=%p fg=%-20s fgTop=%p click=%p | "
@@ -987,26 +737,14 @@ BOOL        g_shiftSymbols = TRUE;     // 按 Shift 时数字键只显示特殊�
 BOOL        g_dualSymbols = TRUE;      // 键面是否**上下并列**显示主/副两个符号（布局 Tab，默认开）
 
 // ===== Shift 双击锁定（2026-10-04 新增）=====
-// 需求：「设置里加个选项：Shift 键能快速按两下锁定」。
-//   单击 Shift = 一次性（下一个键带上 Shift 就自动释放，行为同实体键盘）
-//   双击 Shift = 锁定（后续连续输入都带 Shift，直到再点一次解除）
-//  —— 这样输入 ! @ # 之类的重复特殊符号时，不用每敲一个都点一次 Shift。
 BOOL        g_shiftLock = FALSE;        // 双击锁定态（界面高亮据此）
 BOOL        g_shiftOnce = FALSE;        // 单击的一次性待用态
 static DWORD g_shiftLastTap = 0;        // 上次点击 Shift 的时刻（双击窗口判定）
 static const DWORD SHIFT_DOUBLE_MS = 350;   // 双击间隔上限
 // ⚠ 默认**关闭**（2026-10-04 用户要求）。双击锁定改变了 Shift 的既有语义
-//   （单击原本是「锁定、再点切中/英输入法」），属于**要主动开启**的新行为，
-//   不该替用户默认打开。ini 缺省值同步为 0。
 BOOL        g_shiftDoubleTap = FALSE;   // 设置项：启用 Shift 双击锁定（ini: General/ShiftDoubleTap）
 
-// 用掉一次"一次性 Shift"：双击锁定模式下，单击 Shift 只对下一个键生效。
-// 锁定态（g_shiftLock）下**不释放** —— 那是用户明确要连续输入的。
-// ⚠⚠ 2026-10-10 修：这里原先两个分支都无条件 `g_sh = FALSE`，而 g_shiftLock 没人清：
-//   双击锁定 → 敲第一个键 → g_sh 被灭、g_shiftLock 仍是 TRUE
-//   ⇒ 高亮立即灭掉、后续按键不再带 Shift（**等于锁定只对第一个键生效**），
-//     而状态机自己还以为处在锁定态 ⇒ 用户报「Shift 双击锁定不能用了」。
-//   ⇒ 锁定态必须原样返回，不碰 g_sh。
+// ⚠⚠ 2026-10-10 修：这里原先两个分支都无条件 `g_sh = FALSE`，而 g_shiftLock 没人清
 static void ReleaseShiftOnce(void) {
     if (g_shiftDoubleTap && g_shiftLock) return;   // 锁定态：Shift 要一直带下去
     if (g_shiftDoubleTap && g_shiftOnce) g_shiftOnce = FALSE;
@@ -1016,18 +754,6 @@ static void ReleaseShiftOnce(void) {
 int         g_keyIconStyle = 2;        // 键面始终「图标+文字」；「仅文字」模式已按实机反馈下线
 DWORD       g_lht = 0;
 int         g_hk = -1, g_pk = -1;
-// 「按下去」的视觉反馈（2026-10-10 用户要求：「按键能不能做个键被按下去的反应，
-//   就知道有没有真的按了」）。
-//
-// 为什么不能只靠 g_pk：`OnLDown` 里 `g_pk = ki` 之后紧接着就是 `DoKeyAction`，
-// 而它开头会 `WaitForLeftButtonUp()` **一直泵消息等到用户松手**（最多 250ms，
-// 见那里的说明）。于是「按下」这一帧根本没机会上屏 —— 等重绘时 WM_LBUTTONUP
-// 早就被泵消息派发过、OnLUp 已经把 g_pk 清掉了。用户看到的就是「按下去毫无反应」。
-//
-// ⇒ 两手：
-//   ① OnLDown 在 DoKeyAction **之前**就 Invalidate + UpdateWindow，把按下帧画出来；
-//   ② 松手后再保留 g_pkFlash 一小会儿（HK_PK_FLASH_MS），保证「快速点一下」
-//      也一定能看到反馈（否则短按可能一帧都来不及画）。由 TIMER_FOCUS 收尾。
 static int   g_pkFlash = -1;          // 刚松开、还在闪光期的那一格
 static DWORD g_pkFlashUntil = 0;
 #define HK_PK_FLASH_MS 130
@@ -1043,9 +769,6 @@ HFONT       g_f10 = 0, g_f9  = 0;              // 键面字体「深降档」：
 HFONT       g_f8 = 0, g_f7 = 0, g_f6 = 0;      // 更深的兜底档：极端高宽比下的 1u 窄键（见 FitKeyFont）
 
 // ⚠ 2026-10-04 第 25 轮：导航区曾经的专用字体（g_nf14…g_nf7 = 常规档 × 0.85）
-//   已整套删除。它让导航区整体比主区小一号（用户截图：「自适应字体有些大有些小」）。
-//   ⇒ 现在全键盘（主区 / 导航区 / 数字区）**共用同一套 g_f* 阶梯**，
-//     字号只由「该键所在分组的可用宽度」决定，不按区块身份预先打折。
 
 int         g_bkspTextW = 0;                   // 「Backspace」在 g_f12 档下的实测容纳宽（退格标签判据）
 static HFONT g_sfBig = 0, g_sfRow = 0, g_sfCtrl = 0, g_sfBase = 0, g_sfMeta = 0;   // 设置/关闭窗口固定字号字体
@@ -1054,7 +777,7 @@ static Gdiplus::PrivateFontCollection* g_gdipFonts = NULL;   // 内嵌字体的 
 static HANDLE g_fontReg = 0;
 static BOOL   g_fontReady = FALSE;     // 内嵌字体注册成功（失败回退系统字体）
 NOTIFYICONDATAW g_nid;
-// 托盘图标点击去抖（见 WM_TRAY 的说明）：一次"双击"会送来三条消息，
+// 托盘图标点击去抖（见 WM_TRAY 的说明）：一次"双击"会送来三条消息
 // 不去抖就会连切三次 —— 净结果纯属奇偶侥幸，某些外壳只送两条时直接变成"没反应"。
 static DWORD g_lastTrayToggleTick = 0;
 
@@ -1103,9 +826,6 @@ static void InitWindowSizeForDpi() {
         g_wh = (int)(404 * dpiScale);
     } else {                        // 默认布局
         g_ww = (int)(980 * dpiScale);
-        // 「功能键行」会多出一整行：高度必须跟着长，否则 6 行被塞进 5 行的高度，
-        // 键帽高度从 ~49 掉到 ~40，整块键盘看着扁（用户报「开了这个比例怪怪的」）。
-        // 53 = 一行键高 + 行距，正好让键高保持在 49 左右。
         g_wh = (int)((320 + (g_showFKeys ? 53 : 0)) * dpiScale);
     }
 }
@@ -1122,19 +842,7 @@ static int AddKey(int x, int y, int w, int h, short vk, KeyType type, BOOL symSh
 }
 
 // ============================================================================
-// 小键盘布局（layoutMode==1，430×320 DIP）：4 列数字盘 + 底部动作行，共 6 行
-// ----------------------------------------------------------------------------
-//     Bksp   /      *      -
-//     7      8      9      +      ← `+` 竖跨 Row1~Row2
-//     4      5      6
-//     1      2      3      Enter  ← `Enter` 竖跨 Row3~Row4
-//     0 (横跨 2 列)         .
-//     Tab    Shift  空格 (横跨 2 列)
-//
-//   没有采用 3×3 的 T9 九宫格：小键盘最常见的用法是连续敲数字（端口号 / IP / 金额），
-//   保持「7-8-9 在上、1-2-3 在下」与实体数字区一致的排布最不容易按错；顺带也腾出了
-//   一整行放 Tab / Shift / 空格 —— 纯数字输入里这三个组合键同样要按。
-//   两套排布都实机出图对比过，用户选了这一套（T9 那版连同它的符号页已删除）。
+// -------------------------------------------------------------------------
 // ============================================================================
 
 // 小键盘：4 列 × 5 行数字盘（含 + 与 .）+ 底行 Tab / Shift / 空格
@@ -1143,7 +851,7 @@ static void BuildNumpadPlus(int y) {
     const int pitch = g_keyHeight + g_keyGap;
     int yy = y;
 
-    // Row 0: 回退, /, *, -
+    // Row 0: 回退, /, *
     {
         short v[4] = {0x08, 0x6F, 0x6A, 0x6D};
         KeyType t[4] = {K_SPECIAL, K_NORMAL, K_NORMAL, K_NORMAL};
@@ -1202,15 +910,11 @@ static void BuildNumpad(int y) {
 // 完整键盘布局（104 键）：主区 + 导航区 + 数字区（6 行：F 行 + 主区 5 行）
 // ============================================================================
 
-// 数字区当前是否隐藏：「用户手动按 Tab / 标题栏按钮」与「窗口过窄自动隐藏」是两件事，
+// 数字区当前是否隐藏：「用户手动按 Tab / 标题栏按钮」与「窗口过窄自动隐藏」是两件事
 // 合成一个生效值再往外用 —— 只在 G 处改一份，绘制 / 命中 / 帧缓存签名才不会互相打架。
 static BOOL NumpadHidden() { return (g_npHidden || g_npHiddenAuto); }
 
-// 窄屏自适应：键帽 44px 是触摸安全下限，反解「22u + 2gap + 2×键区边距」得 1090 DIP；
-// 低于这个宽度就把数字区收起来（复用同一套显隐机制，而不是让键位溢出窗口）。
-// 只在全尺寸布局下生效；由窗口宽度推导，因此不落盘。
-// ⚠ 这个阈值同时是「取消隐藏」时必须把窗口拉到的宽度 —— 见 SetFullNumpadHidden，
-//    两处各写一份数值就会得到「点了按钮没反应」。
+// ⚠ 这个阈值同时是「取消隐藏」时必须把窗口拉到的宽度 —— 见 SetFullNumpadHidden
 #define FULL_NUMPAD_MIN_W_DIP 1090
 static void UpdateNumpadAuto(int ww, double dpiScale) {
     if (g_layoutMode != 2) { g_npHiddenAuto = FALSE; return; }
@@ -1218,16 +922,6 @@ static void UpdateNumpadAuto(int ww, double dpiScale) {
 }
 
 // ============================================================================
-// 全尺寸（ANSI 104）布局：1u 单位网格
-//
-// 列位是单一真源：主区 15u / 导航区 3u / 数字区 4u，块间 1 个 gap；
-// 1u 由键区宽度反解一次，所有 x = KEY_AREA_X + round(列位 × u) + 跨块 gap。
-// 于是「列永远对齐、行尾永远齐平」，也不再需要逐行 rem / 逐行除法。
-//
-// 旧写法是每行各算各的「剩余宽度 ÷ 键数」，同一把键盘上 1u 键的实际宽度
-// 从 46px 游走到 73px（差 59%），字母键最多偏出一整个键位 —— 这次连根换掉。
-//
-// vrow = 2 表示竖向跨两行（数字区的 + 与回车）。
 // ============================================================================
 struct KbKeySpec { float col; float w; short vk; KeyType type; unsigned char vrow; };
 struct KbRowSpec { const KbKeySpec* keys; int n; };
@@ -1243,20 +937,7 @@ static int FullColX(float col, double u, int gap, const float* bc, int nb) {
     return KEY_AREA_X + (int)floor(col * u + 0.5) + b * gap;
 }
 
-// 放一个键：宽度由「列位到列位」直接相减，不再由「本行键数」除出来。
-// base 是这一块（主区 0 / 导航区 15 / 数字区 18）的起始列，表里写块内列位更好读，
-// 但换算必须用全局列位 —— 否则导航区/数字区会被画到主区左边那一列上。
-//
 // ⚠⚠ 2026-10-04 修：宽度**不能**用 `FullColX(c1) - FullColX(c0) - gap`。
-//   FullColX 里含「跨块补偿 b*gap」，而 bc 的取值恰好是下一块的起始列
-//   （bc = {15, 18}，导航区起点 15、数字区起点 18）。于是**右端正好落在块边界上的
-//   那一列**（导航区第 3 列 = Pause/PgUp/PgDn、主区每行最后一列、数字区最后一列）
-//   会凭空多吃一个 gap —— 实测导航区三列宽 57/58/**63**，第三列多 6px。
-//   后果不是"看起来挤"，而是**同一排 1u 键宽度不等 → FitKeyFont 逐键选档时
-//   窄列的 ScrLk / Home 被降档，字号比同排的 Pause 小一号**（用户实机截图）。
-//
-//   ⇒ 宽度改为只按「列位差 × u」算，跨块补偿只作用于 x 起点（那是它本来的用途：
-//     把导航区/数字区整体右移，让开块间间隙）。
 static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, int gap,
                     const float* bc, int nb, int block = 0) {
     float c0 = base + s.col, c1 = c0 + s.w;
@@ -1266,11 +947,8 @@ static void FullPut(float base, const KbKeySpec& s, int yy, int kh, double u, in
     AddKey(xa, yy, w, kh, s.vk, s.type, FALSE, KA_CENTER, block);
 }
 
-// ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）--------------------
+// ---- 主区 6 行（列位严格按 ANSI 104，每行合计 15u）-----------------
 static const KbKeySpec kFullMain0[] = {      // F 行：Esc + F1~F12（三组），无 Del
-    // Del 只在导航区出现（真 104 的 F 行没有 Del）—— 之前两处都有，整把键盘出现两个 Del。
-    // 腾出来的 2u 平分给三处组间缝（Esc|F1、F4|F5、F8|F9 各 2/3 u）：
-    // 既不留空档，F 键又还都是 1u（14.0000 + 1.00 = 15.00，正好收在主区右边缘）。
     { 0.0000f, 1.00f, 0x1B, K_SPECIAL, 1 },
     { 1.6667f, 1.00f, 0x70, K_NORMAL , 1 }, { 2.6667f, 1.00f, 0x71, K_NORMAL , 1 },
     { 3.6667f, 1.00f, 0x72, K_NORMAL , 1 }, { 4.6667f, 1.00f, 0x73, K_NORMAL , 1 },
@@ -1324,10 +1002,6 @@ static const KbKeySpec kFullMain5[] = {      // Ctrl 行（含 6.25u 空格）
     { 11.25f, 1.25f, 0x12, K_MOD, 1 }, { 12.50f, 1.25f, 0x5D, K_MOD, 1 },
     { 13.75f, 1.25f, 0x11, K_MOD, 1 },
 };
-// 不带 Fn 的同一行：全尺寸布局本身就常驻 F 行（kFullMain0），底行的 Fn 只用来切
-// 「Fn 网页层」，而 Fn 在默认布局里的正职（显示 F1~F12）在这里已经由 F 行完成了。
-// 用户反馈「启用顶部显示 F 键时就应该隐藏 Fn 按钮」——全尺寸就是那个状态。
-// 腾出来的 1.25u 直接并进空格（3.75 + 7.50 = 11.25，右半段列位一字不动）。
 static const KbKeySpec kFullMain5NoFn[] = {
     { 0.00f, 1.25f, 0x11, K_MOD, 1 },
     { 1.25f, 1.25f, 0x5B, K_SPECIAL, 1 }, { 2.50f, 1.25f, 0x12, K_MOD, 1 },
@@ -1356,10 +1030,10 @@ static const KbRowSpec kFullMainRows[6] = {
 // Fn 网页层用到的那一行
 #define kFullWebShiftN ((int)(sizeof(kFullWebShift) / sizeof(KbKeySpec)))
 
-// ---- 导航区 3u：行位与主区对齐（PrtSc 在 F 行、Ins 在数字行、Del 在 Tab 行、
-//      ↑ 在 Shift 行、←↓→ 在 Ctrl 行）—— 这一点现状就是对的，保持不动 ----
+// ---- 导航区 3u：行位与主区对齐（PrtSc 在 F 行、Ins 在数字行、Del 在 Tab 行
+//      ↑ 在 Shift 行、←↓→ 在 Ctrl 行）—— 这一点现状就是对的，保持不动 -
 static const KbKeySpec kFullNav0[] = {
-    // ⚠ ScrLk 必须是 VK_SCROLL(0x91)：一直写成 0x46，而 0x46 是字母 F ——
+    // ⚠ ScrLk 必须是 VK_SCROLL(0x91)：一直写成 0x46，而 0x46 是字母 F
     //    这一格等于在按 f，从来没切换过滚动锁。字母 f 是 K_LETTER，两者靠 type 区分。
     { 0.00f, 1.00f, 0x2C, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x91, K_SPECIAL, 1 },
     { 2.00f, 1.00f, 0x13, K_SPECIAL, 1 },
@@ -1378,13 +1052,8 @@ static const KbKeySpec kFullNav5[] = {
     { 2.00f, 1.00f, 0x27, K_ARROW, 1 },
 };
 
-// ---- 数字区 4u：5 行，对齐主区的「数字行 ↔ Ctrl 行」（= 真实 104）--------
-// 旧写法把 NumLock 行放在 F 行，整块被拉成 6 行，回车底边停在「0 行之上整整一行」，
-// 与 0 键、与键盘底边都不齐；F 行右侧那 4 列现在空着（真 104 那里就是空的）。
+// ---- 数字区 4u：5 行，对齐主区的「数字行 ↔ Ctrl 行」（= 真实 104）-----
 static const KbKeySpec kFullNum0[] = {
-    // 保留 0x90(NumLock)：数字区要跟真 104 对齐，那一格就是 NumLock；主区本来就有 2u 的
-    // 退格，而这里每个键只有 1u（56.9 DIP），「Backspace」降到底档也要 154px、只有 89px
-    // 可用 —— 换成回退键只能画成图标，不如留给 NumLock（也是全程序唯一能开 NumLock 的地方）。
     { 0.00f, 1.00f, 0x90, K_SPECIAL, 1 }, { 1.00f, 1.00f, 0x6F, K_NORMAL, 1 },
     { 2.00f, 1.00f, 0x6A, K_NORMAL , 1 }, { 3.00f, 1.00f, 0x6D, K_NORMAL, 1 },
 };
@@ -1418,10 +1087,6 @@ static void BuildComplete(int y, BOOL webFn) {
     const double u     = (double)(KEY_AREA_W - nb * gap) / (double)units;
     const float  bc[2] = { FULL_U_MAIN, FULL_U_MAIN + FULL_U_NAV };
 
-    // 主区 6 行
-    // 底行 Fn 的取舍：全尺寸布局常驻 F 行，Fn 只剩「切 Fn 网页层」这一个作用 ——
-    // 网页布局没开时它就是废键，按用户要求隐掉（腾出的宽度并进空格）；
-    // 开着时保留，否则打开网页布局后就没有回到主键位的路了。
     const BOOL hideFn = !g_fnWebLayout;
     const int  noFnN  = (int)(sizeof(kFullMain5NoFn) / sizeof(KbKeySpec));
     for (int r = 0; r < 6; r++) {
@@ -1471,22 +1136,6 @@ static void BuildComplete(int y, BOOL webFn) {
     }
 }
 
-// Fn 网页布局层（默认布局下按 Fn 切换）
-//
-// 结构照用户给的参考图（clipboard-2026-10-01 …648Z）：把「要按 Shift 才出得来」的符号
-// 直接铺成两行键面，打网址 / 填表单不用先按 Shift 再回头找键：
-//   Row 0: Esc, `, F1~F12, Backspace
-//   Row 1: Tab, ! @ # $ % ^ & * ( ) [ ] \, Del
-//   Row 2: Caps, _ + { } | : " < > ; ', Enter
-//   Row 3: Shift, www. .com .cn .org .cc .net, ? , . /, ↑, Shift
-//   Row 4: Fn, Ctrl, Win, Alt, 空格, Alt, Menu, Ctrl, ←, ↓, →
-//
-// 旧写法把字母行留在 Row1/Row2（qwerty / asdf），只在 Shift 行塞网址后缀 ——
-// 结果是「上网时要的数字与符号一个都打不出来」，正是用户说的「布局太怪」。
-// 符号键一律用 K_SYM：键面固定画一个符号、点击直接输出它，不再依赖 g_sh/g_shiftSymbols，
-// 所以这个层里点 Shift 不会把键面换成符号（用户明确要求「点击 Shift 键就不用高亮显示符号了」）。
-//
-// 符号格 = (基础虚拟键, 取不取副符号)。取副符号的格子点击时自动带 Shift 发出。
 struct WebSymSpec { short vk; unsigned char shifted; };
 // Row1：数字行 10 格的副符号 + 主符号的 [ ] 与反斜杠
 static const WebSymSpec kWebSym1[13] = {
@@ -1502,24 +1151,6 @@ static const WebSymSpec kWebSym2[11] = {
 };
 
 // ============================================================================
-// 默认布局（layoutMode==0，980×320 DIP）：1u 单位网格
-//
-// 列位是单一真源：每行合计 15.5u，1u 的列距由窗口宽度反解一次，
-//   左右留白各 0.30u  →  2×0.30u + 15.5u = g_ww + gap  →  u = (g_ww + gap) / 16.1
-// 所有 x = KEY_AREA_X + round(列位 × u)，键面宽 = 两个列位各自取整后相减再扣一个 gap。
-// 于是「每行白键严格等宽、行尾永远齐平、↑ 与 ↓ 自动落在同一列」。
-//
-// 旧写法是每行各算各的「剩余宽度 ÷ 键数」，四行白键因此各不一样
-// （980 DIP 实测 57.3 / 59.1 / 67.5 / 71.3 DIP，最大差 24.6%）——
-// 用户要求「白色的数字、字母、按钮大小统一」，差异的根源就在这里。
-//
-// 宽键按真键盘比例：Esc 1u、Backspace 1.5u、Tab 1.5u、Del 1u、Caps 2u、
-// Enter 2.5u、LShift 2.5u、↑ 1u、RShift 2u、空格 5.5u。
-// 参考图实测的是 Tab 1.5u / Caps 2u / LShift 2.4u / RShift 1.8u / Enter 2.5u，
-// 只有 Shift 取整成 2.5 与 2 —— 这样 ↑ 与 ↓ 才正好同列（13.5u 处）。
-//
-// 底行键序 = 参考图：Ctrl Fn Win Alt [空格] Menu Alt ← ↓ → Ctrl
-// （Menu 落在空格右侧、右 Alt 之前；最后一个 Ctrl 贴到最右端）。
 // ============================================================================
 #define DEF_ROW_U   15.5    // 每行合计 u 数
 #define DEF_PAD_U    0.30   // 左右留白（u 的倍数）
@@ -1538,10 +1169,7 @@ static void DefPutRow(int y, const DefKeySpec* ks, int n, double u) {
     }
 }
 
-// ---- F 行（可选，g_showFKeys）：Esc + F1~F12 + Del = 15.5u ----
-// Del 取 1.5u，与下一行的 Backspace 同宽；腾出来的 1u 平分给三处组间缝
-// （Esc|F1、F4|F5、F8|F9 各 1/3 u）—— F 键因此仍全是 1u，末格 F12 又正好与
-// 数字行的 `=` 列位重合。与全尺寸布局的 F 行是同一套做法。
+// ---- F 行（可选，g_showFKeys）：Esc + F1~F12 + Del = 15.5u -
 static const DefKeySpec kDefRowF[] = {
     {  0.0000f, 1.00f, 0x1B, K_SPECIAL, KA_LEFT  , 0 },
     {  1.3333f, 1.00f, 0x70, K_NORMAL , KA_CENTER, 0 },
@@ -1560,7 +1188,7 @@ static const DefKeySpec kDefRowF[] = {
 };
 #define kDefRowFN ((int)(sizeof(kDefRowF) / sizeof(DefKeySpec)))
 
-// ---- Row0：Esc, `, 1~0, -, =, Backspace = 15.5u ----
+// ---- Row0：Esc, `, 1~0, -, =, Backspace = 15.5u -
 static const DefKeySpec kDefRow0[] = {
     {  0.00f, 1.00f, 0x1B, K_SPECIAL, KA_LEFT  , 0 },
     {  1.00f, 1.00f, 0xC0, K_NORMAL , KA_CENTER, 0 },
@@ -1599,7 +1227,7 @@ static const DefKeySpec kDefRow0NoEsc[] = {
 };
 #define kDefRow0NoEscN ((int)(sizeof(kDefRow0NoEsc) / sizeof(DefKeySpec)))
 
-// ---- Row1：Tab, q~p, [, ], \, Del = 15.5u ----
+// ---- Row1：Tab, q~p, [, ], \, Del = 15.5u -
 static const DefKeySpec kDefRow1[] = {
     {  0.00f, 1.50f, 0x09, K_SPECIAL, KA_LEFT  , 0 },
     {  1.50f, 1.00f, 0x51, K_LETTER , KA_CENTER, 0 },
@@ -1638,7 +1266,7 @@ static const DefKeySpec kDefRow1NoDel[] = {
 };
 #define kDefRow1NoDelN ((int)(sizeof(kDefRow1NoDel) / sizeof(DefKeySpec)))
 
-// ---- Row2：Caps, a~l, ;, ', Enter = 15.5u ----
+// ---- Row2：Caps, a~l, ;, ', Enter = 15.5u -
 static const DefKeySpec kDefRow2[] = {
     {  0.00f, 2.00f, 0x14, K_CAPS  , KA_LEFT  , 0 },
     {  2.00f, 1.00f, 0x41, K_LETTER, KA_CENTER, 0 },
@@ -1656,7 +1284,7 @@ static const DefKeySpec kDefRow2[] = {
 };
 #define kDefRow2N ((int)(sizeof(kDefRow2) / sizeof(DefKeySpec)))
 
-// ---- Row3：LShift, z~m, ,, ., /, ↑, RShift = 15.5u ----
+// ---- Row3：LShift, z~m, ,, ., /, ↑, RShift = 15.5u -
 // ↑ 落在 12.5u 处，与下一行的 ↓ 完全同列（无需额外对齐变量）
 static const DefKeySpec kDefRow3[] = {
     {  0.00f, 2.50f, 0xA0, K_MOD   , KA_LEFT  , 0 },
@@ -1675,7 +1303,7 @@ static const DefKeySpec kDefRow3[] = {
 };
 #define kDefRow3N ((int)(sizeof(kDefRow3) / sizeof(DefKeySpec)))
 
-// ---- Row4：底行（参考图键序）----
+// ---- Row4：底行（参考图键序）-
 // 带 Fn：Ctrl Fn Win Alt [空格 5.5u] Menu Alt ← ↓ → Ctrl = 15.5u
 static const DefKeySpec kDefRow4[] = {
     {  0.00f, 1.00f, 0x11, K_MOD    , KA_CENTER, 0 },
@@ -1749,7 +1377,7 @@ static void BuildFnSurf(int y, double u) {
 
     // Row 3: Shift, 网址后缀×6, ? , . /, ↑, Shift (13 keys)
     {
-        // ⚠ `/` 的虚拟键码是 VK_OEM_2 = 0xBF，**不是** 0x2F —— 0x2F 是 ASCII 的 '/'，
+        // ⚠ `/` 的虚拟键码是 VK_OEM_2 = 0xBF，**不是** 0x2F —— 0x2F 是 ASCII 的 '/'
         //    不是虚拟键码：GetSymForKey 查不到它 → 键面空白；点下去也发不出任何字符。
         static const DefKeySpec ks[13] = {
             {  0.00f, 2.50f, 0xA0 , K_MOD    , KA_LEFT  , 0 },
@@ -1770,15 +1398,9 @@ static void BuildFnSurf(int y, double u) {
         y += g_keyHeight + g_keyGap;
     }
 
-    // Row 4: 与默认布局的底行完全同一张表 —— 网页层只是字母区换了内容，
-    // 底行的键序/宽度必须逐像素一致，否则切层时下半张键盘会跳一下。
-    // Fn 必须留：它是这个层的唯一出口（「已有 F 行就藏 Fn」的规则不适用于这里）。
     DefPutRow(y, kDefRow4, kDefRow4N, u);
 }
 
-// 页头里胶囊按钮的位置（DIP）：上留白 10 + 按钮高 28，底边 = 38。
-// 键位竖向留白以「按钮底边」为基准，所以这两个常量必须与 GetHeaderMetrics 同源
-// —— 两处各写一遍数值，改一处就会让整个键盘在窗口里偏上/偏下。
 #define HDR_BTN_TOP_DIP 10
 #define HDR_BTN_H_DIP   28
 
@@ -1807,10 +1429,6 @@ static void BuildKeys() {
              : (g_layoutMode == 1) ? 6
              : 5 + (g_showFKeys && !webSurf ? 1 : 0);
 
-    // 竖向留白统一成 10 DIP（与左右留白同节奏），基准取**页头里胶囊按钮的底边**，不是页头盒底：
-    // 页头盒 44 DIP 里按钮只占 10+28=38，余下 6 DIP 是页头内部留白，以盒底为基准会让
-    // 「按钮 → 第一排键」比「最后一排键 → 窗口底」小一截。
-    // 行高是整数除法，余数不再全堆到底部，改为上下各分一半（误差 ≤1px）。
     const int padV   = (int)(10 * dpiScale);
     const int hdrBot = (int)((HDR_BTN_TOP_DIP + HDR_BTN_H_DIP) * dpiScale);   // 胶囊按钮底边
     int vAvail = (g_wh - padV) - (hdrBot + padV);
@@ -1835,9 +1453,6 @@ static void BuildKeys() {
     }
 
     // ===== 默认布局（layoutMode==0）与其 Fn 网页层：统一 1u 单位网格 =====
-    // 留白与 u 互相依赖（u 要用键区宽度反解，而键区宽度要先减去留白），先联立解出 u：
-    //   2×0.30u + 15.5u = g_ww + gap   →   u = (g_ww + gap) / 16.1
-    // 表与逐键列位见文件上方「默认布局：1u 单位网格」那一段。
     const double u = ((double)g_ww + g_keyGap) / (DEF_ROW_U + 2 * DEF_PAD_U);
     g_keyAreaX = (int)(DEF_PAD_U * u + 0.5);
     if (g_keyAreaX < 6) g_keyAreaX = 6;
@@ -1877,19 +1492,11 @@ static void BuildKeys() {
                  g_showFKeys ? kDefRow4NoFnN : kDefRow4N, u);
 }
 
-// 全尺寸布局下「数字区显隐」的唯一入口：标题栏「小键盘」按钮与 Tab 键都走这里。
-// 之前两条路径各改一遍 g_npHidden，迟早分叉；收成一个函数（故放在 BuildKeys 之后）。
-// ⚠ 顺序：needW 用闭式解，绝不能在改 g_ww 之前去读 g_keyGap —— 它由 g_ww 反算，
-//    这时还是旧值，算出的 needW 会偏小，数字区照样被挤出去。
+// ⚠ 顺序：needW 用闭式解，绝不能在改 g_ww 之前去读 g_keyGap —— 它由 g_ww 反算
 static void SetFullNumpadHidden(HWND hWnd, BOOL hidden) {
     g_npHidden = hidden;
     IniSetInt(L"Keyboard", L"NpHidden", hidden ? 1 : 0);
     if (!hidden) {
-        // 「显示数字区」必须先保证窗口够宽：生效值 = g_npHidden || g_npHiddenAuto，
-        // 而窄屏自动收起是**由窗口宽度算出来的**（ww < 1090 DIP 就收起）。
-        // 旧写法只拉到 700 DIP，窗口在 700~1090 之间时 g_npHiddenAuto 仍是 TRUE，
-        // 于是点标题栏那个「小键盘」按钮看起来完全没反应（实机反馈「按钮点了不更新状态」）。
-        // 这里直接拉到自动收起的阈值以上，数字区才真的回得来。
         int needW = (int)(FULL_NUMPAD_MIN_W_DIP * GetSystemDpiScale()) + 8;
         if (g_ww < needW) {                     // 只加宽，不缩窄（缩回去是「手比你快」）
             g_ww = needW;
@@ -1903,11 +1510,7 @@ static void SetFullNumpadHidden(HWND hWnd, BOOL hidden) {
     if (hWnd && IsWindow(hWnd)) InvalidateRect(hWnd, NULL, TRUE);
 }
 
-// 注册内嵌字体（MiSans Medium 精简子集，界面唯一字面）到当前进程；失败则回退系统字体
 // ⚠ 子集是按「源码全部 UI 字符」生成的（tools/subset_font.py，从 build/font-backup 的
-//   全量字体子集化）。**新增任何 UI 文案后必须重跑 `python tools/subset_font.py`**，
-//   或先跑 `--check` 校验 —— 否则新文案里表外的字会回退系统宋体，
-//   同一行 MiSans 与宋体混排（v2.0 关于页「社区交流」的「社/流」即此，实机确认）。
 static void LoadEmbeddedFonts() {
     HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(IDR_FONT), MAKEINTRESOURCEW(10));  // RT_RCDATA
     if (!hr) return;
@@ -1928,11 +1531,6 @@ static void LoadEmbeddedFonts() {
         }
     }
 }
-// 创建 UI 字体。界面只有一个字面（MiSans Medium），族里**不存在** 700：
-// 请求 FW_BOLD 只会拿到 GDI 的仿真加粗（轮廓等距外扩），实测墨迹 +30~38%、
-// 连通域 21→16（笔画被填死）、字宽 +6~13% —— 中文小字号受害最重，
-// 而且「量宽用粗体、绘制用常规」会让 FitKeyFont 误判降档。
-// 所以本函数**只提供 FW_NORMAL**，层级一律由「字号 + 颜色」承担（见字体显示方案 v6）。
 static HFONT MakeFont(double size) {
     HDC hdc = GetDC(0);
     int h = -MulDiv((int)(size * 10 + 0.5), 96, 720);
@@ -1944,12 +1542,6 @@ static HFONT MakeFont(double size) {
         DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
-// 设置页六档：18 大标题 / 14 章节标题 / 12.5 行主文本 / 11 控件标签 / 10 行描述 / 9 元信息。
-// 单字重下层级完全由「字号 + 颜色」承担，相邻档至少差 1pt。
-// 基准对齐 Windows 设置页：本窗口只有 700 DIP 宽（系统设置约 1024），字号不能照抄它的绝对值，
-// 但也不该按 1024 的宽窗口取值 —— 这一档比首版整体下移一档，阶梯形状不变。
-// 14 这一档现在只由关于页的产品名用（制作工具同一处是 18 DIP、页标题 26，比例 0.69；
-// 本窗口页标题 18，按同一比例落在 12.4 —— 但那与行主文本同号，层级就没了）。
 static void InitFixedFonts() {
     double dpi = GetSystemDpiScale();
     g_sfBig  = MakeFont(18 * dpi);     // 页面大标题
@@ -1972,26 +1564,14 @@ static void RecreateFontsAndLayout() {
 
     double dpiScale = GetSystemDpiScale();
 
-    // 字号跟「键高」走，不跟窗口高度走 —— 这一条就是默认布局的字号规则。
-    // 先算布局拿到 g_keyHeight，再按它定字号：默认布局 5 行 @320 DIP 的键高是 48，
-    // 正好是参考值（finalFontScale = dpiScale，与改动前完全一致，默认布局观感不变）；
-    // 全尺寸 6 行、同样窗口高度下键更矮，字号自动按比例收回来 —— 否则键面标签会比默认
-    // 布局明显偏大，挤到只能逐键降档，「字体大小不统一」就是这么来的。
     BuildKeys();
 
-    // 字号跟「键高」走，但增长**封顶在 90 DIP**：窗口 8 向可拖拽，键高被拉到 125 DIP
-    // （980×700）时按比例算出的基准字号是 64pt，而 104 DIP 宽的 Esc / Caps / Enter 可用宽
-    // 只有 171px —— 五档降档全放不下，下方 GDI+ 在 NoWrap 下就把标签**整字截断**
-    // （Esc → Es、Caps → Cap、Enter → Ente、Shift → Sh、Ctrl → Ct、Fn → F）。
-    // 封顶后大键上的文字偏小，但标签永远完整；48~90 DIP 这一段（含全尺寸 53 DIP）比例不变。
     const double kFontRefKeyH  = 48.0;   // 默认布局（5 行 / 320 DIP）的键高，字号基准
     const double kFontGrowCapH = 90.0;   // 字号随键高增长的上限（DIP）
     double keyHDip = (double)g_keyHeight / dpiScale;
     if (keyHDip > kFontGrowCapH) keyHDip = kFontGrowCapH;
 
-    // ⚠ 基准只能取键高，**不要再掺键宽**：试过 min(键高, 1u 键宽)，窗口拖窄时整盘字都跟着缩，
-    // 实机反馈「反而字体太小」，而且修饰键的标签被挤到整字截断（Esc→Es、Del→D）。
-    // 键宽不够是**逐键**问题，交给 FitKeyFont 的降档阶梯处理，不要动全局基准。
+    // ⚠ 基准只能取键高，**不要再掺键宽**：试过 min(键高, 1u 键宽)，窗口拖窄时整盘字都跟着缩
     double finalFontScale = dpiScale * (keyHDip / kFontRefKeyH);
     if (finalFontScale < 0.4 * dpiScale) finalFontScale = 0.4 * dpiScale;
 
@@ -1999,42 +1579,14 @@ static void RecreateFontsAndLayout() {
     g_f12 = MakeFont((int)(12 * finalFontScale + 0.5));   // 四舍五入，别让非整数缩放累积偏差
     g_f13 = MakeFont((int)(13 * finalFontScale + 0.5));
     g_f14 = MakeFont((int)(14 * finalFontScale + 0.5));   // 主档
-    // 深降档：全尺寸布局的 1u 键是**方形**（52 DIP 宽 × 53 DIP 高），字号却按键高算，
-    // 于是「PrtSc / ScrLk / Pause / Home / Enter」这类 4~5 字标签在 12pt 档也放不下，
-    // GDI+ NoWrap 会**整字丢弃尾部**（PrtSc → PrtS、Home → Hom、Pause → Pa）。
-    // 实测（MiSans-Medium，em 36/33/30/25/22）：1u 可用宽 80px 时，「Home」需要
-    //   97(f14) / 91(f13) / 87(f12) / 81(f11) / 74(f10) / 68(f9)
-    // —— 12pt 地板不够，必须在下面再补两档，否则这些键只能画残缺标签。
     g_f10 = MakeFont((int)(10 * finalFontScale + 0.5));
     g_f9  = MakeFont((int)( 9 * finalFontScale + 0.5));
-    // 更深的兜底三档：键「宽」不跟着窗口长高，所以把窗口拖得极高时，1u 键会变成
-    // 「窄而高」（1280×900 DIP 时键宽 99px、高 238px）。这时即使字号增长已封顶在
-    // 90 DIP，9pt 档仍放不下 PrtSc / Home / PgUp（实测 116px > 89px 可用宽）。
-    // 阶梯一路降到 6pt 才能保证「任何尺寸下标签都完整」；正常尺寸下前几档就已命中，
-    // 不会走到这里（全尺寸 2240×707 的出图在加深阶梯前后逐字节相同）。
     g_f8 = MakeFont((int)(8 * finalFontScale + 0.5));
     g_f7 = MakeFont((int)(7 * finalFontScale + 0.5));
     g_f6 = MakeFont((int)(6 * finalFontScale + 0.5));
 
     // ⚠⚠ 2026-10-04 第 25 轮：**导航区专用字体（g_nf* / NAV_FONT_SCALE）整套删除**。
-    //
-    //   上一轮的 B 方案给导航区单独乘了 0.85，出发点是「让导航区九键都能停在
-    //   同一档位、长标签不裁」。它确实解决了「导航区内部不齐」，
-    //   **但制造了新的、更大的不齐** —— 导航区整体比主区小一号：
-    //       主区字母 14pt  →  导航区 Ins/Home/PgUp ≈ 12pt
-    //   用户截图一眼就看出来：「自适应字体有些大有些小」。
-    //
-    //   根本判断：**全键盘的键面字号应该只有一套阶梯**。
-    //   「导航区需不需要降档」是**该由可用宽度决定**的事，
-    //   不该由区块身份预先打折 —— 打折等于把这个决定从宽度手里抢走了。
-    //   ⇒ 导航区回到与主区同一套 g_f*，走同一套 FitTierInLadder 判据。
 
-    // 「Backspace」在最小字号档（g_f12）下的实际容纳宽，字体一改就重量一次。
-    // 退格标签要不要缩写成 Bksp**只能**跟这个实测值比：
-    //   字号是跟键高走的（finalFontScale = dpiScale × keyHeight/48），而窗口 8 向可拖拽，
-    //   把键盘拖高之后同一个键宽就放不下整词了 —— 此时 GDI+ 在 NoWrap 下**把尾部字符整字丢掉**
-    //   （「Backspace」直接变成「Backsp」，不是裁一半），实机反馈的「退格文本放不下」就是它。
-    //   反过来按 DIP 画条线（曾经写过 `k->w >= 90*dpi`）等于偷偷假设「键高 ≈ 49 DIP」，必翻车。
     {
         HDC dc = GetDC(0);
         g_bkspTextW = MeasureTextW(dc, L"Backspace", g_f12);
@@ -2214,10 +1766,6 @@ static void ApplyWindowOpacity(HWND hWnd, BOOL enable) {
 }
 
 // ===== 统一文字绘制：GDI+ 无网格拟合抗锯齿 =====
-// GDI 的 TrueType 光栅器把笔画 snap 到整数像素，于是「字号连续变化、笔画粗细不连续」：
-// 实测竖画/em 在 13→14 DIP 骤降 22%，12 DIP 甚至比 13 更粗 —— 单字重下无法建立层级。
-// GDI+ 的 AntiAlias 不做网格拟合，笔画按 em 线性缩放（实测波动 ±5%）。
-// 从 HFONT 取 em 像素高：GDI 的 lfHeight 负值就是 em 高，与 GDI+ UnitPixel 同义。
 static float FontEmPx(HFONT f) {
     LOGFONTW lf = {};
     if (!f || !GetObjectW(f, sizeof(lf), &lf)) return 0.0f;
@@ -2234,24 +1782,13 @@ static BOOL TextHasDescender(const wchar_t* s) {
     return FALSE;
 }
 
-// 单行垂直居中时，把文字矩形下移这个量，墨迹中心才落到矩形中心上。
-//
-// 起因：GDI+ 的 LineAlign=Center 居中「行盒」，实测基线固定在「矩形中心 + 0.2936em」
-// （MiSans-Medium hhea asc/desc = 1.044/0.282em，行盒 1.326em）。而汉字与无下降部的拉丁字
-// 并不占满下降部，墨迹中心因此比矩形中心高（实测，24pt 归一化）：
-//     汉字（设置/自动呼出/小键盘）  -0.089 ~ -0.107 em
-//     大写·数字·无降部拉丁（A/1/Tab/Del）  -0.071 ~ -0.080 em
-//     带下降部（Caps/Backspace/Settings/Layout）  +0.018 ~ +0.027 em
-// 而**图标是按自身包围盒居中的**（`DrawHkIcon` 的路径上下对称），于是只要文字不补偿，
-// 「图标 + 文字」这一对就整体对不齐 —— 实机反馈的「图标文本对不齐」即此。
-// 两类各取一个折中值：无下降部 +0.085em（下移），有下降部 -0.025em（≈ 不下移）。
 static int TextInkShiftPx(float emPx, const wchar_t* s) {
     if (emPx <= 0.0f) return 0;
     float v = emPx * (TextHasDescender(s) ? -0.025f : 0.085f);
     return (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
 }
 
-// GDI+ 单行水平对齐模式。贴边标签必须用 Near/Far 而不是 Center：
+// GDI+ 单行水平对齐模式。贴边标签必须用 Near/Far 而不是 Center
 // 见 DrawTextKey 里关于「矩形边 vs 墨迹边」的说明。
 enum TextAlignMode { TAL_Near = 0, TAL_Center = 1, TAL_Far = 2 };
 
@@ -2261,7 +1798,7 @@ static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
     if (!g_gdipFonts) return FALSE;          // GDI+ 私有字体未就绪 → 调用方回退 GDI 直绘
 
     Gdiplus::Graphics g(dc);
-    // 高 DPI 用无 gridfit 的 AntiAlias（笔画线性、层级可预测）；
+    // 高 DPI 用无 gridfit 的 AntiAlias（笔画线性、层级可预测）
     // 低 DPI（<150%）小字号太糊，退回带 gridfit 的 AntiAliasGridFit 保清晰。
     g.SetTextRenderingHint(GetSystemDpiScale() >= 1.5
         ? Gdiplus::TextRenderingHintAntiAlias
@@ -2287,10 +1824,6 @@ static BOOL DrawTextGp(HDC dc, int x, int y, int w, int h, const wchar_t* s,
     Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color),
                                                   GetGValue(color), GetBValue(color)));
     Gdiplus::RectF rc((Gdiplus::REAL)x, (Gdiplus::REAL)y, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
-    // 垂直居中时补偿「行盒中心 vs 墨迹中心」的差（见 TextInkShiftPx）。
-    // 不做这一步，所有居中文字都会整体偏高 1~3px；和图标并排时最刺眼。
-    // 折行文本同样要补：首行的上升部与末行的下降部一样没占满行盒，偏移是同一个量
-    // （唯一的折行调用点是设置行的长描述，补上它才与不折行的描述同高）。
     rc.Y += (Gdiplus::REAL)TextInkShiftPx(emPx, s);
     g.DrawString(s, -1, &font, rc, &fmt, &brush);
     return TRUE;    // Graphics 析构时自动 Flush
@@ -2328,27 +1861,7 @@ static void DrawTextR(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFON
     DrawTextW(dc, s, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
-// 按键的对齐方式把标签摆到键面的左端 / 右端（k->align，见 KeyAlign）。
-// 参考图里左列的 Esc / Tab / Caps / Shift 名字贴着左边缘、右列的 Backspace / Del /
-// Enter / Shift 贴着右边缘 —— 宽键居中会让名字独自飘在一条缝上，反而看不出是哪个键。
-//
 // ⚠ 贴边锚点只有一个：DrawKeyLabel（图标+文字那一路）的 edge = 6 DIP。
-//   两条路径必须共用同一个值，否则同一列的 Esc（纯文字）与 Tab / Caps（带图标）
-//   留白会差一倍 —— 这是踩过的坑，记在这里免得下次又改回去。
-//
-// ⚠ 贴边看的是**墨迹边缘**，所以这里不能用 DrawTextC（它在矩形里居中）：
-//   DrawTextC 会按 MeasureTextW 的「容纳宽度」给矩形，而容纳宽度比实际推进宽约
-//   0.2em（175% DPI 下 ≈ 10px），居中之后墨迹又往键心缩回去半个余量 ——
-//   Esc 的墨迹离键左因此变成 inset(10 DIP) + 10px ≈ 27px，而带图标的 Tab 只有 14px。
-//   故左对齐用 DrawTextL、右对齐用 DrawTextR（GDI+ Near / Far），让墨迹边直接贴上去。
-//
-// ⚠ 但 Near / Far 对齐的是 GDI+ 的「容纳框」，它比推进框（advance）两侧各宽
-//   约 0.2em / 2 ≈ 5px；不补偿的话右贴边会凭空多出这 5px（实测 Del 的右侧留白
-//   从 11 涨到 18px）。故把 (tw − adv) / 2 这圈内缩量加回矩形，让对齐边落在
-//   「推进边」上 —— 与 DrawKeyLabel 里「整组按 adv 计算宽度」是同一个坐标基准，
-//   两条路径的贴边留白因此严格一致（都等于 edge + 该字形自身的边距）。
-//   （曾经只把右侧改成「减去容纳宽度」，结果左 24 / 右 11，图标键与文字键分了家，
-//     木已成舟地劣化了默认档 —— 那个提交已被回退，切勿再走那条路。）
 static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWORD c) {
     if (!s || !s[0]) return;
 
@@ -2373,10 +1886,7 @@ static void DrawTextKey(HDC dc, const KeyDef* k, const wchar_t* s, HFONT f, DWOR
     else                     DrawTextR(dc, x, k->y, w, k->h, s, f, c);
 }
 
-// 双符号键绘制：上=副符号（灰色），下=主字符（正常色，通常黑）。
-// ⚠ 唯一调用点在 DrawKeys 里，副符号固定传 C_DIM —— 用户 2026-10-10 明确：
-//   「符号应该是灰色部分而不是黑色部分」，所以符号**永远**是灰色（含 Shift 按下时，
-//   那时走的是"只显示符号"的单字路径，同样传 C_DIM）。别再改回"按 Shift 变亮/变白"。
+// ⚠ 唯一调用点在 DrawKeys 里，副符号固定传 C_DIM —— 用户 2026-10-10 明确
 static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
                         wchar_t baseCh, wchar_t shiftCh,
                         HFONT fBase, HFONT fShift, DWORD baseC, DWORD shiftC) {
@@ -2405,22 +1915,9 @@ static void DrawKeyDual(HDC dc, int x, int y, int w, int h,
 }
 
 // ===== 自绘图标运行层（替代图标字体）=====
-// 几何来自 hk_icons_generated.h，与 PanDaPE-Maker 的 icons.rs 同源（24 网格 / 1.9 描边 / round）。
-// 收益：任意尺寸、任意色相都可用，加一个图标＝加一段顶点数据，不用重跑字体子集化。
 static const HkIconDef& HkIcon(int id) { return k_hkIcons[id]; }
 
-// ⚠ 文字宽度有**两个不能混用**的用途：
-//   · 容纳宽度 = GDI+ MeasureString（本函数）—— DrawString 在 NoWrap 下按这个宽度判断放不放得下，
-//     所以「绘制矩形的宽」必须 ≥ 它；量出来的值比 advance 两侧各多约 0.2em。
-//   · 布局宽度 = advance（用 MeasureTextAdvW）—— 排版 / 居中 / 图标与文字的间距必须用它，
-//     否则那 0.2em 的余量会被当成真实文字宽度：图标与文字之间凭空多出空隙、整组还会偏左
-//     （标题栏 pill 实测：图标↔文字间距 19px，而设计值是 10px）。
-//
-// 实测（「常规」，11pt @175%，MiSans-Medium）：
-//   GDI 量 52px（26px/字，与 hmtx 的 1000/1000 = 1.0em 一致，这是 advance，是**对的**）
-//   GDI+ 需要 61.4px（30.7px/字）—— 多出的是 GDI+ 自己的保守余量。
-// 历史事故：Tab 矩形按 GDI 量出 52 + 4dip = 59px 当绘制宽度，GDI+ 判定放不下两个字，
-// 四个 Tab 各只剩第一个字（常规/布局/主题/关于 → 常/布/主/关）。
+// ⚠ 文字宽度有**两个不能混用**的用途
 static int MeasureTextGp(HDC dc, const wchar_t* s, HFONT f) {
     if (!s || !s[0] || !f || !g_gdipFonts) return 0;
     float emPx = FontEmPx(f);
@@ -2469,18 +1966,7 @@ static int MeasureTextW(HDC dc, const wchar_t* s, HFONT f) {
     return MeasureTextAdvW(dc, s, f);
 }
 
-// 键面标签自适应字号：救「PrtSc / ScrLk / Pause / Home / PgUp / PgDn / Enter」这类
-// 塞不进 1u 键的长标签。全尺寸布局的导航区与数字区键宽只有与字母键相同的 1u。
-//
-// 阶梯五档：基础档 → 13 → 12 → 10 → 9（9 是地板）。
-//
 // ⚠ 这里曾经「刻意只有三档」（地板 12），理由是「掉到 9pt 会让同一排导航键冒出 4 种字号」。
-//   但那个结论是按 52px 键宽算的（注释里「最宽的 Pause 约 48px，仍在 52px 键内」），
-//   而实机 1u 是 ~90px、可用宽 80px —— 12pt 档下 Home 要 87px、Pause 要 98px，
-//   照样放不下，GDI+ NoWrap 会把尾部**整字丢掉**（实机截图：PrtSc→PrtS、Home→Hom、Pause→Pa）。
-//   残缺标签比「同一排字号不齐」严重得多，所以补回 10 / 9 两档：
-//   每个键取「放得下的最大档」，放得下的键仍停在 14，只有真正长的标签才往下掉。
-// 真正决定观感的是上面 RecreateFontsAndLayout 的字号缩放：字号跟键高走，这里只是收尾。
 static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW) {
     if (!s || !s[0] || maxW <= 0) return g_f14;
     // 8 档降档阶梯：正常尺寸命中前几档，越靠后只在「键窄而窗口极高」时才用得上。
@@ -2492,9 +1978,7 @@ static HFONT FitKeyFont(HDC dc, const wchar_t* s, int maxW) {
 }
 
 // ===== 同宽键的字号必须一致（2026-10-04）=====
-//
 // ⚠ FitUnifiedTier 要遍历全盘键读它们的标签与「有没有图形」，这两个函数定义在
-//   本文件更靠后的位置（KeyText / KeyHasGlyph），必须在此前置声明 —— 否则 C2065。
 static const wchar_t* KeyText(const KeyDef* k);
 static BOOL KeyHasGlyph(const KeyDef* k);
 // 缓冲区版（写进调用方缓冲）—— 定义在更后面，同样要前置声明。
@@ -2503,15 +1987,7 @@ static const wchar_t* KeyTextInto(const KeyDef* k, wchar_t* out, size_t n);
 // 区块统一档计算（定义在下面一点），BlockTierNow 与 FontDiagDump 都要用。
 static int FitUnifiedTier(HDC dc, unsigned char block);
 
-// 统一档位的**每帧一次**缓存（按区块各一份）。
-//
-// 代价说明（第 27 轮实测）：FitUnifiedTier 要遍历该区块**全部**纯文字键
-// × 8 档 MeasureString（约 100 键 × 8 = 800 次 GDI+ 量宽）。若逐键调用，
-// 一帧就是 100 × 800 = 8 万次 —— 用户实机反馈「卡得要死」。
-//
 // ⚠ 第 29 轮：**主区与导航区各自成组、各算一档**（见 FitUnifiedTier）。
-//   一帧各算一次即可（2 次），仍然远低于逐键调用。
-//   索引：0 = 主区(block 0)，1 = 导航区(block 1)，2 = 数字区(block 2)。
 static int  g_blockTier[3] = { 0, 0, 0 };
 static BOOL g_blockTierValid = FALSE;
 
@@ -2529,12 +2005,7 @@ static int BlockTierNow(HDC dc, unsigned char blk) {
     return g_blockTier[blk];
 }
 
-// 降档阶梯。档位序号 0 = 最大字号，7 = 地板。
-//
 // ⚠⚠ 2026-10-04 第 25 轮：**原来这里有两套阶梯**（g_f* 常规 / g_nf* 导航区
-//   ×0.85）。导航区那一套已整套删除 —— 它让导航区整体比主区小一号，
-//   用户截图直接看出「自适应字体有些大有些小」。
-//   ⇒ 现在**全键盘只有这一套阶梯**，主区 / 导航区 / 数字区共用。
 struct FontLadder {
     HFONT f[8];
 };
@@ -2554,23 +2025,6 @@ static int FitTierInLadder(HDC dc, const wchar_t* s, int maxW, const FontLadder&
 }
 
 // ⚠ 统一字号的**分组判据**（第 29 轮）：**区块各自成组**。
-//
-//   第 28 轮把「主区 + 导航区」合成一个组，本意是让全键盘只有一个字号。
-//   但用户反馈「默认窗口大小字体看着有点小」—— 因为把两块合并后，
-//   **导航区的长标签（Delete / Pause / Insert / ScrLk 等 5~6 字母键）
-//   把整个键盘的档位一起拖下去**，而主区字母键在最大档都还有富余。
-//
-//   ⇒ 用户定稿（第 29 轮）：**分组拆回「主区」「导航区」各自成组**。
-//       主区   → 实测 t=0（14pt，字母 / Esc / Ctrl / Alt / F1~F12 全都放得下）
-//       导航区 → 实测 t=3（10pt，被 6 字母的 Delete 限制）
-//     用户原话：「字体还能再大一点吗」+「导航栏的字体大小就别动了，
-//     感觉导航栏按钮字体这个大小，再扩大个 0.5 就差不多了」。
-//
-//   ⚠ 这**不是**回到第 25 轮那个被否掉的「导航区 ×0.85 缩放」方案 ——
-//     那套是给导航区**预先打折**（身份决定字号），本方案仍由**可用宽度**决定档位，
-//     只是不再强迫两块共用一个档。用户明确接受「两块可以不一样大」。
-//
-//   数字区（block 2）仍单独成组 —— 它的标签全是单字符，天然放得下最大档。
 static BOOL InUnifiedGroup(unsigned char blk, unsigned char want) {
     return blk == want;
 }
@@ -2584,7 +2038,7 @@ static int FitUnifiedTier(HDC dc, unsigned char block) {
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         if (!InUnifiedGroup(k->block, block)) continue;
-        // 图标键（Tab / Caps / Shift / Enter / 退格 / 方向键 / Win / Menu）不参与 ——
+        // 图标键（Tab / Caps / Shift / Enter / 退格 / 方向键 / Win / Menu）不参与
         // 它们走 DrawKeyLabel 自己那套「图标 + 名字」阶梯，可用宽里还要留图标位。
         if (KeyHasGlyph(k)) continue;
         wchar_t s[KEY_TEXT_MAX];
@@ -2600,13 +2054,9 @@ static int FitUnifiedTier(HDC dc, unsigned char block) {
 }
 
 // ⚠ 2026-10-05 第 29 轮：**tier 由调用方传入**，本函数不再自己量档。
-//   档位是按区块算一次的结果（见 BlockTierNow），逐键调 FitUnifiedTier
-//   会让一帧退化成数万次量宽 ⇒ 卡。
 static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_t* s, int maxW, int tier) {
     (void)idx; (void)self; (void)maxW;
     // ⚠ 2026-10-04 第 25 轮：全键盘只有一套阶梯（导航区专用档已删）。
-    //   量宽（FitUnifiedTier）与取字体（这里）必须是同一套，取错就会画出
-    //   与量宽时不同的字号。
     const FontLadder L = MainLadder();
     if (!s || !s[0]) return L.f[0] ? L.f[0] : g_f14;
     if (tier < 0) tier = 0;
@@ -2616,18 +2066,7 @@ static HFONT FitKeyFontUnified(HDC dc, int idx, const KeyDef* self, const wchar_
 }
 
 #ifdef HK_DIAG
-// ---- -fontdiag：把「每个键的标签 / 键宽 / 最终档位」dump 成表 ----
-//
-// 用途：用户多轮反馈「字号不统一 / Ctrl 那处大得要死」，而**离线复算**每次都说
-// "应该统一"。分歧只能在**真实的 GDI+ 量宽**上 —— 离线脚本用的是 PIL 的 advance，
-// 程序用的是 GDI+ MeasureString 的包围盒（更宽）。
-// ⇒ 与其继续拿近似值推演，不如让程序自己把**它实际算出来的东西**交出来。
-//
-// 输出列：idx block w maxW glyph t_own t_block label
-// 判读方法（第 29 轮）：**同一 block 内** t_block 应当处处相同；
-//   block 之间允许不同（这是本方案的预期：主区大、导航区小、数字区最大）。
-//   t_own 是"这一键孤立看能放多大"—— t_own 比 t_block 小的键，
-//   就是**把本区块档位拖下去的那个键**（例：导航区的 Pause / Home）。
+// ---- -fontdiag：把「每个键的标签 / 键宽 / 最终档位」dump 成表 -
 static void FontDiagDump() {
     if (!g_fontDiag) return;
 
@@ -2646,7 +2085,7 @@ static void FontDiagDump() {
              g_layoutMode, g_ww, g_wh, g_keyHeight, g_keyGap, g_keyAreaX, GetSystemDpiScale());
     fwprintf(f, L"# cols: idx block w maxW glyph t_own t_block label\n");
 
-    // 逐键打印。FitUnifiedTier 每次都会遍历本区块 —— 这里刻意**不走缓存**，
+    // 逐键打印。FitUnifiedTier 每次都会遍历本区块 —— 这里刻意**不走缓存**
     // 直接算才是"当前几何的真值"。
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
@@ -2667,7 +2106,7 @@ static void FontDiagDump() {
 }
 #endif  // HK_DIAG
 
-// 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k，
+// 图标定义在网格坐标里，描边宽度也是网格单位：缩放后必须把 pen 宽度乘回 k
 // 否则 16px 图标的线会连带缩细，与制作工具的观感对不上。
 static void DrawHkIcon(HDC dc, float x, float y, float size,
                        const HkIconDef& def, DWORD fg, DWORD hole) {
@@ -2694,10 +2133,6 @@ static void DrawHkIcon(HDC dc, float x, float y, float size,
         while (n->op != HKIC_BEGIN && n->op != HKIC_END) {
             switch (n->op) {
             case HKIC_MOVE:
-                // ⛔ GDI+ 的 GraphicsPath::AddLine 是「接到当前点」的：同一个 <path> 里第二个
-                // 子路径若直接 AddLine，会被从上一个子路径的终点拉一条线连过来（符号和汉堡都
-                // 因此画错 —— X 多一条边、三条杠之间多两道斜线）。换子路径必须先 StartFigure()
-                // 显式断开。实测 PathTypes 才是判据：断开前 0,1,1,1；断开后 0,1,0,1。
                 if (path.GetPointCount() > 0) path.StartFigure();
                 px = n->a; py = n->b; have = TRUE;
                 break;
@@ -2765,7 +2200,7 @@ static const HkIconDef* KeyIconFor(const KeyDef* k) {
     return NULL;
 }
 
-// 这个键有没有可画的图形。Win 键是特例：Windows 徽标字体里没有对应字形，
+// 这个键有没有可画的图形。Win 键是特例：Windows 徽标字体里没有对应字形
 // 一直是矢量特绘（见 DrawKeyGlyph），所以它不在 KeyIconFor 的 switch 里。
 static BOOL KeyHasGlyph(const KeyDef* k) {
     if (!k) return FALSE;
@@ -2777,10 +2212,7 @@ static BOOL KeyHasGlyph(const KeyDef* k) {
 static void DrawKeyGlyph(HDC dc, int x, int y, int size, const KeyDef* k, DWORD color) {
     if (!k || size <= 0) return;
     if (k->vk == 0x5B) {
-        // Win11 风格四格徽标：四块圆角方块 + 中间一条缝。
-        // ⚠ 外框要比 size 收一圈：Menu 的三条杠在 24 网格里只占 2..22（≈83%），
-        //    而这里原来铺满整个 size —— 同样 size 下 Win 明显比 Menu 满一圈
-        //    （实机反馈「Menu 键和 Win 键的图标大小需一致」）。按 0.78 缩后再居中。
+        // ⚠ 外框要比 size 收一圈：Menu 的三条杠在 24 网格里只占 2..22（≈83%）
         int box = (int)(size * 0.78 + 0.5);
         int sq = (int)(box * 0.44 + 0.5);
         int gp = (int)(box * 0.12 + 0.5);
@@ -2800,22 +2232,9 @@ static void DrawKeyGlyph(HDC dc, int x, int y, int size, const KeyDef* k, DWORD 
     if (ic) DrawHkIcon(dc, (float)x, (float)y, (float)size, *ic, color, color);
 }
 
-// 键面标签的图标形态；返回 FALSE 表示该键不参与图标化（调用方继续走文字路径）。
-// 颜色只有 textC 一个来源，所以「普通/修饰/按下」三态与深色主题都自动跟随，零分支。
-// 注意：局部变量不要叫 small / pure —— <windows.h> 的 rpcndr.h 里有 `#define small char`。
-//
-// 三档落位（默认「图标+文字」，见 g_keyIconStyle）：
-//   1) 图标 + 文字并排；宽度不够就**逐档降字号**（用户要求「挤不了就缩小字体」）；
-//   2) 一路降到最小档仍放不下 → 只画图形（用户明确允许的最后一档，也是方向键的常态）；
-//   3) 该键本身没有公认图形 → 返回 FALSE，交回纯文字路径。
-// 旧实现里没有第 1 档的降字号：放不下就直接退回纯文字，于是参考图上
-// 「⌫ Backspace / ⇥ Tab / ⇪ Caps」这类「图形 + 名字」的键全都丢了图形。
 static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, DWORD color) {
     if (!KeyHasGlyph(k)) return FALSE;
 
-    // 尺寸一律**按键高**取值（原来写死 15/20 DIP）：窗口缩小、键帽变矮时，固定尺寸的图标
-    // 会挤掉同排文字，[图标 + 文字] 放不下就只能退成纯图标 —— 即缩小窗口后的图标显示异常。
-    // 用键高做基准，DPI 与窗口缩放天然同步（48 DIP 键 ≈ 原来的 15/20 DIP）。
     int iconInline = k->h * 36 / 100;
     int iconOnly   = k->h * 52 / 100;
     int gap        = k->h * 8 / 100;
@@ -2843,12 +2262,6 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
             else                           gx = k->x + (k->w - groupW) / 2;
             if (gx < k->x) gx = k->x;
 
-            // 图标与文字的**纵向**对齐：图标按自身包围盒居中（DrawHkIcon 的路径上下对称），
-            // 文字按「墨迹框」居中。串里带下降部（Caps / Bksp / Backspace…）时墨迹下缘被
-            // 降部拖低，墨迹中心比字身（cap 高）中心低约「降部深的一半」，图标照键框居中
-            // 就会显得比字母低一截（实测 175% DPI 下 Caps 的图标低 4.5px）。
-            // 带降部时把图标上移这半个降部深（MiSans 墨迹降部 ≈ 0.21em，故取 0.105em）；
-            // 无降部的串（Tab / Enter / Menu / Win / Shift）墨迹中心＝字身中心，不补偿。
             int iconY = k->y + (k->h - iconInline) / 2;
             if (TextHasDescender(text))
                 iconY -= (int)(0.105f * FontEmPx(ff) + 0.5f);
@@ -2861,9 +2274,6 @@ static BOOL DrawKeyLabel(HDC dc, const KeyDef* k, HFONT f, const wchar_t* text, 
         }
     }
 
-    // 只画图形（没有文字 / 箭头键 / 降到底仍放不下）
-    // 只有**方向键**用更大的独占尺寸（键面本来就是那个箭头，撑满键帽更好看）；
-    // 其余没名字的键（Win / Menu 徽标）沿用 inline 档 —— 同排的字都在，放大的徽标会大一号。
     iconOnly = (k->type == K_ARROW) ? (k->h * 42 / 100) : iconInline;
     if (iconOnly > k->w - 2 * edge) iconOnly = k->w - 2 * edge;
     if (iconOnly < 6) iconOnly = 6;
@@ -2898,20 +2308,6 @@ static int FnMap(short vk) {
 }
 
 // ⚠⚠⚠ 2026-10-05 血案（第 27 轮）：`KeyText` 曾经返回**指向静态缓冲区**的指针。
-//   只要调用方拿到指针后又调一次 `KeyText`，前一个指针的内容就被改写。
-//
-//   潜伏已久，直到 `FitUnifiedTier` 里那个"取组内最严档"的循环被修好（判据取反，
-//   见该函数说明）才引爆 —— 修好之前循环是空转的，从不调 `KeyText`，所以没事；
-//   修好之后循环要遍历全组键，于是：
-//       DrawKeys:  const wchar_t* txt = KeyText(k);     // "q"
-//                  FitKeyFontUnified(...) → FitUnifiedTier → 循环调 KeyText(每个组员)
-//                  → 最后一个组员是字母 m ⇒ 静态 buf 变成 "m"
-//                  DrawTextKey(dc, k, txt, ...)          // 画出来是 "m"
-//   ⇒ **全键盘字母键都显示成 `m`**，且 F1~F12 行、导航区一起乱套；
-//     更糟的是量宽也全拿到同一个短串，字号统一逻辑跟着失效 ⇒ 全尺寸字大得离谱。
-//
-//   ⇒ 从此**所有返回文本的入口都写进调用方给的缓冲区**，不再有任何 static 返回。
-//     缓冲区大小统一用 KEY_TEXT_MAX（前置声明处已 define）。
 static void LetterKeyTextInto(short vk, wchar_t* out, size_t n) {
     if (!out || n < 2) return;
     BOOL upper = g_cp;
@@ -2923,12 +2319,7 @@ static void LetterKeyTextInto(short vk, wchar_t* out, size_t n) {
 // 网页布局的网址后缀键（vk 0x200 起为索引哨兵）
 static const wchar_t* g_domainTexts[6] = { L"www.", L".com", L".cn", L".org", L".cc", L".net" };
 
-// 网页布局层是否生效（Fn 层 + 「Fn 网页布局」开关）。
-// 这一层的键面是「画什么就发什么」——符号已经全铺在键面上（K_SYM），
-// 所以**整个层都不随 Shift 换字**。
-// ⚠ 判定点有两处，必须同源，否则会出现「大部分键面不动、个别键（如 `~）还在跟着变」：
-//   1) KeyTextInto 里 K_NORMAL 的 GetSymForKey(vk, g_sh && g_shiftSymbols)
-//   2) DrawKeys 里 K_NORMAL 的双符号换面（baseCh / shiftCh / shiftOn）
+// ⚠ 判定点有两处，必须同源，否则会出现「大部分键面不动、个别键（如 `~）还在跟着变」
 static BOOL IsWebFnLayer() { return (g_fnLayer && g_fnWebLayout); }
 
 // 把键面文本写进调用方缓冲区（⚠ 不要再改成"返回 static 指针"，理由见上方血案注释）。
@@ -2979,7 +2370,7 @@ static const wchar_t* KeyTextInto(const KeyDef* k, wchar_t* out, size_t n) {
         // Win / Menu：键面只留图形，不再带名字（实机反馈：这两个键的文字描述去掉）。
         // 键面本身就是公认图形（四格徽标 / 三条杠），名字是冗余信息，去掉后与方向键一样干净。
         case 0x5B: case 0x5D: lit = L""; break;
-        // 独立小键盘是 4 列网格，纯空白的一格看着像画错了（参考图那里写着「空格」）；
+        // 独立小键盘是 4 列网格，纯空白的一格看着像画错了（参考图那里写着「空格」）
         // 默认布局 / 全尺寸的空格键很宽，沿用屏幕键盘的惯例不写字。
         case 0x20: lit = (g_layoutMode == 1) ? T(L"\x7A7A\x683C", L"Space") : L""; break;
         case 0x25: lit = L"\x2190"; break;
@@ -2988,23 +2379,9 @@ static const wchar_t* KeyTextInto(const KeyDef* k, wchar_t* out, size_t n) {
         case 0x28: lit = L"\x2193"; break;
         case 0x2C: lit = L"PrtSc"; break;
         // ⚠ 2026-10-05：这三个**保持全称**，导航区因此停在 9pt。
-        //   全尺寸 1u 键可用宽只有 46px，ScrLk / Pause / Home 在 10pt 档超宽 1~3px，
-        //   是它们把导航区的统一档从 10pt 压到 9pt。
-        //   曾试过缩成 Scr / Pse / Hom 以换取 10pt，用户看了实机后否掉：
-        //   「不能显示全称太难受了」—— 宁可 9pt 也要全称。
-        //   ⚠ 不要再动这三个标签；想给导航区升档只能改键宽或阶梯。
         case 0x91: lit = L"ScrLk"; break;   // VK_SCROLL（原来是 0x46 = 字母 F，已修）
         case 0x13: lit = L"Pause"; break;
         case 0x08: {
-            // 退格：宽键显示全称 Backspace，窄键用 Bksp。
-            // 判据 = 「可用宽 vs 实测文字宽」，与 FitKeyFont 同源（两边都走 MeasureTextW，
-            // 也就是 GDI+ 的容器宽，绘制的 NoWrap 判据一致）：
-            //   可用宽 = 键宽 − 两侧各 3 DIP 安全边距。
-            //   g_bkspTextW = 字体重建时量一次的「Backspace」在 g_f12 档下的容纳宽。
-            // 字体还没建完时（极早的一次绘制）退回几何判据 —— 实测「放得下」⇔ 键宽 ≥ 1.83 × 键高。
-            //
-            // 默认布局的退格键只有 1.75u，文字被挤到只剩「Bksp」——实机反馈直接不要文字，
-            // 只留 ⌫ 图形（图形本身已经说清楚）。全尺寸 / 小键盘里键够宽，保留 Backspace。
             if (g_layoutMode == 0) { lit = L""; break; }
             int avail = k->w - (int)(6 * GetSystemDpiScale());
             if (g_bkspTextW > 0) { lit = (avail >= g_bkspTextW) ? L"Backspace" : L""; break; }
@@ -3037,16 +2414,8 @@ static const wchar_t* KeyText(const KeyDef* k) {
 
 static BOOL IsActive(const KeyDef* k) {
     if (k->vk == 0x14 && g_cp) return TRUE;
-    // NumLock 高亮跟 g_npLock —— 它就是**系统真实锁定态**（点 Num 键时读回
-    // `ReadSystemNumLock()` 读到的系统真实值，见 OnKeyDown 里 0x90 分支）。
     // ⚠ 不要再改成「跟实体灯走」或「自己取反」：第 17~20 轮在这上面反复翻车
-    //   （假亮、不同步、反复翻转）。**唯一真值是系统状态。**
     if (k->vk == 0x90 && g_npLock) return TRUE;
-    // Shift 高亮分两路（2026-10-10 改）：
-    //   · 屏幕键盘 Shift 锁定（g_sh）—— 左右两格一起亮，这是点击屏幕 Shift 的既有行为，不动；
-    //   · 实体 Shift —— **左右各管各的**，按哪边亮哪边，松开即灭。
-    // 原来三者的判定是一条 `(vk==SHIFT||LSHIFT||RSHIFT) && (g_sh||g_physShift)`，
-    // 一个共用标志同时驱动两格 ⇒ 只按左边时右边也亮、先松一边时亮灭对不上。
     if (k->vk == VK_LSHIFT) return (g_sh || g_physLShift);
     if (k->vk == VK_RSHIFT) return (g_sh || g_physRShift);
     if (k->vk == VK_SHIFT && (g_sh || g_physShift)) return TRUE;   // 通用 VK_SHIFT：现有布局未用到，留着防以后加键
@@ -3059,34 +2428,8 @@ static BOOL IsActive(const KeyDef* k) {
 
 // ========== IME-Compatible Input Injection ==========
 // ⚠ 必须用 SendInput（keybd_event 已废弃且拦不到高权限窗口），扫描码走
-//   MapVirtualKeyW(MAPVK_VK_TO_VSC) —— 部分 IME 依赖正确扫描码。
-//
-// ⚠⚠ **注入必须分段，down/up 之间要让出消息循环**（Win10 微软拼音不收，issue #3）
-//
-//   现象：Win10 + 微软拼音打不出中文，但**微信拼音正常**、**Win11 正常**、
-//   **Win7 正常**，而且**同一台机器上资源管理器搜索框里能打中文、
-//   Edge 地址栏和记事本里不能**。
-//   这组对照说明注入通路本身是通的（英文/数字全部正常），微软拼音的状态机
-//   只是不接受这种「一个 SendInput 里down+up 全部灌完、零延时」的节奏。
-//
-//   原理：微软拼音的 TSF 前端要在 WM_KEYDOWN 之后**跑一轮自己的消息循环**
-//   才开始组字；down 与 up 在同一个 SendInput 里同批到达时，它还没来得及
-//   进入组字状态就收到了 KEYUP，于是整串被丢掉 —— 不上屏、不出候选窗。
-//   微信拼音的实现更宽容，Win11 / Win7 的 IME 容错更高，所以都不复现。
-//   Chromium（Edge）与纯文本控件对按键节奏最敏感，资源管理器的搜索框反而宽容，
-//   于是出现「换个窗口就能用」的迷惑现象。
-//
-//   佐证：本文件原有的 ToggleImeLang / SendWinToggle **都**是「分两次发送 +
-//   Sleep(50)」并在注释里写明了「避免过快 down+up 被 IME 忽略」，
-//   偏偏 SendKey 这条最常走的路径漏了 —— 现在按同样的思路补上。
-//
-//   ⚠ 延时不能省，也不能给太大：太大则长按连发（TIMER_REPEAT 40ms 一个 tick）
-//   会因为 Sleep 累积而拖慢。1ms 是「足够让出消息循环」与「不拖慢连发」的折中。
 #define KEY_INJECT_GAP_MS 1
 
-// gapMs = 0 表示「不分段、一次性 SendInput 灌完」，即v2.0 修复前的行为。
-// 只给**连续大量注入**的场景用（Fn 层的网址后缀键TypeDomainText、长按连发）：
-// 那里本来就不会触发中文组字，逐键 1ms 的延时只会累积成几十毫秒的卡顿。
 // ⚠ 绝不要给「用户敲单个键」用 —— 那正是 issue #3 的场景，需要让出消息循环。
 static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs) {
     if (gapMs == 0) {
@@ -3127,14 +2470,7 @@ static void SendKeyGap(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win, DWORD gapMs
     SendKey(vk, sh, ct, al, win);
 }
 
-// 小键盘数字键 -> 未锁定时的等价光标键（实体小键盘 NumLock 关掉时的行为）。
-// 布局与实体 104 键盘的数字区一致：
-//   7=Home 8=↑ 9=PgUp   4=← 5=(无) 6=→   1=End 2=↓ 3=PgDn   0=Ins
-// 5 在未锁定时实体键盘**不发任何键**（它只在锁定时是 5）—— 返回 0 表示不发。
-//
 // ⚠ 2026-10-10：**当前没有被调用** —— 屏幕小键盘的数字键已改为"一律发数字"
-//   （原因见 DoKeyAction 的 K_NORMAL 段）。这张映射表保留备查：万一以后要恢复
-//   "跟随系统 NumLock 的导航模式"，用它就行（静态函数未引用在 /W1 下不告警）。
 static BYTE NumpadNavKey(BYTE vk) {
     switch (vk) {
     case 0x67: return VK_HOME;        // 7
@@ -3163,7 +2499,7 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
 
     DWORD extFlag = isExtended ? KEYEVENTF_EXTENDEDKEY : 0;
 
-    // ---- 第 1 段：修饰键按下（一次 SendInput，顺序 ct → al → sh → win）----
+    // ---- 第 1 段：修饰键按下（一次 SendInput，顺序 ct → al → sh → win）-
     {
         INPUT mods[4] = {};
         int mc = 0;
@@ -3183,14 +2519,6 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
         }
         if (sh) {
             // ⚠⚠ **必须用右 Shift（VK_RSHIFT / 扫描码 0x36），不能用 VK_SHIFT。**
-            //   实测（2026-10-03 Win10）：用 VK_SHIFT（→扫描码 0x2A =左 Shift）
-            //   时，**按 Shift 切不了中英文**。
-            //   原因：微软拼音的切换键默认绑定在**右 Shift** 上。
-            //   补上 KEYEVENTF_SCANCODE 后系统按扫描码反查 VK，
-            //   0x2A 反查出来是 VK_LSHIFT，IME 自然不认。
-            //   ⇒与 ToggleImeLang 保持一致（它用 VK_RSHIFT / 0x36）。
-            //   另：右 Shift 本身**不是**扩展键（不带 0xE0），
-            //   所以这里不能加 KEYEVENTF_EXTENDEDKEY。
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_RSHIFT;
             mods[mc].ki.wScan = 0x36;              // 右 Shift 标准扫描码
@@ -3208,28 +2536,8 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
         if (mc > 0) Sleep(KEY_INJECT_GAP_MS);
     }
 
-    // ---- 第 2 段：目标键 down ----
-    //
+    // ---- 第 2 段：目标键 down -
     // ⚠⚠⚠ **必须带 KEYEVENTF_SCANCODE**，否则 `wScan` 是死字段（issue #3 根因）
-    //
-    //   Win32 语义：**不设 KEYEVENTF_SCANCODE 时，系统只认 `wVk`，
-    //   `wScan` 会被完全忽略**。而我们下面把 `wScan` 填了却没设这个标志，
-    //   于是它从来没生效过 —— 文件顶部注释「扫描码走 MapVirtualKeyW，
-    //   部分 IME 依赖正确扫描码」说的事情，实际上**一件都没发生**。
-    //
-    //   佐证：本文件里**能正常工作**的 `ToggleImeLang` / `SendWinToggle`
-    //   都老老实实设了 `dwFlags = KEYEVENTF_SCANCODE`：
-    //       in.ki.dwFlags = KEYEVENTF_SCANCODE;              // ToggleImeLang
-    //       in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-    //   偏偏最常走的 SendKey 这条漏了。
-    //
-    //   为什么这会让微软拼音丢字：TSF 前端从 `WM_KEYDOWN` 的 `lParam`
-    //   （bit 16~23 = 扫描码、bit 24 = 扩展键标志）判断按了哪个物理键。
-    //   只给 `wVk` 时系统要自己反推扫描码，在非美式布局 / IME 激活态下
-    //   反推结果可能与真键盘不同 ⇒ IME 认不出这串按键 ⇒ 不组字、不上屏。
-    //
-    //   设定 SCANCODES 后 `wVk` 会被忽略，所以**保持同时赋值无害**，
-    //   且能让意图在代码里保持清晰。
     {
         INPUT down = {};
         down.type = INPUT_KEYBOARD;
@@ -3242,7 +2550,7 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
     // 关键延时：给 IME 的 TSF 前端跑一轮消息循环、进入组字状态
     Sleep(KEY_INJECT_GAP_MS);
 
-    // ---- 第 3 段：目标键 up ----
+    // ---- 第 3 段：目标键 up -
     {
         INPUT up = {};
         up.type = INPUT_KEYBOARD;
@@ -3252,7 +2560,7 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
         SendInput(1, &up, sizeof(INPUT));
     }
 
-    // ---- 第 4 段：修饰键抬起（逆序win → sh → al → ct，与按下相反）----
+    // ---- 第 4 段：修饰键抬起（逆序win → sh → al → ct，与按下相反）-
     {
         INPUT mods[4] = {};
         int mc = 0;
@@ -3264,9 +2572,6 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
             mc++;
         }
         if (sh) {
-            // 与第 1 段的按下**必须成对**：同样是右 Shift / 扫描码 0x36。
-            // 若按下发左 Shift、抬起发右 Shift（或反过来），
-            // 系统会认为有另一个 Shift 被按下/释放，状态会错乱。
             mods[mc].type = INPUT_KEYBOARD;
             mods[mc].ki.wVk = VK_RSHIFT;
             mods[mc].ki.wScan = 0x36;              // 右 Shift 标准扫描码
@@ -3291,10 +2596,6 @@ static void SendKey(BYTE vk, BOOL sh, BOOL ct, BOOL al, BOOL win) {
     }
 }
 
-// 输入法中英文切换：由左右 Shift 的第 2 次点击触发（用右 Shift 扫描码，与真实右 Shift 一致）。
-// 采用“纯扫描码 + 按下/抬起分两次发送”：
-//  - KEYEVENTF_SCANCODE 直接注入物理扫描码，不受键盘布局映射影响，IME 能识别为真实右 Shift；
-//  - 按下与抬起之间留出间隔，避免过快 down+up 被微软拼音/搜狗等 IME 忽略。
 static void ToggleImeLang() {
     UINT sc = MapVirtualKeyW(VK_RSHIFT, MAPVK_VK_TO_VSC);
     if (sc == 0) sc = 0x36;  // 右 Shift 标准扫描码
@@ -3315,7 +2616,7 @@ static void ToggleImeLang() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// 发送一次 Win 键（开/关开始菜单）：按下与抬起分两次注入并留出间隔，
+// 发送一次 Win 键（开/关开始菜单）：按下与抬起分两次注入并留出间隔
 // 确保系统可靠识别切换，避免快速连点时注入被合并/吞掉导致“关闭又弹开”。
 static void SendWinToggle() {
     UINT sc = MapVirtualKeyW(VK_LWIN, MAPVK_VK_TO_VSC);
@@ -3338,27 +2639,18 @@ static void SendWinToggle() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// 清除 Win 锁定：解锁并重置点击计数（使用 Win+快捷键或检测到开始菜单时调用）。
 // ⚠ 别再用「注入 Esc 关开始菜单」那套：曾这么做过，但注入的 Win 键在部分环境下
-//   「能开不能关」，后来改成按 Win 键本身开合，锁定态只由这里统一清。
 static void ClearWinLock() {
     g_winKey = FALSE;
     g_winCount = 0;
 }
 
 // ========== 开始菜单可见性检测（IAppVisibility，Win8+ 官方 API） ==========
-// Win10/11 的开始菜单是 UWP/XAML 窗口（Windows.UI.Core.CoreWindow），用 FindWindow/
-// IsWindowVisible 无法可靠检测（"Start" 窗口长期保持可见属性且不进入前台）。
-// 这里改用系统自身逻辑 IAppVisibility::IsLauncherVisible 判断开始菜单是否显示，
-// 与 Win8 及以上的系统实现保持一致。
 static const GUID CLSID_AppVisibility =
     {0x7E5FE3D9, 0x985F, 0x4908, {0x91, 0xF9, 0xEE, 0x19, 0xF9, 0xFD, 0x15, 0x14}};
 static const GUID IID_IAppVisibility =
     {0x2246EA2D, 0xCAEA, 0x4444, {0xA3, 0xC4, 0x6D, 0xE8, 0x27, 0xE4, 0x43, 0x13}};
 
-// IAppVisibility vtable（不依赖 shobjidl_core.h，手动声明）
-// [0] QueryInterface  [1] AddRef  [2] Release
-// [3] GetAppVisibilityOnMonitor  [4] IsLauncherVisible  [5] Advise  [6] Unadvise
 typedef struct AppVisibilityVtbl {
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(void*, REFIID, void**);
     ULONG   (STDMETHODCALLTYPE *AddRef)(void*);
@@ -3410,28 +2702,15 @@ static void TypeDomainText(const wchar_t* s) {
         } else {
             continue;
         }
-        // 网址后缀是「一次性把整串打完」，不会进中文组字 —— 走 gap=0 的快速路径，
+        // 网址后缀是「一次性把整串打完」，不会进中文组字 —— 走 gap=0 的快速路径
         // 否则每个字符 2 次 Sleep(1)，20 字符的域名就是 40ms 的卡顿。
         SendKeyGap((BYTE)vk, sh, FALSE, FALSE, FALSE, 0);
     }
 }
 
 #ifdef HK_DIAG
-// ---- -diag：最小诊断，记录"注入前后"的关键系统状态 ----
-//
-// 用途：issue #3 已经缩小到「用户**手动点击**按键 → 注入的按键不被微软拼音
-// 组字」，而**同样的注入由定时器触发时却正常**。两者在代码路径上已被逐一
-// 证明等价（SendKey ≡ SendTestKey、SetCapture/重绘均已排除），
-// 所以差异只可能在**注入那一刻的系统状态**上。
-//
-// 只记录跨进程可取、且与"输入法为什么会拒绝组字"直接相关的几项：
-//   前台窗口类名 / 焦点窗口 / 光标窗口(hwndCaret) / **鼠标左键是否按下** / 键盘布局
-//
-// ⚠ 重点看 LBTN：
-//   用户手动点击时，注入发生在 WM_LBUTTONDOWN 的处理过程中，
-//   此刻鼠标左键**必然是按下状态**；而定时器触发的注入不是。
-//   若两边的 LBTN 不同，差异就找到了 —— 那说明微软拼音在
-//   "鼠标按键按下期间"会拒绝处理注入的键盘事件。
+// ---- -diag：最小诊断，记录"注入前后"的关键系统状态 -
+// ⚠ 重点看 LBTN
 BOOL g_diag = FALSE;
 
 static void DiagSnap(const wchar_t* tag) {
@@ -3469,35 +2748,8 @@ static void DiagSnap(const wchar_t* tag) {
 #endif  // HK_DIAG
 
 // ⚠⚠⚠ **注入前必须等鼠标左键抬起** —— issue #3 的真正根因（2026-10-04 定位）
-//
-// 实测依据（diag.txt 记录的"注入前后系统状态"）：
-//     用户**真实**鼠标点击  -> LBTN=1  -> 微软拼音不组字（出英文）
-//     **注入**鼠标点击      -> LBTN=0  -> 正常组字
-//     定时器触发注入        -> LBTN=0  -> 正常组字
-//   三者其余状态**完全相同**：同一个前台窗口(Notepad)、同一个 focus/caret、
-//   同一个键盘布局(0x08040804 = zh-CN)。唯一差异就是 LBTN。
-//
-//   最有说服力的一点：同样是 `[before]/[after]` 两组，一组 LBTN=1、
-//   一组 LBTN=0 —— 说明 **SendInput 注入的鼠标按下不会被系统记为"按下"**，
-//   所以自动化测试永远测不出这个问题。
-//
-// ⇒ 结论：**微软拼音（Win10）在"鼠标左键按下期间"拒绝处理注入的键盘事件。**
-//   这一条同时解释了全部现象：手动点击必然失败、自动化注入必然成功、
-//   物理键盘不受影响、Win11/Win7/第三方输入法对鼠标状态不敏感。
-//
-// ⚠ 实现上必须用 PeekMessage 泵消息，**不能死 Sleep**：
-//   `OnLDown` 是在 WM_LBUTTONDOWN 的处理过程中调用的，此刻左键必然按下；
-//   而 WM_LBUTTONUP 还得靠消息循环派发才能到达 —— 死等的话它永远收不到，
-//   必然一路等到超时。泵消息同时保证界面不卡。
-//
-// ⚠ 加防重入：泵消息会派发 WM_LBUTTONUP -> OnLUp，若用户此刻又点了别的键，
-//   会重入 WndProc -> DoKeyAction -> 本函数。没有这个标志会递归下去。
 static BOOL g_inWaitLButton = FALSE;
-// 长按连发中：跳过左键等待。
-// ⚠ 连发时用户**一直按着**鼠标，等下去只会每次都耗满 250ms 超时，
-//   把连发拖成每 250ms 一次。而连发本身是"重复同一个字符"
-//   （退格/删除/空格/方向键），不走组字 —— 真正需要组字的是**第一次**
-//   注入，那一次在 OnLDown 里、用户刚按下，等待很短就能过。
+// ⚠ 连发时用户**一直按着**鼠标，等下去只会每次都耗满 250ms 超时
 static BOOL g_inRepeat = FALSE;
 
 static void WaitForLeftButtonUp() {
@@ -3511,9 +2763,7 @@ static void WaitForLeftButtonUp() {
            GetTickCount() - start < 250) {                    // 250ms 上限，别卡死
         MSG msg;
         while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
-            // ⚠ WM_QUIT 必须自己再投回去：PeekMessage 会把它取走，
-            //   而 DispatchMessage 不处理它 —— 取走后没人管，程序就再
-            //   也收不到退出信号了。
+            // ⚠ WM_QUIT 必须自己再投回去：PeekMessage 会把它取走
             if (msg.message == WM_QUIT) {
                 PostQuitMessage((int)msg.wParam);
                 break;
@@ -3528,7 +2778,7 @@ static void WaitForLeftButtonUp() {
 
 static void DoKeyAction(const KeyDef* k) {
     if (!k) return;
-    // ⚠ 所有按键都在此统一等待 —— 空格尤其重要：它负责把候选框里的中文上屏，
+    // ⚠ 所有按键都在此统一等待 —— 空格尤其重要：它负责把候选框里的中文上屏
     //   若在左键按下期间注入，中文同样上不去（这正是 issue #3 的主诉之一）。
     WaitForLeftButtonUp();
     switch (k->type) {
@@ -3540,17 +2790,7 @@ static void DoKeyAction(const KeyDef* k) {
             SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
             ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         } else {
-            // 大小写：**要发出去的 Shift 不等于屏幕上的 Shift**。
-            // 目标程序最终显示什么，取决于「CapsLock 与送达的 Shift 的异或」；
-            // 而屏幕键盘的键面是 `大写 = g_cp 异或 g_sh`（见 KeyTextInto）。
-            // 所以要按「键面显示的那个大小写」反推该不该带 Shift：
-            //     想要大写 → 送 Shift = !Caps；想要小写 → 送 Shift = Caps
-            //
-            // ⚠⚠ 2026-10-17 修（用户报「双击 Shift 锁定后按 Caps，键面变小写但打出来还是大写」）：
-            //   上一版写的是 `us = g_sh ? !Caps : FALSE`，只在「Caps 开 + Shift 开」这一种组合上错：
-            //   Caps=1、Shift=1 → 键面算的是小写（1 异或 1 = 0），上一版却送 us=FALSE
-            //   ⇒ 系统按 Caps=1 又把它变成大写 ⇒ 键面与输入相反。
-            //   其他三种组合恰好都对，所以这个问题只在「锁定 Shift 之后再按 Caps」复现。
+            // ⚠⚠ 2026-10-17 修（用户报「双击 Shift 锁定后按 Caps，键面变小写但打出来还是大写」）
             BOOL wantUpper = (g_cp != g_sh);
             BOOL us = wantUpper ? !(GetKeyState(VK_CAPITAL) & 1) : ((GetKeyState(VK_CAPITAL) & 1) != 0);
             SendKey(k->vk, us, FALSE, FALSE);
@@ -3572,29 +2812,9 @@ static void DoKeyAction(const KeyDef* k) {
                 break;
             }
         }
-        // ---- 小键盘数字键：**始终发数字键**（2026-10-10 改）----
-        //
-        // ⚠⚠ 为什么不看 NumLock 了（用户报「小键盘没作用了 / 小键盘布局也输入不了数字」）：
-        //   旧写法是「g_npLock 为真发 VK_NUMPAD0-9，否则发 NumpadNavKey（Ins/Home/PgUp…）」，
-        //   而 g_npLock 由 TIMER **每 tick 从系统读回**。平板 / 轻薄本上系统 NumLock
-        //   默认是**关**的（本机实测 GetKeyState(VK_NUMLOCK)&1 == 0）⇒ 屏幕小键盘 50ms 内
-        //   就变成"导航模式"，点数字键只会发 Ins/Home/方向键 ⇒ **一个字都打不进去**；
-        //   而独立小键盘布局里**根本没有 Num 键**，用户连打开数字模式的入口都没有。
-        //
-        //   本机实测（原生 Win32 EDIT 控件 + 注入，NumLock 明确为 0）：
-        //       NumLock 关 → 注入 VK_NUMPAD1..4 → 文本框得到 "1234" ✓
-        //   ⇒ 只要**直接注入 VK_NUMPAD0-9**，目标程序一定能得到数字，与系统 NumLock 无关
-        //     （NumLock 影响的是"扫描码→VK"那一步，我们跳过扫描码直接给 VK）。
-        //   ⇒ 屏幕小键盘的职责就是"打数字"，不该被系统灯的状态悄悄改成方向键。
-        //   Num 键（0x90）仍然照旧真的发出去，只为让实体灯 / 目标程序的 NumLock 跟着翻，
-        //   不再参与决定这里发什么键。
+        // ---- 小键盘数字键：**始终发数字键**（2026-10-10 改）-
+        // ⚠⚠ 为什么不看 NumLock 了（用户报「小键盘没作用了 / 小键盘布局也输入不了数字」）
         if (k->vk >= 0x60 && k->vk <= 0x69) {
-            // 布局不同、语义不同（用户 2026-10-10）：
-            //   独立小键盘（1）：**始终发 VK_NUMPAD0-9**。它没有 Num 键，职责就是打数字，
-            //     不能被系统灯悄悄改成方向键（旧写法就是这么翻车的，见上）。
-            //   全尺寸（2）：这里是**真键盘的数字区**，必须跟 NumLock 走 —— 灯灭时发导航键
-            //     （Ins/Home/PgUp/←/→/End/↓/PgDn/Del），与实体键盘完全一致。
-            //   ⇒ NumpadNavKey 这张表正是为此保留的（见其定义处的说明）。
             SendKey((g_layoutMode == 2 && !g_npLock) ? NumpadNavKey(k->vk) : k->vk,
                     g_sh, g_ct, g_al, g_winKey);
             ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
@@ -3619,10 +2839,6 @@ static void DoKeyAction(const KeyDef* k) {
             break;
         }
         if (k->vk == VK_LWIN) {
-            // Win 键参考大写键（Caps）的开关逻辑：
-            //  第 1 次点击：锁定并高亮（等待 Win+组合键，再点其它键发送 Win+按键）；
-            //  第 2 次点击：轻按一次 Win 键（打开开始菜单），解除锁定、取消高亮；
-            //  第 3 次起：每次点击都轻按 Win 键（开始菜单随点击开/关交替），不再失步。
             if (g_winKey) {
                 g_winKey = FALSE;
                 g_winCount = 0;
@@ -3639,35 +2855,8 @@ static void DoKeyAction(const KeyDef* k) {
             InvalidateRect(g_hWnd, 0, TRUE);
             break;
         }
-        // NumLock：**只做一件事 —— 真的把 VK_NUMLOCK 发出去**。
-        //
+        // --- 以下是第 20~24 轮留下的结论，仍然成立，保留备查
         // ⚠⚠ 2026-10-10 大改（用户报「Num Lock 又不能点击了 / 小键盘输入不了数字」）。
-        //   历史包袱很长（下面留着第 20~24 轮的结论），但根子是一件事：
-        //   这里**既想真发出去、又想自己维护一份锁定态**，两份状态就会打架。
-        //
-        //   本轮的处置是把两者彻底分开：
-        //     ① 本键只负责"真发"：注入一次 VK_NUMLOCK，让目标程序与实体灯真的翻转。
-        //     ② **不再自己维护任何锁定态**（去掉 `g_npLock = !before` 那句乐观赋值）
-        //        —— 高亮完全由 TIMER_FOCUS 每 50ms 从系统读回的真实值驱动。
-        //        ⇒ 界面永远不会撒谎（注入失败就是"没亮"，而不是"亮了但假的"），
-        //          也不会出现"点一下先亮、50ms 后被打回"的闪烁。
-        //     ③ 屏幕小键盘的数字键**不再看 NumLock**（见 K_NORMAL 里那段说明）：
-        //        平板/轻薄本系统 NumLock 默认是关的，旧写法会让数字键变成方向键。
-        //        ⇒ 系统灯关着也能打数字，本键就纯粹是"给目标程序/实体灯用的开关"。
-        //   ⇒ 于是「点不动」不再是一个致命的可用性问题：即使这台机器上注入没被接受，
-        //     小键盘照样能输数字（这条是本机实测过的，见 K_NORMAL 处的数据）。
-        //
-        // --- 以下是第 20~24 轮留下的结论，仍然成立，保留备查 ---
-        //   ① 注入**只发一次**，走 **VK 路径**（`wVk = VK_NUMLOCK`、不带 SCANCODE）
-        //      —— 锁存键的翻转由键盘布局层按 VK 处理，扫描码路径会被忽略（第 21 轮实测：
-        //      加 SCANCODE 灯不亮）。⚠ 重复注入不是"重试"而是"继续翻转"：
-        //      锁存键每收到一次就翻一次，注入 N 次 = 翻 N 次 —— 第 20 轮的"重试"
-        //      正是「关>开、开>关、有时候却正常」的来源。
-        //   ② **不在点击里等读回**（第 24 轮）：曾经在这里死等最多 200ms 读结果，
-        //      把 WndProc 堵住 ⇒ 掉帧、点键手感停顿（用户说"卡卡的"）。
-        //      TIMER_FOCUS 每 50ms 读回真实锁定态并对齐高亮，可以自愈。
-        //   ③ 只用 `KEYEVENTF_EXTENDEDKEY`。本机（Win11）实测三种写法都能翻：
-        //      EXTENDEDKEY ✓ / 无 flag ✓ / 再 EXTENDEDKEY ✓（`SendInput` 返回 2）。
         if (k->vk == 0x90) {
             INPUT pair[2] = {};
             pair[0].type = INPUT_KEYBOARD;
@@ -3684,28 +2873,19 @@ static void DoKeyAction(const KeyDef* k) {
         ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_SYM:
-        // 网页层符号键：键面画什么就发什么。symShift=1 的格子（! @ # …）内部自动带 Shift，
+        // 网页层符号键：键面画什么就发什么。symShift=1 的格子（! @ # …）内部自动带 Shift
         // 所以不需要用户先点 Shift，点击结果与键面永远一致。
         SendKey(k->vk, k->symShift ? TRUE : FALSE, g_ct, g_al, g_winKey);
         ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         break;
     case K_MOD:
         if (k->vk == VK_RSHIFT || k->vk == VK_SHIFT || k->vk == VK_LSHIFT) {
-            // 左右 Shift 状态机（状态以 g_sh 为准）：
-            //  - 未处于 Shift 状态：点击进入 Shift 锁定（后续按键为 Shift+组合键）；
-            //  - 已处于 Shift 状态：再次点击切换中/英输入法，并退出 Shift 锁定。
-            // 任意 Shift+组合键使用后会退出 Shift 状态，因此下次点击 Shift 可再次正常进入，不会失步。
-            //
-            // ⚠ 网页布局层里 Shift 不再兼作「退出 Fn 层」：
-            //   那个层的符号本来就全铺在键面上（K_SYM），Shift 只用来做
-            //   Shift+方向键这类组合；原来无条件 `g_fnLayer = FALSE`，
-            //   点一下 Shift 整层就退回默认布局，实机反馈「点了 Shift 键面全变了」。
-            //   退出的唯一入口留给那一层 Row4 的 Fn 键。
+            // ⚠ 网页布局层里 Shift 不再兼作「退出 Fn 层」
             BOOL keepFn = (g_fnLayer && g_fnWebLayout);
             BOOL wasFn = g_fnLayer;
 
             if (g_shiftDoubleTap) {
-                // ---- 新模式：单击 = 一次性，双击 = 锁定 ----
+                // ---- 新模式：单击 = 一次性，双击 = 锁定 -
                 DWORD now = GetTickCount();
                 BOOL isDouble = (g_shiftLastTap && (now - g_shiftLastTap) <= SHIFT_DOUBLE_MS);
                 g_shiftLastTap = now;
@@ -3730,7 +2910,7 @@ static void DoKeyAction(const KeyDef* k) {
                 }
                 InvalidateRect(g_hWnd, 0, TRUE);
             } else if (g_sh) {
-            // ---- 旧模式：单击即锁定，再点切输入法（保持原行为）----
+            // ---- 旧模式：单击即锁定，再点切输入法（保持原行为）-
                 g_sh = FALSE;
                 if (!keepFn) g_fnLayer = FALSE;
                 ToggleImeLang();
@@ -3747,9 +2927,6 @@ static void DoKeyAction(const KeyDef* k) {
         } else if (k->vk == 0x12) {
             g_al = !g_al;
         } else {
-            // Menu（VK_APPS = 0x5D）：以前它被归成 K_MOD，而这里只认 Shift/Ctrl/Alt
-            // ⇒ 点下去什么都不发，右键菜单永远出不来（用户报「菜单键点击无效」）。
-            // 它不是修饰键，直接发一次即可，由系统按前台窗口弹出上下文菜单。
             SendKey(k->vk, g_sh, g_ct, g_al, g_winKey);
             ReleaseShiftOnce(); g_ct = FALSE; g_al = FALSE; ClearWinLock();
         }
@@ -3780,9 +2957,6 @@ static void DoKeyAction(const KeyDef* k) {
 #define HDR_LAYOUT 1007  // 标题栏布局胶囊：打开/收起布局菜单（A1）
 #define HDR_HIDE  1006   // ⏑ 按钮：永久隐藏到托盘（单击托盘图标恢复）
 
-// 标题栏几何：绘制与命中必须取自同一份数据。
-// 这里历史上抄过两份（DrawHeader / HitHeader 各写一遍），改宽度就会出「按钮画在左、
-// 热区在右」的 bug；今后任何改动只改这里。
 struct HeaderMetrics {
     int btnY, btnH;
     int wMenu, wMin, wHide, wNum, wClose;
@@ -3791,9 +2965,6 @@ struct HeaderMetrics {
     BOOL numBtnVisible;
 };
 
-// 页头胶囊与其中文字共用 g_f12，而 g_f12 = 12pt × 键高/48 —— 所以胶囊尺寸必须按同一个比例
-// 缩放，否则字号一大文字就撑出主色底（实机图：「小键盘」三个字溢出胶囊）。只放大不缩小：
-// 窄窗口下字号本来就不缩（基准是键高），胶囊也不该缩。上限与字号封顶（90 DIP）一致。
 static double HeaderFontRatio() {
     double r = ((double)g_keyHeight / GetSystemDpiScale()) / 48.0;
     if (r < 1.0) r = 1.0;
@@ -3807,7 +2978,7 @@ static HeaderMetrics GetHeaderMetrics() {
     HeaderMetrics hm = {};
     double fr = HeaderFontRatio();
     hm.btnH = (int)(HDR_BTN_H_DIP * dpi * fr);
-    // 按钮上留白固定 10 DIP（原来是 (header-btnH)/2 居中，页头 36 时只剩 4 DIP，贴顶）；
+    // 按钮上留白固定 10 DIP（原来是 (header-btnH)/2 居中，页头 36 时只剩 4 DIP，贴顶）
     // 页头被压得很矮时退回居中，免得按钮溢出页头。
     hm.btnY = (int)(HDR_BTN_TOP_DIP * dpi);
     if (hm.btnY + hm.btnH > g_headerH) {
@@ -3818,10 +2989,6 @@ static HeaderMetrics GetHeaderMetrics() {
     int gap     = (int)(8 * dpi);
     int rMargin = (int)(8 * dpi);
 
-    // 「设置」和「小键盘」两个按钮都是「图标 + 文字」，宽度按内容给足，
-    // 两者共用 DrawHeaderPill 绘制（形状、配色、留白一致）。
-    // 基值 78 / 96 是「12pt 档、1em ≈ 16 DIP」下量出来的（中文 设置 = 2em、小键盘 = 3em），
-    // 再乘 fr 跟上字号 —— 字号来自键高，所以窗口拉高时胶囊同步变大，不会越看越小。
     hm.wMenu  = (int)(78 * dpi * fr);
     hm.wClose = (int)(32 * dpi);
     hm.wMin   = (int)(32 * dpi);
@@ -3855,14 +3022,6 @@ static int HitHeader(int x, int y) {
     return -1;
 }
 
-// （原 NumBtnActive「小键盘开着吗」已删：布局胶囊改成菜单按钮后，激活态表示
-//   「菜单开着」。数字区是否可见由键盘自己显示，不需要胶囊再报一次 ——
-//   全尺寸下它常亮反而会让人误以为那是个开关，实机截图就是这么误读的。）
-
-// 标题栏图标的外框尺寸（DIP）。**不能**所有图标共用一个 size：几何包围盒差得很远
-// （Numpad 17.6/24、Gear 22.4/24；最小化与关闭用的还是 12 网格，各占 8/12、6/12），
-// 同一个外框画出来齿轮比小键盘大 27%、「—」又比「×」宽一截 —— 实机看着就是「一大一小」。
-// 这里按「想让它在视觉上多大」反解外框，各图标的可见尺寸就统一了。
 static int HeaderIconBox(int id, double dpi) {
     double box;
     switch (id) {
@@ -3876,15 +3035,6 @@ static int HeaderIconBox(int id, double dpi) {
     return (int)(box * dpi + 0.5);
 }
 
-// 标题栏胶囊按钮：底色 + 矢量图标 + 文字，三者同一配方。
-// 「设置」与「布局」共用这一份 —— 两个按钮的观感必须一致。
-// 设置按钮恒定显示「齿轮 + 设置」（设置页页头也是齿轮，两处观感才对得上）。
-// 宽度由调用方从 HeaderMetrics 取（绘制与命中同源，见 GetHeaderMetrics 上方的说明）。
-// active：实底态。**只有「布局」会用到**，含义是「菜单正开着」（见 DrawHeader 的调用点）：
-//   它已经是一个菜单按钮，不再用「小键盘开着」当激活态 —— 否则全尺寸下常亮，
-//   用户分不清「菜单开着」和「数字区可见」，也读不出它其实是个下拉。
-// caret：在文字右侧画一个小下箭头，明确「点它会弹出列表」。这是菜单按钮的必要提示，
-//   少了它这个胶囊和原来的三态开关长得一模一样（实机反馈就是这么误读的）。
 static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL hov,
                            const HkIconDef& icon, int iconId,
                            const wchar_t* label, BOOL active, BOOL caret) {
@@ -3905,18 +3055,15 @@ static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL h
     int tw     = MeasureTextW(dc, label, g_f12);       // 容纳宽度 → 绘制矩形用它（见 MeasureTextW）
     int adv    = MeasureTextAdvW(dc, label, g_f12);    // 布局宽度 → 排版必须用它
     if (adv <= 0) adv = tw;
-    // 下箭头：可见约 9 DIP 的小三角。间距 6 DIP —— 再小就和文字粘在一起，
+    // 下箭头：可见约 9 DIP 的小三角。间距 6 DIP —— 再小就和文字粘在一起
     // 再大整组就往左偏（组是整体居中的）。
     int cGap    = caret ? (int)(6 * dpi * HeaderFontRatio()) : 0;
     int caretSz = caret ? (int)(9 * dpi * HeaderFontRatio()) : 0;
     int groupW  = iconSz + gap + adv + (caret ? cGap + caretSz : 0);
-    // 按「图标 + 间距 + 文字实际占宽」整组居中。若用容纳宽度，GDI+ 那两侧各约 0.2em 的余量
-    // 会被当成文字宽度：图标被挤到贴左、图标与文字之间凭空多出近一倍空隙
-    // （实测 19px，设计值 10px）。
     int cx = x + (w - groupW) / 2;
     DrawHkIcon(dc, (float)cx, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
                icon, fg, fg);
-    // DrawTextC 是把墨迹居中在矩形里的，所以矩形要再左移「(矩形宽 - 文字宽)/2」，
+    // DrawTextC 是把墨迹居中在矩形里的，所以矩形要再左移「(矩形宽 - 文字宽)/2」
     // 墨迹才会正好落在间距之后（否则整段文字右移半个余量）。
     DrawTextC(dc, cx + iconSz + gap + adv / 2 - (tw + 4) / 2, hm.btnY, tw + 4, hm.btnH,
               label, g_f12, fg);
@@ -3936,10 +3083,7 @@ static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
 }
 
 // ===== 布局菜单（A1：窗口内弹层，见 HKeyboard-UI方案评估 §三）=====
-// 点标题栏按钮 → 按钮下方弹出：默认布局 / 小键盘 / 全尺寸（当前项带勾），
-// 全尺寸布局时多一项「数字区」。不新建窗口、不抢前台。
-// ⚠ 三件事必须一起做，少一件就是 bug：
-//   ① 绘制排在按键之后 ② 状态进 KbFrameSig ③ UpdateAutoVisibility 里短路
+// ⚠ 三件事必须一起做，少一件就是 bug
 static BOOL g_lmOpen = FALSE;
 static int  g_lmHover = -1;
 // 打开菜单时所在的前台窗口。换到别的程序后菜单就不该留着（见 UpdateAutoVisibility 的短路）。
@@ -4006,11 +3150,7 @@ static void DrawMenuCheck(HDC dc, int cx, int cy, int size, DWORD color) {
     DeleteObject(pen);
 }
 
-// 菜单里的开关（只给「数字区」那一行用）。
 // ⚠ 为什么不用勾：全尺寸下菜单里有**两个** ✓（全尺寸 + 数字区），而且两行都涂着同一层
-//   选中底色 —— 实机截图里看就是「四个并列的布局」，用户分不清哪个是选项、哪个是开关。
-//   ⇒ 前三个是单选（勾 + 淡底），数字区是开关（右侧小开关 + 不涂底 + 上方一条分隔线），
-//     形状不同，一眼能分开。
 static void DrawMenuToggle(HDC dc, int x, int y, int w, int h, BOOL on) {
     double dpi = GetSystemDpiScale();
     // 关：面板底与键面之间的一档灰；开：主色。两种主题下都成立（都是与 C_KEY 混出来的）。
@@ -4132,22 +3272,10 @@ static void DrawKeys(HDC dc) {
         }
         BOOL isPlain = (k->type == K_HIDE) || isDomain;       // 收起 / 次要键
 
-        // 键帽状态机：底色 / 轮廓 / 文字三路同时变（Ethereal 的按钮配方）。
-        // 触摸没有 hover 的预览语义，按下即直接给出「按下」态，无需逐帧插值。
-        // Enter（K_SPECIAL）与退格、Tab、Shift 同配方：不再给它主色实底——
-        // 实底在触摸键盘上会被当成「已经按下了」，与真正的按下态撞车。
         DWORD bg, outline, textC;
         if (active || pressed) {
             if (g_themeStyle == 1) {
-                // 经典风格的高亮：**用主题色相填实底**，键面其余部分保持中性灰。
-                // 这就是 v1.1 的做法（那一版是灰键面 + #0078D4 实底 + 按亮度选字色），
-                // 也是「经典但不失高亮」的关键：灰色是壳，颜色只出现在按下 / 锁定那一格。
-                //
-                // ⚠ 上一版这里走 btnRegularBgActive，而经典风格把它覆盖成了 #D8D8D8 ——
-                //   于是「按下的键」和「修饰键的常态」（#E8E8E8）几乎同色，
-                //   锁定的 Shift / Caps / Num 看不出任何区别，高亮等于不存在。
-                // ⇒ 底色用主色，描边仍用中性灰（v1.1 的外框也没跟着变色），
-                //   文字用 primaryFg（浅色主题下是深字，压在 0.70 明度的主色上约 5.8:1）。
+                // ⚠ 上一版这里走 btnRegularBgActive，而经典风格把它覆盖成了 #D8D8D8
                 bg = C_HOT; outline = C_KEY_BORDER; textC = C_ON_PRIMARY;
             } else {
                 bg = C_REGULAR_ACT; outline = C_BORDER_HOVER; textC = C_WHITE;
@@ -4165,51 +3293,27 @@ static void DrawKeys(HDC dc) {
 
         DrawRoundRect(dc, k->x, k->y, k->w, k->h, bg, outline, g_themeStyle == 1 ? 4 : 8);
 
-        // ---- 按**本键所在区块**取统一档 ----
-        // 主区 / 导航区 / 数字区各自成组、各算一档（见 FitUnifiedTier）；
-        // 每帧每组只算一次（BlockTierNow 里有缓存），不逐键量。
+        // ---- 按**本键所在区块**取统一档 -
         int tier = BlockTierNow(dc, k->block);
 
-        // ⚠ 文本必须存在**本作用域的局部缓冲**里（不能拿 static 包装的指针）：
-        //   上面 BlockTierNow → FitUnifiedTier 会调 KeyTextInto 遍历本组键，
-        //   覆盖 static buf —— 结果就是全键盘都画出最后那个键的字
-        //   （见文件上方第 27 轮血案注释）。
+        // ⚠ 文本必须存在**本作用域的局部缓冲**里（不能拿 static 包装的指针）
         wchar_t txtBuf[KEY_TEXT_MAX];
         const wchar_t* txt = KeyTextInto(k, txtBuf, KEY_TEXT_MAX);
-        // 界面只有一个字面：不加粗。修饰键靠底色（C_REGULAR）与文字色（C_BTN_CONTENT）
-        // 区分，与设置页 Tab 的选中态同一套逻辑 —— 少了「有些字粗有些字细」的杂音。
-        // 同一区块内统一字号（见 FitUnifiedTier 的说明）：主区（含 1u 字母与
-        // 1.25u 的 Ctrl/Alt）共用一个档位，不再出现「Ctrl 那边大得要死、字母这边小一号」；
-        // 导航区、数字区各算各的，互不拖累。
         HFONT f = FitKeyFontUnified(dc, i, k, txt, k->w - (int)(6 * GetSystemDpiScale()), tier);
 
-        // 双符号键（数字行/标点）：同时显示主字符与副符号，副符号随 Shift 灰/白；
-        // Fn 层（非网页布局）时仅数字行/-/= 键改为显示 F1~F12（不显示双符号），其余标点键双符号显示不变。
-        //
-        // ⚠ 网页布局层（IsWebFnLayer）整个不做「随 Shift 换面」：
-        //   那一层的符号是全铺在键面上的（K_SYM，键面画什么就发什么），
-        //   再让残留的双符号键（如 `~）跟着 Shift 换面，就变成
-        //   「点一下 Shift，键面反而变花」—— 正是用户要求去掉的行为。
-        //   与 KeyText 的同名判定共用 IsWebFnLayer()，两处不能各写一份。
+        // ⚠ 网页布局层（IsWebFnLayer）整个不做「随 Shift 换面」
         const BOOL webLayer = IsWebFnLayer();
         wchar_t baseCh = 0, shiftCh = 0;
         if (k->type == K_NORMAL && !webLayer && !(g_fnLayer && FnMap(k->vk) != 0)) {
             baseCh = GetSymForKey(k->vk, FALSE);
             shiftCh = GetSymForKey(k->vk, TRUE);
         }
-        // 未按 Shift：双符号显示（数字 + 顶部特殊符号，副符号置灰）；
+        // 未按 Shift：双符号显示（数字 + 顶部特殊符号，副符号置灰）
         // 按 Shift：开启“仅显示特殊符号”时只显示顶部符号（不显示数字），关闭时仍显示数字。
         BOOL shiftOn = (g_sh || g_physShift);
         BOOL dual = (baseCh && shiftCh && shiftCh != baseCh);
 
-        // Menu 与 Win 不再在这里特判：它们和 Tab/Caps/Shift 一样走 DrawKeyLabel 的
-        // 「图形 + 名字」（Win 徽标由 DrawKeyGlyph 矢量特绘 —— 字体里没有那个字形）。
-        // 图标样式选「文字」时 DrawKeyLabel 返回 FALSE，两者自然落回纯文字。
         if (dual) {
-            // 三条路（用户 2026-10-11 定稿，两个开关各管一件事）：
-            //   ① 「Shift 符号」开（常规 Tab）且按住了 Shift → 只显示副符号（灰）
-            //   ② 否则「双符号」开（布局 Tab）→ 键面上下并列显示 主字符 + 灰色副符号
-            //   ③ 都关 → 只显示主字符（黑）
             // ⚠ 符号永远是灰色，别再改回「按 Shift 把符号提成大黑字」。
             if (shiftOn && g_shiftSymbols) {
                 wchar_t single[2] = { shiftCh, 0 };
@@ -4237,29 +3341,7 @@ static int HitKey(int x, int y) {
     return -1;
 }
 
-// 只失效「某个 vk 对应的那一格键」，而不是整个窗口。
-//
-// 背景：TIMER_FOCUS 每 50ms 校正一次物理键/锁定键状态，原先一有变化就
-// `InvalidateRect(hWnd, 0, TRUE)` —— 全窗重绘 + 擦背景。本窗口的重绘不是
-// 直接往屏幕画，而是**先整张 32bpp 帧缓存重画一遍**（RenderKbFrameInto），
-// 几十个圆角矩形 + 文字 alpha 混合 ⇒ 每次几十毫秒，体感就是"卡卡的"。
-//
-// 状态变化实际只影响 1~4 个键帽（Shift / Win / Num / Caps）。
-// 收窄成按格失效后：
-//   · WM_PAINT 里只 BitBlt 脏区（见那里的说明）；
-//   · 帧缓存即使因签名变化整张重建，重建后的呈现面积也只有这几格。
-//
 // ⚠ 帧缓存的重建由 `EnsureKbFrameCache` 的签名比对决定，**与本函数的
-//   失效范围无关** —— 也就是说本函数省下来的是「上屏面积」，不是「绘制量」。
-//   （要连绘制量一起省，得把键帽状态从签名里拆出来做单键重画；
-//     收益有限、改动面大，本轮不做。）
-//
-// vk 的匹配容错：传 VK_LSHIFT 时把 RSHIFT 那格一起失效；VK_LWIN 同理。
-//   · 屏幕键盘的 Shift 锁定（g_sh）本来就让左右两格同时亮 / 同时灭 ⇒ 两格都必须重画；
-//   · 实体 Shift 现在按左右分开记（g_physLShift / g_physRShift），只变一边时
-//     多失效另一格只是多贴一格，代价可忽略 —— 换来的是这段不做特判、逻辑简单。
-// 找不到任何匹配键时什么都不做：该键不在当前布局里（例如数字区已收起），
-// 状态值已经存进 g_* 变量，下次切回该布局会按新状态重画，不会留下错误高亮。
 static void InvalidateKeyByVk(HWND hWnd, short vk) {
     short alt = 0;
     if (vk == VK_LSHIFT) alt = VK_RSHIFT;
@@ -4270,7 +3352,7 @@ static void InvalidateKeyByVk(HWND hWnd, short vk) {
     for (int i = 0; i < g_nk; i++) {
         const KeyDef* k = &g_keys[i];
         if (k->vk != vk && (alt == 0 || k->vk != alt)) continue;
-        // 外扩 2px：圆角/描边/按下态的发光都在键矩形外沿一点点，
+        // 外扩 2px：圆角/描边/按下态的发光都在键矩形外沿一点点
         // 不留余量会切出一条没重画的边。
         RECT r = { k->x - 2, k->y - 2, k->x + k->w + 2, k->y + k->h + 2 };
         InvalidateRect(hWnd, &r, FALSE);
@@ -4278,11 +3360,6 @@ static void InvalidateKeyByVk(HWND hWnd, short vk) {
 }
 
 // ========== 主窗口帧缓存（首帧预热 + 动画/重绘零开销呈现） ==========
-// 每次重绘都全量 GDI+ 绘制（几十个圆角矩形 + 文字 alpha 混合）是启动动画
-// 卡顿与材质首帧黑屏的根源：首帧绘制发生在窗口可见之后，DWM 先合成出
-// 一帧空/黑内容，且首帧绘制耗时直接表现为“顿一下”。
-// 引入 32bpp 顶向下 DIB 帧缓存：绘制状态签名未变时直接 memcpy/BitBlt
-// 呈现；窗口显示前即可预热渲染完成，首帧与动画期间无可见绘制开销。
 static HBITMAP   g_kbCacheBmp = 0;
 static HDC       g_kbCacheDc = 0;
 static RGBQUAD*  g_kbCacheBits = 0;
@@ -4295,16 +3372,16 @@ struct KbFrameSig {
     float dpi;
     BOOL sh, ct, al, cp, winKey, physShift, physWin, physNum, fnLayer, showFKeys,
          fnWebLayout, shiftSymbols, lang;
-    // ⚠ 左右 Shift 分开进签名（2026-10-10）：physShift 只是两者的「或」，
+    // ⚠ 左右 Shift 分开进签名（2026-10-10）：physShift 只是两者的「或」
     //   从「按住左」变成「按住右」时或值不变 —— 不分开就会漏重绘。
     BOOL physLShift, physRShift;
     // 布局菜单：打开/悬停变化必须触发重绘（整帧缓存，漏了就「点了没反应」）
     BOOL lmOpen;
     int  lmHover;
-    // 数字区显隐（生效值）：之前没进签名，靠「17 个键消失 → nk 变」侥幸触发重绘；
+    // 数字区显隐（生效值）：之前没进签名，靠「17 个键消失 → nk 变」侥幸触发重绘
     // 窄屏自动收起与手动收起是两条路径，显式纳入才不依赖这个巧合。
     BOOL npHidden;
-    // 标题栏「布局」胶囊的显隐：设置页里一拨开关，签名不变就不会重绘，
+    // 标题栏「布局」胶囊的显隐：设置页里一拨开关，签名不变就不会重绘
     // 表现为「要拿鼠标碰一下标题栏才刷新」（用户实机反馈）。
     BOOL showNumBtn;
     BOOL operator!=(const KbFrameSig& o) const { return memcmp(this, &o, sizeof(*this)) != 0; }
@@ -4346,7 +3423,7 @@ static void RenderKbFrameInto(HDC refDc, int w, int h) {
 
 static void EnsureKbFrameCache(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd) || g_ww <= 0 || g_wh <= 0) return;
-    // 必须零初始化：签名是 memcmp 全字节比较，结构体里有填充字节，
+    // 必须零初始化：签名是 memcmp 全字节比较，结构体里有填充字节
     // 留着不确定值会让缓存永远打不中（每帧都全量重绘）。
     KbFrameSig sig = {};
     sig.w = g_ww; sig.h = g_wh;
@@ -4403,7 +3480,7 @@ static void StartWindowMotion(WindowMotion* motion, HWND hWnd, int x,
     motion->finish = finish;
     motion->active = TRUE;
 
-    // 显示前先在隐藏状态下同步完成首帧绘制：DWM 首次合成时窗口内容已就绪，
+    // 显示前先在隐藏状态下同步完成首帧绘制：DWM 首次合成时窗口内容已就绪
     // 消除首帧全量绘制造成的可见顿挫
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     SetWindowPos(hWnd, HWND_TOPMOST, x, fromY, 0, 0,
@@ -4506,17 +3583,9 @@ static void ShowKB(BOOL show, BOOL isManual) {
 
 static void ToggleKB() { ShowKB(!g_vis, TRUE); }
 
-// 临时收起（「收起」键 K_HIDE 与标题栏 HDR_MIN 共用）：
-//   自动收起开启时，若焦点在输入框里记下该控件，同一输入框内不再自动回弹
-//   （焦点换到别的框后恢复自动呼出）。
-//
-// ⚠ 这里**故意不置 g_manualHide** —— 自动呼出是这个键盘的核心功能，
-// 最小化只是「暂时不要」，不能等同于「我不想看到它」。
-// 「明确不想看到」的语义由标题栏的 ⏑ 按钮（HideToTray）承担，见其定义。
+// ⚠ 这里**故意不置 g_manualHide** —— 自动呼出是这个键盘的核心功能
 static void UserHideKeyboard() {
     // ⚠ 防回弹记录**无条件生效**（原来受 g_afAutoHide 控制，但那个开关已改为
-    //   管"自动隐藏"）。防回弹是必要条件：没有它，用户手动收起后会被
-    //   UpdateAutoVisibility 立刻弹回来，"手动收起"这个动作就失效了。
     {
         HWND input = GetFocusedInputControl();
         if (input) {
@@ -4528,10 +3597,6 @@ static void UserHideKeyboard() {
     ShowKB(FALSE, TRUE);
 }
 
-// 永久隐藏到托盘：置 g_manualHide，UpdateAutoVisibility 的
-// `if (!g_manualHide && !g_vis) ShowKB(TRUE)` 就再也弹不回来。
-// 恢复入口 = 单击托盘图标（走 ToggleKB → ShowKB(TRUE, TRUE)，
-// isManual 分支会清 g_manualHide）。
 static void HideToTray() {
     g_manualHide = TRUE;
     ShowKB(FALSE, TRUE);
@@ -4629,7 +3694,6 @@ static void ShowHelpDialog(HWND hWnd) {
         MB_OK | MB_ICONINFORMATION);
 }
 
-
 // ========== 设置页面（分 Tab） ==========
 #define S_HIT_NONE           0
 #define S_HIT_CLOSE          1
@@ -4686,10 +3750,6 @@ static LONGLONG g_switchAnimStart = 0;
 static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
-// 关闭对话框的单选圆点已改为「勾选方块 + 整行底色」语法（见 PromptDraw），
-// 原来的 DrawRadio（圆环 + 挖空 + 实心点）随之无调用点，删除。
-//
-// 开关按钮（on=开启；通常右侧对齐显示）
 static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
     DrawRoundRect(dc, x, y, w, h, on ? C_HOT : C_DARK, C_KEY_BORDER, h / 2);
     int knob = h - 6;
@@ -4698,9 +3758,6 @@ static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
 }
 
 // ========== 设置页度量与布局 ==========
-// 语法对齐制作工具：一个 tab 就是一张卡，卡内逐行，行间画 1px 分隔线。
-// 行高不再是常数（下拉/分段行 40 高，比开关行高），所以行位置由累计高度算出；
-// 绘制与命中都走下面同一组函数，避免两边各算一遍。
 struct SettingsMetrics {
     double dpi;
     int W, H;
@@ -4721,7 +3778,7 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
     m.dpi = GetSystemDpiScale();
     m.W = rc.right; m.H = rc.bottom;
     m.margin = (int)(30 * m.dpi);
-    // 顶部留白比左右边距略小即可：原来只有 10 DIP，页头会顶在窗口上沿，
+    // 顶部留白比左右边距略小即可：原来只有 10 DIP，页头会顶在窗口上沿
     // 与 30 DIP 的左右/下边距不成比例。这里给到 20 DIP，其余间距按同一节奏排。
     m.titleY = (int)(20 * m.dpi);
     m.titleH = (int)(34 * m.dpi);
@@ -4745,19 +3802,7 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
     return m;
 }
 
-// 全尺寸(2) / 小键盘(1) 布局下「不存在」的行 —— 它们只对默认布局有意义：
-//   常规 Tab：功能键行（Shift 符号 / Shift 双击锁定 已不再藏 —— 见 SettingsRowHidden）
-//            布局 Tab：Fn 网页布局
-// 这些行**高度给 0**、绘制与命中也一并跳过：SettingsRowRect 是按行高累加出来的，
-// 高度归零后后面的行自动上移，绘制 / 命中 / 点击读的仍是同一份几何，不会出现「画一行点一行」。
-//
-// ⚠⚠ 布局 Tab 的 index 是**按绘制顺序从 0 数**的，别把注释当行号：
-//   0 = 键盘布局   1 = Fn 网页布局   2 = 小键盘按钮
-//   这里原来写的是 `index == 2`（注释却写着「Fn 网页布局」），于是小键盘 / 全尺寸布局下
-//   **藏错了行**：Fn 网页布局照画（小键盘按钮被挤到它下面），而真正该藏的
-//   「小键盘按钮」高度归 0 却仍被绘制 —— 绘制处拿到的 row 高度为 0，
-//   SettingsRowHeadH 返回 0，文字块整体上移约 44 DIP，直接压在 Fn 行的描述上
-//   （实机截图：三行文字糊成一团，卡片底部还露出去）。
+// ⚠⚠ 布局 Tab 的 index 是**按绘制顺序从 0 数**的，别把注释当行号
 static BOOL SettingsRowHidden(int tab, int index) {
     BOOL onlyDefault = (g_layoutMode != 0);
     if (tab == 0) {
@@ -4793,7 +3838,7 @@ static int SettingsRowCtrlDip(int tab, int index) {
     return 0;
 }
 
-// 描述**可能**需要两行的行（文案本身长，窗口窄时一行放不下会被硬截断）：
+// 描述**可能**需要两行的行（文案本身长，窗口窄时一行放不下会被硬截断）
 // 行高、绘制、命中三处都读这一份判断，才不会出现「字画到行外 / 热区对不上」。
 static BOOL SettingsRowDescWraps(int tab, int index) {
     // Fn 网页布局（换文案后变长）/ 小键盘按钮：可能折成两行
@@ -4814,10 +3859,6 @@ static const wchar_t* SettingsRowDescText(int tab, int index) {
     return NULL;
 }
 
-// 「需要两行」只是可能性 —— 中文短、英文长，窗口宽度也会变。真放得下一行时还按两行
-// 留白，描述下方就会空出一大块（实机 30 DIP，一眼可见）：行高 80 DIP 而内容只占 52。
-// 所以行高按实测决定：一行 → 64 DIP，两行 → 80 DIP。
-// 命中测试与窗口高度都走 SettingsRowHeight，因此这个判断必须与绘制**同一时刻**成立。
 static BOOL SettingsRowDescTwoLines(const SettingsMetrics& m, int tab, int index) {
     if (!SettingsRowDescWraps(tab, index)) return FALSE;
     const wchar_t* desc = SettingsRowDescText(tab, index);
@@ -4834,11 +3875,7 @@ static BOOL SettingsRowDescTwoLines(const SettingsMetrics& m, int tab, int index
     return need > right - tx;
 }
 
-// 行高 = (12 + max(图标 tile 30, 控件高, 文字块高) + 12) 个 DIP，最后统一乘 dpi。
-// ⚠ 全长度必须同单位再乘 dpi：这里曾经写成 `m.rowPadY * 2 + content`，
-//   其中 rowPadY 已乘过 dpi、content 还是 DIP，于是高 DPI 下行高偏小 ——
-//   表现为整张卡比预期矮一截、底部留一大片空白、两行文字挤在一起。
-// 主题 tab 的色相行是可展开行：展开态固定 210 DIP（内含分隔线 + 色板 + 滑轨 + HEX）
+// ⚠ 全长度必须同单位再乘 dpi：这里曾经写成 `m.rowPadY * 2 + content`
 static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     if (SettingsRowHidden(g_sTab, index)) return 0;      // 见 SettingsRowHidden：后续行随之上移
     if (g_sTab == 1 && index == 2 && !g_wallpaperAccent) return (int)(210 * m.dpi);
@@ -4847,7 +3884,7 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
     // 文字块：标题 18 + 间距 6 + 描述 16 = 40。间距不能省 —— 标题的下缘和描述的上缘
     // 会顶在一起（实机反馈「文本和描述的间距对吗」）；文字蒙版本身还上下各留了 4px。
     if (contentDip < 40) contentDip = 40;
-    // 描述真会折成两行时内容高 40 → 58（多 18 DIP）。原来这里是「可能折行就留」，
+    // 描述真会折成两行时内容高 40 → 58（多 18 DIP）。原来这里是「可能折行就留」
     // 于是中文单行的「小键盘按钮」行高 80 DIP、内容只占 52，描述下方空 30 DIP。
     if (SettingsRowDescTwoLines(m, g_sTab, index) && contentDip < 58)
         contentDip = 58;                    // 标题 20 + 间距 6 + 描述两行 32（与 DrawSettingRowContent 的块高一致）
@@ -4856,10 +3893,6 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
 
 static int SettingsRowCount(int tab) {
     // ⚠⚠ 2026-10-04 修：原来返回 `g_af ? 7 : 6`，**漏算了「Shift 双击锁定」那一行**。
-    //   行序（见 SettingsRowHidden 里的 closeRow）：g_af 开时用到 closeRow+5 = 7，
-    //   即索引 0..7 共 **8** 行；关时用到 closeRow+5 = 6，共 **7** 行。
-    //   少算一行 ⇒ SettingsCardRect 的 bottom 少一行高，SettingsDesiredHeight
-    //   算出的窗口就偏矮 ⇒ **「界面语言」那一行被裁在窗口外**（用户实机截图）。
     if (tab == 0) return g_af ? 8 : 7;
     if (tab == 3) return 4;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
     if (tab == 1) return 4;
@@ -4904,38 +3937,12 @@ static void DrawSettingsCard(HDC dc, const SettingsMetrics& m) {
 static int SettingsRowTileX(const SettingsMetrics& m) { return m.contentX + (int)(20 * m.dpi); }
 static int SettingsRowTextX(const SettingsMetrics& m) { return SettingsRowTileX(m) + m.tileSize + m.tileGap; }
 
-// 行的「头部」高度：图标 tile、文字块、行内控件（开关 / 分段 / 下拉）**共用同一段居中**。
-//
 // ⚠ 折叠行必须用**整行高**，不能写死 `rowPadY*2 + 40`（= 64 DIP）。
-//   布局页「Fn 网页布局」「小键盘按钮」两行的描述会折成两行，整行高 80 DIP。
-//   写死 64 时，多出的 16 DIP 全被推到行底，而头部又贴在行顶 ——
-//   实机量到 tile 中心 23.61 / 文字块心 32.82 / 行心 40.59：
-//   标题距行顶只剩 5.18，描述第二行下方空 20.73，**整块内容浮在上半部**。
-//   改成整行居中后三者都落在行心 40.59，顶底各 12.95 对称。
-//
-//   原文写的理由是「控件若按整行居中，就会比 tile 与文字块低 8 DIP」——
-//   那是**控件按整行、tile 按 64 头部**两种基准混用才有的偏差。
-//   三者统一读同一个 SettingsRowHeadH 之后差恒为 0。别再为了这个 8 DIP 拆成两套基准。
-//
-// ⚠⚠ **可展开行是例外，标题区必须贴在行顶**（头部高固定 64 DIP）。
-//   主题页色相行展开后高 210 DIP，行内结构是：
-//       0..64   标题区（tile + 「主题色相」+ 描述 + 模式分段）
-//       64      分隔线
-//       76..192 展开区（色板 76..102 / 滑轨 124..138 / HEX 160..192）
-//   展开区的坐标全是**相对 row.top 的硬编码 DIP**，不随头部高度变化。
-//   若标题区也按 210 居中，文字块盒顶会从 11 掉到 84、描述盒顶到 110，
-//   **直接压在色板（76..102）上** —— 实机就是这个现象：
-//   「主题色相」四个字被色块盖住，标题与描述叠在色板那一行。
-//   所以这里必须区分：色相展开行（主题页 index 2）给 64，其他折叠行给整行高。
-//   ⚠ 别去掉这个分支 —— 「整行居中」只对**折叠行**成立。
 static int SettingsRowHeadH(const SettingsMetrics& m, const RECT& row) {
     int headH = m.rowPadY * 2 + (int)(40 * m.dpi);
     // 色相可展开行：标题区固定 64 DIP，展开区坐标是相对 row.top 的硬编码（见上方说明）。
     if (g_sTab == 1) return headH;
     // ⚠⚠ 折叠行返回**整行高 rowH**，不要写成 `headH > rowH ? headH : rowH` 之类的
-    //   「取小值兜底」—— 那个写法在 headH(111px) < rowH(141px) 时会取 111，
-    //   等于又按 64 DIP 头部居中，把 a8f61c8 修的 bug 原样带回来（实测距行顶 5.18）。
-    //   不折行的行 headH == rowH（64 == 63.33），两者等价，所以直接返回 rowH 无副作用。
     return row.bottom - row.top;
 }
 
@@ -4948,13 +3955,13 @@ static int SettingsComboYTop(const SettingsMetrics& m, const RECT& row) {
     return row.top + m.rowPadY;
 }
 
-// 开关行的文字块右界：给「开/关」文字（34）+ 开关（46）让位，
+// 开关行的文字块右界：给「开/关」文字（34）+ 开关（46）让位
 // 否则长描述会压到开关上（标签宽度按控件自适应，不写死）
 static int SettingsSwitchTextRight(const SettingsMetrics& m, const RECT& row) {
     return row.right - (int)(20 * m.dpi) - m.switchW - (int)(42 * m.dpi);
 }
 
-// 行悬停底色：铺满整行、左右直接贴到卡片边缘（不再内缩，否则会切到图标 tile），
+// 行悬停底色：铺满整行、左右直接贴到卡片边缘（不再内缩，否则会切到图标 tile）
 // 圆角取卡片同款半径 —— 首行/末行因此与卡片圆角正好嵌套，不会凸出到卡片外面。
 static void DrawSettingsRowHover(HDC dc, const SettingsMetrics& m, const RECT& row) {
     int h = row.bottom - row.top;
@@ -4970,23 +3977,11 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
                                   const wchar_t* title, const wchar_t* desc,
                                   BOOL hover, int ctrlLeft, BOOL descWrap = FALSE,
                                   BOOL noTile = FALSE) {
-    // noTile：把这一行画成**子项**样式（左侧不画图标 tile）。
-    // 文字位置不动 —— 子项标题与父项标题左对齐，视觉上的"内缩"来自少了个图标，
-    // 参考 UU 远程设置页那种「父行带图标 / 子行不带图标」的层级表达。
     // ⚠ 不能只靠 iconId<0 表示：DrawIconTile 在 iconId<0 且无文字时仍会画一个
-    //   空的圆角 tile（见其实现），所以必须显式跳过调用。
-    // ⚠ 隐藏行（SettingsRowHidden 命中）的高度是 0，**不能进来**。
-    //   行高 0 时 SettingsRowHeadH 返回 0，tile / 文字块 / 控件全部算出负偏移，
-    //   直接糊在上一行上（实机截图：布局页三行文字叠成一团）。
-    //   绘制处虽已逐处判 SettingsRowHidden，这里再兜一道 —— 将来新增行忘了加判断，
-    //   最坏也只是「这一行不画」，不会再退化成满屏错位。
     if (row.bottom <= row.top) return;
 
     if (hover) DrawSettingsRowHover(dc, m, row);
 
-    // 图标 tile 与文字块都按**折叠行整行**居中（见 SettingsRowHeadH）：行因为描述折行
-    // 变高时，tile / 文字 / 控件三者一起下移，仍中心对中心。
-    // 色相可展开行是例外（头部固定 64 DIP），见 SettingsRowHeadH 的说明。
     int headH = SettingsRowHeadH(m, row);
     int ty = row.top + (headH - m.tileSize) / 2;
     if (!noTile)
@@ -4997,21 +3992,12 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
     int tw = rightLimit - tx;
     if (tw < (int)(60 * m.dpi)) tw = (int)(60 * m.dpi);
 
-    // 兜底：右侧控件特别宽时文本列会被挤到画不下标题，GDI+ 在 NoWrap 下会把标题右侧
-    // 整段裁掉（主题页「主界面透明度」就曾被裁成「主界面透」）。真的放不下时，允许标题
-    // 一直画到控件左缘为止 —— 只吃掉那 12 DIP 的行内间距，不压住控件本身。
-    // 宁可标题与控件贴在一起，也不要出现半截标题。
     int needTitle = MeasureTextW(dc, title, g_sfRow);
     if (ctrlLeft > 0 && tw < needTitle) {
         int hard = ctrlLeft - tx;
         if (hard > tw) tw = hard;
     }
 
-    // 文字块与 tile「中心对中心」。tile 30 DIP，文字块 42 DIP（标题盒 20 + 间隙 6 +
-    // 描述盒 16），**共用同一个 top 不行** —— 那样 tile 中心会比文字块中心高 6 DIP。
-    // 块内两个盒的中心分别落在 块顶+10（标题）与 块顶+26+8（描述）处，块心 = 块顶+22。
-    // 折行时描述占 32 DIP（两行），块心 = 块顶+29；两种块高各算各的，别共用 22。
-    // （「行盒中心 vs 墨迹中心」的补偿已在 DrawTextGp 里统一做掉，这里按盒中心算即可。）
     int blockBottom = descWrap ? ((int)(26 * m.dpi) + (int)(32 * m.dpi))
                                : ((int)(26 * m.dpi) + (int)(16 * m.dpi));
     int textMid = blockBottom / 2;
@@ -5019,10 +4005,6 @@ static void DrawSettingRowContent(HDC dc, const SettingsMetrics& m, const RECT& 
 
     DrawTextL(dc, tx, tyText, tw, (int)(20 * m.dpi), title, g_sfRow, C_WHITE);
     if (desc && desc[0]) {
-        // 折行与不折行**同一个描述盒顶 26 DIP**，标题↔描述的间距因此恒定。
-        // 原来折行把盒顶上移到 18 DIP，想让描述第一行对齐不折行的位置，但 18 已在
-        // 标题盒（高 20）的底缘之下，标题下缘与描述上缘直接压在一起：实机量到标题↔描述
-        // 1.7 DIP、描述两行之间 4.6 DIP，节奏反了（肉眼就是「标题粘住描述」）。
         if (descWrap)
             DrawTextL(dc, tx, tyText + (int)(26 * m.dpi), tw, (int)(32 * m.dpi), desc, g_sfBase, C_DIM, TRUE);
         else
@@ -5081,12 +4063,6 @@ static void DrawTabStrip(HDC dc, const SettingsMetrics& m) {
 // ===== 分段控件（三选一）：轨道 C_REGULAR + 选中段 C_KEY/C_BTN_CONTENT =====
 // 选中段文字用 btn_content 而不是 primary：#53A3F2 在白卡上只有 2.66:1。
 
-// 单个分段的宽度 = 文字「布局宽度」+ 左右各 14 DIP 内边距。
-// 必须用 advance（MeasureTextAdvW）而不是 DrawString 的容纳宽度（MeasureTextW）：
-// 容纳宽度两侧各含约 0.2em 的绘制安全边距，把它当成设计留白加进去，每段会凭空宽出约
-// 10px（em 26px 时）。主题页「主界面透明度」那一行的分段控件有 6 段，多出来的宽度把
-// 左侧文本列挤到只剩 142px，而标题「主界面透明度」需要 174px —— 于是被裁成「主界面透」。
-// 段宽只喂给绘制与命中两条路径（三处共用本函数），且恒大于容纳宽度，不会造成段内文字被裁。
 static int SegmentedItemWAtDpi(const wchar_t* item, double dpi) {
     HDC dc = GetDC(0);
     int adv = MeasureTextAdvW(dc, item, g_sfCtrl);
@@ -5142,8 +4118,6 @@ static int SegmentedHitIndex(const SettingsMetrics& m, const RECT& r,
 }
 
 // ===== 设置行的「画框选择」（替代下拉框）=====
-// 各选择类行统一走这几个函数：右对齐、垂直居中、宽度按选项文字量出来。
-// 绘制与命中读同一份矩形算法（RowSegRect），不会再出现「画在左、热区在右」。
 static RECT RowSegRect(const SettingsMetrics& m, const RECT& row,
                        const wchar_t** items, int count) {
     int w = SegmentedWidth(m, items, count);
@@ -5209,7 +4183,7 @@ static int RowSegIndexTop(const SettingsMetrics& m, const RECT& row,
     return SegmentedHitIndex(m, r, items, count, x);
 }
 
-// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」）；g_keyIconStyle 固定为 2，
+// 「按键图标样式」行已下线（实机反馈：只保留「图标+文字」）；g_keyIconStyle 固定为 2
 // 见 LoadConfig 与 DrawKeyLabel。
 
 static RECT SettingsHexRect(const SettingsMetrics& m, const RECT& row) {
@@ -5235,11 +4209,6 @@ static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row) {
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
-    // 常规 Tab 行序（自动隐藏行仅在自动呼出开启时存在）：
-    //   g_af 开：0=自动呼出 1=自动隐藏 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号
-    //           6=Shift双击锁定 7=界面语言
-    //   g_af 关：0=自动呼出 1/2=关闭按钮/记住选择 3=功能键行 4=Shift符号 5=Shift双击锁定 6=界面语言
-    // 布局 Tab（「按键图标样式」行已删）：0=键盘布局 1=Fn 网页布局 2=小键盘按钮
     int rowIndex;
     if (hit == S_HIT_AUTO) rowIndex = 0;
     else if (hit == S_HIT_AUTOHIDE) rowIndex = 1;
@@ -5270,10 +4239,6 @@ static void BeginSwitchAnimation(HWND hWnd, int hit, BOOL from, BOOL to) {
 
 static void DrawSettingSwitch(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL on, int hit) {
     int x = row.right - (int)(20 * m.dpi) - m.switchW;
-    // 开关与「开/关」文字跟 tile / 文字块用同一条基准（见 SettingsRowHeadH）。
-    // 原来这里刻意按 64 DIP 的「头部」居中、理由是「否则会比标题低 8 DIP」——
-    // 那是控件与 tile 用了两套基准才有的偏差。三者统一后差为 0，而折行行
-    // 不再出现「内容全浮在上半部、行底空 20 DIP」的问题。
     // ⚠ 本函数只在常规页 / 布局页用（那里没有可展开行），所以不用管色相行的例外。
     int headH = SettingsRowHeadH(m, row);
     int y = row.top + (headH - m.switchH) / 2;
@@ -5387,22 +4352,11 @@ static const wchar_t* CloseActionName() {
              g_closeToTray ? L"Hide to tray" : L"Exit program");
 }
 // ===== 关于页几何（与制作工具 PanDa PE 的 about 页同一套语法）=====
-// 卡片内边距上下 14 / 左右 20、堆叠间距 6、身份卡「56 DIP 标识网格 + 产品名 + 版本」、
-// 行「标题 + 说明 + 右侧 34 DIP 圆钮」、许可行「标签 + MIT + 查看按钮」。
-// 下面全部是 DIP，实机再乘 dpi。
-//
-// ⚠ 上下内边距是 **14 不是 10**：制作工具的许可卡高 78 DIP、许可行 46，反推出 padY = 16；
-//   本窗口许可行同样是 46，把 padY 提到 14 后三张卡的留白节奏与它一致。
-//   改 10 时身份卡只有 76 高，文字块上下各剩 12.7 DIP，描述贴着卡底，看着像「掉下去」。
+// ⚠ 上下内边距是 **14 不是 10**：制作工具的许可卡高 78 DIP、许可行 46，反推出 padY = 16
 static int AboutPadY(const SettingsMetrics& m) { return (int)(14 * m.dpi); }      // .card-pad 上下
 static int AboutPadX(const SettingsMetrics& m) { return (int)(20 * m.dpi); }      // .card-pad 左右
 static int AboutGap(const SettingsMetrics& m) { return (int)(6 * m.dpi); }        // 卡与卡之间的间距
 
-// 页内一行：上 12 + 内容 36 + 下 12；末行只给下 2（制作工具 form_card 的
-// `.field{padding:12px 0}` + `:last-child{padding-bottom:2px}`）。
-// 内容 36 = 标题盒 15 + 说明盒顶偏移 23 + 说明盒 13。偏移取 23 而非 20：本窗口行标题
-// （g_sfCtrl ≈ 14.7 DIP）墨迹比制作工具的 14px 高，偏移 20 时两行墨迹只隔 4.6 DIP
-// （制作工具 8.6），肉眼是「标题和说明糊在一起」。
 static int AboutRowH(const SettingsMetrics& m, BOOL last) {
     return m.rowPadY + (int)(36 * m.dpi) + (last ? (int)(2 * m.dpi) : m.rowPadY);
 }
@@ -5437,9 +4391,6 @@ static RECT AboutLicenceRowRect(const SettingsMetrics& m, const RECT& card, int 
     return r;
 }
 
-// 「查看」/「导出」按钮：高 32 / 圆角 8 / 左右内边距各 14（制作工具的 .btn-sm）。
-// 宽度按文字**推进宽**算（容纳宽度两侧各含约 0.2em 的绘制余量，当内边距用会凭空宽 10px），
-// 绘制与命中读同一份 —— 量宽用 GetDC(0)，与 SegmentedWidth 同法。
 static int AboutBtnW(const wchar_t* label, double dpi) {
     HDC dc = GetDC(0);
     int adv = MeasureTextAdvW(dc, label, g_sfCtrl);
@@ -5489,9 +4440,6 @@ static AboutLayout GetAboutLayout(const SettingsMetrics& m) {
 }
 
 // ===== 窗口高度跟随当前 tab 的内容 =====
-// 设置窗宽度固定，但各 tab 的内容高度差很多（常规 7 行 vs 关于两张卡）。
-// 高度按「内容底部 + 一个 margin」算：切 tab / 改行数后收一次边，
-// 短 tab 底部就不会留一大片空白。
 static int SettingsDesiredHeight(HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
     int bottom;
@@ -5522,15 +4470,7 @@ static void SettingsFitHeight(HWND hWnd) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-// 链接行：左「标题 + 说明」，右一枚 34 DIP 圆钮，圆钮里的图标 = 去哪里。
-//
-// ⚠ 高亮**只作用在圆钮上，不铺整行**（实测制作工具：链接卡整卡纯白 (255,255,255)，
-//   三行的行背景在 hover 下都不变色，只有圆钮底色从 btn_regular_bg 变到
-//   btn_regular_bg_hover）。原来这里调 DrawSettingsRowHover 把整行铺成 C_REGULAR_HOV，
-//   实测高亮块 547×60 DIP 横跨整张卡，比圆钮大一个量级；更糟的是圆钮也用同一个
-//   C_REGULAR_HOV —— 两者同色，圆钮在 hover 态直接「消失」在行底里。
-//
-//   命中区仍是整行（触摸场景下按钮不能只有 34×34 DIP）。
+// ⚠ 高亮**只作用在圆钮上，不铺整行**（实测制作工具：链接卡整卡纯白 (255,255,255)
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
                              int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
     int btn = (int)(34 * m.dpi);
@@ -5542,10 +4482,6 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
     DrawHkIcon(dc, (float)(bx + (btn - isz) / 2), (float)(by + (btn - isz) / 2), (float)isz,
                HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
 
-    // 文字块（标题盒 15 + 说明盒 13，顶偏移 23 → 块高 36）与圆钮中心对中心。
-    // 标题用 g_sfCtrl（11pt ≈ 14.7 DIP）而不是 g_sfRow：制作工具的行标题是 14px，
-    // 而章节标题是 18 —— 层级比 1.29。本窗口 g_sfRow 实际是 16.7 DIP，与章节的 18.7
-    // 只差 1.12 倍，行标题会顶到章节标题上，读起来像同级。
     int tx = row.left + AboutPadX(m);
     int tw = bx - (int)(12 * m.dpi) - tx;
     int blockH = (int)(36 * m.dpi);
@@ -5555,12 +4491,6 @@ static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
         DrawTextL(dc, tx, tyText + (int)(23 * m.dpi), tw, (int)(13 * m.dpi), desc, g_sfBase, C_DIM);
 }
 
-// 许可行：「许可协议」标签列（110 DIP，与制作工具 widgets::field 的标签列同宽）+ 主色值
-// + 右侧 32 DIP「查看」按钮。标签与值分两列而不是连成一句：MIT 是**值**，颜色交回主色，
-// 扫一行就知道许可是什么；按钮才是动作。
-// 「标签 + 值 + 右侧动作按钮」行。许可行与诊断行共用同一套画法：
-//   许可行：开源许可 / MIT / [查看]
-//   诊断行：诊断日志 / 自动呼出问题排查 / [导出]
 static void DrawAboutActionRow(HDC dc, const SettingsMetrics& m, const RECT& row, BOOL hover,
                                const wchar_t* label, const wchar_t* value, const wchar_t* btnLabel) {
     int labelW = (int)(110 * m.dpi);
@@ -5609,7 +4539,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     if (g_sTab != 2) DrawSettingsCard(dc, m);
 
     if (g_sTab == 0) {
-        // 行序（自动收起行仅在自动呼出开启时存在，隐藏时后续行上移一行）：
+        // 行序（自动收起行仅在自动呼出开启时存在，隐藏时后续行上移一行）
         //   0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
         int closeRow = g_af ? 2 : 1;
 
@@ -5649,9 +4579,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r2, g_rememberClose, S_HIT_REMEMBER);
 
         RECT r;
-        // ⚠ 守卫**只包住功能键行**。Shift 两行必须留在守卫外面 —— 它们在全尺寸布局下照常显示，
-        //   一旦被包进来，全尺寸里「功能键行被藏」就会连带把这两行也跳过：绘制跳过但行高还在，
-        //   结果就是两个空白格子（实机截图症状）。
+        // ⚠ 守卫**只包住功能键行**。Shift 两行必须留在守卫外面 —— 它们在全尺寸布局下照常显示
         if (!SettingsRowHidden(0, closeRow + 2)) {
         r = SettingsRowRect(m, closeRow + 2);
         DrawSettingRowContent(dc, m, r, -1, L"F",   // 功能键行保留手绘 F
@@ -5760,9 +4688,6 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSegmented(dc, m, hsegR, hseg, hsegn, HlSel());
 
         if (customHue) {
-            // 分隔线是「标题区 / 展开区」的分界，要落在两者正中间：上方到描述盒底
-            // （块顶+52）、下方到色板顶（76），两边都留 12 DIP。原来画在 56，
-            // 离描述只有 4 DIP —— 实机上看着像给描述加的下划线。
             Fill(dc, r.left + (int)(20 * m.dpi), r.top + (int)(64 * m.dpi),
                  r.right - r.left - (int)(40 * m.dpi), 1, C_META);
 
@@ -5828,55 +4753,18 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
           DrawSegmented(dc, m, stR, st, stn, g_themeStyle); }
 
     } else {
-        // 关于 tab：身份卡 → 链接卡（项目地址）→ 「开源许可」→ 许可卡，版权行在最下方居中。
-        // 语法整体照制作工具（PanDa PE）的关于页：身份卡是「方块 + 产品名 + 版本」，
-        // 链接行是「标题 + 说明 + 目的地图标圆钮」，许可是独立一行。见 GetAboutLayout。
         AboutLayout al = GetAboutLayout(m);
         DrawRoundRect(dc, al.card1.left, al.card1.top,
                       al.card1.right - al.card1.left, al.card1.bottom - al.card1.top,
                       C_KEY, C_KEY, (int)(16 * m.dpi));
 
-        // 身份标识：矢量 KeyboardMark（主色键盘体 + 挖空键块），不用位图。
-        // 纵向**居中于卡片本身**，而不是居中于「标题 + 描述」的行盒：
-        //   卡高 76 = 上下内边距 10 + 标识 56，标识盒正好落在内边距上；
-        //   文字块（标题盒 32 + 间隙 6 + 描述盒 18 = 56）也按卡纵心居中，两者同轴。
-        //   直接由卡高算，改字号或改卡高都自洽。
-        //
-        // ⚠ hole 色必须与 fg 不同（这里传 C_ON_PRIMARY = primaryFg 浅色下的深色正文色）：
-        //   键块是**独立子路径**，靠 hole 色「挖」出来才看得见键盘。同色 ⇒ 挖空失效，
-        //   56×56 的位置里只剩一个实心方块，键块全部消失（实机踩过）。
-        // ⚠ 也**别再往外套一层圆角方块**。制作工具的 brand_tile 是「色块 + 另一枚图形」，
-        //   它那枚是熊猫头，与色块同色系但形状完全不同；KeyboardMark 本身就是完整剪影，
-        //   套色块后只会在 56 DIP 的位置里塞进一条 49×34 的扁带，中间还多一圈冗余底色。
+        // ⚠ hole 色必须与 fg 不同（这里传 C_ON_PRIMARY = primaryFg 浅色下的深色正文色）
         int my = al.card1.top + (al.card1.bottom - al.card1.top - al.mark) / 2;
         // ⚠ 文字起点用 **13.3 DIP**（原 18）：al.mark 是 56 DIP 的**绘制网格**，而
-        //   KeyboardMark 的着色只占网格的 88%（实测墨迹 49.52 DIP，网格内左留白 2.48）。
-        //   按网格量间距会多算 6.5 DIP，这是「图标贴着文字」的成因。
-        //   制作工具那边实测视觉间距 18.98（tile 满格，网格=墨迹，不存在这个偏差）；
-        //   本窗口同样要 18.98，就得从 18 往下减：18 − 6.5(网格/墨迹差) + 1.8(GDI+ 与
-        //   字形左边距的差，实测反解) ≈ 13.3。改完实测 18.98±0.3。
-        //   ⚠ 别再套一层圆角方块去「填满」网格 —— 那会让 49×34 的扁带缩在色块里。
         DrawHkIcon(dc, (float)(al.card1.left + AboutPadX(m)), (float)my, (float)al.mark,
                    HkIcon(HKICON_KEYBOARDMARK), C_HOT, C_ON_PRIMARY);
 
-        // 产品名用 g_sfSec（17pt ≈ 22.7 DIP）而不是页面标题那一档：制作工具的名称 20 /
-        // 页标题 26（0.77），本窗口页标题是 18pt，若卡里的名字也用 18pt 就和页面大标题
-        // 同号，两行字重一样、互相打架。17pt 保住层级差（0.94），又比 20pt 少占 5 DIP
-        // 高度 —— 这一项是「描述别掉下去」的关键，见下。
-        //
         // ⚠ 文字块高度是 **49 DIP**（标题盒 28 + 间隙 3 + 描述盒 18），不是 53。
-        //   「标题↔描述中心距」= 墨迹间隙 + 两个墨迹高的一半，而汉字墨迹比拉丁高得多：
-        //   20pt 下「HKeyboard 轻键」墨迹 29.36 DIP，制作工具的「PanDa PE」只有 15.43
-        //   （纯拉丁 cap height）。中心距因此被撑到 29.36 对 22.57，描述被推下去。
-        //   标题压到 17pt 后墨迹降到 24.18，中心距收到 27.05，块才排得进 84 高的卡。
-        //   ⚠ 别想着「把盒顶间隙调成 0 补回来」：汉字墨迹几乎撑满标题盒，间隙归零后
-        //   标题与描述的字面会贴到一起。间隙 3 是下限。
-        //
-        // ⚠ 文字块整体**下移 1.7 DIP**。盒高 49 按卡纵心居中只是「盒子居中」，
-        //   而 17pt 标题的墨迹在 28 DIP 的盒里只留 0.1 DIP 上留白（行盒 1.326em = 29.17
-        //   比盒高还大 1.17，GDI+ 居中后墨迹几乎贴着盒顶），只居中盒子会让整块偏上。
-        //   下移 1.7 后实测顶 19.58 / 底 17.85，墨迹块心落在卡心 +0.87 ——
-        //   制作工具那边是 +1.72（同为「块心略低于卡心」），所以纵向不必再补。
         int tx = al.card1.left + AboutPadX(m) + al.mark + (int)(13.3 * m.dpi);
         int ty = al.card1.top + ((al.card1.bottom - al.card1.top) - (int)(49 * m.dpi)) / 2
                  + (int)(1.7 * m.dpi + 0.5);
@@ -6025,7 +4913,7 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_STYLE; }
 
     } else {
-        // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）；
+        // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）
         // 许可 / 诊断行的热区只有右侧按钮本身 —— 行内的文字是读数，不是动作
         AboutLayout al = GetAboutLayout(m);
         RECT r0 = AboutRowRect(m, al.card2, 0);
@@ -6103,9 +4991,6 @@ static void SaveWindowState() {
     swprintf(key, 40, L"Layout%dHeight", g_layoutMode);   IniSetInt(L"Window", key, rc.bottom - rc.top);
 }
 
-// 首次启动自动生成 HKeyboard.ini（含默认值），之后按需写入。
-// 已存在的旧配置执行一次性升级：清除早期版本写入的未缩放默认窗口尺寸，
-// 交给 InitWindowSizeForDpi 按 DPI 重算（避免高 DPI 首启窗口过小）。
 static void EnsureConfigFile() {
     wchar_t path[MAX_PATH];
     GetConfigPath(path, MAX_PATH);
@@ -6132,10 +5017,6 @@ static void EnsureConfigFile() {
             IniSetInt(L"General", L"ConfigVersion", 5);
         }
         if (ver < 6) {
-            // 默认「按键图标样式」由「文字」改为「图标+文字」（参考图里 Tab / Caps /
-            // Shift / 退格 / 回车这些宽键都是「图形 + 名字」）。
-            // 旧配置里几乎都写着 0 —— 那是旧默认值灌进去的，不代表用户的选择，
-            // 所以这里一并改成 2；不喜欢可在设置页一键切回「文字」。
             IniSetInt(L"Keyboard", L"KeyIconStyle", 2);
             IniSetInt(L"General", L"ConfigVersion", 6);
         }
@@ -6448,7 +5329,7 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/blob/main/LICENSE", NULL, NULL, SW_SHOWNORMAL);
         break;
     case S_HIT_DIAG: {
-        // 关于 Tab / 托盘右键都有这个入口：导出最近约 3 分钟的运行记录，
+        // 关于 Tab / 托盘右键都有这个入口：导出最近约 3 分钟的运行记录
         // 外加环境快照与 UIA 自检结果（见 ExportDiagLog）。
         ExportDiagLog();
         break;
@@ -6467,10 +5348,6 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
 }
 
 // ========== 窗口渐显/渐隐（记事本风格 fade） ==========
-// AnimateWindow 的 AW_BLEND 在 Win8+ 的 DWM 合成窗口上无效。改用所有
-// "窗口淡入淡出"工具的标准做法：临时给窗口加 WS_EX_LAYERED，用
-// SetLayeredWindowAttributes 对整个窗口（含材质背景）做整体透明度渐变，
-// 任何主题/材质/模式下都必然可见；动画结束移除分层属性恢复正常呈现。
 struct WinFade {
     BOOL     active;
     BOOL     closing;    // TRUE=渐隐（结束后销毁窗口）
@@ -6586,9 +5463,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
-        // 兜底：内容比客户区高就先长高再重绘。
-        // 行数会随「布局 / 功能键行 / 双符号」等开关变化，只靠点击后收一次边，
-        // 任一路径漏掉就会出现「最后一行被窗口裁掉」（用户视频里的现象）。
         {
             RECT cr; GetClientRect(hWnd, &cr);
             int want = SettingsDesiredHeight(hWnd);
@@ -6810,19 +5684,6 @@ static void ClosePromptAnimated(HWND hWnd) {
     StartWindowFade(hWnd, g_promptFade, TRUE);
 }
 
-// 关闭方式提示窗口的几何 —— **绘制与命中必须读同一份**（PromptDraw / PromptHitTest）。
-//
-// 原来两边各算一遍，尺寸改一处就漏一处（老坑：按钮画在右边、热区还在左边）。
-// 全部 DIP，乘 dpi 后给像素。
-//
-// 结构照搬设置页的「标题 + 卡片 + 行」语法（见用户实机图）：
-//   标题行   图标块 + 「是否关闭轻键」         （落在 pageBg 淡紫底上，不进卡片）
-//   卡片     C_KEY 白底 + 16 圆角，两行内容（**均无描述**，按用户要求）：
-//              选择关闭方式 [✕] 标题   右对齐分段控件
-//              记住我的选择 [✓] 标题   右对齐开关
-//   按钮区   分隔线 + 确定 / 取消            （也在淡紫底上）
-// 这样对话框就是设置页「常规」Tab 的一个特写：卡片、图标块、分段、开关全是同一套令牌，
-// 不再是「卡片里摆一堆孤立控件」的另一套语法。
 struct PromptLayout {
     int pad;        // 左右内边距（也等于上下留白）
     int closeW, closeH, closeX, closeY;   // 右上关闭钮
@@ -6849,14 +5710,7 @@ struct PromptLayout {
     int btnW, btnH, okX, cancelX, btnY;
 };
 
-// 纵向推进链（单位 DIP；窗口高 287 = 上下各 20 + 内容 247）：
-//   20 标题行(38) → 58 +18 → 76 卡片顶
-//   卡片内：12(上留白) + 54(行) + 1(行间分隔线) + 54(行) + 12(下留白) = 133，圆角 16
-//   → 76 + 133 = 209 卡片底 → +16 → 225 分隔线 → +12 → 237 按钮(30)
-//   → 267 +20 底留白 = 287
 // ⚠ 卡片高**必须含上下 rowPadY**。原来漏成 rowH*2+1 = 109，让行 2 底超出
-//   卡片底 12 DIP（卡片内上留白 24.6 / 下留白 0.6，肉眼是「下面顶到边了」）。
-// ⚠ 改任何一个间距都要重算这条链，并同步 OpenClosePrompt 里的窗口高。
 static PromptLayout PromptComputeLayout(int W, double dpi) {
     PromptLayout L;
     L.pad      = (int)(20 * dpi);
@@ -6881,8 +5735,6 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
     L.cardR = (int)(16 * dpi);
     L.cardW = W - L.pad * 2;
     // ⚠ 必须含上下 rowPadY：`rowPadY*2 + rowH*2 + 1`。
-    //   原来漏成`rowH*2 + 1`，行 2 底超出卡片底 12 DIP ——
-    //   卡片内上留白 24.6 / 下留白 0.6，肉眼就是「下面顶到边了」（用户实测发现）。
     L.cardH = L.rowPadY * 2 + L.rowH * 2 + 1;
 
     // 卡片内两行
@@ -6899,8 +5751,6 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
         L.segW = w;
     }
     // ⚠ 右对齐必须减掉 segW **自身宽度**（设置页 RowSegRect 就是
-    //   x = row.right - 20*dpi - w）。只减到「右边界」会让分段控件
-    //   整体向右溢出 segW 像素，末段被窗口裁掉。
     L.segX = W - L.pad - (int)(20 * dpi) - L.segW;
     L.swW = (int)(46 * dpi);   // 与设置页 switchW 一致
     L.swH = (int)(26 * dpi);
@@ -6922,13 +5772,10 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     (void)H;
     PromptLayout L = PromptComputeLayout(W, dpi);
 
-    // 窗口底：**pageBg**（淡紫），与设置页页面底同一层 ——
+    // 窗口底：**pageBg**（淡紫），与设置页页面底同一层
     // 白卡片浮在它上面构成层级。原来的纯白底把卡片「吸」进去了，看着像一张大表格。
     DrawRoundRect(dc, 0, 0, W, H, C_BG, C_BG, (int)(14 * dpi));
 
-    // 标题行：图标块 + 「是否关闭轻键」（落在 pageBg 上，不进卡片 —— 与设置页页头同一语法）
-    //图标用 DIALOGINFO（ⓘ圆圈信息），语义上是「询问」而不是「关闭」——
-    //   HKICON_CLOSE 已经被右上角那个 ✕ 用了，两处同图标会让人以为是同一个按钮。
     DrawRoundRect(dc, L.pad, L.titleY, L.headIcon, L.headIcon,
                   C_REGULAR, C_REGULAR, (int)(9 * dpi));
     {
@@ -6963,7 +5810,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     int tx = L.cardX + (int)(20 * dpi) + L.tile + L.tileGap;
     int txMax = L.segX - (int)(12 * dpi);
 
-    // ---- 行 1：选择关闭方式（描述已按要求去掉，标题在行盒内垂直居中）----
+    // ---- 行 1：选择关闭方式（描述已按要求去掉，标题在行盒内垂直居中）-
     {
         int ry = L.segRowY + (L.rowH - L.tile) / 2;
         DrawRoundRect(dc, L.cardX + (int)(20 * dpi), ry, L.tile, L.tile,
@@ -6972,7 +5819,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
         DrawHkIcon(dc, (float)(L.cardX + (int)(20 * dpi) + (L.tile - isz) / 2),
                    (float)(ry + (L.tile - isz) / 2), (float)isz,
                    HkIcon(HKICON_CLOSE), C_BTN_CONTENT, C_BTN_CONTENT);
-        // ⚠ 没有描述了，标题必须按**整个行盒**居中（不是 titleH2 居中后再偏上），
+        // ⚠ 没有描述了，标题必须按**整个行盒**居中（不是 titleH2 居中后再偏上）
         //   否则字会偏行盒中心 3 DIP —— 与右侧分段控件/开关不在一条基线上。
         int ty = L.segRowY + (L.rowH - L.titleH2) / 2;
         DrawTextL(dc, tx, ty, txMax - tx, L.titleH2,
@@ -6999,7 +5846,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
         }
     }
 
-    // ---- 行 2：记住我的选择（描述已按要求去掉）----
+    // ---- 行 2：记住我的选择（描述已按要求去掉）-
     {
         int ry = L.remRowY + (L.rowH - L.tile) / 2;
         DrawRoundRect(dc, L.cardX + (int)(20 * dpi), ry, L.tile, L.tile,
@@ -7031,7 +5878,7 @@ static int PromptHitTest(HWND hWnd, int x, int y) {
     RECT rc; GetClientRect(hWnd, &rc);
     int W = rc.right;
     double dpi = GetSystemDpiScale();
-    // ⚠ 与 PromptDraw 读**同一个** PromptComputeLayout —— 原来两边各算一遍，
+    // ⚠ 与 PromptDraw 读**同一个** PromptComputeLayout —— 原来两边各算一遍
     // 改尺寸必然漏一处（老坑：按钮画在右边、热区还在左边）。
     PromptLayout L = PromptComputeLayout(W, dpi);
 
@@ -7181,16 +6028,7 @@ static void OpenClosePrompt() {
     g_pChoice = g_closeToTray ? 1 : 0;
     g_pRemember = g_rememberClose;
     double dpi = GetSystemDpiScale();
-    // 460x287：与 PromptComputeLayout 的推进链对齐 ——
-    // 20 + 38(标题行) + 18 + 133(卡片：上下留白 24 + 两行 108 + 分隔线 1)
-    // + 16 + 1(分隔线) + 12 + 30(按钮) + 20 = 287。上下留白各 20 DIP。
-    //
-    // ⚠ 宽度按**实机字宽**（MiSans 11pt）反推。描述去掉后约束变成了分段控件：
-    //   行1 标题「选择关闭方式」= 90 DIP，但右侧分段控件 segW=197 DIP 才是瓶颈 ——
-    //   tx(88) + 间距(12) + segW(197) + 右留白(40) = 337 DIP 起步。
-    //   取 460 留 33 DIP 余量；设置页是 705 DIP，这里取其 65%。
-    //   （曾经按「带描述」的口径定过 540，去掉描述后收窄，否则右边空一大片。）
-    // ⚠ 改这个数必须同步 PromptComputeLayout 里的推进链。
+    // ⚠ 宽度按**实机字宽**（MiSans 11pt）反推。描述去掉后约束变成了分段控件
     int w = (int)(460 * dpi), h = (int)(287 * dpi);
     RECT work = {0};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
@@ -7209,7 +6047,7 @@ static void OpenClosePrompt() {
 static void ShowMenu(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    // “显示轻键”仅在自动呼出关闭且键盘隐藏时提供：
+    // “显示轻键”仅在自动呼出关闭且键盘隐藏时提供
     // 自动呼出开启时键盘由呼出逻辑自动管理，无需手动呼出入口
     if (!g_af && !g_vis) {
         AppendMenuW(m, MF_STRING, ID_MENU_TOGGLE, T(L"\x663E\x793A\x8F7B\x952E", L"Show Keyboard"));
@@ -7320,8 +6158,6 @@ static BOOL AccessibleRoleIsEditable(IAccessible* acc, VARIANT child) {
 
 static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* token) {
     // ⚠ 深度上限 3 → 6（2026-10-04）：Chrome 系的 a11y 树很深
-    //   （窗口 → 文档 → 容器 → 输入框…），3 层可能永远够不到焦点元素。
-    //   放宽后配合 fvt/frole 诊断看实际能走到哪一层。
     if (!acc || depth > 6) return FALSE;
     VARIANT focus;
     ZeroMemory(&focus, sizeof(focus));
@@ -7339,34 +6175,6 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
             return TRUE;
         }
         // ⚠⚠⚠ 2026-10-04 第七轮：**这里以前是 `return FALSE;`** —— 根因就在这。
-        //
-        //   用户日志实测（Chrome 系应用，908 次采样）：
-        //       frole = 0x0F = ROLE_SYSTEM_GROUPING   739 次（81%）
-        //       frole = 0x29 = ROLE_SYSTEM_ANIMATION  168 次
-        //       frole = 0x2A = ROLE_SYSTEM_TEXT（白名单内）  0 次
-        //   也就是说 **Chrome 从不把焦点放在输入框本身，而是放在一个"容器"元素上**，
-        //   真正的输入框是那个容器的**子节点**。
-        //
-        //   而 VT_I4 这条分支不匹配就返回 FALSE，把容器整个判死 ——
-        //   于是「QQ / 浏览器 / Electron 的输入框在 a11y 树里永远认不出来」，
-        //   `IsAccessibleInputWindow` 恒 FALSE，键盘只能靠类名粗判兜着，
-        //   而类名粗判又分不出"点在输入框"还是"点在空白处"。
-        //
-        //   ⚠ 注意 `VT_DISPATCH` 分支一直是**会递归**的（`depth+1`），
-        //     只有 VT_I4 分支漏了 —— 两条路径行为不一致，这次的 bug 正在于此。
-        //
-        //   ⇒ 修法：角色不匹配时，用 get_accChild 把这个 child 的 IAccessible
-        //     取下来**继续往下钻**，与 VT_DISPATCH 分支保持一致。
-        //     focus.lVal == 0 是 CHILDID_SELF（就是自身），无子可下钻。
-        // ⚠ get_accChild 的原型（CI x86 编译器给出，oleacc.h:596）：
-        //     HRESULT get_accChild(VARIANT varID, IDispatch **ppdispChild);
-        //   **两参数、IDispatch** 是出参** —— 既不是三参数，也不是返回值
-        //   （前两次分别报 C2660 / C2440，别再凭印象写）。
-        //
-        //   MSAA 语义：**varID 就是要取的那个子元素 id**（不是"父对象 id"）。
-        //   `get_accFocus` 返回 VT_I4 时，lVal 是焦点元素在**本对象**下的
-        //   childId —— 直接把它当 varID 传下去即可取到该元素的对象。
-        //   `focus.lVal == 0` 是 CHILDID_SELF（焦点就是 acc 自己），无子可取。
         if (focus.lVal == 0) return FALSE;
         VARIANT varId;
         ZeroMemory(&varId, sizeof(varId));
@@ -7403,24 +6211,7 @@ static BOOL AccessibleHasEditableFocus(IAccessible* acc, int depth, ULONG_PTR* t
     return FALSE;
 }
 
-// 目标窗口所属线程是否还在正常处理消息。
-//
-// ⚠⚠ 存在的理由（用户实测的「自动呼出卡死」）：
-//   下面 IsAccessibleInputWindow 里的 AccessibleObjectFromWindow 是**跨进程
-//   COM 调用**，目标进程一旦无响应（弹模态框、正在启动、死循环），它会阻塞
-//   很久甚至不返回。而这个探测由 **50ms 的焦点轮询**驱动 ——
-//
-//     UI 线程僵死
-//       → WM_TIMER 得不到处理（它在消息队列里优先级很低）
-//       → 窗口滑动动画停在半路，g_mainMotion.active 一直是 TRUE
-//       → UpdateAutoVisibility 开头那道「动画期间不评估」的保护**永久生效**
-//       → 自动呼出彻底失效
-//
-//   症状完全吻合用户的描述：**整个程序完全无响应**、**有时恢复有时不恢复**
-//   （目标恢复响应 / 永久挂着）、**切换窗口和长时间没用后最容易出现**。
-//
-//   SMTO_ABORTIFHUNG 会在目标 hung 时立刻返回，把「无限期阻塞」压成
-//   「有界的最多 timeoutMs」。这一步挡在 COM 调用之前，是性价比最高的防线。
+// ⚠⚠ 存在的理由（用户实测的「自动呼出卡死」）
 static BOOL IsWindowResponsive(HWND hw, UINT timeoutMs) {
     if (!hw || !IsWindow(hw)) return FALSE;
     DWORD_PTR res = 0;
@@ -7432,8 +6223,6 @@ static BOOL IsWindowResponsive(HWND hw, UINT timeoutMs) {
 static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
     g_dbgResp = 0; g_dbgAcc = -100; g_dbgAccFound = -1;
     // ⚠ 先确认目标还活着，再做跨进程 COM 探测（见 IsWindowResponsive 的说明）。
-    //   100ms 是权衡值：正常进程的 WM_NULL 在 1ms 内返回，繁忙进程几十毫秒也够；
-    //   真 hung 的会被 SMTO_ABORTIFHUNG 立刻打回。
     if (!IsWindowResponsive(hWnd, 100)) return FALSE;
     g_dbgResp = 1;
 
@@ -7468,9 +6257,6 @@ static BOOL IsAccessibleInputWindow(HWND hWnd, ULONG_PTR* token) {
     return result;
 }
 
-// 系统外壳界面：任务栏、开始菜单、搜索、托盘折叠弹窗（^）等，
-// 一律不视为输入区域，也跳过代价较高的跨进程 Accessibility 探测。
-// 注意：CoreWindow 同时是 UWP 应用窗口类，不能排除，否则 UWP 输入框失效。
 static BOOL IsShellSurfaceClass(const char* cls) {
     if (!cls) return FALSE;
     return strstr(cls, "Shell_") || strstr(cls, "Progman") || strstr(cls, "WorkerW") ||
@@ -7482,23 +6268,7 @@ static BOOL IsShellSurfaceClass(const char* cls) {
 }
 
 // ===== Windows 自带触摸键盘（Win10 与 Win11 形态不同）=====
-// 它在本项目里有特殊地位：点输入框时系统会把它弹出来，而**它一旦成为前台窗口**，
-// 自动呼出的两个判断会同时被它带偏，结果是「HKey 完全不弹、只剩系统键盘」：
-//   ① UpdateAutoVisibility 里「前台变了 → 进入等待用户操作」（g_fgAwaitUserInput）
-//      —— 这个封锁会一直拦住自动弹出，要等用户再点一次输入框 / 按键才解；
-//   ② GetFocusedInputControl 会把 fg 认成它，探测不出输入框 → 返回 NULL
-//      → 走「没有输入焦点」分支，把键盘收掉。
-// ⇒ 判定时一律**跳过它**，改用「上一个真正的前台窗口」（RealForegroundWindow）。
 // ⚠ 只做判定上的忽略，**不主动关掉系统键盘**（用户明确要求不动它）。
-// ⚠ osk.exe 的 `OSKMainClass` 是用户主动开的辅助键盘，不该被忽略。
-//
-// ⚠⚠ 两个平台的形态**不一样**（实测本机 Win11 得到的事实）：
-//   Win10：`TabTip.exe` 的窗口类 `IPTip_Main_Window`
-//   Win11：`TextInputHost.exe`（进程）承载，窗口类 `Windows.UI.Core.CoreWindow`
-//          —— 这类名被大量 UWP 宿主复用（本机 explorer.exe / SystemSettings.exe
-//             都各有一个），**所以必须再按进程名确认**，只看类名会误伤。
-// ⚠ 本项目目标是 XP（_WIN32_WINNT=0x0501）⇒ `QueryFullProcessImageNameW`
-//   （Vista+）在头文件里**没有声明**，按本项目惯例**动态取**（同 DwmSetWindowAttribute）。
 typedef BOOL (WINAPI *QueryFullProcessImageNameWProc)(HANDLE, DWORD, LPWSTR, PDWORD);
 static BOOL WindowProcessName(HWND h, wchar_t* out, int cch) {
     if (out) out[0] = 0;
@@ -7546,9 +6316,6 @@ static BOOL IsSystemTouchKeyboard(HWND h) {
 // 上一个「真正的」前台窗口（跳过系统触摸键盘）。
 // 触摸键盘抢前台时不更新它，于是自动呼出的判定继续对着底下那个应用。
 static HWND g_lastRealFg = NULL;
-// 诊断（-afdiag）：前台窗口类变化时记一笔。
-// 万一用户机器上的系统触摸键盘不是 IPTip_Main_Window（不同 Win10 版本可能不同），
-// 日志里能直接看到真实类名，不用再猜 —— 只有带 -afdiag 时会写。
 static char g_dbgLastFgCls[64] = {0};
 static HWND RealForegroundWindow() {
     HWND fg = GetForegroundWindow();
@@ -7572,38 +6339,7 @@ static HWND RealForegroundWindow() {
 }
 
 // ===== 会话级「用户操作过」判定（触屏必需，2026-10-10）=====
-//
-// 触屏上「点输入框」这件事，HKeyboard 现在是**看不见**的：
-//   Chromium 系窗口注册了指针输入，触控只走 WM_POINTER / WM_TOUCH，
-//   **不会被系统提升成鼠标消息** ⇒ WH_MOUSE_LL 一次都不触发。
-//   而 UpdateAutoVisibility 里"用户操作过"只有两个来源：byKey（实体按键）与
-//   clickInFg（鼠标落点）—— 触屏上一个都不成立，于是那道
-//   「刚切窗口先别弹」的封锁（g_fgAwaitUserInput）**永远解不开**，
-//   自动呼出在这台机器上等于完全失效（用户实测：只能从托盘手动打开）。
-//   火狐没做这个注册，触控照常提升成鼠标消息 —— 所以火狐一直是正常的。
-//
-// ⇒ 用 GetLastInputInfo 兜底：它统计**会话级最后一次输入**（鼠标 / 键盘 /
-//   触控 / 笔都算），不区分来源，但足够回答"用户刚才动过没有"。
-//
 // ⚠ 判据是「**刚刚**有过一次输入」，不绑定"这一次前台变化"。
-//   ⚠⚠ 上一版是"输入发生在前台变化之后 **且** 光标自那次切换起没动过" ——
-//      那个写法有个致命缺陷：**只要中途有任何一次移动光标**（平板最典型：
-//      手指点了任务栏、外接鼠标被碰一下、或别的程序 SetCursorPos），
-//      第二个条件就**永久为假**，直到下一次前台变化 ⇒ 封锁 g_fgAwaitUserInput
-//      再也解不开 ⇒ **自动呼出在该机器上完全失效**。
-//      平板用户的诊断日志里 `await=1` 占 48%，正是这个。
-//      （旧函数 `UserInputAfterForegroundChange` + `g_lastFgSetTick` /
-//        `g_lastFgCursor` 已按此删除。）
-//
-// ⚠ 只在触屏设备上启用（见调用点的 IsTouchDevice）。桌面机上鼠标随便一晃就满足，
-//   那会退化成"切窗口就弹"，把这道封锁的意义抹掉。
-//
-// ⚠⚠ 再加一道过滤：**"仅鼠标移动"不算操作**。
-//   GetLastInputInfo 连鼠标移动也计入，而触屏笔记本 + 鼠标是最常见的组合 ——
-//   没有这道过滤，晃一下鼠标就会解锁，等于把上面的触屏限定架空。
-//   判据用"**这次采样之间**光标位置有没有变"：触控投在 Chromium 系窗口上
-//   不会移动光标（见上面的论证），鼠标移动 / 点任务栏都会把光标挪到别处。
-//   ⚠ 注意是"和上一次采样比"，不是"和切窗口那一刻比" —— 这正是上一版的病根。
 static DWORD g_touchTapTick = 0;         // 最近一次"触控式点击"（有输入且光标未动）
 static DWORD g_touchInputTick = 0;       // 上一次采样到的 GetLastInputInfo.dwTime
 static POINT g_touchCursor = {0, 0};
@@ -7633,14 +6369,7 @@ static BOOL TouchTappedRecently() {
     return (DWORD)(GetTickCount() - g_touchTapTick) <= 1500;
 }
 
-// 触屏**一次性**证据：刚刚那次触控式点击，**每次只放行一拍**。
 //   ⚠ 为什么需要它：触屏拿不到落点（没有鼠标消息），触屏的两条强证据
-//     （系统触摸键盘出现 / 前台窗口里有焦点事件）都可能在用户的机器上不成立 ——
-//     那样"隐藏态要弹必须攒证据"就变成了**永远弹不出来**（平板用户报的正是这个）。
-//     这条是兜底：用户确实点了一下（有输入且光标没动），就放行一次。
-//   ⚠ 为什么不会振荡：**一次性**（消费掉就没了）。放行 → 弹出 → 精判若说
-//     "不在可编辑元素里" → 立刻收起并重新进压制态；下一拍没有新证据 ⇒ 保持收起。
-//     代价：在压制态下点空白会闪一下（一次点击闪一次）—— 比"叫不出键盘"好得多。
 static DWORD g_touchTapConsumed = 0;
 static BOOL TouchTapEdgeConsume() {
     if (!g_touchTapTick || g_touchTapTick == g_touchTapConsumed) return FALSE;
@@ -7649,61 +6378,16 @@ static BOOL TouchTapEdgeConsume() {
 }
 
 // ===== Chromium 系「光标到底在不在输入框里」的精判（UI Automation）=====
-//
-// 背景：IsInputControl() 对 Chromium 系是**粗判**（见那里的长注释）——
-//   它能回答"前台是不是一个 Chromium 窗口"，回答不了"光标在不在输入框里"。
-//   于是 Chromium 系一旦到了前台，input 恒非空 ⇒ **永远不收起**。
-//
-// 判据（2026-10-10 本机实测，WorkBuddy/Electron，真实鼠标点击驱动）：
-//   点进输入框   → GetFocusedElement().ControlType == EditControl(50004)，rect 就是输入框  3/3
-//   点同窗口空白 → DocumentControl(50030)                                              4/4
-//   点回输入框   → EditControl(50004)                                                  3/3
-//   ⇒ **ControlType 是不是 Edit，就等于"焦点在不在可编辑输入框里"。**
-//
-// ⚠⚠ 与历史结论的关系（必读，别再重复回退）：
-//   第七~十轮引入过 UIA 精判，第十一轮整体回退，理由是
-//   「整张网页永远有一个 Document(50030) 持有键盘焦点」。
-//   **本次实测与该结论不符** —— 输入框焦点稳定报 EditControl。
-//   翻当年那几笔提交，失败的可查原因是**管道接错**，不是判据不可用：
-//     · `修 VT_I4 分支不下钻` · `UIA 接入的两个编译错误`
-//     · `Document 不能当「可编辑」判据`（说明当时确实把 Document 当成了可编辑）
-//   当年还把它们用在了**显示**上，所以判错就是"输入框不弹"。
-//
-// ⚠⚠⚠ 但用法必须**对称** —— 判据要同时回答"该不该弹"和"该不该收"。
-//   这是被实测逼出来的：第一版只想让它管收起（显示仍走粗判），
-//   结果直接变成自激振荡（用户日志周期约 2 秒，见 UpdateAutoVisibility 的完整记录）。
-//   道理很简单：粗判对 Chromium 恒为真，只要"收起"由精判决定、
-//   而"弹出"由粗判决定，两者就一定互相打架。
-//
-//   对称使用就要求判据本身够硬，于是配了两道护栏（都在 UpdateAutoVisibility 侧）：
-//     · **信任门**：只有在这个窗口上**见过 Edit** 才采信它的"不在输入框"——
-//       contenteditable 型输入框报不出 Edit（实测 QQ 的 ProseMirror 报 GroupControl，
-//       整个窗口 EditControl 数为 **0**），没这道门那类应用会变成再也不弹；
-//     · **保持期 400ms**：刚见过 Edit 的一小段时间内一律按"在输入框"处理。
-//
-//   判据本身的稳定性有实测背书：WorkBuddy 在前台、光标在输入框里、**全程不碰任何东西**
-//   → EditControl **233/233 连续 14 秒无一次跳变**（脚本 `.workbuddy/uia_stability2.py`）。
-//   用户日志里那个"50004/50030 成块交替"是**上面那个振荡带出来的**，不是判据不稳。
-//// ⚠ 只在**键盘已显示**时查（调用点负责）：没显示就没有"要不要收"的问题，
-//   不该为它付跨进程 COM 的代价。
-// ⚠ 还留了 ini 开关 General/ChromiumPrecise（默认 1）—— 万一它带来新问题，
-//   关掉一个开关就回到旧行为，不必动主逻辑（这是当年那条教训的直接落实）。
+// ⚠⚠ 与历史结论的关系（必读，别再重复回退）
 #define HK_UIA_CT_EDIT 50004    // UIA_EditControlTypeId
 #define HK_UIA_CT_DOC  50030    // UIA_DocumentControlTypeId（诊断用）
 
 static IUIAutomation* g_uia = NULL;
 
-// 「这个窗口上的精判可信吗」—— 只有在那里**见过可编辑元素**才算可信。
 // ⚠ 必须的护栏：contenteditable 型输入框报不出 Edit —— 实测 QQ NT 主窗口里
-//   只有搜索框是 EditControl（1 个），聊天输入框是 ProseMirror，报
-//   GroupControl / DocumentControl。没有这道门，那类应用会被判成
-//   "永远不在输入框" ⇒ 自动呼出直接失效（第十一轮的翻车形态）。
-//   没见过 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
 static HWND g_chromiumTrustFg = NULL;
 
-// 精判驱动的自动收起状态（详见 UpdateAutoVisibility 的判定段）。
 //   ⚠ 它只是一句备忘："当前这个窗口正处于精判收起态"。
-//     **不是封锁** —— 能不能再弹回来由"正面证据"回答（见判定段）。
 static BOOL g_verdictHide = FALSE;
 static HWND g_verdictHidFg = NULL;
 static int  g_dbgUiaPt = -1;             // 诊断：最近一次落点查询结果
@@ -7714,35 +6398,23 @@ static BOOL EnsureUia() {
     // 复用已有的 COM 初始化（oleacc 那条路也是它）—— 重复 CoInitializeEx 会拿到
     // RPC_E_CHANGED_MODE，虽然无害，但没必要。
     if (!EnsureAccessibilityCom()) return FALSE;
-    // ⚠ CLSID_CUIAutomation / IID_IUIAutomation 走 __uuidof —— 只取 GUID 常量，
+    // ⚠ CLSID_CUIAutomation / IID_IUIAutomation 走 __uuidof —— 只取 GUID 常量
     //   不需要 import lib（不要改成 GetCurrentPropertyValue，那会拉进 oleaut32）。
     HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER,
                                   __uuidof(IUIAutomation), (void**)&g_uia);
     return SUCCEEDED(hr) && g_uia != NULL;
 }
 
-// 焦点元素判定。
-// ⚠⚠ **必须校验"这个元素属于哪个顶层窗口"** —— `GetFocusedElement` 是全局的，
-//   在窗口切换的瞬间可能还停留在**上一个窗口**；不校验就会把"信任门"设到错误的
-//   窗口上。用户实测的后果很典型：在 WorkBuddy 里精判正常（见过 Edit），
-//   切到 QQ 后那 400ms 保持期把 1 带过去、信任门被设成 **QQ 的窗口**，
-//   于是 QQ 的"不在输入框"（ProseMirror 只报 Group）开始生效 ⇒ **QQ 再也弹不出来**。
-// 返回值：1 = 焦点在可编辑输入框里；0 = 明确不在；-1 = 查不出来 / 不属于该窗口
+// ⚠⚠ **必须校验"这个元素属于哪个顶层窗口"** —— `GetFocusedElement` 是全局的
 static int UiaFocusEditable(HWND fgExpect) {
     g_dbgUiaCt = -1;
     if (!EnsureUia()) return -1;
-    // 跨进程调用前先做响应性预检，与 IsAccessibleInputWindow 同一纪律：
-    //   SMTO_ABORTIFHUNG 把"无限期阻塞"压成"有界的最多 50ms"。
-    //   ⚠ 本函数在 UI 线程上跑，没有这道闸，目标进程一卡死，
-    //     键盘自己的界面会跟着僵住。预检不过就返回 -1（= 不做决定）。
+    //   ⚠ 本函数在 UI 线程上跑，没有这道闸，目标进程一卡死
     if (!IsWindowResponsive(GetForegroundWindow(), 50)) return -1;
     IUIAutomationElement* el = NULL;
     HRESULT hr = g_uia->GetFocusedElement(&el);
     if (FAILED(hr) || !el) return -1;
-    // get_CurrentNativeWindowHandle 是**强类型 getter**，不用 VARIANT
-    // （走 GetCurrentPropertyValue 会拉进 oleaut32，arm64 上链接失败过）。
     // ⚠ 它的出参类型是 `UIA_HWND*`（= `void*`），**不是 `HWND*`** —— 直接传 HWND*
-    //   会 C2664。
     UIA_HWND elHwndRaw = NULL;
     el->get_CurrentNativeWindowHandle(&elHwndRaw);
     HWND elHwnd = (HWND)elHwndRaw;
@@ -7759,14 +6431,7 @@ static int UiaFocusEditable(HWND fgExpect) {
     return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
 }
 
-// 带缓存的版本：UIA 是跨进程 COM，别每 50ms 调一次。
-//   TTL 250ms —— 比 tick（50ms）粗得多，又比"人手离开输入框"快得多。
 //   ⚠ 缓存的是**判定结果**，不是元素指针。
-// ⚠⚠ 缓存**按前台窗口分组**。原来是一个全局 static —— 全局缓存会让
-//   "上一个窗口"的结论被当成"这个窗口"的结论（见 UiaFocusEditable 的说明）。
-// ⚠⚠ -1（查不出来）**必须原样保留**，绝不能折成 1。曾经把它当成"是输入框"、
-//   又拿它去设信任门 ⇒ 后面一次无效值就把键盘永久收掉，用户点输入框也回不来。
-//   语义：**只有明确查出来才做决定**，-1 一律不做决定。
 static HWND  g_uiaCacheFg = NULL;
 static int   g_uiaCacheVal = -1;
 static DWORD g_uiaCacheTick = 0;
@@ -7780,16 +6445,10 @@ static int UiaFocusEditableCached(HWND fg) {
     return g_uiaCacheVal;
 }
 
-// 用户刚点过鼠标 / 敲过键时调用：缓存的那一拍**必然已经过期**。
 //   ⚠ 不加这个，点进输入框之后的前 250ms 还会拿"点在空白"时的旧结论去收起
-//     —— 表现就是"点一下输入框，键盘闪一下又没了"。
 static void InvalidateUiaCache() { g_uiaCacheTick = 0; }
 
-// 在缓存之上再加一层"保持期"：**刚见过 Edit 的一小段时间内一律按"在输入框"处理**。
-// 挡的是单次误报 —— Chromium 的焦点上报偶有瞬时非 Edit。
-// 保持期比缓存粗一档，让一次坏采样翻不动结论。
 // ⚠ 同样**按窗口分组**（理由同上）。
-// 代价：离开输入框后收起会晚 400ms，可接受。
 static HWND  g_uiaHoldFg = NULL;
 static DWORD g_uiaHoldTick = 0;
 static int UiaFocusEditableHeld(HWND fg) {
@@ -7801,14 +6460,7 @@ static int UiaFocusEditableHeld(HWND fg) {
 }
 
 // ===== 落点查询：这个屏幕点上是可编辑输入框吗？（UIA ElementFromPoint）=====
-//
-// ⚠⚠ 为什么"要再弹"这件事用**落点**而不是**焦点**：
-//   焦点查询在**隐藏期间**给过无效值 —— 实测（-hide 启动的实例）连续 129 拍
-//   恒为 `ButtonControl`，而同刻 Python 侧按同一 API 查到的是 `EditControl`。
-//   可见状态下它又完全正确（167 拍 `50004` / 182 拍 `50030`，与真值一致）。
-//   ⇒ 隐藏态不拿它做决定；**落点查询不依赖焦点跟踪**，两个状态都稳
-//     （实测：输入框上 = `EditControl`，同窗口空白 = `DocumentControl`）。
-// 返回值：1 = 是输入框；0 = 不是；-1 = 查不出来
+// ⚠⚠ 为什么"要再弹"这件事用**落点**而不是**焦点**
 static int UiaPointEditable(POINT pt) {
     g_dbgUiaPtCt = -1;
     if (!EnsureUia()) return -1;
@@ -7822,7 +6474,7 @@ static int UiaPointEditable(POINT pt) {
     return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
 }
 
-// dwmapi 的 DwmGetWindowAttribute —— 与上面 DwmSetWindowAttribute 一样**动态取**，
+// dwmapi 的 DwmGetWindowAttribute —— 与上面 DwmSetWindowAttribute 一样**动态取**
 //   不新增链接依赖（本机没有编译器，arm64 job 上链新的 lib 有翻车史）。
 typedef HRESULT (WINAPI *DwmGetWindowAttributeProc)(HWND, DWORD, PVOID, DWORD);
 static DwmGetWindowAttributeProc GetDwmGetWindowAttribute() {
@@ -7836,17 +6488,7 @@ static DwmGetWindowAttributeProc GetDwmGetWindowAttribute() {
     return proc;
 }
 
-// 系统触摸键盘此刻是否**真的显示着**。
-//   Win10：`TabTip.exe` 的 `IPTip_Main_Window`，直接按类名找 + IsWindowVisible 就够。
-//   Win11：由 `TextInputHost.exe` 承载，窗口类 `Windows.UI.Core.CoreWindow`。
 //     ⚠⚠ 实测（本机 Win11）：**这个宿主窗口常年 IsWindowVisible=TRUE**
-//        （rect 就是整屏 1463x914，标题「Windows 输入体验」）——
-//        只看 IsWindowVisible 会永远判成"键盘在显示"。
-//        真正没显示时它被 **DWM cloak**（实测 `DWMWA_CLOAKED=2` = DWM_CLOAKED_SHELL）。
-//        ⇒ 所以补一道 cloaked 判定：visible 且 **未** cloak 才算显示。
-//   （该窗口类被大量 UWP 宿主复用 —— 本机 explorer.exe / SystemSettings.exe 各有一个
-//     —— 所以必须再按**进程名**确认，只看类名会误伤。）
-// ⚠ 只在"精判刚收过"的分支里调（频率极低），并有 100ms 缓存，不进每 50ms 主路径。
 struct TipEnumCtx { BOOL found; };
 static BOOL CALLBACK TipEnumProc(HWND h, LPARAM lp) {
     TipEnumCtx* c = (TipEnumCtx*)lp;
@@ -7889,12 +6531,6 @@ static BOOL SystemTouchKeyboardVisible() {
     return vis;
 }
 
-// 触屏专用证据：**刚才有过一次焦点变化**（WinEvent 全局钩子，out-of-context）。
-// 触屏上"点了哪儿"我们拿不到（Chromium 系注册了指针输入，触控不会被提升成鼠标消息，
-// WH_MOUSE_LL 收不到），但"点了输入框"一定伴随一次焦点转移（Document → Edit）。
-//   · 原来焦点在空白 → 点输入框：焦点转移 → 有事件 ⇒ 放行 ✓
-//   · 原来焦点就在空白 → 再点空白：焦点没变 → 没事件 ⇒ 保持收起 ✓（不会闪）
-//   · 原来焦点在输入框 → 点空白：焦点转移 → 会弹，然后精判立刻收（这一种才闪）
 // ⚠ 只对触屏启用：桌面机上点空白同样产生焦点事件，那会退化成"点哪儿都弹"。
 static BOOL TouchFocusEvidence() {
     if (!IsTouchDevice()) return FALSE;
@@ -7906,19 +6542,12 @@ static BOOL TouchFocusEvidence() {
     HWND evTop = GetAncestor(g_lastFocusEvHwnd, GA_ROOT);
     if (evTop && evTop == fgTop) return TRUE;
     // ⚠ 放宽一档：**同进程**也算。
-    //   Chromium 系有多个顶层窗口（主窗口 / 各种隐藏宿主），焦点事件有时报在
-    //   另一个顶层窗口上；只看"顶层窗口必须相同"会漏掉那种情况（平板用户的
-    //   诊断日志里自动呼出完全不工作，而焦点事件是触屏唯一可靠的证据来源之一）。
-    //   代价：同进程的无关焦点事件会放行一次 —— 真放行了也会有精判把它收回去。
     DWORD pidEv = 0, pidFg = 0;
     GetWindowThreadProcessId(g_lastFocusEvHwnd, &pidEv);
     GetWindowThreadProcessId(fg, &pidFg);
     return (pidEv != 0 && pidEv == pidFg);
 }
 
-// 用户**主动**把键盘叫出来（托盘单击/菜单、热键）时作废"精判收起"备忘。
-//   理由：那是明确的"我要键盘"信号，不该被上一轮的收起状态挡着；
-//   也让"某一轮判据出错把键盘锁住"有一个用户可自救的出口。
 static void ForgetVerdictHide() {
     g_verdictHide = FALSE;
     g_verdictHidFg = NULL;
@@ -7926,9 +6555,7 @@ static void ForgetVerdictHide() {
 }
 
 // ===== 导出诊断日志（托盘右键菜单）=====
-// 把常驻环形缓冲 + 一份环境快照写成文件，用户直接把这个文件发出来即可。
-// ⚠ 不需要带 -afdiag 启动、也不需要"重现前先做准备工作" —— 缓冲一直在跑，
-//   出问题时再导出，最近约 3 分钟的过程都在里面。
+// ⚠ 不需要带 -afdiag 启动、也不需要"重现前先做准备工作" —— 缓冲一直在跑
 static void DiagWrite(HANDLE h, const char* s) {
     DWORD wr = 0;
     WriteFile(h, s, (DWORD)strlen(s), &wr, NULL);
@@ -7936,7 +6563,6 @@ static void DiagWrite(HANDLE h, const char* s) {
 
 // ===== 导出内容之二：环境 + UIA 自检（换机 / 虚拟机排查用）=====
 // ⚠ 这一段是给"我拿不到现场"用的：把「钩子装没装上」「UIA 能不能用」
-//   「焦点元素到底是什么」「系统触摸键盘长什么样」一次性写进文件。
 static BOOL IsInputControl(HWND hw);      // 定义在后面（此处需要用）
 
 // 列一个触摸键盘候选窗口（classe 匹配 + 进程名 + 可见性 + DWM cloak + 矩形）
@@ -7980,7 +6606,7 @@ static void DiagAppendProbe(HANDLE h) {
     {
         HANDLE tok = NULL;
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
-            // TokenElevation = 20（Vista+）。本项目目标是 XP，不引它的枚举名/结构名，
+            // TokenElevation = 20（Vista+）。本项目目标是 XP，不引它的枚举名/结构名
             // 直接按 DWORD 读（TOKEN_ELEVATION 就一个 DWORD）。
             DWORD elev = 0, cb = 0;
             if (GetTokenInformation(tok, (TOKEN_INFORMATION_CLASS)20, &elev, sizeof(elev), &cb))
@@ -8105,9 +6731,7 @@ static void DiagAppendProbe(HANDLE h) {
     DiagWrite(h, "------------------------------------------------------------\r\n");
 }
 
-// 读注册表里的 Windows 版本（GetVersionEx 在没有清单时会撒谎，这里取真值）。
 // ⚠ 本项目目标是 XP（_WIN32_WINNT=0x0501），**不能用 `RegGetValueA`**（Vista+ 才声明）
-//   —— 用 RegOpenKeyExW + RegQueryValueExW，与文件里其它读注册表的地方一致。
 static void DiagOsVersion(char* out, int cch) {
     out[0] = 0;
     char product[96] = "?", dv[32] = "?", build[32] = "?", ubr[32] = "";
@@ -8174,7 +6798,7 @@ static void ExportDiagLog() {
         "pid            : %lu\r\n"
         "OS             : %s\r\n"
         "DPI scale      : %.3f\r\n"
-        // ⚠ 这三个 SM_* 常量在 _WIN32_WINNT=0x0501 下没有声明（Vista+ 才进 winuser.h），
+        // ⚠ 这三个 SM_* 常量在 _WIN32_WINNT=0x0501 下没有声明（Vista+ 才进 winuser.h）
         //   所以按数值写 —— 与 IsTouchDevice 里的 94/95 同一处理。
         "touch device   : %d (maxTouches=%d, digitizer=0x%X, tabletPC=%d)\r\n"
         "ini AutoPopup  : %d\r\n"
@@ -8205,9 +6829,7 @@ static void ExportDiagLog() {
     // 环境 + UIA 自检（换机 / 虚拟机排查用；见 DiagAppendProbe）
     DiagAppendProbe(h);
 
-    // 环形缓冲按时间顺序输出（每行一条）
     //   ⚠ 兜底补换行：即使某条被 _TRUNCATE 截掉了结尾的 '\n'，也要保证一行一条
-    //     —— 上一版没补，用户导出后整段 640 条**挤成一行**，根本没法看。
     int start = (g_ringCount < HKRING_N) ? 0 : g_ringHead;
     for (int i = 0; i < g_ringCount; i++) {
         const char* line = g_ring[(start + i) % HKRING_N];
@@ -8228,7 +6850,6 @@ static void ExportDiagLog() {
                  L"诊断日志已导出：\n%s\n\n请把该文件发送给开发者。", path);
     MessageBoxW(g_hWnd, msg, L"导出诊断日志", MB_OK | MB_ICONINFORMATION);
 }
-
 
 // ⚠ 取**上升沿**：TabTip 一旦出现会持续可见（电平），直接用会变成
 //   "清标记 → 弹出 → 精判又收起 → 还在可见 → 再清 → …" 的振荡。
@@ -8252,19 +6873,9 @@ static BOOL IsInputControl(HWND hw) {
         strstr(buf, "Search") || strstr(buf, "InputSite") || strstr(buf, "TXGuiFoundation"))
         return TRUE;
 
-    // Chromium/Electron（NTQQ / Chrome / Edge / WorkBuddy）：网页内容获得键盘
-    // 焦点时 Win32 焦点落在渲染宿主/组件窗口上，视为输入区域。
-    //
     // ⚠⚠ 2026-10-04 第十一轮：这里曾改成"由 a11y 精判说话"，**连续两次回归**
-    //   —— 一次「输入框反而不弹」、一次「切到窗口后本来能弹的也不弹」。
-    //   精判在 Chrome 上两头都不准：MSAA 认不出输入框（焦点在 GROUPING 容器），
-    //   UIA 又把 Document 元素（整张网页永远持有焦点）误当成可编辑。
-    //   **在没有可靠判据之前，粗判是唯一稳定的行为** ——
-    //   「点空白就收」是附加功能，自动呼出是主功能，冲突时保后者。
     if (strstr(buf, "Chrome_RenderWidgetHostHWND") || strstr(buf, "Chrome_WidgetWin")) {
         // ⚠ 这是**粗判**：只说明"前台是 Chromium 窗口"，不含"光标在输入框里"这层信息。
-        //   把"本次是粗判命中的"记下来 —— 只有这种命中才需要补一次 UIA 精判，
-        //   而且那个精判**只用来决定要不要收起**（见 UpdateAutoVisibility 的论证）。
         g_detectedByChromiumClass = TRUE;
         return TRUE;
     }
@@ -8289,7 +6900,7 @@ static HWND GetFocusedInputControl() {
     HWND fg = RealForegroundWindow();
     if (!fg || IsOwnForegroundWindow(fg)) return NULL;
 
-    // 系统外壳界面（桌面/任务栏/开始菜单/托盘弹窗等）直接跳过，
+    // 系统外壳界面（桌面/任务栏/开始菜单/托盘弹窗等）直接跳过
     // 避免每 50ms 轮询都发起跨进程 COM 调用（动画卡顿的主要来源）
     {
         char fgClass[128] = {0};
@@ -8312,19 +6923,9 @@ static HWND GetFocusedInputControl() {
     }
     if (haveGuiInfo) {
         // ⚠ 2026-10-04 第十一轮：Chrome / Electron 系的 a11y 精判**整体移除**。
-        //   第七~十轮试过两条精判路线，两次都造成回归：
-        //     · MSAA：焦点落在 GROUPING 容器元素上，下钻穿不到真正的输入框
-        //       （746 次采样里走到白名单的只有 3%）
-        //     · UIA：整张网页永远有一个 Document 元素持有键盘焦点，
-        //       把它当"可编辑"会把"点空白"也判成有焦点（56 次误判）
-        //   **类名粗判是目前唯一稳定的行为。**
-        //   「点空白就收」是附加功能，自动呼出是主功能 —— 冲突时保后者。
-        //   （下面的类名分支里仍保留诊断补查，只记录、不影响行为。）
         if (IsInputControl(focus)) {
             g_detectedInputToken = (ULONG_PTR)focus;
-            // 诊断（-afdiag）：类名快速路径补查一次 accessibility。
             // ⚠ 纯验证用，**不影响返回值**。仅在诊断模式 + 用户操作窗口内
-            //   （g_dbgExtraDue）+ 距上次补查 ≥300ms 时执行。
             if (g_dbgExtraDue && g_afLogPath[0]) {
                 DWORD nx = GetTickCount();
                 if (nx - g_dbgExtraLastTick >= 300) {
@@ -8349,17 +6950,6 @@ static HWND GetFocusedInputControl() {
     }
 
     // ⚠⚠⚠ 下面这一段是**必需**的兜底路径，不要因为"怕误判"就把它砍掉。
-    //
-    //   拿不到 GUI 线程信息时，focus 会退化成"整个前台窗口"，随后对它做
-    //   accessibility 探测 —— NTQQ / 浏览器 / UWP / Electron 的输入框**本来
-    //   就不在 gi.hwndFocus 里**（焦点落在渲染宿主/组件窗口上），只能靠探测
-    //   整个窗口才认得出。资源管理器的搜索栏也走这条。
-    //
-    //   ⚠ 2026-10-04 踩过：曾经在 `haveGuiInfo` 失败时直接 `return NULL`，
-    //     结果把这些应用的自动呼出**全砍了** —— 用户实测「NTQQ 有时可以有时
-    //     不行、浏览器 / UWP / Electron 无法正常呼出、资源管理器搜索栏也不行」。
-    //     已经回退过了，**别再改回 return NULL**。
-    //     误判问题改用「启动预热期」（AUTOSHOW_WARMUP_MS）解决，那条不影响这里。
     ULONG_PTR token = 0;
     if (IsAccessibleInputWindow(focus, &token) || (focus != fg && IsAccessibleInputWindow(fg, &token))) {
         g_detectedInputToken = token ? token : (ULONG_PTR)focus;
@@ -8374,23 +6964,17 @@ static void UpdateAutoVisibility() {
     g_dbgWhy = "?";
     g_dbgEvFoc = -1;    // -1 = 本拍没评估
     g_dbgEvTip = -1;
-    // 启动预热期内不评估（见 g_appStartTick 的说明）：此刻前台状态还没稳定，
+    // 启动预热期内不评估（见 g_appStartTick 的说明）：此刻前台状态还没稳定
     // 判断不可靠，容易在没输入框的地方误弹键盘并连带卡住状态。
     if (g_appStartTick && GetTickCount() - g_appStartTick < AUTOSHOW_WARMUP_MS) { g_dbgWhy = "warmup"; return; }
 
     // ⚠ 设置窗（或关闭提示窗）开着时**挂起自动显隐**：用户此刻在配置，不是在打字。
-    //   否则焦点一进一出就走一遍「弹出 → 精判说不在输入框 → 又收」，
-    //   在用户眼里就是设置页在乱跳（实机反馈：打开设置页 + 点编辑框再离开 → 乱跳）。
-    //   注意是**挂起**不是禁用：这是静止态，窗口关掉后下一个轮询周期照常评估，
-    //   所以不需要任何额外的"锁死"标记（那条路历史上翻过车，见 g_verdictHide 的说明）。
     if ((g_settingsHwnd && IsWindow(g_settingsHwnd) && IsWindowVisible(g_settingsHwnd)) ||
         (g_closePromptHwnd && IsWindow(g_closePromptHwnd) && IsWindowVisible(g_closePromptHwnd))) {
         g_dbgWhy = "settings-open";
         return;
     }
-    // 布局菜单开着时同样挂起：用户正在挑布局，不能让键盘自己滑走。
-    // ⚠ 但如果用户已经切到别的程序了，菜单留着就没意义 —— 收掉再走正常判定，
-    //   否则「开着菜单去用别的程序」会让键盘永久挂在屏幕上（短路把自动隐藏也一起跳过了）。
+    // ⚠ 但如果用户已经切到别的程序了，菜单留着就没意义 —— 收掉再走正常判定
     if (g_lmOpen) {
         if (g_lmOpenFg && RealForegroundWindow() != g_lmOpenFg) {
             g_lmOpen = FALSE;
@@ -8401,15 +6985,10 @@ static void UpdateAutoVisibility() {
             return;
         }
     }
-    // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
+    // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用
     // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
     if (g_mainMotion.active) {
         // ⚠⚠ 兜底：动画靠 WM_TIMER（15ms）推进，而 WM_TIMER 在消息队列里
-        //   优先级很低 —— 一旦 UI 线程被跨进程调用阻塞过久，定时器没能收尾，
-        //   `g_mainMotion.active` 就会一直是 TRUE，上面那道 return 于是让
-        //   **自动呼出永久失效**。这正是用户实测「有时候不会恢复」的路径。
-        //   这里按时间戳补一次收尾，保证无论定时器发生什么都能自愈。
-        //   余量给足（动画时长 + 1000ms），避免误判正常的慢帧。
         if (QpcNowMs() - g_mainMotion.started >
             (LONGLONG)g_mainMotion.duration + 1000) {
             HWND mh = g_mainMotion.hWnd;
@@ -8440,9 +7019,6 @@ static void UpdateAutoVisibility() {
     DWORD nowTick = GetTickCount();
 
     // ⚠⚠⚠ 全部判断都不再依赖 `input`（GetFocusedInputControl 的返回值
-    //   滞后于焦点转移，用它做"点击落点"比较会误判 —— 用户实测
-    //   「点了输入框反而被收掉 / 再点也不弹」就是这条）。
-    //   改用「点击落点所属顶层窗口 == 当前前台窗口」这个稳定得多的判据。
     HWND fgNow = RealForegroundWindow();   // 跳过系统触摸键盘（见 RealForegroundWindow）
     HWND fgTop = fgNow ? GetAncestor(fgNow, GA_ROOT) : NULL;
 
@@ -8461,13 +7037,7 @@ static void UpdateAutoVisibility() {
     BOOL clickInFg   = (recentClick && g_lastClickTopHwnd && fgTop &&
                         g_lastClickTopHwnd == fgTop);
 
-    // 用户主动操作（点在前台窗口内 / 敲键盘 / 触屏点过）-> 解除"切换窗口"的封锁。
-    //
-    // ⚠⚠ byUserInFg 是**触屏专用兜底**（见 TouchInputTick 的完整论证）：
-    //   触控在 Chromium 系上不会被提升成鼠标消息 ⇒ clickInFg 永远为假 ⇒
-    //   这道封锁永远解不开 ⇒ 自动呼出彻底失效（用户实测：只能从托盘手动打开、
-    //   平板触屏环境下自动呼出完全不工作）。
-    //   只对触屏设备启用，桌面机行为保持原样。
+    // ⚠⚠ byUserInFg 是**触屏专用兜底**（见 TouchInputTick 的完整论证）
     BOOL byUserInFg = TouchTappedRecently();
     if (byKey || clickInFg || byUserInFg) g_fgAwaitUserInput = FALSE;
 
@@ -8477,48 +7047,18 @@ static void UpdateAutoVisibility() {
     g_dbgExtraOk = -1;
     g_dbgExtraDue = (g_afLogPath[0] && (recentClick || byKey)) ? TRUE : FALSE;
     // ⚠ 这一句必须放在 `if (input)` 判定段**之前**：那段里有 `goto done`，而 done 在
-    //   函数末尾 —— 若在 goto 之后才声明带初始化的 `fg`，C++ 会判「跳过初始化」
-    //   （MSVC C2362）。声明提前到这儿就消除了这个坑。
     HWND fg = RealForegroundWindow();   // 别让系统触摸键盘被当成"别的程序"而误收键盘
     HWND input = GetFocusedInputControl();
 
-    // ★ Chromium 系精判（2026-10-10，第 34 轮重写）
-    //
-    //   粗判（IsInputControl 的类名分支）只能说明"前台是 Chromium 窗口"，
-    //   说明不了"光标在不在可编辑输入框里" —— 于是 Chromium 系一在前台就永远不收起。
-    //
     //   ⚠⚠ 前几版反复翻车的根因只有一条：**"该不该弹"和"该不该收"用了两个
-    //     不对称的判据**。粗判对 Chromium 恒为真，所以只要"收"由精判定、
-    //     "弹"由粗判定，两者必然互相打架 ⇒ 周期约 2 秒的自激振荡
-    //     （日志特征：`vis=0 ... => hasInput uiact=-1`，即那一拍没查）。
-    //
-    //   ⇒ 本轮把两个方向都用**同一个判据**回答，而且都要求**正面证据**：
-    //       已显示 → 问焦点（此刻可信，实测 233/233 连续 14 秒零跳变）；
-    //                明确"不在可编辑元素里"才收。
-    //       隐藏中 → 必须有"用户刚点了可编辑元素"的正面证据才允许弹；
-    //                没有证据就保持隐藏 —— **"保持隐藏"本身即稳定态**，
-    //                所以不需要任何额外的压制标记去兜（前几版的锁死都出自那里）。
-    //
-    //   护栏（都是为了不重蹈第十一轮"输入框不弹"的覆辙）：
-    //     ① **信任门**（g_chromiumTrustFg）：只有在这个窗口上**见过可编辑元素**
-    //        才采信它的"不在输入框"。contenteditable 型输入框报不出 Edit ——
-    //        实测 QQ NT 主窗口里 EditControl 只有搜索框一个，聊天输入框
-    //        （ProseMirror）报 GroupControl。没这道门那类应用会被判成
-    //        "永远不在输入框" ⇒ 自动呼出直接失效。
-    //        没见过 = 判据在这不可用 ⇒ 退回粗判（= 旧行为）。
-    //     ② **正在输入时不收**（typing）：实体键或刚按过屏幕键盘的键。
-    //     ③ 判据的缓存/保持期**按窗口分组**，并且校验焦点元素的归属窗口 ——
-    //        否则"上一个窗口"的结论会被当成"这个窗口"的（实测把 QQ 锁死的正是这条）。
     HWND inputForLog = input;       // 判定会把 input 置空（精判收起），日志要看判定前的值
-    // ⚠ g_vis 也要留判定前的值：日志现在打在函数出口（判定/动作之后），
+    // ⚠ g_vis 也要留判定前的值：日志现在打在函数出口（判定/动作之后）
     //   直接读 g_vis 会记成"动作之后"的值，跟 ShowKB 那行的语义就对不上了。
     BOOL visForLog = g_vis;
     int chromiumVerdict = -1;       // 焦点判据：1=可编辑 0=明确不是 -1=未知
     if (input && g_afChromiumPrecise && g_detectedByChromiumClass) {
         if (g_vis) {
             // ⚠ 只在**已显示**时用焦点判据：隐藏期间它给过无效值
-            //   （实测 -hide 启动的实例连续 129 拍恒为 ButtonControl，
-            //     而同刻同 API 在 Python 侧查到的是 EditControl）。
             BOOL typing = byKey || (g_lastOwnKeyTick && (nowTick - g_lastOwnKeyTick) <= 1200);
             if (!typing) chromiumVerdict = UiaFocusEditableHeld(fgNow);
         } else {
@@ -8539,24 +7079,7 @@ static void UpdateAutoVisibility() {
     if (g_verdictHide && g_verdictHidFg != fgNow) g_verdictHide = FALSE;
 
     if (input) {
-        // ★ Chromium 系精判驱动的自动收起：要再弹回来，必须**重新攒到正面证据**。
-        //
-        // ⚠ 不能用"点了窗口内任何地方"当证据 —— 那样点空白也会弹一下再收（闪一下），
-        //   而用户点空白本来就是要它收着。⇒ 用 UIA **落点查询**（ElementFromPoint）
-        //   问"这一下点在什么上面"：
-        //     点在可编辑元素上   → 用户要打字 → 放行，弹回来；
-        //     点在空白 / Document → 保持收起（**不发 ShowKB**，所以不会闪）；
-        //     查不出来(-1)        → 保守放行（判据失效时宁可多弹一次，
-        //                           也不能让用户点了输入框叫不出键盘）。
-        //   ⚠ 只有**信任门已开**（这个窗口见过可编辑元素）时才采信"不是输入框"；
-        //     否则落点判据在此不可用（contenteditable 应用）⇒ 保守放行。
-        //
-        // ⚠⚠ 第 33 轮的"连点 3 次判不出就放回来"是错的，已删：`pt==0` 是
-        //   **判出来了、就是空白**，不是判定失败。拿它当"失败"去放行，
-        //   结果正是用户看到的「离开输入框时乱跳一次」—— 日志特征：连着 3 拍
-        //   `hid=1 pt=0` 之后紧跟一个 ShowKB，然后再收。
-        //
-        // 其它放行路径：敲了实体键、换了前台窗口、系统触摸键盘刚出现（触屏）。
+        // ⚠ 不能用"点了窗口内任何地方"当证据 —— 那样点空白也会弹一下再收（闪一下）
         if (g_verdictHide) {
             if (g_verdictHidFg != fgNow || byKey) {
                 g_verdictHide = FALSE;      // 换了前台窗口 / 敲了实体键 → 重新攒证据
@@ -8570,11 +7093,7 @@ static void UpdateAutoVisibility() {
                 g_verdictHide = FALSE;      // 点在可编辑元素上 / 判据不可用 → 放行
                 g_dbgWhy = "vhid-click-ok";
             } else {
-                // 触屏（拿不到落点，所以这两条是触屏的替代证据）：
-                //   · 系统触摸键盘刚弹出来 = 用户刚点了文本输入框；
-                //   · 或者刚才那次焦点变化发生在当前前台窗口里（见 TouchFocusEvidence）。
-                // ⚠ SysTipJustAppeared 有副作用（更新上升沿），每拍**只能调一次** ——
-                //   所以不像原来那样写成 `A || B`（短路会让 B 有时不执行，日志也看不全）。
+                // ⚠ SysTipJustAppeared 有副作用（更新上升沿），每拍**只能调一次**
                 BOOL evTip = SysTipJustAppeared();
                 BOOL evFoc = evTip ? FALSE : TouchFocusEvidence();
                 BOOL evTap = (evTip || evFoc) ? FALSE : TouchTapEdgeConsume();
@@ -8584,9 +7103,7 @@ static void UpdateAutoVisibility() {
                     g_verdictHide = FALSE;
                     g_dbgWhy = evTap ? "vhid-tap-ok" : "vhid-touch-ok";
                 } else {
-                    // 没有新的用户动作 → 保持收起。
                     // ⚠ 这里**刻意不用 byUserInFg** —— 它是电平式的（一次触控后一直为真
-                    //   直到换前台），拿它当"用户刚动过"会立刻变成新的振荡。
                     g_dbgWhy = "vhid-hold";     // ← 触屏上"点了输入框也不弹"时最常停在这里
                     goto done;
                 }
@@ -8597,52 +7114,16 @@ static void UpdateAutoVisibility() {
         g_noInputSinceTick = 0;   // 输入焦点恢复，失焦计时清零（见失焦分支防抖说明）
         g_manualShow = FALSE;
 
-        // 防回弹：用户刚在这个输入框里手动收起过，别立刻弹回来。
-        // ⚠ token 对不上也先按住，直到超时才放行（原来无条件清标记，
-        //   只要有一次对不上防回弹就永久失效 —— 用户看到的"莫名其妙回弹"）。
-        // ⚠ 2026-10-04：**删掉"8 秒超时自动弹回"** —— 用户实测「手动收起后
-        //   过几秒键盘自己弹回来」，日志里三次收起后 3.7 / 7.1 / 8.0 秒全部
-        //   弹回，与 8 秒超时吻合。用户的心智模型是「收起后不自动出现，除非我
-        //   再点输入框 / 按键」。清除路径保留三条：
-        //     · 用户按键（byKey —— 明确要用键盘）
-        //     · token 变化（焦点换到别的输入控件 → 用户明显换了目标）
-        //     · 失焦分支的"真的失焦"（见那里的防抖说明）
-        // 防回弹：用户在这个输入框里手动收起过，别立刻弹回来。
-        //
-        // ⚠⚠⚠ 2026-10-04 第十二轮：**`clickInFg` 必须算作"用户想要键盘"**。
-        //   第十一轮删掉"8 秒超时自动弹回"时，清除条件只剩
-        //   `byKey`（按键）与"token 变化"，**漏了鼠标点击** ——
-        //   于是「手动收起 → 再点同一个输入框」被这条拦住，键盘再也不弹。
-        //
-        //   用户日志实测（Edge，18:53:42.3~46.6 连续 **4.2 秒**）：
-        //       vis=0 rc=1 cif=1 aw=0 hasInput
-        //       └ vis=0        键盘隐藏着
-        //         rc=1         刚点过
-        //         cif=1        点在当前前台窗口内（= 点了地址栏）
-        //         aw=0         没被"切窗口"封锁
-        //         hasInput     有输入焦点
-        //   **条件全部满足，却 4.2 秒不弹** —— 唯一能拦住的就是本段。
-        //
-        //   ⇒ 清除条件补上 `clickInFg`：
-        //       点输入框 / 敲键盘 / 换输入控件 / 真失焦 → 都算"用户改主意了"
+        // ⚠ token 对不上也先按住，直到超时才放行（原来无条件清标记
         if (g_userHidInInput) {
             BOOL sameInput = (g_hiddenInputToken && g_detectedInputToken == g_hiddenInputToken);
-            // cif=1 = 用户点了当前前台窗口内（对 QQ/Edge/浏览器，
+            // cif=1 = 用户点了当前前台窗口内（对 QQ/Edge/浏览器
             // 顶层窗口内点击就意味着点到了地址栏 / 输入框 / 页面）
             if (sameInput && !byKey && !clickInFg && !byUserInFg) { g_dbgWhy = "userHid"; goto done; }
             g_userHidInInput = FALSE;
         }
 
-        // 自动隐藏（2026-10-04 收窄，修"键盘自激振荡"）：
         //   ⚠ 原来接受"点击落点 != 前台窗口"作为"点到别处"的依据，但那个条件
-        //     在真实场景里误报率极高 —— 用户日志实测 click=0x411504 vs
-        //     fgTop=0xA163C 持续不一致（应用多窗口 / NOACTIVATE 窗口 / 激活
-        //     延迟都会造成），于是每一拍评估都触发"隐藏"、下一拍"自动呼出"
-        //     又满足条件 —— 形成周期恰好等于动画时长（220ms / 150ms）的
-        //     **自激振荡**（用户看到的"键盘乱闪"）。
-        //   ⇒ 只在落点**确实是系统外壳表面**（桌面 / 任务栏 / 托盘，由
-        //     IsShellSurfaceClass 识别）时才立即收起。这是唯一能**确定**用户
-        //     在"别处"的信号。应用内的"点空白收起"由失焦逻辑与后续判据修复承担。
         if (g_afAutoHide && g_vis && recentClick && g_lastClickTopHwnd) {
             char hitCls[128] = {0};
             GetClassNameA(g_lastClickTopHwnd, hitCls, 128);
@@ -8653,34 +7134,20 @@ static void UpdateAutoVisibility() {
             }
         }
 
-        // 仍处于"切换窗口后还没操作过"的状态 -> 不弹
-        // （网页自动聚焦搜索框、同窗口内 Tab 跳转不受影响：那些情况下
-        //   前台窗口没变过，g_fgAwaitUserInput 一直是 FALSE）
         if (g_fgAwaitUserInput) { g_dbgWhy = "await"; goto done; }
         if (!g_manualHide && !g_vis) { ShowKB(TRUE, FALSE); g_dbgWhy = "show"; goto done; }
         g_dbgWhy = g_vis ? "shown" : "manualHide";
         goto done;
     }
 
-
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) { g_dbgWhy = "own-window"; goto done; }
 
-    // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量），
-    //   只凭一次就拿去隐藏会让键盘闪烁 —— 用户看到的"莫名其妙回弹"。
-    //   连续 4 次（约 200ms，叠加下面的 hideDelay 已足够）都没焦点才继续。
+    // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量）
     g_noInputStreak++;
     if (g_noInputStreak < 4) { g_dbgWhy = "noInput-streak"; goto done; }
     if (g_noInputSinceTick == 0) g_noInputSinceTick = nowTick;
 
-    // ⚠⚠ 防抖（2026-10-04 用户日志实测，修的是「手动收起后过几秒键盘自己弹回来」）：
-    //   焦点探测会**爆发式**失败 —— 日志里出现过 80ms 内连续 6 条 noInput 的采样，
-    //   根因是 `GetForegroundWindow` 瞬时返回 NULL。只按"连续次数"判定时，
-    //   这种抖动会穿过上面那道门槛，把 g_userHidInInput（手动收起标记）清掉，
-    //   防回弹于是永久失效 —— 下一次轮到 input 有效就直接弹回来了。
-    //   ⇒ 改为按**失焦持续时间**判定：只有失焦真的持续了
-    //     AUTOSHOW_INPUT_GRACE_MS 以上，才认为焦点确实离开了。
-    //   ⚠ 这里**只保护这一句**：下面的隐藏流程保持原有节奏（80ms 级的爆发抖动
-    //     本来就穿不过 300ms 的 hideDelay），避免把隐藏时机整体拖慢。
+    // ⚠⚠ 防抖（2026-10-04 用户日志实测，修的是「手动收起后过几秒键盘自己弹回来」）
     if (nowTick - g_noInputSinceTick >= AUTOSHOW_INPUT_GRACE_MS)
         g_userHidInInput = FALSE;
     if (g_lastNonInput == 0) g_lastNonInput = GetTickCount();
@@ -8703,7 +7170,7 @@ static void UpdateAutoVisibility() {
 done:
     // 诊断（-afdiag / 日志导出）：记录这次评估的全部输入量
     {
-        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时查）：
+        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时查）
         // 结果既进日志，也供下面的 show 分支决定要不要放行 —— 一拍只查一次。
         g_dbgUiaPt = -1;
         g_dbgUiaPtCt = -1;
@@ -8711,14 +7178,6 @@ done:
             g_afChromiumPrecise && g_detectedByChromiumClass)
             g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
         char st[160];
-        // 顺序即重要性（见 AfLog 里的说明）：
-        //   why   ：本拍为什么这么判（分支名）——"自动呼出没弹"的直接答案
-        //   uiact ：焦点元素 ControlType（50004=Edit / 50030=Document / -1=没查）
-        //   pt/ptc：点击落点查询结果与落点元素 ControlType（-1=没查/查不出）
-        //   inFg  ：触屏"刚点过一下"（TouchTappedRecently）
-        //   tip/foc：触屏的两个证据源（系统触摸键盘刚出现 / 前台窗口里有焦点事件）
-        //   mh/uhi：manualHide / userHidInInput（"手动收起"的两道封锁）
-        //   ns    ：连续无输入焦点的拍数（要 >=4 才开始算失焦）
         _snprintf_s(st, sizeof(st), _TRUNCATE,
                     "why=%s uiact=%d pt=%d ptc=%d inFg=%d tip=%d foc=%d mh=%d uhi=%d ns=%d hid=%d",
                     g_dbgWhy, g_dbgUiaCt, g_dbgUiaPt, g_dbgUiaPtCt, (int)byUserInFg,
@@ -8751,9 +7210,6 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LO
 }
 
 // ===== 全局鼠标监控（WH_MOUSE_LL） =====
-// 只做一件事：记录"用户刚在哪里点过鼠标"，供自动呼出判断某次焦点变化是不是
-// 用户主动点出来的。**不改变任何鼠标行为**，永远 CallNextHookEx 放行。
-// 只记左键 —— 右键/中键不用于聚焦输入框。
 static LRESULT CALLBACK PhysMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         const MSLLHOOKSTRUCT* m = (const MSLLHOOKSTRUCT*)lParam;
@@ -8763,7 +7219,7 @@ static LRESULT CALLBACK PhysMouseHookProc(int nCode, WPARAM wParam, LPARAM lPara
             // 当场记下落点的顶层窗口（供 UpdateAutoVisibility 判断"点的是不是当前前台窗口"）
             HWND h = WindowFromPoint(m->pt);
             g_lastClickTopHwnd = h ? GetAncestor(h, GA_ROOT) : NULL;
-            // 点击之后焦点必然变了 ⇒ 作废 UIA 判定缓存，
+            // 点击之后焦点必然变了 ⇒ 作废 UIA 判定缓存
             // 否则点进输入框后的前 250ms 还在用"点在空白"时的旧结论去收起（会闪）。
             InvalidateUiaCache();
         }
@@ -8772,8 +7228,6 @@ static LRESULT CALLBACK PhysMouseHookProc(int nCode, WPARAM wParam, LPARAM lPara
 }
 
 // ===== 实体键盘状态监控（WH_KEYBOARD_LL） =====
-// 同步显示：实体 Win/Shift/Caps 键做到哪一步，程序显示就对应哪一步；
-// Fn 预留接口（多数键盘 Fn 不产生按键事件，后续按需扩展 g_physFn）。
 static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         const KBDLLHOOKSTRUCT* p = (const KBDLLHOOKSTRUCT*)lParam;
@@ -8787,11 +7241,7 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
             if (down || up) {
                 BOOL changed = FALSE;
                 switch (p->vkCode) {
-                // 左右 Shift **分开**记录（见 g_physLShift 的说明）。
                 // ⚠ 实体 Shift 按下时顺手解除屏幕键盘上的 Shift 锁定（g_sh / g_shiftLock /
-                //   g_shiftOnce）：那个锁定会让高亮一直被钉住，实体键松开也灭不掉 ——
-                //   用户报的「按物理 Shift 后高亮无法隐藏」就是它。
-                //   按下实体键 = 用户明确要用实体键，此时让实体状态接管高亮。
                 case VK_LSHIFT: case VK_RSHIFT: {
                     BOOL& side = (p->vkCode == VK_LSHIFT) ? g_physLShift : g_physRShift;
                     if (side != down) { side = down; changed = TRUE; }
@@ -8812,7 +7262,7 @@ static LRESULT CALLBACK PhysKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
                 case VK_CAPITAL:
                     if (down) { g_cp = !g_cp; changed = TRUE; }
                     break;
-                // NumLock 与 Caps 同为锁存键：keydown 时系统还没翻状态（钩子在系统处理之前），
+                // NumLock 与 Caps 同为锁存键：keydown 时系统还没翻状态（钩子在系统处理之前）
                 // 所以先按「取反」记一笔，真实值由 WM_TIMER 的 GetAsyncKeyState 自校正兜住。
                 case VK_NUMLOCK:
                     if (down) { g_physNum = !g_physNum; changed = TRUE; }
@@ -8864,10 +7314,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
     if (ki < 0) return;
     g_pk = ki;
     g_pkFlash = -1;                 // 真的按下了，撤掉上一次松手留下的闪光
-    // ⚠⚠ 「按下去」这一帧必须**在 DoKeyAction 之前**上屏：
-    //   DoKeyAction 开头会 WaitForLeftButtonUp() 泵消息等到用户松手（最多 250ms），
-    //   等它返回时 WM_LBUTTONUP 早已派发过、g_pk 已被 OnLUp 清掉
-    //   ⇒ 不先画这一帧，用户永远看不到任何按下反馈（“按了没反应”）。
+    // ⚠⚠ 「按下去」这一帧必须**在 DoKeyAction 之前**上屏
 #ifdef HK_DIAG
     if (!g_noClickRepaint) {
 #endif
@@ -8876,7 +7323,7 @@ static void OnLDown(HWND hWnd, int x, int y) {
 #ifdef HK_DIAG
     }
 #endif
-    // ⚠ 正式版里这两句恒为真（`#ifdef` 整块不编译），保持原行为不变；
+    // ⚠ 正式版里这两句恒为真（`#ifdef` 整块不编译），保持原行为不变
     //   诊断版可以用 -noscapture / -norepaint 临时跳过它们做二分。
 #ifdef HK_DIAG
     if (!g_noSetCapture)
@@ -8920,9 +7367,6 @@ static void OnMMove(HWND hWnd, int x, int y) {
         InvalidateRect(hWnd, 0, TRUE);
     }
     // ⚠ 布局菜单开着时：只在菜单内做悬停，**不点亮底下的键**。
-    //   否则指针扫过菜单会连带点亮菜单底下那一格（菜单是半透明观感的浮层，
-    //   两处同时高亮看着像画错）。g_lmHover 以前只在关闭时被清、从来没被更新过 ——
-    //   所以「悬停菜单项」这条反馈一直是失效的。
     int nk = g_lmOpen ? -1 : HitKey(x, y);
     int li = g_lmOpen ? LayoutMenuHitIndex(x, y) : -1;
     if (nk != g_hk || li != g_lmHover) {
@@ -8984,12 +7428,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO mmi = (LPMINMAXINFO)l;
-        // 下限按「1u 键不低于触摸安全线、标签不被挤到截断」反解（三种布局各一套）：
-        //   全尺寸  870 × 300 —— 键帽 44px 的触摸安全线，数字区收起后的宽度
-        //   默认    480 × 240 —— 13 键一行、每键 ≥30 DIP；5 行 + 页头 ≈ 240
-        //   小键盘  330 × 260 —— 4 列数字键
-        // 上限不设：交给系统（= 屏幕工作区）。硬编码上限在竖屏 / 多屏下会变成「能拖但拖不出去」。
-        // 注意「退格标签放不下」不是靠这里兜的 —— 标签判据本身就是实测文字宽（见 KeyText）。
         double dpiScale = GetSystemDpiScale();
         int minW, minH;
         if (g_layoutMode == 2)      { minW = 870; minH = 300; }
@@ -9031,18 +7469,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(hWnd, &ps);
         RECT rc = {0, 0, g_ww, g_wh};
         // ⚠⚠ 2026-10-04 第 24 轮（卡顿）：确保缓存**在 Blit 之前**就绪。
-        //   注意 EnsureKbFrameCache 内部会按签名决定「复用 or 重画整张缓存」。
-        //   本函数只负责把缓存里对应的那块贴上去，贴的范围收窄见下。
         EnsureKbFrameCache(hWnd);
         BOOL useKbCache = g_kbCacheBmp && g_kbCacheDc && g_kbCacheBits &&
                           g_kbCacheW == g_ww && g_kbCacheH == g_wh;
         // ⚠ 只贴**脏区**（ps.rcPaint），不再无条件 BitBlt 整个窗口。
-        //   这就是本轮"只失效几个键帽"能真正省下开销的关键一步 ——
-        //   否则前面 InvalidateKeyByVk 收窄了失效范围，这里又整窗贴回去，
-        //   等于白改（Blit 本身不贵，但**整窗 Blit 会顺带把
-        //   DWM 合成 / 重绘区域放大回整窗**，把收益吃光）。
-        //   rcPaint 是本次绘制需要覆盖的矩形，全窗失效时它就等于整窗，
-        //   所以这条改动对原有全窗刷新路径**语义完全等价**。
         RECT dirty = ps.rcPaint;
         if (dirty.right <= dirty.left || dirty.bottom <= dirty.top) dirty = rc;
         int dx = dirty.left, dy = dirty.top;
@@ -9107,7 +7537,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         UpdateAutoVisibility();
         return 0;
     case WM_SHOW_KEYBOARD:
-        // 诊断：这个分支来自单实例消息转发 —— 每次有第二个 HKeyboard 启动，
+        // 诊断：这个分支来自单实例消息转发 —— 每次有第二个 HKeyboard 启动
         // 就会往已有实例发这条消息（w = 新实例是否要求隐藏）。
         g_dbgShowFrom = "WM_SHOW_KEYBOARD";
         if (w) {
@@ -9118,7 +7548,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_SETTINGCHANGE: {
-        // 跟随系统主题自动切换（themeMode==0 或开启壁纸强调色时生效）；
+        // 跟随系统主题自动切换（themeMode==0 或开启壁纸强调色时生效）
         // 壁纸更换时也立即刷新强调色（SPI_SETDESKWALLPAPER）
         if (g_themeMode == 0 || g_wallpaperAccent) {
             if (w == SPI_SETDESKWALLPAPER) {
@@ -9160,7 +7590,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             SetTimer(hWnd, TIMER_REPEAT, 40, NULL);
             if (g_pk >= 0 && g_pk == g_repeatKeyIdx) {
                 const KeyDef* k = &g_keys[g_pk];
-                // ⚠ 标记为"连发中"，让 WaitForLeftButtonUp 直接返回 ——
+                // ⚠ 标记为"连发中"，让 WaitForLeftButtonUp 直接返回
                 //   连发时用户一直按着鼠标，等下去每次都要耗满 250ms 超时。
                 g_inRepeat = TRUE;
                 DoKeyAction(k);
@@ -9179,18 +7609,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 g_pkFlash = -1;
                 InvalidateRect(hWnd, NULL, FALSE);
             }
-            // 键盘已被收起（最小化 / 托盘 / 自动隐藏）时，菜单不该留着 —— 否则下次
-            // 显示出来会看到它挂在标题栏下面，还得再点一次才收。这里只在隐藏态清，
-            // 不重绘（不可见）。
             if (g_lmOpen && !g_vis) { g_lmOpen = FALSE; g_lmHover = -1; }
-            // Win 锁定/高亮状态与开始菜单状态同步：
+            // Win 锁定/高亮状态与开始菜单状态同步
             // 开始菜单（无论由本键盘还是任务栏打开）一旦显示，即清除 Win 锁定，避免高亮残留。
             if (g_winKey && IsStartMenuOpen()) {
                 ClearWinLock();
                 InvalidateRect(hWnd, 0, TRUE);
             }
 
-            // Win 状态超时自动复位：锁定/开始菜单已开未操作 8 秒即回到空闲，
+            // Win 状态超时自动复位：锁定/开始菜单已开未操作 8 秒即回到空闲
             // 防止一直高亮，以及残留状态导致“第一次点击就弹开始菜单”。
             if (g_winCount != 0 && (GetTickCount() - g_lastWinTick) > 8000) {
                 ClearWinLock();
@@ -9206,43 +7633,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 BOOL pWin   = ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0) ||
                               ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
                 // ⚠⚠ 2026-10-04 第 23 轮：NumLock 改成**每个 tick 都读回真值**。
-                //
-                //   以前写的是「只在启动后跟随实体灯一次，之后只由用户点 Num 键控制」
-                //   —— 那个设计的出发点是「怕两处输入源互相干扰」。但它有个致命后果：
-                //   **一旦哪一次没对上，就再也回不来了**，高亮会一直错到下次点击。
-                //   用户实测的「点一次之后高亮就不对了、开关很多遍也好不了」
-                //   正是这个「错一次就锁死」的机制放大出来的。
-                //
-                //   ⇒ 现在每 tick 无条件读回真实锁定态（ReadSystemNumLock），
-                //     物理按键、屏幕键盘点击、甚至别的程序切 NumLock，
-                //     下一 tick（几十毫秒内）高亮自动纠正 —— **可以自愈**。
-                //     这才是「高亮 = 真实状态」这一条恒等式最直接的写法。
-                // ⚠⚠ 2026-10-04 第 24 轮（卡顿）：
-                //   这里原先对**整个窗口** `InvalidateRect(hWnd, 0, TRUE)`
-                //   （erase=TRUE ⇒ 先擦背景再重画）。NumLock 每按一次至少走
-                //   一次这条路径，且 sh/win/caps 任一变化也会走 ⇒ 每 50ms
-                //   都有机会触发一次全窗重绘 + 背景擦除。
-                //   在全尺寸布局下窗口 1280×404、几十个键帽，
-                //   全局重绘 30~50ms 量级 ⇒ 用户可感的"卡卡的"。
-                //
-                //   ⇒ 两处收窄（本轮只改**代价**，不改**语义**：
-                //     谁该亮、谁该灭，与上一轮完全一致）：
-                //     ① erase 由 TRUE 改 FALSE —— 本窗口 WM_ERASEBKGND
-                //        本来就 `return 1`（不擦），传 TRUE 只是让系统多发一次
-                //        擦除通知，纯浪费。
-                //     ② 不再全窗失效，而是只失效**受影响的那几格**：
-                //        NumLock 态变化 → 数字区 Num 键；
-                //        修饰键态变化 → 对应键帽。
-                //        实现上统一走一个「按键状态找矩形」的小工具
-                //        （InvalidateKeyByVk）。
-                //
-                //   ⚠ 两个 g_* 名字要分清（上一版这里有个隐蔽的耦合 bug）：
-                //       g_npLock  —— NumLock 高亮的**唯一**依据（是否显示锁定）
-                //       g_physNum —— 物理态快照，只用于「有没有变」的判定
-                //     上一版在第一个 if 里顺手写了 `g_physNum = pNum`，
-                //     于是下面 `dNum = (g_physNum != pNum)` **恒为假** ——
-                //     靠第一个 if 已经失效过那格才没出问题。这里解耦：
-                //     g_physNum 只在下面统一更新，谁变谁失效，判据自洽。
                 BOOL pNum   = ReadSystemNumLock();
                 BOOL pCaps  = (GetKeyState(VK_CAPITAL) & 1) != 0;
                 BOOL dLock  = (g_npLock != pNum);        // 高亮依据变了
@@ -9286,10 +7676,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_TRAY:
-        // ⚠ 托盘图标的一次**双击**会送来三条消息：UP / DBLCLK / UP ——
-        //   原来这三条都调 ToggleKB()，等于"显示→隐藏→显示"切三次：
-        //   净结果看着对纯属**奇偶侥幸**，中间还闪两下；一旦外壳只送两条（UP / DBLCLK），
-        //   就变成"点了托盘没反应"。⇒ 加 400ms 去抖：一次用户动作只切换一次。
+        // ⚠ 托盘图标的一次**双击**会送来三条消息：UP / DBLCLK / UP
         if (l == WM_LBUTTONUP || l == WM_LBUTTONDBLCLK) {
             DWORD tn = GetTickCount();
             if (tn - g_lastTrayToggleTick >= 400) {
@@ -9343,44 +7730,7 @@ static BOOL HasArg(const char* cmd, const char* arg) {
 
 #ifdef HK_DIAG
 // ========== 注入方式对照实验（-sendtest）==========
-//
-// ⚠⚠⚠ 为什么需要这个入口（2026-10 加）：
-//
-//   issue #3（Win10 + 微软拼音打不出中文）排查了多轮都没解决，
-//   根本困难在于**无法区分下面三种可能**：
-//
-//     (a) 注入方式本身与微软拼音不兼容
-//     (b) HKeyboard 的其它部分（键盘钩子 / 定时器 / 焦点轮询）
-//         干扰了输入
-//     (c) 只是节奏或某个参数不对
-//
-//   用户每轮只能"实机试一次"，一轮几十分钟，而且结果无法归因 ——
-//   改了三次都没效果，就是因为一直分不清是哪个原因。
-//
-//   这个入口把变量降到**最低**：不装钩子、不建窗口、不建互斥体、
-//   不轮询焦点、不读剪贴板 —— 只有裸的注入调用。
-//   然后用 4 种方式各打一次 nihao，看哪一种能让微软拼音组字上屏。
-//
-//   一次实验就能定方向：
-//     · 某一种成功  ⇒ 照那种方式改 SendKey，问题解决
-//     · 四种全失败  ⇒ SendInput 这条路走不通，得换注入途径
-//                      （低级键盘钩子 / TSF API / 剪贴板粘贴）
-//     · 四种全成功  ⇒ 注入没问题，是 HKeyboard 的其它部分在干扰，
-//                      回头查钩子与定时器
-//
-// 用法：
-//   1. 打开记事本，把光标点进**空白**编辑区
-//   2. 确认输入法是微软拼音**中文态**
-//   3. 运行  HKeyboard_x64.exe -sendtest
-//   4. 3 秒内切回记事本（程序会等这 3 秒）
-//   5. 看记事本里出现了什么
-//
-// 结果判读（记事本里从上到下依次是 4 种方式的结果，用空行分开）：
-//   "你好"   = 该方式**有效**
-//   "nihao"  = 该方式下 IME 没组字
-//   该段空白 = 按键根本没送达
-//
-// 同目录会生成 sendtest_readme.txt（含构建戳与判读说明）。
+// ⚠⚠⚠ 为什么需要这个入口（2026-10 加）
 static void SendTestKey(BYTE vk, int method) {
     UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 
@@ -9467,28 +7817,8 @@ static void RunSendTest() {
     }
 }
 
-// ---- -envtest：在 HKeyboard 的**完整环境**里只做纯注入 ----
-//
-// 背景：`-sendtest` 已证明，在**什么都不装**的裸进程里，四种纯注入
-// 方式**全部成功**（记事本四段都是「你好」）。⇒ 注入代码本身没问题，
-// 问题出在 HKeyboard 的**运行环境**或**调用方式**上。
-//
-// 这个入口把问题一分为二：让 HKeyboard **正常启动** —— 窗口、低层键盘
-// 钩子、两个 WinEvent 钩子、焦点定时器、托盘图标全都装好，和平时一模一样 ——
-// 但**只用纯注入**打字，既不经过 SendKey，也不需要用户点击按键。
-//
-//   · 若记事本里出现「你好」 ⇒ 环境无辜，问题在 SendKey 的代码路径，
-//                              或者「用户点击按键」这个动作本身
-//   · 若出现 nihao          ⇒ 环境里有东西在干扰注入，
-//                              再逐个摘掉（钩子 / 窗口 / 定时器）即可定位
-//
+// ---- -envtest：在 HKeyboard 的**完整环境**里只做纯注入 -
 // ⚠ 用定时器触发，**不在 WinMain 里 Sleep**。真实按键也是"短暂阻塞 UI 线程
-//   后立即返回"，用定时器才与它等价；直接 Sleep 会把消息循环堵很久，
-//   那是另一种（不真实的）状态，测出来的东西不可信。
-// 下面 EnvTestInject 用到的三个辅助函数定义在其后，先声明。
-// （顺序上它们必须排在 EnvTestInject 之后 —— 因为要用到 HitKey /
-//   g_keys 等前面定义的东西，而把 EnvTestInject 挪到最后又要动
-//   WinMain 附近的结构，声明在前最省事。）
 static void SendNihao();
 static BOOL FindKeyPos(BYTE vk, int* outX, int* outY);
 static void ClickOwnKey(BYTE vk);
@@ -9515,22 +7845,13 @@ static void EnvTestInject() {
             fwprintf(f, L"  第 2 段是 nihao     = **点击路径就是元凶**，定位完成\n");
             fwprintf(f, L"  第 2 段是 n + 你好  = 点击的那个 n 没进 IME，之后才正常\n\n");
 
-            // ---- 键表诊断（关键！）----
-            //
-            // ⚠ 上一轮"点 N 键"那版，用户反馈两段都是「你好」——
-            //   但第 2 段里**看不到那个本该多出来的 n**。
-            //   若真如此，说明 ClickOwnKey 根本没点下去，而它的前提是
-            //   FindKeyPos 能找到 N 键的坐标；FindKeyPos 又依赖 HitKey。
-            //   ⇒ 把键表的真实数据打出来：只要 k->x/y 是"格"单位（1.x、2.x）
-            //     而不是客户区像素，HitKey 就永远匹配不上，
-            //     **HKeyboard 的鼠标点击会整体失效** —— 那才是根因。
+            // ---- 键表诊断（关键！）-
+            // ⚠ 上一轮"点 N 键"那版，用户反馈两段都是「你好」
             fwprintf(f, L"---- 键表诊断（排查用）----\n");
             fwprintf(f, L"g_nk=%d  g_ww=%d  g_wh=%d  g_keyAreaX=%d\n",
                      g_nk, g_ww, g_wh, g_keyAreaX);
             for (int i = 0; i < g_nk && i < 6; i++) {
                 // ⚠ KeyDef.x/y/w/h 是 **int**（见其定义），这里必须用 %d。
-                //   写成 %.2f 会让 varargs 把一个 int 当 double 读，
-                //   结果是垃圾值甚至崩溃 —— 排查工具自己先崩就没意义了。
                 fwprintf(f, L"  keys[%d] vk=0x%02X  x=%d y=%d w=%d h=%d type=%d\n",
                          i, g_keys[i].vk, g_keys[i].x, g_keys[i].y,
                          g_keys[i].w, g_keys[i].h, (int)g_keys[i].type);
@@ -9546,11 +7867,8 @@ static void EnvTestInject() {
         }
     }
 
-    // ---- 阶段 1：纯注入（基线）----
-    //
-    // ⚠ 这里的 DiagSnap 是关键对照：它记录的是**定时器触发注入**时的系统状态，
-    //   与用户**手动点击按键**时（DoKeyAction 里那次 DiagSnap）形成对照。
-    //   两边只有一处可能不同 —— LBTN（鼠标左键是否按下）—— 那就是元凶所在。
+    // ---- 阶段 1：纯注入（基线）-
+    // ⚠ 这里的 DiagSnap 是关键对照：它记录的是**定时器触发注入**时的系统状态
     DiagSnap(L"[env-bef]");
     SendNihao();
     DiagSnap(L"[env-aft]");
@@ -9558,17 +7876,8 @@ static void EnvTestInject() {
     SendTestKey(VK_RETURN, 1);
     Sleep(700);
 
-    // ---- 阶段 2：**完全用真实点击**打一遍 nihao + 空格 ----
-    //
-    // ⚠⚠ 上一版这里只点了一个 N 键，然后接纯注入 —— **那个设计有歧义**：
-    //   点 N 若成功进入组字（拼音串 "n"），后续注入的 "nihao" 会追加成
-    //   "nnihao"，上屏结果不可预期；点 N 若失败（打出英文 n），后面的
-    //   纯注入照样能独立组出「你好」。两种情况都会看到「你好」，
-    //   却指向完全相反的结论 —— 等于白测。
-    //
-    //   ⇒ 改成**全程真实点击**：五个字母 + 空格全部由鼠标点击产生。
-    //     这就和用户手打一模一样，结果无歧义：
-    //       出「你好」⇒ 点击路径正常；出 nihao ⇒ 点击路径就是元凶。
+    // ---- 阶段 2：**完全用真实点击**打一遍 nihao + 空格 -
+    // ⚠⚠ 上一版这里只点了一个 N 键，然后接纯注入 —— **那个设计有歧义**
     {
         static const BYTE kL[5] = { 'N', 'I', 'H', 'A', 'O' };
         for (int i = 0; i < 5; i++) {
@@ -9591,11 +7900,7 @@ static void SendNihao() {
     SendTestKey(VK_SPACE, 1);       // 上屏
 }
 
-// 反查某个 vk 对应的按键在**窗口坐标**里的位置。
-//
 // ⚠ 刻意不自己算"格单位 → dpiScale → scaleX"那套换算：那一串乘除
-//   容易写错，而且各布局（默认/小键盘/网页层）还不一样。
-//   直接拿现成的 HitKey 反查，得到的坐标一定和点击处理用的是同一套。
 static BOOL FindKeyPos(BYTE vk, int* outX, int* outY) {
     for (int y = 0; y < g_wh; y += 2) {
         for (int x = 0; x < g_ww; x += 2) {
@@ -9641,9 +7946,6 @@ static void ClickOwnKey(BYTE vk) {
 }
 #endif  // HK_DIAG —— 以上全部诊断代码在正式版里不参与编译
 
-// 高精度计时器分辨率（动态加载 winmm，避免新增链接依赖）
-// SetTimer 默认受 ~15.6ms 系统计时粒度限制，动画会一顿一顿；
-// 进程级调到 1ms 让窗口滑动定时器按请求间隔触发。
 struct TimePeriodApi {
     HMODULE module;
     ULONG (WINAPI *begin)(UINT);
@@ -9707,21 +8009,15 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
 
 #ifdef HK_DIAG
-    // ---- 以下全是排查参数，正式版不编译（见文件顶部"诊断开关"说明）----
+    // ---- 以下全是排查参数，正式版不编译（见文件顶部"诊断开关"说明）-
 
-    // -sendtest：注入方式对照实验（说明见 RunSendTest 上方的大段注释）。
-    // ⚠⚠ 必须在 `CreateMutexW` **之前**返回。否则若托盘里已有实例在跑，
-    //   就会被单实例逻辑转发消息后静默退出，实验根本跑不起来 ——
-    //   而用户看到的现象会是"运行了但没反应"，又是一次无谓的往返。
+    // ⚠⚠ 必须在 `CreateMutexW` **之前**返回。否则若托盘里已有实例在跑
     if (HasArg(cmd, "-sendtest")) {
         RunSendTest();
         return 0;
     }
 
-    // -envtest：在**完整环境**里只做纯注入（说明见 EnvTestInject）。
-    // 与 -sendtest 的区别：那个什么都不装，这个全装（窗口/钩子/定时器）。
-    // ⚠ 不能在这里 return —— 要让它正常启动到消息循环，
-    //   再由 TIMER_ENVTEST 驱动注入，这样环境才是"真在跑的 HKeyboard"。
+    // ⚠ 不能在这里 return —— 要让它正常启动到消息循环
     g_envTest = HasArg(cmd, "-envtest") ? TRUE : FALSE;
 
     // 排查开关：二分「点击按键」时哪个动作破坏了 IME 组字（见其定义处说明）
@@ -9731,14 +8027,12 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     g_diag            = HasArg(cmd, "-diag")       ? TRUE : FALSE;
     // -fontdiag：键面字号诊断表（见 FontDiagDump）。字体建好后自动 dump 一次。
     g_fontDiag        = HasArg(cmd, "-fontdiag")   ? TRUE : FALSE;
-    // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组，
+    // -envtest 一律开启记录：它的两次注入就是"手动点击"的对照组
     // 少了这个没法比较（见 DiagSnap 的说明）。
     if (g_envTest) g_diag = TRUE;
 #endif  // HK_DIAG
 
     // ⚠ -afdiag 必须放在 #endif **外面** —— 它要能在正式版里工作。
-    //   自动呼出诊断日志（临时，定位完删）
-    // -dginj：让钩子接受注入事件（**仅供自测**，见 g_dbgAcceptInjected 的说明）
     g_dbgAcceptInjected = HasArg(cmd, "-dginj") ? TRUE : FALSE;
     if (HasArg(cmd, "-afdiag")) {
         wchar_t lp[MAX_PATH] = {0};
@@ -9767,7 +8061,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
 
     g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
     if (g_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        // 诊断：上次 afdiag.txt 只有 BOM、一行都没有，最可能就是走的这条路 ——
+        // 诊断：上次 afdiag.txt 只有 BOM、一行都没有，最可能就是走的这条路
         // 旧实例还在跑，新进程转发消息后静默退出，日志自然空白。
         AfNote("!!! ANOTHER INSTANCE ALREADY RUNNING -> exit now");
         CloseHandle(g_mutex);
@@ -9830,9 +8124,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     }
 
 #ifdef HK_DIAG
-    // -envtest：3 秒后开始注入（给用户切回记事本、放进光标的时间）。
-    // 此刻窗口、低层键盘钩子、两个 WinEvent 钩子、焦点定时器、托盘
-    // 全都已装好 —— 与真实使用状态完全一致，只差"用户点击按键"那一下。
     if (g_envTest) {
         SetTimer(hWnd, TIMER_ENVTEST, 3000, NULL);
     }

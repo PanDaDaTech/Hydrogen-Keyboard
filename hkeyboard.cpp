@@ -3109,6 +3109,8 @@ static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
 
 // ===== 布局菜单（A1：窗口内弹层，见 HKeyboard-UI方案评估 §三）=====
 // ⚠ 三件事必须一起做，少一件就是 bug
+// 前台短暂变成任务栏/桌面时，先记下时刻；停留不到 500ms 就当没发生（见 UpdateAutoVisibility）
+static DWORD g_shellFgSince = 0;
 static BOOL g_lmOpen = FALSE;
 static int  g_lmHover = -1;
 // 打开菜单时所在的前台窗口。换到别的程序后菜单就不该留着（见 UpdateAutoVisibility 的短路）。
@@ -7071,6 +7073,24 @@ static void UpdateAutoVisibility() {
     // ⚠⚠⚠ 全部判断都不再依赖 `input`（GetFocusedInputControl 的返回值
     HWND fgNow = RealForegroundWindow();   // 跳过系统触摸键盘（见 RealForegroundWindow）
     HWND fgTop = fgNow ? GetAncestor(fgNow, GA_ROOT) : NULL;
+
+    // ⚠ 点任务栏图标切换应用时，前台会**短暂**变成 Shell_TrayWnd / XamlExplorerHostIslandWindow。
+    //   以前这被当成"没有输入焦点"⇒ 先收起；切到目标程序又满足"换前台"证据 ⇒ 再弹出，
+    //   实机就是「切一次窗口，键盘跳一下」。停留不足 500ms 一律当没发生；
+    //   真点桌面/任务栏不动 500ms 仍会收起，原行为保留。
+    {
+        char fcls[128] = {0};
+        if (fgNow) GetClassNameA(fgNow, fcls, 128);
+        if (fgNow && IsShellSurfaceClass(fcls)) {
+            DWORD nw = GetTickCount();
+            if (!g_shellFgSince) g_shellFgSince = nw ? nw : 1;
+            // ⚠ 这里用 return 而不是 goto done：done 在函数末尾，向前跳会跨过后面那些
+            //    带初始化的局部量（MSVC C2362）。跳过这一拍日志可以接受。
+            if (nw - g_shellFgSince < 500) { g_dbgWhy = "shell-transient"; return; }
+        } else {
+            g_shellFgSince = 0;
+        }
+    }
 
     // 前台窗口变了 -> 进入"等待用户操作"状态
     if (fgNow != g_lastFg) {

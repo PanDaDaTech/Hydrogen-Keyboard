@@ -325,7 +325,9 @@ static DWORD HueAccentBgr(int hue) {
 // 由色相派生全部令牌。轮廓与分隔线一律预混成实色：
 // GDI+ 往 32bpp BI_RGB DIB 里画半透明形状时 alpha 语义不可靠，实色还能让 XP 与 Win11 字节级一致。
 // 界面风格（方案 §4.1 B1）：与明暗 / 色相正交的第二维。
-// 0=现代（默认，带色相）1=经典（中性灰，忽略色相，只做浅色）
+// 0=现代（默认，色相贯穿面板与按键）1=经典（灰色键面 + **高亮仍用色相**，只做浅色）
+// ⚠ 「经典」不等于「去掉颜色」：v1.1 就是灰键面 + 强调色实底（见 DrawKeys 的高亮分支）。
+//   把色相也一起抹掉，按下 / 锁定的格子就和修饰键常态分不出来（上一版的实际后果）。
 // ⚠ 必须定义在 HkbTokensBuild 之前 —— 令牌函数要读它（上一版放到后面，先用后定义直接编译错）
 static int  g_themeStyle = 0;
 
@@ -355,23 +357,45 @@ static void HkbTokensBuild(int hue, BOOL dark, HkbTokens* out) {
     // Enter / 确认键：浅色底压深字（5.7:1），深色底用黑 70% 混主色（5.4:1）
     out->primaryFg       = dark ? BlendColor(out->primary, RGB(0, 0, 0), 0.70) : out->text;
 
-    // 经典风格（方案 §4.2 的实机取色）：中性灰、忽略色相。深色下不套用 ——
-    // #D6D6D6 描边在深色上不可用（§4.4.3），经典只做浅色。
-    if (g_themeStyle == 1 && !dark) {
-        out->pageBg             = RGB(243, 243, 243);
-        out->cardBg             = RGB(255, 255, 255);
-        out->btnRegularBg       = RGB(232, 232, 232);
-        out->btnRegularBgHover  = RGB(224, 224, 224);
-        out->btnRegularBgActive = RGB(216, 216, 216);
-        out->btnCardBgHover     = RGB(247, 247, 247);
-        out->btnPlainBgHover    = RGB(240, 240, 240);
-        out->keyOutline         = RGB(214, 214, 214);
-        out->keyOutlineHover    = RGB(190, 190, 190);
-        out->text               = RGB(26, 26, 26);
-        out->textMuted          = RGB(102, 102, 102);
-        out->btnContent         = RGB(26, 26, 26);
-        out->lineDivider        = RGB(230, 230, 230);
-        out->metaDivider        = RGB(214, 214, 214);
+    // 经典风格（方案 §4.2 的实机取色）：**只把"壳"中性化** —— 面板、键面、修饰键、
+    // 描边、正文全走 v1.1 实测值；`primary` / `primaryFg` / `titleActive` **故意不覆盖**，
+    // 它们继续跟着色相走，专供「高亮」使用（按下 / 锁定 / 菜单选中 / 开关）。
+    // 深色用 v1.1 当年那张深色表：面板 #1F1F1F / 键面 #2C2C2C / 修饰键 #242424 /
+    // 描边 #3A3A3A / 悬停 #383838 / 正文 #F5F5F5 / 弱化 #A0A0A0。
+    if (g_themeStyle == 1) {
+        if (!dark) {
+            out->pageBg             = RGB(243, 243, 243);
+            out->cardBg             = RGB(255, 255, 255);
+            out->btnRegularBg       = RGB(232, 232, 232);
+            out->btnRegularBgHover  = RGB(224, 224, 224);
+            out->btnRegularBgActive = RGB(216, 216, 216);
+            out->btnCardBgHover     = RGB(247, 247, 247);
+            out->btnPlainBgHover    = RGB(240, 240, 240);
+            out->keyOutline         = RGB(214, 214, 214);
+            out->keyOutlineHover    = RGB(190, 190, 190);
+            out->text               = RGB(26, 26, 26);
+            out->textMuted          = RGB(102, 102, 102);
+            out->btnContent         = RGB(26, 26, 26);
+            out->lineDivider        = RGB(230, 230, 230);
+            out->metaDivider        = RGB(214, 214, 214);
+        } else {
+            out->pageBg             = RGB(31, 31, 31);
+            out->cardBg             = RGB(44, 44, 44);
+            out->btnRegularBg       = RGB(36, 36, 36);
+            out->btnRegularBgHover  = RGB(56, 56, 56);
+            out->btnRegularBgActive = RGB(56, 56, 56);
+            out->btnCardBgHover     = RGB(51, 51, 51);
+            out->btnPlainBgHover    = RGB(42, 42, 42);
+            out->keyOutline         = RGB(58, 58, 58);
+            out->keyOutlineHover    = RGB(78, 78, 78);
+            out->text               = RGB(245, 245, 245);
+            out->textMuted          = RGB(160, 160, 160);
+            out->btnContent         = RGB(245, 245, 245);
+            out->lineDivider        = RGB(51, 51, 51);
+            out->metaDivider        = RGB(58, 58, 58);
+            out->controlBg          = RGB(58, 58, 58);
+            out->floatPanelBg       = RGB(40, 40, 40);
+        }
     }
 }
 
@@ -4093,7 +4117,20 @@ static void DrawKeys(HDC dc) {
         // 实底在触摸键盘上会被当成「已经按下了」，与真正的按下态撞车。
         DWORD bg, outline, textC;
         if (active || pressed) {
-            bg = C_REGULAR_ACT; outline = C_BORDER_HOVER; textC = C_WHITE;
+            if (g_themeStyle == 1) {
+                // 经典风格的高亮：**用主题色相填实底**，键面其余部分保持中性灰。
+                // 这就是 v1.1 的做法（那一版是灰键面 + #0078D4 实底 + 按亮度选字色），
+                // 也是「经典但不失高亮」的关键：灰色是壳，颜色只出现在按下 / 锁定那一格。
+                //
+                // ⚠ 上一版这里走 btnRegularBgActive，而经典风格把它覆盖成了 #D8D8D8 ——
+                //   于是「按下的键」和「修饰键的常态」（#E8E8E8）几乎同色，
+                //   锁定的 Shift / Caps / Num 看不出任何区别，高亮等于不存在。
+                // ⇒ 底色用主色，描边仍用中性灰（v1.1 的外框也没跟着变色），
+                //   文字用 primaryFg（浅色主题下是深字，压在 0.70 明度的主色上约 5.8:1）。
+                bg = C_HOT; outline = C_KEY_BORDER; textC = C_ON_PRIMARY;
+            } else {
+                bg = C_REGULAR_ACT; outline = C_BORDER_HOVER; textC = C_WHITE;
+            }
         } else if (isPlain) {
             bg = hover ? C_REGULAR_HOV : C_PLAIN;
             outline = C_LINE_DIV; textC = C_DIM;
@@ -5760,7 +5797,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
           RECT stR = RowSegRect(m, r, st, stn);
           DrawSettingRowContent(dc, m, r, HKICON_CONTRAST, NULL,
                                 T(L"界面风格", L"Interface Style"),
-                                T(L"经典：中性灰 + 4px 圆角（忽略色相）", L"Classic: neutral grey, 4px corners (hue ignored)"),
+                                T(L"灰色键面 + 4px 圆角；按下与锁定仍用主题色相高亮",
+                                  L"Grey keys, 4px corners; presses and locks still use the accent hue"),
                                 g_sHov == S_HIT_STYLE, stR.left);
           DrawSegmented(dc, m, stR, st, stn, g_themeStyle); }
 

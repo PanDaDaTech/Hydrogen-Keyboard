@@ -7144,9 +7144,32 @@ static void UpdateAutoVisibility() {
             g_dbgUiaCt = -1;        // 本 tick 没查 —— 别在日志里留上一次的残值
         }
     }
+    // ⚠ 精判结果也要过多数票：日志实测 UIA 的 ControlType 在 50004(Edit)/50030(Document)
+    //   之间逐拍翻，单拍判定会让"收起"刚置上就被下一拍推翻（表现为"能弹不能收"）。
+    //   最近 10 次里 ≥7 次是 Edit 才算"在输入框"，≤3 次才算"不在"，中间维持上一次结论。
+    static unsigned g_uiaHist = 0;      // bit0 最新，1 = Edit
+    static int      g_uiaSamples = 0;
+    static HWND     g_uiaHistFg = NULL;
+    if (g_uiaHistFg != fgNow) {         // 换窗口：上一个窗口的样本不能带过来
+        g_uiaHistFg = fgNow;
+        g_uiaHist = 0;
+        g_uiaSamples = 0;
+    }
+    if (chromiumVerdict >= 0) {
+        g_uiaHist = ((g_uiaHist << 1) | (chromiumVerdict ? 1u : 0u)) & 0x3FFu;
+        if (g_uiaSamples < 10) g_uiaSamples++;
+    }
+    int uiaCnt = 0;
+    for (int i = 0; i < 10; i++) uiaCnt += (int)((g_uiaHist >> i) & 1u);
+    int uiaStable = -1;
+    if (g_uiaSamples >= 4) {
+        if (uiaCnt * 10 >= g_uiaSamples * 7)      uiaStable = 1;
+        else if (uiaCnt * 10 <= g_uiaSamples * 3) uiaStable = 0;
+    }
+
     // 信任门：**只有真正见到可编辑元素才设**。-1（未知）绝不算。
-    if (chromiumVerdict == 1) g_chromiumTrustFg = fgNow;
-    if (input && chromiumVerdict == 0 &&
+    if (uiaStable == 1) g_chromiumTrustFg = fgNow;
+    if (input && uiaStable == 0 &&
         g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) {
         // 精判说"光标不在可编辑元素里" ⇒ 收起，并记下"这一次是精判收的"。
         g_verdictHide = TRUE;

@@ -725,6 +725,7 @@ static int g_dbgRc[4] = {0, 0, 0, 0};
 // ⚠ 用户日志里 SHOW/HIDE 成对交替、且都是 isManual=TRUE —— 最像
 static const char* g_dbgShowFrom = "(startup)";
 static int g_dbgUiaCt = -1;
+static int g_dbgUiaCap = -1;     // 最近一次焦点能力判据（1=可编辑 0=只读/非输入 -1=本拍没查）
 //   ⚠ 这一栏是"自动呼出为什么没弹"的唯一直接答案 —— 之前只有一堆输入量
 static const char* g_dbgWhy = "-";
 // 诊断：两个触屏证据源的即时值（见 TouchFocusEvidence / SysTipJustAppeared）
@@ -3808,6 +3809,8 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_DIAG           33   // 关于 Tab：诊断日志行的「导出」按钮
 #define S_HIT_CLOSE_DROP     70
 #define S_HIT_RUNAS         98   // 常规 Tab：以管理员身份运行
+#define S_HIT_RA_OK         101  // 「以管理员身份运行」询问窗：确定
+#define S_HIT_RA_CANCEL     102  // 「以管理员身份运行」询问窗：取消
 #define S_HIT_LANG_DROP      50
 #define S_HIT_HL_DROP        60
 #define S_HIT_HL_BOX         64
@@ -3903,7 +3906,10 @@ static SettingsMetrics GetSettingsMetrics(HWND hWnd) {
 static BOOL SettingsRowHidden(int tab, int index) {
     BOOL onlyDefault = (g_layoutMode != 0);
     if (tab == 0) {
-        int closeRow = g_af ? 2 : 1;
+        // 常规 Tab 行序（2026-10-18：「以管理员身份运行」按用户要求移到首位）：
+        //   0=以管理员身份运行 1=自动呼出 2=自动隐藏 3=选择关闭方式 4=记住选择
+        //   5=功能键行 6=Shift符号 7=Shift双击锁定 8=界面语言
+        int closeRow = g_af ? 3 : 2;
         // 功能键行：全尺寸也藏（全尺寸常驻 F 行，开关没有意义）
         if (index == closeRow + 2) return onlyDefault;
         // Shift 符号 / Shift 双击锁定：留在常规（2026-10-11 回退搬迁），全尺寸也显示
@@ -3922,7 +3928,7 @@ static BOOL SettingsRowHidden(int tab, int index) {
 // 每行的「控件高」，单位 DIP（不乘 dpi）：开关 26 / 下拉与分段 40；无控件行给 0
 static int SettingsRowCtrlDip(int tab, int index) {
     if (tab == 0) {                                 // 常规
-        int closeRow = g_af ? 2 : 1;
+        int closeRow = g_af ? 3 : 2;
         if (index == closeRow) return 40;           // 关闭按钮下拉
         if (index == closeRow + 5) return 40;       // 界面语言下拉
         return 26;
@@ -4306,20 +4312,22 @@ static RECT SettingsColorSliderRect(const SettingsMetrics& m, const RECT& row) {
 }
 
 static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
+    // 常规 Tab 行序（与 SettingsHitTest / 绘制同源）：
+    //   0=以管理员身份运行 1=自动呼出 2=自动隐藏 3=选择关闭方式 4=记住选择
+    //   5=功能键行 6=Shift符号 7=Shift双击锁定 8=界面语言
     int rowIndex;
-    if (hit == S_HIT_AUTO) rowIndex = 0;
-    else if (hit == S_HIT_AUTOHIDE) rowIndex = 1;
+    if (hit == S_HIT_RUNAS)    rowIndex = 0;
+    else if (hit == S_HIT_AUTO) rowIndex = 1;
+    else if (hit == S_HIT_AUTOHIDE) rowIndex = 2;
     else if (hit == S_HIT_FNWEB) rowIndex = 1;
     else if (hit == S_HIT_NPBTN) rowIndex = 2;
-    else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 3 : 2;
-    else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 4 : 3;
-    // 2026-10-11：Shift 符号 / Shift 双击锁定 从常规 Tab 搬到**布局 Tab**（行号 3 / 4）。
-    // 原来的 2026-10-04 那条注释（"+4 落到 else"）随搬迁作废，别再按老行号推。
-    else if (hit == S_HIT_SHIFTSYM) rowIndex = g_af ? 5 : 4;
-    else if (hit == S_HIT_SHDLOCK)  rowIndex = g_af ? 6 : 5;
+    else if (hit == S_HIT_REMEMBER) rowIndex = g_af ? 4 : 3;
+    else if (hit == S_HIT_FKEYS) rowIndex = g_af ? 5 : 4;
+    // Shift 符号 / Shift 双击锁定：2026-10-11 搬去布局 Tab 后又回退，现留在常规 Tab
+    else if (hit == S_HIT_SHIFTSYM) rowIndex = g_af ? 6 : 5;
+    else if (hit == S_HIT_SHDLOCK)  rowIndex = g_af ? 7 : 6;
     else if (hit == S_HIT_DUAL)     rowIndex = 3;
-    else if (hit == S_HIT_LANG_DROP) rowIndex = g_af ? 7 : 6;
-    else if (hit == S_HIT_RUNAS)    rowIndex = g_af ? 8 : 7;
+    else if (hit == S_HIT_LANG_DROP) rowIndex = g_af ? 8 : 7;
     else rowIndex = g_af ? 5 : 4;
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(120 * m.dpi);
@@ -4607,6 +4615,7 @@ static void DrawAboutActionRow(HDC dc, const SettingsMetrics& m, const RECT& row
               value, g_sfCtrl, C_HOT);
 }
 
+static void RunasAskDraw(HDC dc, HWND hWnd);   // 定义在 SettingsDraw 之后（模态层要画在最上层）
 static void SettingsDraw(HDC dc, HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
 
@@ -4637,11 +4646,21 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
     if (g_sTab != 2) DrawSettingsCard(dc, m);
 
     if (g_sTab == 0) {
-        // 行序（自动收起行仅在自动呼出开启时存在，隐藏时后续行上移一行）
-        //   0=自动呼出 1=自动收起 2/3=关闭按钮/记住选择 4=功能键行 5=Shift符号 6=界面语言
-        int closeRow = g_af ? 2 : 1;
+        // 行序（2026-10-18：「以管理员身份运行」按用户要求放在首位）
+        //   0=以管理员身份运行 1=自动呼出 2=自动隐藏 3/2=关闭按钮/记住选择
+        //   5/4=功能键行 6/5=Shift符号 7/6=Shift双击锁定 8/7=界面语言
+        int closeRow = g_af ? 3 : 2;
 
-        RECT r0 = SettingsRowRect(m, 0);
+        // 以管理员身份运行（首位）：提权后键盘才能向管理员权限的程序注入按键
+        RECT rr = SettingsRowRect(m, 0);
+        DrawSettingRowContent(dc, m, rr, HKICON_GEAR, NULL,
+                              T(L"以管理员身份运行", L"Run as administrator"),
+                              T(L"重启后生效。提权后才能向以管理员权限运行的程序输入按键",
+                                L"Takes effect after restart. Required to type into elevated programs"),
+                              g_sHov == S_HIT_RUNAS, SettingsSwitchTextRight(m, rr));
+        DrawSettingSwitch(dc, m, rr, g_runAsAdmin, S_HIT_RUNAS);
+
+        RECT r0 = SettingsRowRect(m, 1);
         DrawSettingRowContent(dc, m, r0, HKICON_CARET, NULL,
                               T(L"自动呼出", L"Auto Pop-up"),
                               T(L"点击输入框时自动弹出键盘", L"Show the keyboard when an input gets focus"),
@@ -4649,7 +4668,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawSettingSwitch(dc, m, r0, g_af, S_HIT_AUTO);
 
         if (g_af) {
-            RECT ra = SettingsRowRect(m, 1);
+            RECT ra = SettingsRowRect(m, 2);
             // 子项样式：不画图标 tile，标题与「自动呼出」的标题左对齐
             DrawSettingRowContent(dc, m, ra, -1, NULL,
                                   T(L"自动隐藏", L"Auto Hide"),
@@ -4707,19 +4726,10 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         int gsegn = LangSegItems(gseg);
         RECT gsegR = RowSegRect(m, r, gseg, gsegn);
         DrawSettingRowContent(dc, m, r, HKICON_GLOBE, NULL,
-                              T(L"界面语言", L"Language"),
-                              T(L"切换设置与键盘的显示语言", L"Language of settings and keyboard"),
-                              g_sHov == S_HIT_LANG_DROP, gsegR.left);
+                             T(L"界面语言", L"Language"),
+                             T(L"切换设置与键盘的显示语言", L"Language of settings and keyboard"),
+                             g_sHov == S_HIT_LANG_DROP, gsegR.left);
         DrawSegmented(dc, m, gsegR, gseg, gsegn, g_lang);
-
-        // 以管理员身份运行（末行）：提权后键盘才能向管理员权限的程序注入按键
-        r = SettingsRowRect(m, closeRow + 6);
-        DrawSettingRowContent(dc, m, r, HKICON_GEAR, NULL,
-                              T(L"以管理员身份运行", L"Run as administrator"),
-                              T(L"重启后生效。提权后才能向以管理员权限运行的程序输入按键",
-                                L"Takes effect after restart. Required to type into elevated programs"),
-                              g_sHov == S_HIT_RUNAS, SettingsSwitchTextRight(m, r));
-        DrawSettingSwitch(dc, m, r, g_runAsAdmin, S_HIT_RUNAS);
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮（「按键图标样式」行已删）
         // （原第 5 行「Fn + Tab 切换小键盘」已下线：全尺寸下显隐数字区只留标题栏那一个入口）
@@ -4916,10 +4926,80 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawTextC(dc, m.contentX, al.card3.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
                   L"Copyright 2019-2026 PanDaTech. All Rights Reserved.", g_sfMeta, C_DIM);
     }
+
+    // 「以管理员身份运行」询问窗：模态层，画在最上层（见 g_runasAskOpen）
+    if (g_runasAskOpen) RunasAskDraw(dc, hWnd);
+}
+
+// ===== 「以管理员身份运行」询问窗（设置窗内的模态层）=====
+// ⚠ 刻意**不做成新的顶层弹窗**：新窗口会抢前台，得在 RealForegroundWindow 里加豁免，
+//   与自动显隐的交互成本也高。设置窗本身已是免检窗口，窗口内模态层零额外风险。
+static BOOL g_runasAskOpen = FALSE;
+
+struct RunasAskLayout { RECT card, ok, cancel; };
+
+// ⚠ 绘制与热区必须读**同一个** RunasAskComputeLayout（老坑：按钮画右边、热区在左边）
+static RunasAskLayout RunasAskComputeLayout(HWND hWnd) {
+    RunasAskLayout L = {};
+    RECT rc; GetClientRect(hWnd, &rc);
+    double dpi = GetSystemDpiScale();
+    int cw = (int)(384 * dpi), ch = (int)(180 * dpi);
+    int cx = (rc.right - cw) / 2, cy = (rc.bottom - ch) / 2;
+    if (cx < (int)(8 * dpi)) cx = (int)(8 * dpi);
+    if (cy < (int)(8 * dpi)) cy = (int)(8 * dpi);
+    L.card.left = cx; L.card.top = cy; L.card.right = cx + cw; L.card.bottom = cy + ch;
+    int bw = (int)(96 * dpi), bh = (int)(36 * dpi), gap = (int)(12 * dpi), pad = (int)(20 * dpi);
+    int by = L.card.bottom - pad - bh;
+    L.ok.left = L.card.right - pad - bw; L.ok.right = L.card.right - pad;
+    L.cancel.right = L.ok.left - gap; L.cancel.left = L.cancel.right - bw;
+    L.ok.top = L.cancel.top = by; L.ok.bottom = L.cancel.bottom = by + bh;
+    return L;
+}
+
+static void RunasAskDraw(HDC dc, HWND hWnd) {
+    RECT rc; GetClientRect(hWnd, &rc);
+    double dpi = GetSystemDpiScale();
+    // 模态遮罩：整窗压一层暗色，背后的设置内容仍可辨读但不可点
+    DrawRoundRectAlpha(dc, 0, 0, rc.right, rc.bottom, 0x000000, 0, 1, 88, 0);
+    RunasAskLayout L = RunasAskComputeLayout(hWnd);
+    DrawRoundRect(dc, L.card.left, L.card.top,
+                  L.card.right - L.card.left, L.card.bottom - L.card.top,
+                  C_KEY, C_KEY, (int)(16 * dpi));
+    int pad = (int)(20 * dpi);
+    int tx = L.card.left + pad;
+    int tw = (L.card.right - pad) - tx;
+    DrawTextL(dc, tx, L.card.top + (int)(18 * dpi), tw, (int)(24 * dpi),
+              T(L"以管理员身份运行？", L"Run as administrator?"), g_sfCtrl, C_WHITE);
+    DrawTextL(dc, tx, L.card.top + (int)(52 * dpi), tw, (int)(18 * dpi),
+              T(L"轻键将请求以管理员权限重启。", L"HKeyboard will restart with administrator rights."),
+              g_sfBase, C_DIM);
+    DrawTextL(dc, tx, L.card.top + (int)(72 * dpi), tw, (int)(18 * dpi),
+              T(L"Windows 会显示用户账户控制（UAC）确认框，允许后轻键重新打开。",
+                L"Windows shows the UAC prompt; HKeyboard reopens after you allow it."),
+              g_sfBase, C_DIM);
+    DrawRoundRect(dc, L.ok.left, L.ok.top, L.ok.right - L.ok.left, L.ok.bottom - L.ok.top,
+                  (g_sHov == S_HIT_RA_OK) ? C_REGULAR_ACT : C_HOT, C_KEY_BORDER, (int)(6 * dpi));
+    // 浅色主题下 C_ON_PRIMARY 近黑，压在蓝底上"发黑"；深色下那个组合反而好看（与关闭提示一致）
+    DWORD okFg = IsDarkThemeActive() ? C_ON_PRIMARY : C_KEY;
+    DrawTextC(dc, L.ok.left, L.ok.top, L.ok.right - L.ok.left, L.ok.bottom - L.ok.top,
+              T(L"确定", L"OK"), g_sfCtrl, okFg);
+    DrawRoundRect(dc, L.cancel.left, L.cancel.top, L.cancel.right - L.cancel.left, L.cancel.bottom - L.cancel.top,
+                  (g_sHov == S_HIT_RA_CANCEL) ? C_REGULAR_HOV : C_REGULAR, C_KEY_BORDER, (int)(6 * dpi));
+    DrawTextC(dc, L.cancel.left, L.cancel.top, L.cancel.right - L.cancel.left, L.cancel.bottom - L.cancel.top,
+              T(L"取消", L"Cancel"), g_sfCtrl, C_BTN_CONTENT);
+}
+
+static int RunasAskHitTest(HWND hWnd, int x, int y) {
+    RunasAskLayout L = RunasAskComputeLayout(hWnd);
+    if (x >= L.ok.left && x < L.ok.right && y >= L.ok.top && y < L.ok.bottom) return S_HIT_RA_OK;
+    if (x >= L.cancel.left && x < L.cancel.right && y >= L.cancel.top && y < L.cancel.bottom) return S_HIT_RA_CANCEL;
+    return S_HIT_NONE;
 }
 
 static int SettingsHitTest(HWND hWnd, int x, int y) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
+    // 「以管理员身份运行」询问窗开着时整窗模态：只有两个按钮可点
+    if (g_runasAskOpen) return RunasAskHitTest(hWnd, x, y);
     if (x >= m.closeX && x < m.closeX + m.closeW && y >= m.closeY && y < m.closeY + m.closeH) return S_HIT_CLOSE;
 
     // tab 条：与绘制共用同一套矩形（文字宽 + 固定间隙）
@@ -4936,12 +5016,16 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
 
     if (g_sTab == 0) {
         RECT r;
-        int closeRow = g_af ? 2 : 1;   // 自动收起行仅在自动呼出开启时存在
+        // 行序与绘制同源：0=以管理员身份运行 1=自动呼出 2=自动隐藏 3/2=关闭方式
+        int closeRow = g_af ? 3 : 2;   // 自动收起行仅在自动呼出开启时存在
 
         r = SettingsRowRect(m, 0);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_RUNAS;
+
+        r = SettingsRowRect(m, 1);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTO;
         if (g_af) {
-            r = SettingsRowRect(m, 1);
+            r = SettingsRowRect(m, 2);
             if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_AUTOHIDE;
         }
 
@@ -4964,13 +5048,12 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         r = SettingsRowRect(m, closeRow + 4);
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_SHDLOCK;
 
-        r = SettingsRowRect(m, closeRow + 3);
+        // ⚠ 语言行是 closeRow+5（原来错写成 closeRow+3，热区落在 Shift 符号行上，
+        //    语言切换整个点不动；2026-10-18 重排行号时一并修正）
+        r = SettingsRowRect(m, closeRow + 5);
         { const wchar_t* it[2]; int n = LangSegItems(it);
           RECT sr = RowSegRect(m, r, it, n);
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LANG_DROP; }
-
-        r = SettingsRowRect(m, closeRow + 6);   // 以管理员身份运行（末行，与绘制同源）
-        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_RUNAS;
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮（「按键图标样式」行已删）
         // （原第 5 行「Fn + Tab 切换小键盘」已下线：全尺寸下显隐数字区只留标题栏那一个入口）
@@ -5395,25 +5478,40 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
         }
         break;
     }
+    case S_HIT_RA_CANCEL:
+        g_runasAskOpen = FALSE;
+        InvalidateRect(hWnd, NULL, TRUE);
+        break;
+    case S_HIT_RA_OK: {
+        g_runasAskOpen = FALSE;
+        g_runAsAdmin = TRUE;
+        IniSetInt(L"General", L"RunAsAdmin", 1);
+        if (RelaunchElevated()) {
+            PostQuitMessage(0);       // 管理员实例已拉起，本实例退出
+            break;
+        }
+        g_runAsAdmin = FALSE;         // UAC 被拒，改回去
+        IniSetInt(L"General", L"RunAsAdmin", 0);
+        InvalidateRect(hWnd, NULL, TRUE);
+        break;
+    }
     case S_HIT_RUNAS: {
+        // 开启且当前没提权 ⇒ 先询问（提权会重启程序，不能一点开关就重启）；
+        // 已提权时开启无需重启（只是记下偏好），关闭也只是改偏好，都不弹窗
+        if (!g_runAsAdmin && !IsProcessElevated()) {
+            g_runasAskOpen = TRUE;
+            InvalidateRect(hWnd, NULL, TRUE);
+            break;
+        }
         BeginSwitchAnimation(hWnd, hit, g_runAsAdmin, !g_runAsAdmin);
         g_runAsAdmin = !g_runAsAdmin;
         IniSetInt(L"General", L"RunAsAdmin", g_runAsAdmin ? 1 : 0);
-        // 打开且当前没提权 ⇒ 立刻以管理员身份重启（用户点了就是要它生效）
-        if (g_runAsAdmin && !IsProcessElevated()) {
-            if (RelaunchElevated()) {
-                PostQuitMessage(0);       // 管理员实例已拉起，本实例退出
-                break;
-            }
-            g_runAsAdmin = FALSE;         // UAC 被拒，改回去
-            IniSetInt(L"General", L"RunAsAdmin", 0);
-            InvalidateRect(hWnd, NULL, TRUE);
-        }
+        InvalidateRect(hWnd, NULL, TRUE);
         break;
     }
     case S_HIT_LANG_DROP: {
         SettingsMetrics gm = GetSettingsMetrics(hWnd);
-        RECT gr = SettingsRowRect(gm, (g_af ? 2 : 1) + 4);
+        RECT gr = SettingsRowRect(gm, (g_af ? 3 : 2) + 5);   // 语言行 = closeRow+5（与绘制/热区同源）
         const wchar_t* it[2]; int n = LangSegItems(it);
         int idx = RowSegIndex(gm, gr, it, n, x);
         if (idx >= 0 && idx != g_lang) {
@@ -5703,6 +5801,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         break;
     case WM_KEYDOWN:
         if (w == VK_ESCAPE) {
+            if (g_runasAskOpen) {          // 询问窗开着时 ESC 只关询问窗，不关设置页
+                g_runasAskOpen = FALSE;
+                InvalidateRect(hWnd, NULL, TRUE);
+                return 0;
+            }
             if (g_hlEditFocus) { g_hlEditFocus = FALSE; InvalidateRect(hWnd, NULL, TRUE); }
             else SendMessageW(hWnd, WM_CLOSE, 0, 0);
             return 0;
@@ -5759,6 +5862,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
 
 static void OpenSettingsTab(int tab) {
     g_sTab = (tab >= 0 && tab <= 2) ? tab : 0;   // 0=常规 1=主题 2=关于
+    g_runasAskOpen = FALSE;   // 重新打开设置页时，询问窗不许残留（模态层会盖住整个窗口）
     if (g_settingsHwnd && IsWindow(g_settingsHwnd)) {
         if (g_settingsFade.active) {
             // 渐隐中途重新打开：取消渐隐并恢复不透明
@@ -6554,9 +6658,41 @@ static BOOL EnsureUia() {
     return SUCCEEDED(hr) && g_uia != NULL;
 }
 
+// ===== 「焦点/落点元素是不是可编辑输入区」的能力判据 =====
+// ⚠⚠ 实测矩阵（2026-10-18，探针 .workbuddy/uitest，Edge/Chromium；QQ / WorkBuddy 同为该引擎）：
+//   <input> / <textarea>   → Edit(50004) + Value(IsReadOnly=FALSE) + TextEdit(10032)
+//   contenteditable        → Group(50026) + TextEdit（无 Value）   ← QQ 的 ProseMirror 属这类
+//   只读文本容器(消息列表) → Group，无 Value、无 TextEdit
+//   网页 body / 应用壳空白 → Document(50030) + Value(IsReadOnly=TRUE) + Text / Text2
+// 旧判据「有 TextPattern2(10024) / ValuePattern 就算可编辑」把 body / 应用壳误判成可编辑
+// ⇒ 点空白永远收不起来（用户日志：Group / Document 全程判"可编辑"，why=shown 不动）。
+// 只认**能编辑**的证据：可改的值，或 TextEdit 且不是只读文档。
+static int UiaEditableCapability(IUIAutomationElement* el, CONTROLTYPEID ct) {
+    if (ct == HK_UIA_CT_EDIT) return 1;
+    if (ct == 50032 || ct == 50033) return 0;         // Window / Pane：没有元素焦点
+    BOOL hasValue = FALSE, readOnly = TRUE, hasTextEdit = FALSE;
+    IUnknown* pat = NULL;
+    if (SUCCEEDED(el->GetCurrentPattern(10002, &pat)) && pat) {           // ValuePattern
+        IUIAutomationValuePattern* vp = (IUIAutomationValuePattern*)pat;
+        hasValue = TRUE;
+        BOOL ro = TRUE;
+        if (SUCCEEDED(vp->get_CurrentIsReadOnly(&ro))) readOnly = ro;
+        pat->Release();
+    }
+    pat = NULL;
+    if (SUCCEEDED(el->GetCurrentPattern(10032, &pat)) && pat) {           // TextEditPattern
+        hasTextEdit = TRUE;
+        pat->Release();
+    }
+    if (hasValue && !readOnly) return 1;
+    if (hasTextEdit && !(hasValue && readOnly)) return 1;
+    return 0;
+}
+
 // ⚠⚠ **必须校验"这个元素属于哪个顶层窗口"** —— `GetFocusedElement` 是全局的
 static int UiaFocusEditable(HWND fgExpect) {
     g_dbgUiaCt = -1;
+    g_dbgUiaCap = -1;
     if (!EnsureUia()) return -1;
     //   ⚠ 本函数在 UI 线程上跑，没有这道闸，目标进程一卡死
     if (!IsWindowResponsive(GetForegroundWindow(), 50)) return -1;
@@ -6569,29 +6705,24 @@ static int UiaFocusEditable(HWND fgExpect) {
     HWND elHwnd = (HWND)elHwndRaw;
     CONTROLTYPEID ct = 0;
     hr = el->get_CurrentControlType(&ct);
-    el->Release();          // 只管当场取值，不留跨帧的 COM 指针（会过期）
-    if (FAILED(hr)) return -1;
-    if (fgExpect && elHwnd) {
-        HWND elTop = GetAncestor(elHwnd, GA_ROOT);
-        HWND fgTop = GetAncestor(fgExpect, GA_ROOT);
-        if (elTop && fgTop && elTop != fgTop) return -1;   // 这不是本窗口的焦点
-    }
-    // 能力判定：contenteditable（QQ / WorkBuddy 的 ProseMirror）在 UIA 里只报
-    // Group / Document、永远不是 Edit，但**有** TextPattern2 / ValuePattern ⇒ 仍是可编辑。
-    // Window(50032) / Pane(50033) 且无任何文本能力 ⇒ 真的没有任何元素持有焦点。
-    BOOL hasText = FALSE;
-    {
-        IUnknown* pat = NULL;
-        if (SUCCEEDED(el->GetCurrentPattern(10024, &pat)) && pat) { hasText = TRUE; pat->Release(); }
-        if (!hasText) {
-            pat = NULL;
-            if (SUCCEEDED(el->GetCurrentPattern(10002, &pat)) && pat) { hasText = TRUE; pat->Release(); }
+    int verdict = -1;
+    if (SUCCEEDED(hr)) {
+        BOOL owned = TRUE;
+        if (fgExpect && elHwnd) {
+            HWND elTop = GetAncestor(elHwnd, GA_ROOT);
+            HWND fgTop = GetAncestor(fgExpect, GA_ROOT);
+            owned = !(elTop && fgTop && elTop != fgTop);   // 这不是本窗口的焦点
         }
+        if (owned) verdict = UiaEditableCapability(el, ct);
     }
+    // ⚠⚠ 所有查询（含能力判据的 GetCurrentPattern）全部做完才 Release。
+    //    曾经 Release 写在 get_CurrentControlType 之后、GetCurrentPattern 之前，
+    //    等于在已释放的 COM 对象上查能力（use-after-free），结论完全不可信。
+    el->Release();
+    if (FAILED(hr) || verdict < 0) return -1;
     g_dbgUiaCt = (int)ct;
-    if (ct == HK_UIA_CT_EDIT) return 1;
-    if (ct == 50032 || ct == 50033) return 0;      // Window / Pane：没有元素焦点
-    return hasText ? 1 : 0;
+    g_dbgUiaCap = verdict;
+    return verdict;
 }
 
 //   ⚠ 缓存的是**判定结果**，不是元素指针。
@@ -6631,10 +6762,12 @@ static int UiaPointEditable(POINT pt) {
     if (FAILED(g_uia->ElementFromPoint(pt, &el)) || !el) return -1;
     CONTROLTYPEID ct = 0;
     HRESULT hr = el->get_CurrentControlType(&ct);
-    el->Release();
+    int verdict = -1;
+    if (SUCCEEDED(hr)) verdict = UiaEditableCapability(el, ct);
+    el->Release();          // 同上：查询做完才释放
     if (FAILED(hr)) return -1;
     g_dbgUiaPtCt = (int)ct;
-    return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
+    return verdict;
 }
 
 // dwmapi 的 DwmGetWindowAttribute —— 与上面 DwmSetWindowAttribute 一样**动态取**
@@ -7355,7 +7488,13 @@ static void UpdateAutoVisibility() {
         if (g_afAutoHide && g_vis && recentClick && g_lastClickTopHwnd) {
             char hitCls[128] = {0};
             GetClassNameA(g_lastClickTopHwnd, hitCls, 128);
-            if (IsShellSurfaceClass(hitCls)) {
+            // ⚠⚠ 还必须**当前前台也仍是桌面/任务栏**才收。点任务栏按钮切到别的程序时，
+            //    落点是任务栏、但前台已经是目标程序（常常还带着输入焦点）⇒ 只按落点收，
+            //    下一拍输入焦点又满足弹出 ⇒ 一收一亮就是「切一次窗口，键盘跳一下」
+            //    （用户日志 00:33:03：切 Chrome 窗口仍跳）。700ms 宽限盖不住任务栏切换的耗时。
+            char fgCls[128] = {0};
+            if (fgNow) GetClassNameA(fgNow, fgCls, 128);
+            if (IsShellSurfaceClass(hitCls) && IsShellSurfaceClass(fgCls)) {
                 if (g_fgChangeTick && GetTickCount() - g_fgChangeTick < 700) { g_dbgWhy = "fg-grace"; goto done; }
                 ShowKB(FALSE, FALSE);
                 g_dbgWhy = "shell-hide";
@@ -7412,10 +7551,10 @@ done:
         if (g_verdictHide && g_verdictHidFg == fgNow && recentClick &&
             g_afChromiumPrecise && g_detectedByChromiumClass)
             g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
-        char st[160];
+        char st[176];
         _snprintf_s(st, sizeof(st), _TRUNCATE,
-                    "why=%s uiact=%d pt=%d ptc=%d inFg=%d tip=%d foc=%d mh=%d uhi=%d ns=%d hid=%d",
-                    g_dbgWhy, g_dbgUiaCt, g_dbgUiaPt, g_dbgUiaPtCt, (int)byUserInFg,
+                    "why=%s uiact=%d cap=%d pt=%d ptc=%d inFg=%d tip=%d foc=%d mh=%d uhi=%d ns=%d hid=%d",
+                    g_dbgWhy, g_dbgUiaCt, g_dbgUiaCap, g_dbgUiaPt, g_dbgUiaPtCt, (int)byUserInFg,
                     g_dbgEvTip, g_dbgEvFoc, (int)g_manualHide, (int)g_userHidInInput,
                     g_noInputStreak, (int)g_verdictHide);
         g_dbgVisWnd = (g_hWnd && IsWindowVisible(g_hWnd)) ? 1 : 0;

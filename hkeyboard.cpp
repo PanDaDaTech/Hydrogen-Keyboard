@@ -3111,6 +3111,9 @@ static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
 // ⚠ 三件事必须一起做，少一件就是 bug
 // 前台短暂变成任务栏/桌面时，先记下时刻；停留不到 500ms 就当没发生（见 UpdateAutoVisibility）
 static DWORD g_shellFgSince = 0;
+// 最近一次「前台换了」的时刻。切窗口后的 700ms 内**不允许自动收起**，
+// 否则任务栏/开始菜单/UWP 宿主的瞬态前台会把键盘先收再弹（实机就是跳一下）。
+static DWORD g_fgChangeTick = 0;
 static BOOL g_lmOpen = FALSE;
 static int  g_lmHover = -1;
 // 打开菜单时所在的前台窗口。换到别的程序后菜单就不该留着（见 UpdateAutoVisibility 的短路）。
@@ -7061,10 +7064,11 @@ static void UpdateAutoVisibility() {
 
     // 前台窗口变了 -> 进入"等待用户操作"状态（见 g_fgAwaitUserInput 的说明）
     {
-        HWND fgNow = RealForegroundWindow();   // 跳过系统触摸键盘：它弹出来不算"用户切了窗口"
+        HWND fgNow = RealForegroundWindow();
         if (fgNow != g_lastFg) {
             g_lastFg = fgNow;
             g_fgAwaitUserInput = TRUE;
+            g_fgChangeTick = GetTickCount();
         }
     }
 
@@ -7096,6 +7100,7 @@ static void UpdateAutoVisibility() {
     if (fgNow != g_lastFg) {
         g_lastFg = fgNow;
         g_fgAwaitUserInput = TRUE;
+        g_fgChangeTick = GetTickCount();
     }
 
     // 触屏："用户刚点了一下"的边沿检测（每 tick 采一次，见 TouchInputTick）
@@ -7198,6 +7203,7 @@ static void UpdateAutoVisibility() {
             char hitCls[128] = {0};
             GetClassNameA(g_lastClickTopHwnd, hitCls, 128);
             if (IsShellSurfaceClass(hitCls)) {
+                if (g_fgChangeTick && GetTickCount() - g_fgChangeTick < 700) { g_dbgWhy = "fg-grace"; goto done; }
                 ShowKB(FALSE, FALSE);
                 g_dbgWhy = "shell-hide";
                 goto done;
@@ -7233,6 +7239,9 @@ static void UpdateAutoVisibility() {
     if (g_manualHide)     { g_dbgWhy = "manualHide-nop"; goto done; }
     if (GetTickCount() - g_lastNonInput < (DWORD)g_hideDelayMs) { g_dbgWhy = "noInput-delay"; goto done; }
     if (g_manualShow)     { g_dbgWhy = "manualShow-nop"; goto done; }
+    // 刚换过前台：先别收。任务栏/开始菜单/UWP 宿主会把前台占住几百毫秒，
+    // 这时候收起来、等目标程序接管前台又弹出来 —— 就是"切一次窗口跳一下"。
+    if (g_fgChangeTick && GetTickCount() - g_fgChangeTick < 700) { g_dbgWhy = "fg-grace"; goto done; }
 
     ShowKB(FALSE, FALSE);
     g_dbgWhy = "auto-hide";

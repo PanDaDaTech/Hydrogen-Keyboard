@@ -606,7 +606,7 @@ BOOL        g_manualShow = FALSE;
 BOOL        g_manualHide = FALSE;      // 用户显式收起（×隐藏到托盘）后不自动弹出，直到手动重新显示
 ULONG_PTR   g_detectedInputToken = 0;   // 最近一次输入焦点识别结果
 BOOL        g_detectedByChromiumClass = FALSE;
-int         g_hideDelayMs = 300;       // 失焦后的自动隐藏延迟（用户实测 1 秒太慢，收到 300ms）
+int         g_hideDelayMs = 200;       // 失焦后的自动隐藏延迟（1s→300ms→200ms，用户两次实测"太慢"）
 DWORD       g_lastNonInput = 0;        // 最近一次离焦时刻（自动隐藏延迟用）
 
 // 语言切换：g_lang=0 简体中文，1 English；返回当前语言对应的文案
@@ -3672,7 +3672,8 @@ static void ShowKB(BOOL show, BOOL isManual) {
         int fromY = targetY;
         if (GetWindowRect(g_hWnd, &current)) fromY = current.top;
         g_vis = FALSE;
-        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, work.bottom, 150, MOTION_HIDE);
+        // 下滑 150→120ms：与 streak/delay 一起把"离焦到收起"压到 ~700ms（用户实测太慢）
+        StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, work.bottom, 120, MOTION_HIDE);
         // 作废还没消费的"触控点击"边沿：显示期间没人咨询它（只在 verdictHide 分支
         // 才被消费），一次 1.9 秒前的点击会在收起后几拍里被当成"该弹"的正面证据，
         // 形成 收起→30ms 后又弹→1.4s 后再收 的闪烁（2026-10-18 实测，why=show）。
@@ -4663,8 +4664,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         RECT rr = SettingsRowRect(m, 0);
         DrawSettingRowContent(dc, m, rr, HKICON_GEAR, NULL,
                               T(L"以管理员身份运行", L"Run as administrator"),
-                              T(L"重启后生效。提权后才能向以管理员权限运行的程序输入按键",
-                                L"Takes effect after restart. Required to type into elevated programs"),
+                              T(L"重启后生效。提权后即可给以管理员身份运行的程序输入按键",
+                                L"Takes effect after restart. Needed to send keys to elevated programs"),
                               g_sHov == S_HIT_RUNAS, SettingsSwitchTextRight(m, rr));
         DrawSettingSwitch(dc, m, rr, g_runAsAdmin, S_HIT_RUNAS);
 
@@ -4879,8 +4880,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
           RECT stR = RowSegRect(m, r, st, stn);
           DrawSettingRowContent(dc, m, r, HKICON_CONTRAST, NULL,
                                 T(L"界面风格", L"Interface Style"),
-                                T(L"灰色键面 + 4px 圆角；按下与锁定仍用主题色相高亮",
-                                  L"Grey keys, 4px corners; presses and locks still use the accent hue"),
+                                T(L"经典：灰色键面 + 4px 圆角；按下与锁定仍用主题色相高亮",
+                                  L"Classic: grey keys, 4px corners; presses and locks keep the accent"),
                                 g_sHov == S_HIT_STYLE, stR.left);
           DrawSegmented(dc, m, stR, st, stn, g_themeStyle); }
 
@@ -4951,7 +4952,7 @@ static RunasAskLayout RunasAskComputeLayout(HWND hWnd) {
     RunasAskLayout L = {};
     RECT rc; GetClientRect(hWnd, &rc);
     double dpi = GetSystemDpiScale();
-    int cw = (int)(384 * dpi), ch = (int)(180 * dpi);
+    int cw = (int)(384 * dpi), ch = (int)(200 * dpi);   // 200：正文改自动换行后要装 3 行
     int cx = (rc.right - cw) / 2, cy = (rc.bottom - ch) / 2;
     if (cx < (int)(8 * dpi)) cx = (int)(8 * dpi);
     if (cy < (int)(8 * dpi)) cy = (int)(8 * dpi);
@@ -4974,17 +4975,26 @@ static void RunasAskDraw(HDC dc, HWND hWnd) {
                   L.card.right - L.card.left, L.card.bottom - L.card.top,
                   C_KEY, C_KEY, (int)(16 * dpi));
     int pad = (int)(20 * dpi);
-    int tx = L.card.left + pad;
+    // 标题行：ⓘ 图标块 + 标题（与关闭提示同一配方 —— 两个对话框视觉同步）
+    int headIcon = (int)(38 * dpi);
+    int ix = L.card.left + pad, iy = L.card.top + (int)(18 * dpi);
+    DrawRoundRect(dc, ix, iy, headIcon, headIcon, C_REGULAR, C_REGULAR, (int)(9 * dpi));
+    {
+        int isz = (int)(17 * dpi);
+        DrawHkIcon(dc, (float)(ix + (headIcon - isz) / 2),
+                   (float)(iy + (headIcon - isz) / 2), (float)isz,
+                   HkIcon(HKICON_DIALOGINFO), C_BTN_CONTENT, C_BTN_CONTENT);
+    }
+    int tx = ix + headIcon + (int)(12 * dpi);
     int tw = (L.card.right - pad) - tx;
-    DrawTextL(dc, tx, L.card.top + (int)(18 * dpi), tw, (int)(24 * dpi),
+    DrawTextL(dc, tx, iy + (headIcon - (int)(24 * dpi)) / 2, tw, (int)(24 * dpi),
               T(L"以管理员身份运行？", L"Run as administrator?"), g_sfCtrl, C_WHITE);
-    DrawTextL(dc, tx, L.card.top + (int)(52 * dpi), tw, (int)(18 * dpi),
-              T(L"轻键将请求以管理员权限重启。", L"HKeyboard will restart with administrator rights."),
-              g_sfBase, C_DIM);
-    DrawTextL(dc, tx, L.card.top + (int)(72 * dpi), tw, (int)(18 * dpi),
-              T(L"Windows 会显示用户账户控制（UAC）确认框，允许后轻键重新打开。",
-                L"Windows shows the UAC prompt; HKeyboard reopens after you allow it."),
-              g_sfBase, C_DIM);
+    // 正文整段自动换行：原来是两行定长文本，长句被卡片右缘硬裁（2026-10-18 用户实测）
+    DrawTextL(dc, L.card.left + pad, iy + headIcon + (int)(10 * dpi),
+              (L.card.right - pad) - (L.card.left + pad), (int)(56 * dpi),
+              T(L"轻键将请求以管理员权限重启。Windows 会显示用户账户控制（UAC）确认框，允许后轻键重新打开。",
+                L"HKeyboard will restart with administrator rights. Windows shows the UAC prompt; HKeyboard reopens after you allow it."),
+              g_sfBase, C_DIM, TRUE);
     DrawRoundRect(dc, L.ok.left, L.ok.top, L.ok.right - L.ok.left, L.ok.bottom - L.ok.top,
                   (g_sHov == S_HIT_RA_OK) ? C_REGULAR_ACT : C_HOT, C_KEY_BORDER, (int)(6 * dpi));
     // 浅色主题下 C_ON_PRIMARY 近黑，压在蓝底上"发黑"；深色下那个组合反而好看（与关闭提示一致）
@@ -5283,7 +5293,7 @@ static void LoadConfig() {
     g_dualSymbols = (IniGetInt(L"General", L"DualSymbols", 1) != 0);
     g_themeStyle = IniGetInt(L"Theme", L"Style", 0);   // 0=现代 1=经典（B1）   // 默认开：键面并列显示两个符号
     g_shiftDoubleTap = (IniGetInt(L"General", L"ShiftDoubleTap", 0) != 0);
-    g_hideDelayMs = 300;    // 失焦后的自动隐藏延迟（见定义处说明）
+    g_hideDelayMs = 200;    // 失焦后的自动隐藏延迟（见定义处说明）
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
@@ -5969,11 +5979,13 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
     L.closeW = (int)(28 * dpi);
     L.closeH = (int)(28 * dpi);
     L.closeX = W - L.pad - L.closeW;
-    L.closeY = (int)(5 * dpi);
 
     L.headIcon = (int)(38 * dpi);
     L.titleY   = L.pad;
     L.titleH   = L.headIcon;
+    // ⚠ 关闭钮与标题行垂直居中对齐（与设置页 closeY 同一公式）。
+    //   原来写死 5 DIP：钮子贴在窗口右上圆角上，用户实测"关闭键位置偏了"（2026-10-18）。
+    L.closeY = L.titleY + (L.titleH - L.closeH) / 2;
 
     L.rowPadY  = (int)(12 * dpi);
     L.tile     = (int)(30 * dpi);
@@ -6011,8 +6023,10 @@ static PromptLayout PromptComputeLayout(int W, double dpi) {
     L.btnW  = (int)(84 * dpi);
     L.btnH  = (int)(30 * dpi);
     L.btnY  = L.lineY + (int)(12 * dpi);
-    L.cancelX = W - L.pad - L.btnW;
-    L.okX     = L.cancelX - (int)(10 * dpi) - L.btnW;
+    // ⚠ 确定在右、取消在左 —— 与「以管理员身份运行？」询问窗一致
+    //   （2026-10-18 用户要求"确定取消倒过来"；原来确定在左）
+    L.okX     = W - L.pad - L.btnW;
+    L.cancelX = L.okX - (int)(10 * dpi) - L.btnW;
     return L;
 }
 
@@ -6037,7 +6051,7 @@ static void PromptDraw(HDC dc, HWND hWnd) {
     }
     DrawTextL(dc, L.pad + L.headIcon + (int)(12 * dpi), L.titleY,
               L.closeX - (L.pad + L.headIcon) - (int)(12 * dpi), L.titleH,
-              T(L"是否关闭轻键", L"Close HKeyboard?"), g_sfCtrl, C_WHITE);
+              T(L"是否关闭轻键？", L"Close HKeyboard?"), g_sfCtrl, C_WHITE);
 
     // 右上关闭钮：平时不铺底，悬停才给一层 btn_regular_bg_hover（与设置页一致）
     if (g_pHov == P_HIT_CLOSE) {
@@ -6287,7 +6301,7 @@ static void OpenClosePrompt() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int x = work.left + ((work.right - work.left) - w) / 2;
     int y = work.top + ((work.bottom - work.top) - h) / 2;
-    g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"是否关闭轻键", L"Close HKeyboard?"), WS_POPUP,
+    g_closePromptHwnd = CreateWindowExW(WS_EX_TOPMOST, L"HKeyboardClosePrompt", T(L"是否关闭轻键？", L"Close HKeyboard?"), WS_POPUP,
         x, y, w, h, NULL, NULL, g_hInst, NULL);
     if (g_closePromptHwnd) {
         // 先置为全透明，再显示并渐显（避免闪现一帧不透明内容）
@@ -7573,8 +7587,10 @@ static void UpdateAutoVisibility() {
     if (fg == g_settingsHwnd || fg == g_closePromptHwnd) { g_dbgWhy = "own-window"; goto done; }
 
     // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量）
+    //   12 拍(≈600ms) → 8 拍(≈400ms)：整套隐藏原来是 streak+delay+动画 ≈1s，
+    //   用户实测"太慢"（2026-10-18）。8 拍连续无输入 + 200ms 延迟仍是双保险。
     g_noInputStreak++;
-    if (g_noInputStreak < 12) { g_dbgWhy = "noInput-streak"; goto done; }
+    if (g_noInputStreak < 8) { g_dbgWhy = "noInput-streak"; goto done; }
     if (g_noInputSinceTick == 0) g_noInputSinceTick = nowTick;
 
     // ⚠⚠ 防抖（2026-10-04 用户日志实测，修的是「手动收起后过几秒键盘自己弹回来」）

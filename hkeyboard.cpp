@@ -134,6 +134,7 @@ int g_keyHeight = 46;
 #define TIMER_WINDOW_ANIM 8828
 #define TIMER_SETTINGS_ANIM 8827
 #define TIMER_WIN_FADE 8831
+#define TIMER_CARET     8834   // 设置页 HEX 输入框的光标闪烁
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
@@ -141,7 +142,6 @@ int g_keyHeight = 46;
 #ifdef HK_DIAG
 // -envtest 专用：驱动"注入→退出"两个阶段（说明见 EnvTestInject）
 #define TIMER_ENVTEST   8833
-#define TIMER_CARET     8834   // 设置页 HEX 输入框的光标闪烁
 // ⚠ 前向声明是必需的：WM_TIMER 的处理在主 WndProc 里（文件靠前）
 BOOL g_envTest = FALSE;
 int  g_envTestStage = 0;
@@ -375,9 +375,9 @@ static DWORD GetWallpaperAccentBgr() {
     if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, path, 0) && path[0]) {
         Gdiplus::Bitmap src(path, FALSE);
         if (src.GetLastStatus() == Gdiplus::Ok && src.GetWidth() > 0) {
-            Gdiplus::Bitmap small(16, 16, PixelFormat32bppARGB);
+            Gdiplus::Bitmap thumb(16, 16, PixelFormat32bppARGB);
             {
-                Gdiplus::Graphics g(&small);
+                Gdiplus::Graphics g(&thumb);
                 g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
                 g.DrawImage(&src, 0, 0, 16, 16);
             }
@@ -385,7 +385,7 @@ static DWORD GetWallpaperAccentBgr() {
             for (int y = 0; y < 16; y++) {
                 for (int x = 0; x < 16; x++) {
                     Gdiplus::Color c;
-                    if (small.GetPixel(x, y, &c) != Gdiplus::Ok) continue;
+                    if (thumb.GetPixel(x, y, &c) != Gdiplus::Ok) continue;
                     if (c.GetA() < 128) continue;
                     r += c.GetR(); gg += c.GetG(); b += c.GetB(); n += 1;
                 }

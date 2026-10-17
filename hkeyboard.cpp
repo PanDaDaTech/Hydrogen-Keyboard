@@ -428,6 +428,9 @@ static HWND g_settingsHwnd = 0;
 static HWND g_closePromptHwnd = 0;
 
 // 重新应用主题；颜色确实发生变化时刷新窗口（三个窗口一起，避免只换主键盘留下残留配色）
+// 主窗口句柄定义在下面（文件靠后），这里要提前引用
+extern HWND g_hWnd;
+
 static void RefreshThemeAndRepaint(HWND hWnd) {
     HkbTokens before = g_themeBuf;
     ApplyTheme();

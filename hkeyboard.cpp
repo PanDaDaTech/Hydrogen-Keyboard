@@ -448,6 +448,9 @@ static BOOL IsProcessElevated() {
     return elevated;
 }
 
+// 互斥体定义在文件靠后，这里要提前引用
+extern HANDLE g_mutex;
+
 // 以管理员身份重启自身。返回 FALSE 表示 UAC 被拒或启动失败，调用方应维持原状。
 static BOOL RelaunchElevated() {
     wchar_t exe[MAX_PATH] = {0};

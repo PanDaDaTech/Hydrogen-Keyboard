@@ -3732,7 +3732,6 @@ static void DoKeyAction(const KeyDef* k) {
 #define HDR_DOCK  1000
 #define HDR_MIN   1003
 #define HDR_CLOSE 1004
-#define HDR_NUM   1005   // 旧语义（三态切换），已被 HDR_LAYOUT 接管，保留备查
 #define HDR_LAYOUT 1007  // 标题栏布局胶囊：打开/收起布局菜单（A1）
 #define HDR_HIDE  1006   // ⏑ 按钮：永久隐藏到托盘（单击托盘图标恢复）
 
@@ -3811,16 +3810,9 @@ static int HitHeader(int x, int y) {
     return -1;
 }
 
-// 「小键盘」按钮当前算不算「开着的」：
-//   独立小键盘布局 —— 整块界面就是小键盘，算开；
-//   全尺寸布局     —— 数字区可见才算开（窄屏自动收起时按钮不该显示成激活态）；
-//   默认布局       —— 没开。
-// 这个语义让同一个按钮在三种布局下自洽：它回答的始终是「小键盘现在开着吗」。
-static BOOL NumBtnActive() {
-    if (g_layoutMode == 1) return TRUE;
-    if (g_layoutMode == 2) return !NumpadHidden();
-    return FALSE;
-}
+// （原 NumBtnActive「小键盘开着吗」已删：布局胶囊改成菜单按钮后，激活态表示
+//   「菜单开着」。数字区是否可见由键盘自己显示，不需要胶囊再报一次 ——
+//   全尺寸下它常亮反而会让人误以为那是个开关，实机截图就是这么误读的。）
 
 // 标题栏图标的外框尺寸（DIP）。**不能**所有图标共用一个 size：几何包围盒差得很远
 // （Numpad 17.6/24、Gear 22.4/24；最小化与关闭用的还是 12 网格，各占 8/12、6/12），
@@ -3840,13 +3832,17 @@ static int HeaderIconBox(int id, double dpi) {
 }
 
 // 标题栏胶囊按钮：底色 + 矢量图标 + 文字，三者同一配方。
-// 「设置」与「小键盘」共用这一份 —— 两个按钮的观感必须一致。
+// 「设置」与「布局」共用这一份 —— 两个按钮的观感必须一致。
 // 设置按钮恒定显示「齿轮 + 设置」（设置页页头也是齿轮，两处观感才对得上）。
 // 宽度由调用方从 HeaderMetrics 取（绘制与命中同源，见 GetHeaderMetrics 上方的说明）。
-// active：「小键盘开着」的实底态（主色底 + 主色上的文字，零新增令牌）。
+// active：实底态。**只有「布局」会用到**，含义是「菜单正开着」（见 DrawHeader 的调用点）：
+//   它已经是一个菜单按钮，不再用「小键盘开着」当激活态 —— 否则全尺寸下常亮，
+//   用户分不清「菜单开着」和「数字区可见」，也读不出它其实是个下拉。
+// caret：在文字右侧画一个小下箭头，明确「点它会弹出列表」。这是菜单按钮的必要提示，
+//   少了它这个胶囊和原来的三态开关长得一模一样（实机反馈就是这么误读的）。
 static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL hov,
                            const HkIconDef& icon, int iconId,
-                           const wchar_t* label, BOOL active) {
+                           const wchar_t* label, BOOL active, BOOL caret) {
     DWORD bg, fg;
     if (active) {
         // 激活态悬停必须「向白混」：向 cardBg 混在深色主题下只有 4.54:1（踩在 AA 线上）
@@ -3864,22 +3860,34 @@ static void DrawHeaderPill(HDC dc, const HeaderMetrics& hm, int x, int w, BOOL h
     int tw     = MeasureTextW(dc, label, g_f12);       // 容纳宽度 → 绘制矩形用它（见 MeasureTextW）
     int adv    = MeasureTextAdvW(dc, label, g_f12);    // 布局宽度 → 排版必须用它
     if (adv <= 0) adv = tw;
+    // 下箭头：可见约 9 DIP 的小三角。间距 6 DIP —— 再小就和文字粘在一起，
+    // 再大整组就往左偏（组是整体居中的）。
+    int cGap    = caret ? (int)(6 * dpi * HeaderFontRatio()) : 0;
+    int caretSz = caret ? (int)(9 * dpi * HeaderFontRatio()) : 0;
+    int groupW  = iconSz + gap + adv + (caret ? cGap + caretSz : 0);
     // 按「图标 + 间距 + 文字实际占宽」整组居中。若用容纳宽度，GDI+ 那两侧各约 0.2em 的余量
     // 会被当成文字宽度：图标被挤到贴左、图标与文字之间凭空多出近一倍空隙
     // （实测 19px，设计值 10px）。
-    int cx = x + (w - (iconSz + gap + adv)) / 2;
+    int cx = x + (w - groupW) / 2;
     DrawHkIcon(dc, (float)cx, (float)(hm.btnY + (hm.btnH - iconSz) / 2), (float)iconSz,
                icon, fg, fg);
     // DrawTextC 是把墨迹居中在矩形里的，所以矩形要再左移「(矩形宽 - 文字宽)/2」，
     // 墨迹才会正好落在间距之后（否则整段文字右移半个余量）。
     DrawTextC(dc, cx + iconSz + gap + adv / 2 - (tw + 4) / 2, hm.btnY, tw + 4, hm.btnH,
               label, g_f12, fg);
+    if (caret) {
+        int ccx = cx + iconSz + gap + adv + cGap;
+        // HKICON_CHEVRONDOWN 是 24 网格、可见区 6..18 ⇒ 外框 = 可见 × 24/12
+        int box = (int)(caretSz * 24.0 / 12.0 + 0.5);
+        DrawHkIcon(dc, (float)ccx, (float)(hm.btnY + (hm.btnH - box) / 2), (float)box,
+                   HkIcon(HKICON_CHEVRONDOWN), fg, fg);
+    }
 }
 
 static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
     DrawHeaderPill(dc, hm, hm.xMenu, hm.wMenu, (g_hdrHov == HDR_DOCK),
                    HkIcon(HKICON_GEAR), HKICON_GEAR,
-                   T(L"\x8BBE\x7F6E", L"Settings"), FALSE);
+                   T(L"\x8BBE\x7F6E", L"Settings"), FALSE, FALSE);
 }
 
 // ===== 布局菜单（A1：窗口内弹层，见 HKeyboard-UI方案评估 §三）=====
@@ -3889,6 +3897,8 @@ static void DrawHeaderMenuButton(HDC dc, const HeaderMetrics& hm) {
 //   ① 绘制排在按键之后 ② 状态进 KbFrameSig ③ UpdateAutoVisibility 里短路
 static BOOL g_lmOpen = FALSE;
 static int  g_lmHover = -1;
+// 打开菜单时所在的前台窗口。换到别的程序后菜单就不该留着（见 UpdateAutoVisibility 的短路）。
+static HWND g_lmOpenFg = NULL;
 
 static void ApplyKeyboardLayout(BOOL resetSize);
 
@@ -3907,7 +3917,9 @@ static RECT LayoutMenuRect() {
     int n = LayoutMenuItemCount();
     int itemH = (int)(44 * dpi);
     int pad = (int)(6 * dpi);
-    int w = (int)(168 * dpi);
+    // 184 而不是 168：开关行右侧要留出开关（36）与间距，168 时英文 "Number pad"
+    // 会被裁掉。中文标签在 168 下是够的，但这份界面有英文版，取两者中较宽的那个。
+    int w = (int)(184 * dpi);
     if (w < hm.wNum) w = hm.wNum;
     int hh = n * itemH + pad * 2;
     int right = hm.xNum + hm.wNum;
@@ -3949,6 +3961,24 @@ static void DrawMenuCheck(HDC dc, int cx, int cy, int size, DWORD color) {
     DeleteObject(pen);
 }
 
+// 菜单里的开关（只给「数字区」那一行用）。
+// ⚠ 为什么不用勾：全尺寸下菜单里有**两个** ✓（全尺寸 + 数字区），而且两行都涂着同一层
+//   选中底色 —— 实机截图里看就是「四个并列的布局」，用户分不清哪个是选项、哪个是开关。
+//   ⇒ 前三个是单选（勾 + 淡底），数字区是开关（右侧小开关 + 不涂底 + 上方一条分隔线），
+//     形状不同，一眼能分开。
+static void DrawMenuToggle(HDC dc, int x, int y, int w, int h, BOOL on) {
+    double dpi = GetSystemDpiScale();
+    // 关：面板底与键面之间的一档灰；开：主色。两种主题下都成立（都是与 C_KEY 混出来的）。
+    DWORD track = on ? C_HOT : BlendColor(C_KEY, C_WHITE, 0.14);
+    DrawRoundRect(dc, x, y, w, h, track, track, h / 2);
+    int inset = (int)(2 * dpi);
+    int d = h - inset * 2;
+    int kx = on ? (x + w - inset - d) : (x + inset);
+    // 滑块固定「接近白」：浅色下是白钮，深色下是浅灰钮，都不需要按主题分叉。
+    DWORD knob = BlendColor(C_KEY, C_WHITE, 0.92);
+    DrawRoundRect(dc, kx, y + inset, d, d, knob, knob, d / 2);
+}
+
 static void DrawLayoutMenu(HDC dc) {
     if (!g_lmOpen) return;
     double dpi = GetSystemDpiScale();
@@ -3959,19 +3989,33 @@ static void DrawLayoutMenu(HDC dc) {
     const wchar_t* labels[4] = { T(L"默认布局", L"Default"), T(L"小键盘", L"Numpad"),
                                  T(L"全尺寸", L"Full size"), T(L"数字区", L"Number pad") };
     int n = LayoutMenuItemCount();
+    int iw = p.right - p.left;
+    int toggleW = (int)(36 * dpi), toggleH = (int)(20 * dpi);
     for (int i = 0; i < n; i++) {
         int top = p.top + pad + i * itemH;
         RECT ir = { p.left + pad, top, p.right - pad, top + itemH };
-        BOOL cur = (i == 3) ? !NumpadHidden() : (i == g_layoutMode);
+        // 数字区（i==3）是开关行：勾/淡底都不给它，只给右侧的小开关
+        BOOL isToggle = (i == 3);
+        BOOL cur = isToggle ? !NumpadHidden() : (i == g_layoutMode);
         if (i == g_lmHover)
             DrawRoundRect(dc, ir.left, ir.top, ir.right - ir.left, ir.bottom - ir.top,
                           C_REGULAR_HOV, C_REGULAR_HOV, (int)(8 * dpi));
-        else if (cur)
+        else if (cur && !isToggle)
             DrawRoundRect(dc, ir.left, ir.top, ir.right - ir.left, ir.bottom - ir.top,
                           BlendColor(C_KEY, C_HOT, 0.08), BlendColor(C_KEY, C_HOT, 0.08), (int)(8 * dpi));
-        if (cur) DrawMenuCheck(dc, ir.left + (int)(16 * dpi), ir.top + itemH / 2, (int)(16 * dpi), C_HOT);
-        DrawTextL(dc, ir.left + (int)(30 * dpi), ir.top, (ir.right - ir.left) - (int)(36 * dpi),
-                  itemH, labels[i], g_sfCtrl, C_WHITE);
+        if (cur && !isToggle)
+            DrawMenuCheck(dc, ir.left + (int)(16 * dpi), ir.top + itemH / 2, (int)(16 * dpi), C_HOT);
+        int textX = ir.left + (int)(30 * dpi);
+        int textR = ir.right - (int)(12 * dpi);
+        if (isToggle) textR = ir.right - toggleW - (int)(26 * dpi);
+        DrawTextL(dc, textX, ir.top, textR - textX, itemH, labels[i], g_sfCtrl, C_WHITE);
+        if (isToggle) {
+            // 分隔线：画在开关行上沿，把「三个选项 / 一个开关」分开
+            Fill(dc, p.left + (int)(12 * dpi), top - (int)(0.5 * dpi),
+                 iw - (int)(24 * dpi), 1, C_META);
+            DrawMenuToggle(dc, ir.right - (int)(12 * dpi) - toggleW,
+                           ir.top + (itemH - toggleH) / 2, toggleW, toggleH, cur);
+        }
     }
 }
 
@@ -3986,12 +4030,12 @@ static void DrawHeader(HDC dc) {
         DrawTextC(dc, hm.xTitle, 0, hm.wTitle, g_headerH, L"", g_f12, C_DIM);
     }
 
-    // 小键盘按钮：三种布局下都常驻（全尺寸下它是数字区唯一的界面开关）。
-    // 激活态 = 「小键盘开着」：独立小键盘布局或在全尺寸下数字区可见时是主色实底。
+    // 布局胶囊：三种布局下都常驻（全尺寸下菜单里还管着数字区显隐）。
+    // 激活态 = **菜单正开着**，不是「小键盘开着」——理由见 DrawHeaderPill 的说明。
     if (hm.numBtnVisible) {
-        DrawHeaderPill(dc, hm, hm.xNum, hm.wNum, (g_hdrHov == HDR_NUM),
+        DrawHeaderPill(dc, hm, hm.xNum, hm.wNum, (g_hdrHov == HDR_LAYOUT),
                        HkIcon(HKICON_NUMPAD), HKICON_NUMPAD,
-                       T(L"\x5E03\x5C40", L"Layout"), NumBtnActive());
+                       T(L"\x5E03\x5C40", L"Layout"), g_lmOpen, TRUE);
     }
 
     // 最小化 / ⏑隐藏 / 关闭：改用矢量图标（与设置页、关闭提示窗口同一套图形，不再手绘线条）
@@ -8265,8 +8309,19 @@ static void UpdateAutoVisibility() {
         g_dbgWhy = "settings-open";
         return;
     }
-    // 布局菜单开着时同样挂起：用户正在挑布局，不能让键盘自己滑走
-    if (g_lmOpen) { g_dbgWhy = "layout-menu"; return; }
+    // 布局菜单开着时同样挂起：用户正在挑布局，不能让键盘自己滑走。
+    // ⚠ 但如果用户已经切到别的程序了，菜单留着就没意义 —— 收掉再走正常判定，
+    //   否则「开着菜单去用别的程序」会让键盘永久挂在屏幕上（短路把自动隐藏也一起跳过了）。
+    if (g_lmOpen) {
+        if (g_lmOpenFg && RealForegroundWindow() != g_lmOpenFg) {
+            g_lmOpen = FALSE;
+            g_lmHover = -1;
+            if (g_hWnd && IsWindow(g_hWnd)) InvalidateRect(g_hWnd, NULL, FALSE);
+        } else {
+            g_dbgWhy = "layout-menu";
+            return;
+        }
+    }
     // 窗口滑动动画期间不做焦点评估：焦点探测可能触发跨进程 COM 调用，
     // 在启动动画中执行会造成可感知的卡顿；动画结束后下个轮询周期再评估。
     if (g_mainMotion.active) {
@@ -8718,26 +8773,9 @@ static void OnLDown(HWND hWnd, int x, int y) {
             // 打开/收起布局菜单（原来的三态语义已收进菜单，见 LayoutMenuApply）
             g_lmOpen = !g_lmOpen;
             g_lmHover = -1;
+            if (g_lmOpen) g_lmOpenFg = RealForegroundWindow();   // 换程序时据此收起
             g_lastOwnKeyTick = GetTickCount();   // 算作「用户正在用键盘」
             InvalidateRect(hWnd, NULL, TRUE);
-            break;
-        case HDR_NUM:   // 「小键盘」按钮：语义统一为「小键盘开着吗」
-            if (g_layoutMode == 2) {
-                // 全尺寸布局：切换右侧数字区。
-                // ⚠ 取反的必须是**生效状态** NumpadHidden()，不是手动标志 g_npHidden ——
-                //   按钮显示（NumBtnActive → !NumpadHidden()）用的是生效状态，
-                //   点击却翻转 g_npHidden，两者在「窄屏自动收起」时会分叉：
-                //   窗口 700 DIP（自动收起中、g_npHidden=FALSE）时点一下算的是「再隐藏一次」，
-                //   界面毫无变化，用户看到的就是「按钮点了不更新状态」。
-                SetFullNumpadHidden(hWnd, !NumpadHidden());
-            } else if (g_layoutMode == 1) {
-                g_layoutMode = g_prevLayout;   // 独立小键盘 → 切回上次用的布局
-                ApplyKeyboardLayout(TRUE);
-            } else {
-                g_prevLayout = g_layoutMode;   // 默认布局 → 切到独立小键盘
-                g_layoutMode = 1;
-                ApplyKeyboardLayout(TRUE);
-            }
             break;
         }
         return;
@@ -8802,9 +8840,15 @@ static void OnMMove(HWND hWnd, int x, int y) {
         g_hdrHov = hh;
         InvalidateRect(hWnd, 0, TRUE);
     }
-    int nk = HitKey(x, y);
-    if (nk != g_hk) {
+    // ⚠ 布局菜单开着时：只在菜单内做悬停，**不点亮底下的键**。
+    //   否则指针扫过菜单会连带点亮菜单底下那一格（菜单是半透明观感的浮层，
+    //   两处同时高亮看着像画错）。g_lmHover 以前只在关闭时被清、从来没被更新过 ——
+    //   所以「悬停菜单项」这条反馈一直是失效的。
+    int nk = g_lmOpen ? -1 : HitKey(x, y);
+    int li = g_lmOpen ? LayoutMenuHitIndex(x, y) : -1;
+    if (nk != g_hk || li != g_lmHover) {
         g_hk = nk;
+        g_lmHover = li;
         InvalidateRect(hWnd, 0, TRUE);
     }
     if (!g_tracking) {
@@ -8973,9 +9017,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_MOUSEMOVE: OnMMove(hWnd, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0;
     case WM_MOUSELEAVE:
         g_tracking = FALSE;
-        if (g_hdrHov != -1 || g_hk != -1) {
+        if (g_hdrHov != -1 || g_hk != -1 || g_lmHover != -1) {
             g_hdrHov = -1;
             g_hk = -1;
+            g_lmHover = -1;
             InvalidateRect(hWnd, 0, TRUE);
         }
         return 0;
@@ -9055,6 +9100,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 g_pkFlash = -1;
                 InvalidateRect(hWnd, NULL, FALSE);
             }
+            // 键盘已被收起（最小化 / 托盘 / 自动隐藏）时，菜单不该留着 —— 否则下次
+            // 显示出来会看到它挂在标题栏下面，还得再点一次才收。这里只在隐藏态清，
+            // 不重绘（不可见）。
+            if (g_lmOpen && !g_vis) { g_lmOpen = FALSE; g_lmHover = -1; }
             // Win 锁定/高亮状态与开始菜单状态同步：
             // 开始菜单（无论由本键盘还是任务栏打开）一旦显示，即清除 Win 锁定，避免高亮残留。
             if (g_winKey && IsStartMenuOpen()) {

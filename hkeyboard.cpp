@@ -7448,6 +7448,19 @@ static void UpdateAutoVisibility() {
     if (uiaStable == 1) { g_chromiumTrustFg = fgNow; g_chromiumTrustPid = PidOfWindow(fgNow); }
     BOOL trustHere = (g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) ||
                      (g_chromiumTrustPid != 0 && g_chromiumTrustPid == PidOfWindow(fgNow));
+    // 落点查询（一拍只查一次）：**必须放在判定之前**。
+    // ⚠⚠ 原来它在 done 块（判定之后）里查，而那里读的是**动作后**的 g_vis：
+    // 在"该弹"的那一拍，下面的 ShowKB(TRUE) 已把 g_vis 置真、verdictHide 也被
+    // 清掉 ⇒ 查询条件双双落空 ⇒ pt 停在 -1。verdictHide 分支把"未知(-1)"当成
+    // "点击有效"放行弹出，下一拍 pt=0 又收起 —— 用户看到「点空白闪一下」
+    // （2026-10-18 回归实测：02:41:25.993 why=show pt=-1 → .250 pt=0 → 27.4 收起）。
+    // 语义：已显示时仍只查"精判刚收过"那一支；**隐藏期间每次新点击都查** ——
+    // 它是 show 通路唯一的鼠标正面证据（隐藏期间实测可靠：空白→50030，输入框→50004）。
+    g_dbgUiaPt = -1;
+    g_dbgUiaPtCt = -1;
+    if (recentClick && g_afChromiumPrecise && g_detectedByChromiumClass &&
+        (!g_vis || (g_verdictHide && g_verdictHidFg == fgNow)))
+        g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
     // ⚠⚠ 只有**已显示**时才抹掉粗判：这条路径的唯一目的是"把可见的键盘收起来"。
     // 隐藏期间 UIA 焦点判据不再采样（上面 g_vis 闸门，原因见那边注释），多数票
     // 冻结在收起前的旧样本上；拿冻结值每拍抹 input，会把下面"重新攒正面证据"的
@@ -7483,7 +7496,7 @@ static void UpdateAutoVisibility() {
                 g_verdictHide = FALSE;      // 换了前台窗口 / 敲了实体键 → 重新攒证据
                 g_dbgWhy = "vhid-reset";
             } else if (recentClick) {
-                // 落点查询结果在诊断块里已经算好（g_dbgUiaPt），一拍只查一次
+                // 落点查询结果在判定前已经算好（g_dbgUiaPt），一拍只查一次
                 if (g_dbgUiaPt == 0 && g_chromiumTrustFg == fgNow) {
                     g_dbgWhy = "vhid-blank";    // 明确点过空白 → 保持收起，不要弹一下再收
                     goto done;
@@ -7581,15 +7594,7 @@ static void UpdateAutoVisibility() {
 done:
     // 诊断（-afdiag / 日志导出）：记录这次评估的全部输入量
     {
-        // 落点查询：已显示时仍只查"精判刚收过"那一支（原语义不变）；
-        // **隐藏期间每次新点击都查** —— show 通路唯一的鼠标正面证据就是它
-        // （ElementFromPoint 在隐藏期间实测可靠：空白→50030，输入框→50004）。
-        // 结果既进日志，也供上面的 show 分支决定要不要放行 —— 一拍只查一次。
-        g_dbgUiaPt = -1;
-        g_dbgUiaPtCt = -1;
-        if (recentClick && g_afChromiumPrecise && g_detectedByChromiumClass &&
-            (!g_vis || (g_verdictHide && g_verdictHidFg == fgNow)))
-            g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
+        // 落点查询已挪到判定之前（见上面 g_dbgUiaPt 的赋值处），这里只打印
         char st[176];
         _snprintf_s(st, sizeof(st), _TRUNCATE,
                     "why=%s uiact=%d cap=%d pt=%d ptc=%d inFg=%d tip=%d foc=%d mh=%d uhi=%d ns=%d hid=%d",

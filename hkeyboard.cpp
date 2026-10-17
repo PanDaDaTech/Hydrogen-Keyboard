@@ -3210,11 +3210,15 @@ static void DrawLayoutMenu(HDC dc) {
         if (i == g_lmHover)
             DrawRoundRect(dc, ir.left, ir.top, ir.right - ir.left, ir.bottom - ir.top,
                           C_REGULAR_HOV, C_REGULAR_HOV, (int)(8 * dpi));
-        else if (cur && !isToggle)
+        else if (cur && !isToggle) {
+            DWORD sel = BlendColor(C_KEY, (g_themeStyle == 1) ? C_WHITE : C_HOT, 0.08);
             DrawRoundRect(dc, ir.left, ir.top, ir.right - ir.left, ir.bottom - ir.top,
-                          BlendColor(C_KEY, C_HOT, 0.08), BlendColor(C_KEY, C_HOT, 0.08), (int)(8 * dpi));
+                          sel, sel, (int)(8 * dpi));
+        }
+        // 经典风格的「布局切换」高亮用中性灰：整块界面已经是灰的，再压一层色相很跳。
+        DWORD accC = (g_themeStyle == 1) ? C_WHITE : C_HOT;
         if (cur && !isToggle)
-            DrawMenuCheck(dc, ir.left + (int)(16 * dpi), ir.top + itemH / 2, (int)(16 * dpi), C_HOT);
+            DrawMenuCheck(dc, ir.left + (int)(16 * dpi), ir.top + itemH / 2, (int)(16 * dpi), accC);
         int textX = ir.left + (int)(30 * dpi);
         int textR = ir.right - (int)(12 * dpi);
         if (isToggle) textR = ir.right - toggleW - (int)(26 * dpi);
@@ -3778,10 +3782,13 @@ static BOOL g_switchAnimFrom = FALSE;
 static BOOL g_switchAnimTo = FALSE;
 
 static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
-    DrawRoundRect(dc, x, y, w, h, on ? C_HOT : C_DARK, C_KEY_BORDER, h / 2);
+    // 与设置页的 DrawSettingSwitch 同一套：轨道 = C_DARK → C_HOT 混色，圆钮恒为 C_KEY。
+    // 原来关态圆钮用 C_DIM（深灰），和设置页的白钮不是一套。
+    DWORD track = BlendColor(C_DARK, C_HOT, on ? 1.0 : 0.0);
+    DrawRoundRect(dc, x, y, w, h, track, C_KEY_BORDER, h / 2);
     int knob = h - 6;
     int kx = on ? x + w - knob - 3 : x + 3;
-    DrawRoundRect(dc, kx, y + 3, knob, knob, on ? C_KEY : C_DIM, on ? C_KEY : C_DIM, knob / 2);
+    DrawRoundRect(dc, kx, y + 3, knob, knob, C_KEY, C_KEY, knob / 2);
 }
 
 // ========== 设置页度量与布局 ==========
@@ -4175,8 +4182,8 @@ static int LayoutSegItems(const wchar_t** out) {
     return 3;
 }
 static int StyleSegItems(const wchar_t** out) {
-    static const wchar_t* zh[2] = { L"\u73B0\u4EE3", L"\u7ECF\u5178" };   // 现代 / 经典
-    static const wchar_t* en[2] = { L"Modern", L"Classic" };
+    static const wchar_t* zh[2] = { L"\u9ED8\u8BA4", L"\u7ECF\u5178" };   // 默认 / 经典
+    static const wchar_t* en[2] = { L"Default", L"Classic" };
     for (int i = 0; i < 2; i++) out[i] = g_lang ? en[i] : zh[i];
     return 2;
 }
@@ -5906,7 +5913,9 @@ static void PromptDraw(HDC dc, HWND hWnd) {
 
     DrawRoundRect(dc, L.okX, L.btnY, L.btnW, L.btnH,
                   (g_pHov == P_HIT_OK) ? C_REGULAR_ACT : C_HOT, C_KEY_BORDER, (int)(6 * dpi));
-    DrawTextC(dc, L.okX, L.btnY, L.btnW, L.btnH, T(L"确定", L"OK"), g_sfCtrl, C_ON_PRIMARY);
+    // 浅色主题下 C_ON_PRIMARY 是近黑色，压在蓝底上"发黑"；深色主题那个组合反而好看，故只改浅色。
+    DWORD okFg = IsDarkThemeActive() ? C_ON_PRIMARY : C_KEY;
+    DrawTextC(dc, L.okX, L.btnY, L.btnW, L.btnH, T(L"确定", L"OK"), g_sfCtrl, okFg);
     // 「取消」改 btnRegularBg：白底描边会与主按钮同权重，主次拉不开
     DrawRoundRect(dc, L.cancelX, L.btnY, L.btnW, L.btnH,
                   (g_pHov == P_HIT_CANCEL) ? C_REGULAR_HOV : C_REGULAR, C_KEY_BORDER, (int)(6 * dpi));

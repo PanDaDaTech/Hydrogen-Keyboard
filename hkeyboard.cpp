@@ -7487,6 +7487,14 @@ static void UpdateAutoVisibility() {
         if (!g_vis && recentClick && g_dbgUiaPt == 0 && g_chromiumTrustFg == fgNow) {
             g_verdictHide = TRUE;
             g_verdictHidFg = fgNow;
+            // 这一下点击已被精判为"空白"⇒ 它不能再当"该弹"的正面证据。
+            // 触屏边沿（TouchTapEdgeConsume）是**粗兜底**，优先级必须低于精判结论：
+            // 不撤掉它，recentClick 窗口过期后那一拍，else 分支会拿这同一 下点击
+            // 放行弹出 —— 「点空白闪一下」（2026-10-18 回归实测：vhid-blank 扛过
+            // 整个窗口，50.610 why=show inFg=1 tip=0 foc=0，证据只有 1.5s 前那一下）。
+            // ⚠ 本机是触屏设备，鼠标点击也会刷新 g_touchTapTick（判据分不清手指
+            //   和鼠标），所以这条路在桌面回归里同样是活的。
+            TouchTapEdgeDiscard();
             g_dbgWhy = "vhid-blank";
             goto done;
         }
@@ -7498,6 +7506,7 @@ static void UpdateAutoVisibility() {
             } else if (recentClick) {
                 // 落点查询结果在判定前已经算好（g_dbgUiaPt），一拍只查一次
                 if (g_dbgUiaPt == 0 && g_chromiumTrustFg == fgNow) {
+                    TouchTapEdgeDiscard();   // 同上：被否掉的点击不当"该弹"证据
                     g_dbgWhy = "vhid-blank";    // 明确点过空白 → 保持收起，不要弹一下再收
                     goto done;
                 }

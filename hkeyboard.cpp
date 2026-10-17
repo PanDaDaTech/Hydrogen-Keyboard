@@ -4616,6 +4616,7 @@ static void DrawAboutActionRow(HDC dc, const SettingsMetrics& m, const RECT& row
 }
 
 static void RunasAskDraw(HDC dc, HWND hWnd);   // 定义在 SettingsDraw 之后（模态层要画在最上层）
+static BOOL g_runasAskOpen = FALSE;            // 同上：SettingsDraw 里要读它，定义只能放后面
 static void SettingsDraw(HDC dc, HWND hWnd) {
     SettingsMetrics m = GetSettingsMetrics(hWnd);
 
@@ -4934,7 +4935,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
 // ===== 「以管理员身份运行」询问窗（设置窗内的模态层）=====
 // ⚠ 刻意**不做成新的顶层弹窗**：新窗口会抢前台，得在 RealForegroundWindow 里加豁免，
 //   与自动显隐的交互成本也高。设置窗本身已是免检窗口，窗口内模态层零额外风险。
-static BOOL g_runasAskOpen = FALSE;
+//   （g_runasAskOpen 的定义在 SettingsDraw 之前，见那里的前向声明）
 
 struct RunasAskLayout { RECT card, ok, cancel; };
 

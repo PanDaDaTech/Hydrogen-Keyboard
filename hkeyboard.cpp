@@ -586,6 +586,9 @@ static BOOL g_fgAwaitUserInput = FALSE;
 // ⚠ 不要等到 UpdateAutoVisibility 里再 WindowFromPoint：那时窗口可能已经变了
 static HWND  g_lastClickTopHwnd = NULL;
 static int   g_noInputStreak = 0;
+// 「这一拍有输入焦点」连续了多少拍。Firefox / Chromium 的焦点探测会一抖一抖的，
+// 只按单拍判定就会 hide→show→hide 地跳（日志里 uiact 在 50026/50030 之间来回）。
+static int   g_inputStreak = 0;
 // 失焦开始的时刻（首次越过"连续确认"门槛时记录，输入焦点恢复时清零）。
 // 与 AUTOSHOW_INPUT_GRACE_MS 配合，滤掉爆发式抖动 —— 见其定义处说明。
 static DWORD g_noInputSinceTick = 0;
@@ -7124,6 +7127,7 @@ static void UpdateAutoVisibility() {
     // ⚠ 这一句必须放在 `if (input)` 判定段**之前**：那段里有 `goto done`，而 done 在
     HWND fg = RealForegroundWindow();   // 别让系统触摸键盘被当成"别的程序"而误收键盘
     HWND input = GetFocusedInputControl();
+    if (input) g_inputStreak++; else g_inputStreak = 0;
 
     //   ⚠⚠ 前几版反复翻车的根因只有一条：**"该不该弹"和"该不该收"用了两个
     HWND inputForLog = input;       // 判定会把 input 置空（精判收起），日志要看判定前的值
@@ -7211,6 +7215,9 @@ static void UpdateAutoVisibility() {
         }
 
         if (g_fgAwaitUserInput) { g_dbgWhy = "await"; goto done; }
+        // 焦点要连续 6 拍（~300ms）才算数：单拍的"有输入"经常是探测抖动，
+        // 直接弹出来会和紧接着的"没有输入"形成 hide→show 循环。
+        if (g_inputStreak < 6) { g_dbgWhy = "input-streak"; goto done; }
         if (!g_manualHide && !g_vis) { ShowKB(TRUE, FALSE); g_dbgWhy = "show"; goto done; }
         g_dbgWhy = g_vis ? "shown" : "manualHide";
         goto done;
@@ -7220,7 +7227,7 @@ static void UpdateAutoVisibility() {
 
     // ⚠ 连续确认：焦点探测会间歇性返回 NULL（hwndCaret 是瞬态量）
     g_noInputStreak++;
-    if (g_noInputStreak < 4) { g_dbgWhy = "noInput-streak"; goto done; }
+    if (g_noInputStreak < 12) { g_dbgWhy = "noInput-streak"; goto done; }
     if (g_noInputSinceTick == 0) g_noInputSinceTick = nowTick;
 
     // ⚠⚠ 防抖（2026-10-04 用户日志实测，修的是「手动收起后过几秒键盘自己弹回来」）

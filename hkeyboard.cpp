@@ -3178,14 +3178,15 @@ static void DrawMenuCheck(HDC dc, int cx, int cy, int size, DWORD color) {
 // ⚠ 为什么不用勾：全尺寸下菜单里有**两个** ✓（全尺寸 + 数字区），而且两行都涂着同一层
 static void DrawMenuToggle(HDC dc, int x, int y, int w, int h, BOOL on) {
     double dpi = GetSystemDpiScale();
-    // 关：面板底与键面之间的一档灰；开：主色。两种主题下都成立（都是与 C_KEY 混出来的）。
-    DWORD track = on ? C_HOT : BlendColor(C_KEY, C_WHITE, 0.14);
+    // ⚠ C_WHITE 是**正文色**（g_theme->text），不是白色！上一版拿它混滑块，
+    //   92% 正文色 + 8% 白 = 近黑色圆钮（实机截图里就是那个"黑钮"）。
+    // ⇒ 与设置页 DrawSettingSwitch 完全同一套：轨道 C_DARK→C_HOT，圆钮 C_DIM→C_KEY。
+    DWORD track = BlendColor(C_DARK, C_HOT, on ? 1.0 : 0.0);
+    DWORD knob  = BlendColor(C_DIM, C_KEY, on ? 1.0 : 0.0);
     DrawRoundRect(dc, x, y, w, h, track, track, h / 2);
     int inset = (int)(2 * dpi);
     int d = h - inset * 2;
     int kx = on ? (x + w - inset - d) : (x + inset);
-    // 滑块固定「接近白」：浅色下是白钮，深色下是浅灰钮，都不需要按主题分叉。
-    DWORD knob = BlendColor(C_KEY, C_WHITE, 0.92);
     DrawRoundRect(dc, kx, y + inset, d, d, knob, knob, d / 2);
 }
 
@@ -3785,10 +3786,11 @@ static void DrawSwitch(HDC dc, int x, int y, int w, int h, BOOL on) {
     // 与设置页的 DrawSettingSwitch 同一套：轨道 = C_DARK → C_HOT 混色，圆钮恒为 C_KEY。
     // 原来关态圆钮用 C_DIM（深灰），和设置页的白钮不是一套。
     DWORD track = BlendColor(C_DARK, C_HOT, on ? 1.0 : 0.0);
+    DWORD knobC = BlendColor(C_DIM, C_KEY, on ? 1.0 : 0.0);
     DrawRoundRect(dc, x, y, w, h, track, C_KEY_BORDER, h / 2);
     int knob = h - 6;
     int kx = on ? x + w - knob - 3 : x + 3;
-    DrawRoundRect(dc, kx, y + 3, knob, knob, C_KEY, C_KEY, knob / 2);
+    DrawRoundRect(dc, kx, y + 3, knob, knob, knobC, knobC, knob / 2);
 }
 
 // ========== 设置页度量与布局 ==========

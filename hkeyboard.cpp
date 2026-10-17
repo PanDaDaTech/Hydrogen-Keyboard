@@ -428,6 +428,51 @@ static HWND g_settingsHwnd = 0;
 static HWND g_closePromptHwnd = 0;
 
 // 重新应用主题；颜色确实发生变化时刷新窗口（三个窗口一起，避免只换主键盘留下残留配色）
+
+// 本进程是否已提权。UIPI：低权限进程向高权限窗口注入键鼠会被**静默丢弃**，
+// 表现为"某个程序里按键全都没反应"（实测 WorkBuddy 以管理员运行时即如此）。
+static BOOL IsProcessElevated() {
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return FALSE;
+    TOKEN_ELEVATION te = {0};
+    DWORD cb = sizeof(te);
+    BOOL elevated = FALSE;
+#ifdef TOKEN_ELEVATION
+    if (GetTokenInformation(tok, TokenElevation, &te, cb, &cb))
+        elevated = te.TokenIsElevated ? TRUE : FALSE;
+#else
+    if (GetTokenInformation(tok, (TOKEN_INFORMATION_CLASS)20, &te, cb, &cb))
+        elevated = te.TokenIsElevated ? TRUE : FALSE;
+#endif
+    CloseHandle(tok);
+    return elevated;
+}
+
+// 以管理员身份重启自身。返回 FALSE 表示 UAC 被拒或启动失败，调用方应维持原状。
+static BOOL RelaunchElevated() {
+    wchar_t exe[MAX_PATH] = {0};
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return FALSE;
+    // 沿用原参数（跳过第一个 token = 程序自身），保留 -hide / -afdiag 等
+    const wchar_t* cmd = GetCommandLineW();
+    wchar_t args[1024] = {0};
+    if (cmd && *cmd) {
+        const wchar_t* p = cmd;
+        if (*p == L'"') { p++; while (*p && *p != L'"') p++; if (*p) p++; }
+        else { while (*p && *p != L' ' && *p != L'\t') p++; }
+        while (*p == L' ' || *p == L'\t') p++;
+        if (wcslen(p) < 1000) wcscpy_s(args, p);
+    }
+    // 必须先释放单实例互斥体，否则新实例会"发现已有实例"而静默退出
+    if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = NULL; }
+    HINSTANCE r = ShellExecuteW(NULL, L"runas", exe, args[0] ? args : NULL, NULL, SW_SHOWNORMAL);
+    INT_PTR v = (INT_PTR)r;
+    if (v <= 32) {                              // 失败：把互斥体补回来，继续以当前权限跑
+        g_mutex = CreateMutexW(0, FALSE, L"HKeyboard_Mutex");
+        return FALSE;
+    }
+    return TRUE;
+}
+
 // 主窗口句柄定义在下面（文件靠后），这里要提前引用
 extern HWND g_hWnd;
 
@@ -610,6 +655,10 @@ static BOOL g_npLock = TRUE;            // TRUE = 数字（小键盘）模式
 //   高亮始终等于真实锁定态，不需要再区分「首帧」与「之后」）
 BOOL        g_physFn = FALSE;         // 预留接口：Fn 实体键状态（多数键盘不产生按键事件，后续按需扩展）
 BOOL        g_af = TRUE;
+BOOL        g_runAsAdmin = FALSE;      // ini General/RunAsAdmin：以管理员身份运行
+
+// 本进程是否已提权（UIPI：低权限进程向高权限窗口注入键鼠会被静默丢弃）
+static BOOL IsProcessElevated();
 BOOL        g_afChromiumPrecise = TRUE;
 // ⚠ 2026-10-04 语义变更：这个开关原来控制的是"收起后在同一输入框内不自动回弹"
 BOOL        g_afAutoHide = TRUE;
@@ -3755,6 +3804,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
 #define S_HIT_DIAG           33   // 关于 Tab：诊断日志行的「导出」按钮
 #define S_HIT_CLOSE_DROP     70
+#define S_HIT_RUNAS         98   // 常规 Tab：以管理员身份运行
 #define S_HIT_LANG_DROP      50
 #define S_HIT_HL_DROP        60
 #define S_HIT_HL_BOX         64
@@ -3937,7 +3987,7 @@ static int SettingsRowHeight(const SettingsMetrics& m, int index) {
 
 static int SettingsRowCount(int tab) {
     // ⚠⚠ 2026-10-04 修：原来返回 `g_af ? 7 : 6`，**漏算了「Shift 双击锁定」那一行**。
-    if (tab == 0) return g_af ? 8 : 7;
+    if (tab == 0) return g_af ? 9 : 8;   // 末行「以管理员身份运行」
     if (tab == 3) return 4;   // 布局 Tab：键盘布局 / Fn 网页布局 / 小键盘按钮
     if (tab == 1) return 4;
     return 0;
@@ -4266,6 +4316,7 @@ static RECT SettingsSwitchRect(const SettingsMetrics& m, int hit) {
     else if (hit == S_HIT_SHDLOCK)  rowIndex = g_af ? 6 : 5;
     else if (hit == S_HIT_DUAL)     rowIndex = 3;
     else if (hit == S_HIT_LANG_DROP) rowIndex = g_af ? 7 : 6;
+    else if (hit == S_HIT_RUNAS)    rowIndex = g_af ? 8 : 7;
     else rowIndex = g_af ? 5 : 4;
     RECT row = SettingsRowRect(m, rowIndex);
     row.left = row.right - (int)(120 * m.dpi);
@@ -4657,6 +4708,15 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
                               T(L"切换设置与键盘的显示语言", L"Language of settings and keyboard"),
                               g_sHov == S_HIT_LANG_DROP, gsegR.left);
         DrawSegmented(dc, m, gsegR, gseg, gsegn, g_lang);
+
+        // 以管理员身份运行（末行）：提权后键盘才能向管理员权限的程序注入按键
+        r = SettingsRowRect(m, closeRow + 6);
+        DrawSettingRowContent(dc, m, r, HKICON_GEAR, NULL,
+                              T(L"以管理员身份运行", L"Run as administrator"),
+                              T(L"重启后生效。提权后才能向以管理员权限运行的程序输入按键",
+                                L"Takes effect after restart. Required to type into elevated programs"),
+                              g_sHov == S_HIT_RUNAS, SettingsSwitchTextRight(m, r));
+        DrawSettingSwitch(dc, m, r, g_runAsAdmin, S_HIT_RUNAS);
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮（「按键图标样式」行已删）
         // （原第 5 行「Fn + Tab 切换小键盘」已下线：全尺寸下显隐数字区只留标题栏那一个入口）
@@ -4905,6 +4965,9 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
         { const wchar_t* it[2]; int n = LangSegItems(it);
           RECT sr = RowSegRect(m, r, it, n);
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_LANG_DROP; }
+
+        r = SettingsRowRect(m, closeRow + 6);   // 以管理员身份运行（末行，与绘制同源）
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return S_HIT_RUNAS;
     } else if (g_sTab == 3) {
         // 布局 Tab：0=键盘布局 1=Fn 网页布局 2=小键盘按钮（「按键图标样式」行已删）
         // （原第 5 行「Fn + Tab 切换小键盘」已下线：全尺寸下显隐数字区只留标题栏那一个入口）
@@ -5130,6 +5193,7 @@ static void LoadConfig() {
     g_lang = IniGetInt(L"General", L"Language", 0);
     if (g_lang < 0 || g_lang > 1) g_lang = 0;
     g_af = (IniGetInt(L"General", L"AutoPopup", 1) != 0);
+    g_runAsAdmin = (IniGetInt(L"General", L"RunAsAdmin", 0) != 0);
     g_afAutoHide = (IniGetInt(L"General", L"AutoHide", 1) != 0);
     // Chromium 系「精判收起」开关（默认开）。关掉就回到"Chromium 一在前台就不收"的旧行为。
     // ⚠ 只影响收起，不影响呼出 —— 见 g_afChromiumPrecise 的说明。
@@ -5325,6 +5389,22 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
                 ApplyWindowOpacity(g_hWnd, g_mainOpacity < 100);
                 RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
             }
+        }
+        break;
+    }
+    case S_HIT_RUNAS: {
+        BeginSwitchAnimation(hWnd, hit, g_runAsAdmin, !g_runAsAdmin);
+        g_runAsAdmin = !g_runAsAdmin;
+        IniSetInt(L"General", L"RunAsAdmin", g_runAsAdmin ? 1 : 0);
+        // 打开且当前没提权 ⇒ 立刻以管理员身份重启（用户点了就是要它生效）
+        if (g_runAsAdmin && !IsProcessElevated()) {
+            if (RelaunchElevated()) {
+                PostQuitMessage(0);       // 管理员实例已拉起，本实例退出
+                break;
+            }
+            g_runAsAdmin = FALSE;         // UAC 被拒，改回去
+            IniSetInt(L"General", L"RunAsAdmin", 0);
+            InvalidateRect(hWnd, NULL, TRUE);
         }
         break;
     }
@@ -6493,8 +6573,22 @@ static int UiaFocusEditable(HWND fgExpect) {
         HWND fgTop = GetAncestor(fgExpect, GA_ROOT);
         if (elTop && fgTop && elTop != fgTop) return -1;   // 这不是本窗口的焦点
     }
+    // 能力判定：contenteditable（QQ / WorkBuddy 的 ProseMirror）在 UIA 里只报
+    // Group / Document、永远不是 Edit，但**有** TextPattern2 / ValuePattern ⇒ 仍是可编辑。
+    // Window(50032) / Pane(50033) 且无任何文本能力 ⇒ 真的没有任何元素持有焦点。
+    BOOL hasText = FALSE;
+    {
+        IUnknown* pat = NULL;
+        if (SUCCEEDED(el->GetCurrentPattern(10024, &pat)) && pat) { hasText = TRUE; pat->Release(); }
+        if (!hasText) {
+            pat = NULL;
+            if (SUCCEEDED(el->GetCurrentPattern(10002, &pat)) && pat) { hasText = TRUE; pat->Release(); }
+        }
+    }
     g_dbgUiaCt = (int)ct;
-    return (ct == HK_UIA_CT_EDIT) ? 1 : 0;
+    if (ct == HK_UIA_CT_EDIT) return 1;
+    if (ct == 50032 || ct == 50033) return 0;      // Window / Pane：没有元素焦点
+    return hasText ? 1 : 0;
 }
 
 //   ⚠ 缓存的是**判定结果**，不是元素指针。
@@ -6680,11 +6774,31 @@ static void DiagAppendProbe(HANDLE h) {
             CloseHandle(tok);
         }
     }
+    // 目标前台进程是否也提权。self=0 而 target=1 时，低权限键盘向高权限窗口注入
+    // 键鼠会被 UIPI **静默丢弃** —— 表现为"只有某个程序打不进字"，不查这一项永远猜不到。
+    int targetElevated = -1;
+    if (pid && pid != GetCurrentProcessId()) {
+        HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (ph) {
+            HANDLE ttok = NULL;
+            if (OpenProcessToken(ph, TOKEN_QUERY, &ttok)) {
+                DWORD elev = 0, cb = 0;
+                if (GetTokenInformation(ttok, (TOKEN_INFORMATION_CLASS)20, &elev, sizeof(elev), &cb))
+                    targetElevated = (elev != 0) ? 1 : 0;
+                CloseHandle(ttok);
+            }
+            CloseHandle(ph);
+        }
+    }
     _snprintf_s(line, sizeof(line), _TRUNCATE,
         "--- hooks / process ---\r\n"
         "mouseHook=%p kbHook=%p winHook=%p fgEvHook=%p   (0/NULL = 装不上)\r\n"
+        "elevation         : self=%d targetForeground=%d\r\n"
+        "                    (1=提权；self=0 且 target=1 时按键会被 UIPI 静默丢弃)\r\n"
+        "                    targetProcessId=%lu\r\n"
         "elevated=%d  pid=%lu  iniPathSee:exe dir\r\n",
         (void*)g_mouseHook, (void*)g_kbHook, (void*)g_winHook, (void*)g_fgHook,
+        (int)elevated, (int)targetElevated, (unsigned long)pid,
         (int)elevated, (unsigned long)GetCurrentProcessId());
     DiagWrite(h, line);
 
@@ -8207,6 +8321,11 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR cmd, int) {
     // 配置：首次启动自动生成 HKeyboard.ini（系统环境已在前置检测）
     EnsureConfigFile();
     LoadConfig();
+    if (g_runAsAdmin && !IsProcessElevated()) {
+        if (RelaunchElevated()) return 0;      // 已拉起管理员实例，本实例退出
+        g_runAsAdmin = FALSE;                  // UAC 被拒：降级普通运行
+        IniSetInt(L"General", L"RunAsAdmin", 0);
+    }
     if (fNoAuto) g_af = FALSE;
     else if (fAuto) g_af = TRUE;
     if (fThemeCli) g_themeMode = fDark ? 1 : (fLight ? 2 : 0);   // 命令行主题优先

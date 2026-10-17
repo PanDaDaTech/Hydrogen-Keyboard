@@ -7430,7 +7430,14 @@ static void UpdateAutoVisibility() {
     if (uiaStable == 1) { g_chromiumTrustFg = fgNow; g_chromiumTrustPid = PidOfWindow(fgNow); }
     BOOL trustHere = (g_chromiumTrustFg && IsWindow(g_chromiumTrustFg) && g_chromiumTrustFg == fgNow) ||
                      (g_chromiumTrustPid != 0 && g_chromiumTrustPid == PidOfWindow(fgNow));
-    if (input && uiaStable == 0 && trustHere) {
+    // ⚠⚠ 只有**已显示**时才抹掉粗判：这条路径的唯一目的是"把可见的键盘收起来"。
+    // 隐藏期间 UIA 焦点判据不再采样（上面 g_vis 闸门，原因见那边注释），多数票
+    // 冻结在收起前的旧样本上；拿冻结值每拍抹 input，会把下面"重新攒正面证据"的
+    // 整条 show 通路堵死 —— 实测 2026-10-18：verdict-hide 收起后点输入框，
+    // pt=1/ptc=50004（落点就是 Edit）证据在场，却每拍 why=hidden-nop 永不弹。
+    // （dcdca1a 引入多数票时把原来的 chromiumVerdict==0 换成 uiaStable==0，
+    //   前者隐藏期间恒 -1 不会抹，后者由冻结样本算出恒 0 —— 回归就在这。）
+    if (g_vis && input && uiaStable == 0 && trustHere) {
         // 精判说"光标不在可编辑元素里" ⇒ 收起，并记下"这一次是精判收的"。
         g_verdictHide = TRUE;
         g_verdictHidFg = fgNow;
@@ -7441,6 +7448,17 @@ static void UpdateAutoVisibility() {
     if (g_verdictHide && g_verdictHidFg != fgNow) g_verdictHide = FALSE;
 
     if (input) {
+        // 隐藏期间刚点过：落点明确**不是**可编辑区 ⇒ 不弹，并记住"这次是精判收的"。
+        // ⚠ 放在 verdictHide 判断**外面**：alt-tab 走一趟再回来时 verdictHide 已因
+        //   换前台作废（多数票也被按进程重置），只判 verdictHide 会漏掉这种
+        //   "点只读区/空白，键盘弹一下"。设了 verdictHide，之后 vhid-hold 继续按住。
+        // ⚠ 信任门不能省：没在该窗口见过可编辑元素时，落点判据的结论不予采信。
+        if (!g_vis && recentClick && g_dbgUiaPt == 0 && g_chromiumTrustFg == fgNow) {
+            g_verdictHide = TRUE;
+            g_verdictHidFg = fgNow;
+            g_dbgWhy = "vhid-blank";
+            goto done;
+        }
         // ⚠ 不能用"点了窗口内任何地方"当证据 —— 那样点空白也会弹一下再收（闪一下）
         if (g_verdictHide) {
             if (g_verdictHidFg != fgNow || byKey) {
@@ -7545,12 +7563,14 @@ static void UpdateAutoVisibility() {
 done:
     // 诊断（-afdiag / 日志导出）：记录这次评估的全部输入量
     {
-        // 落点查询（只在"精判刚收过 + 这一拍有新点击"时查）
-        // 结果既进日志，也供下面的 show 分支决定要不要放行 —— 一拍只查一次。
+        // 落点查询：已显示时仍只查"精判刚收过"那一支（原语义不变）；
+        // **隐藏期间每次新点击都查** —— show 通路唯一的鼠标正面证据就是它
+        // （ElementFromPoint 在隐藏期间实测可靠：空白→50030，输入框→50004）。
+        // 结果既进日志，也供上面的 show 分支决定要不要放行 —— 一拍只查一次。
         g_dbgUiaPt = -1;
         g_dbgUiaPtCt = -1;
-        if (g_verdictHide && g_verdictHidFg == fgNow && recentClick &&
-            g_afChromiumPrecise && g_detectedByChromiumClass)
+        if (recentClick && g_afChromiumPrecise && g_detectedByChromiumClass &&
+            (!g_vis || (g_verdictHide && g_verdictHidFg == fgNow)))
             g_dbgUiaPt = UiaPointEditable(g_lastClickPt);
         char st[176];
         _snprintf_s(st, sizeof(st), _TRUNCATE,

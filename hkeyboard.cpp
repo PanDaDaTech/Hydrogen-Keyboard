@@ -3617,6 +3617,8 @@ static BOOL TickWindowMotion(WindowMotion* motion, HWND hWnd) {
     return TRUE;
 }
 
+static void TouchTapEdgeDiscard();   // 定义在触屏证据段（约 6600 行）之后
+
 static void ShowKB(BOOL show, BOOL isManual) {
     // 诊断（-afdiag）：谁在显示/隐藏键盘
     {
@@ -3671,6 +3673,11 @@ static void ShowKB(BOOL show, BOOL isManual) {
         if (GetWindowRect(g_hWnd, &current)) fromY = current.top;
         g_vis = FALSE;
         StartWindowMotion(&g_mainMotion, g_hWnd, sx, fromY, work.bottom, 150, MOTION_HIDE);
+        // 作废还没消费的"触控点击"边沿：显示期间没人咨询它（只在 verdictHide 分支
+        // 才被消费），一次 1.9 秒前的点击会在收起后几拍里被当成"该弹"的正面证据，
+        // 形成 收起→30ms 后又弹→1.4s 后再收 的闪烁（2026-10-18 实测，why=show）。
+        // 新的一次触控会刷新 g_touchTapTick，边沿自动重新武装，不影响正常使用。
+        TouchTapEdgeDiscard();
     }
 }
 
@@ -6615,12 +6622,23 @@ static BOOL TouchTappedRecently() {
     return (DWORD)(GetTickCount() - g_touchTapTick) <= 1500;
 }
 
-//   ⚠ 为什么需要它：触屏拿不到落点（没有鼠标消息），触屏的两条强证据
+//   ⚠ 为什么需要它：触屏拿不到鼠标落点，焦点变化 / 系统触摸键盘出现这两条强证据
+//   在边缘场景都会失效，只能拿"用户刚点了一下"当"该弹"的正面证据。
+//   ⚠⚠ 必须带**新鲜度**判断：边沿本身没有时间上限，而它只在 verdictHide 分支里
+//   才被咨询（显示期间无人消费）。缺了新鲜度，一次 1.9 秒前的触控点击会在键盘
+//   收起后 30ms 又放行弹出，1.4s 后再收起 —— 用户看到的就是"闪一下"
+//   （2026-10-18 回归实测：02:19:36.094 why=show tip=0 foc=0）。
 static DWORD g_touchTapConsumed = 0;
 static BOOL TouchTapEdgeConsume() {
     if (!g_touchTapTick || g_touchTapTick == g_touchTapConsumed) return FALSE;
+    if ((DWORD)(GetTickCount() - g_touchTapTick) > 1500) return FALSE;   // 过期不认
     g_touchTapConsumed = g_touchTapTick;
     return TRUE;
+}
+
+// 键盘收起时作废尚未消费的边沿（见 ShowKB 隐藏分支的调用处）
+static void TouchTapEdgeDiscard() {
+    g_touchTapConsumed = g_touchTapTick;
 }
 
 // ===== Chromium 系「光标到底在不在输入框里」的精判（UI Automation）=====

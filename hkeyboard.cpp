@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <commdlg.h>    // 只用 OPENFILENAMEW 结构体；GetSaveFileNameW 运行时动态加载（不新增链接依赖）
 #include <objbase.h>
 #include <oleacc.h>
 // ⚠ 只用到纯 getter（CoCreateInstance / GetFocusedElement / get_CurrentControlType）
@@ -135,6 +136,7 @@ int g_keyHeight = 46;
 #define TIMER_SETTINGS_ANIM 8827
 #define TIMER_WIN_FADE 8831
 #define TIMER_CARET     8834   // 设置页 HEX 输入框的光标闪烁
+#define TIMER_DIAGDONE  8835   // 「导出」按钮的完成态：3 秒后变回
 #define WM_TRAY         (WM_APP + 100)
 #define WM_FOCUS_EVENT  (WM_APP + 101)
 #define WM_SHOW_KEYBOARD (WM_APP + 102)
@@ -552,7 +554,7 @@ static BOOL IsTouchDevice();          // 定义在窗口过程附近；自动呼
 // 前向声明在这里是因为 ShowKB 定义在那套 UIA 状态之前。
 static void ForgetVerdictHide();
 // 导出诊断日志（实现在那套 UIA 状态之后）：托盘右键与设置页「关于」Tab 都调它
-static void ExportDiagLog();
+static BOOL ExportDiagLog();
 static BOOL LoadLayoutWindowRect(RECT* out);
 static BOOL LayoutRectOnScreen(const RECT& rc);
 // 文字量宽（定义在绘制函数区，RecreateFontsAndLayout 里量「Backspace」要提前声明）
@@ -3815,6 +3817,7 @@ static void ShowHelpDialog(HWND hWnd) {
 #define S_HIT_URL            30
 #define S_HIT_LICENSE        32   // 关于 Tab：开源许可行的「查看」按钮
 #define S_HIT_DIAG           33   // 关于 Tab：诊断日志行的「导出」按钮
+#define S_HIT_SITE           34   // 关于 Tab：项目地址行的「官网」圆钮
 #define S_HIT_CLOSE_DROP     70
 #define S_HIT_RUNAS         98   // 常规 Tab：以管理员身份运行
 #define S_HIT_RA_OK         101  // 「以管理员身份运行」询问窗：确定
@@ -4522,6 +4525,30 @@ static RECT AboutLicenceBtnRect(const SettingsMetrics& m, int rowTop, const wcha
     return r;
 }
 
+// 链接行圆钮：GitHub 在最右，「官网」钮在其左邻（2026-10-19 用户要求加官网入口）。
+// 绘制与命中必须读同一份几何。
+static RECT AboutGithubBtnRect(const SettingsMetrics& m, const RECT& row) {
+    int b = (int)(34 * m.dpi);
+    int x = row.right - AboutPadX(m) - b;
+    int y = row.top + ((row.bottom - row.top) - b) / 2;
+    RECT r = {x, y, x + b, y + b};
+    return r;
+}
+static RECT AboutSiteBtnRect(const SettingsMetrics& m, const RECT& row) {
+    RECT g = AboutGithubBtnRect(m, row);
+    int b = g.right - g.left;
+    int x = g.left - (int)(10 * m.dpi) - b;
+    RECT r = {x, g.top, x + b, g.bottom};
+    return r;
+}
+
+// 「导出」按钮的完成态：导出成功后显示「完成」3 秒再变回（替代弹窗反馈，用户要求）
+static DWORD g_diagDoneTick = 0;
+static const wchar_t* DiagBtnLabel() {
+    if (g_diagDoneTick && GetTickCount() - g_diagDoneTick < 3000) return T(L"完成", L"Done");
+    return T(L"导出", L"Export");
+}
+
 // 关于 tab 的卡与章节：绘制与命中必须取自同一份几何，避免两边各算一遍
 struct AboutLayout {
     RECT card1;   // 身份卡
@@ -4586,18 +4613,24 @@ static void SettingsFitHeight(HWND hWnd) {
 
 // ⚠ 高亮**只作用在圆钮上，不铺整行**（实测制作工具：链接卡整卡纯白 (255,255,255)
 static void DrawAboutLinkRow(HDC dc, const SettingsMetrics& m, const RECT& row,
-                             int iconId, const wchar_t* title, const wchar_t* desc, BOOL hover) {
-    int btn = (int)(34 * m.dpi);
-    int bx = row.right - AboutPadX(m) - btn;
-    int by = row.top + ((row.bottom - row.top) - btn) / 2;   // 圆钮在行内居中
-    DrawRoundRect(dc, bx, by, btn, btn, hover ? C_REGULAR_HOV : C_REGULAR,
-                  hover ? C_REGULAR_HOV : C_REGULAR, btn / 2);
+                             int iconId, const wchar_t* title, const wchar_t* desc,
+                             BOOL hoverGh, BOOL hoverSite) {
+    // 两个圆钮：GitHub（最右）+ 官网（左邻），几何与命中共用同一份 helper
+    RECT g = AboutGithubBtnRect(m, row);
+    RECT s = AboutSiteBtnRect(m, row);
+    int bw = g.right - g.left, bh = g.bottom - g.top;
     int isz = (int)(17 * m.dpi);
-    DrawHkIcon(dc, (float)(bx + (btn - isz) / 2), (float)(by + (btn - isz) / 2), (float)isz,
+    DrawRoundRect(dc, g.left, g.top, bw, bh,
+                  hoverGh ? C_REGULAR_HOV : C_REGULAR, hoverGh ? C_REGULAR_HOV : C_REGULAR, bw / 2);
+    DrawHkIcon(dc, (float)(g.left + (bw - isz) / 2), (float)(g.top + (bh - isz) / 2), (float)isz,
                HkIcon(iconId), C_BTN_CONTENT, C_BTN_CONTENT);
+    DrawRoundRect(dc, s.left, s.top, bw, bh,
+                  hoverSite ? C_REGULAR_HOV : C_REGULAR, hoverSite ? C_REGULAR_HOV : C_REGULAR, bw / 2);
+    DrawHkIcon(dc, (float)(s.left + (bw - isz) / 2), (float)(s.top + (bh - isz) / 2), (float)isz,
+               HkIcon(HKICON_GLOBE), C_BTN_CONTENT, C_BTN_CONTENT);
 
     int tx = row.left + AboutPadX(m);
-    int tw = bx - (int)(12 * m.dpi) - tx;
+    int tw = s.left - (int)(12 * m.dpi) - tx;   // 文字止于官网钮左侧
     int blockH = (int)(36 * m.dpi);
     int tyText = row.top + ((row.bottom - row.top) - blockH) / 2;
     DrawTextL(dc, tx, tyText, tw, (int)(15 * m.dpi), title, g_sfCtrl, C_WHITE);
@@ -4880,8 +4913,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
           RECT stR = RowSegRect(m, r, st, stn);
           DrawSettingRowContent(dc, m, r, HKICON_CONTRAST, NULL,
                                 T(L"界面风格", L"Interface Style"),
-                                T(L"经典：灰色键面 + 4px 圆角；按下与锁定仍用主题色相高亮",
-                                  L"Classic: grey keys, 4px corners; presses and locks keep the accent"),
+                                T(L"选择默认主题或经典灰白主题。",
+                                  L"Choose the default theme or the classic grey theme."),
                                 g_sHov == S_HIT_STYLE, stR.left);
           DrawSegmented(dc, m, stR, st, stn, g_themeStyle); }
 
@@ -4917,7 +4950,7 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         DrawAboutLinkRow(dc, m, AboutRowRect(m, al.card2, 0), HKICON_GITHUB,
                          T(L"项目地址", L"Project URL"),
                          T(L"源码、版本发布与使用说明", L"Source, releases and documentation"),
-                         g_sHov == S_HIT_URL);
+                         g_sHov == S_HIT_URL, g_sHov == S_HIT_SITE);
 
         DrawRoundRect(dc, al.card3.left, al.card3.top,
                       al.card3.right - al.card3.left, al.card3.bottom - al.card3.top,
@@ -4928,8 +4961,8 @@ static void SettingsDraw(HDC dc, HWND hWnd) {
         // 自动呼出出问题时用它导出最近约 3 分钟的运行记录 + 环境/UIA 快照。
         DrawAboutActionRow(dc, m, AboutLicenceRowRect(m, al.card3, 1), g_sHov == S_HIT_DIAG,
                            T(L"诊断日志", L"Diagnostics"),
-                           T(L"自动呼出与 UIA 状态排查", L"Auto pop-up / UIA troubleshooting"),
-                           T(L"导出", L"Export"));
+                           T(L"导出运行日志，方便提交反馈时附带", L"Export a run log to attach with feedback"),
+                           DiagBtnLabel());
 
         // 版权行：文字逐字保留（含 2026 与结尾句点），9px C_DIM 居中，放在最后一张卡下方
         DrawTextC(dc, m.contentX, al.card3.bottom + (int)(18 * m.dpi), m.contentW, (int)(18 * m.dpi),
@@ -5131,16 +5164,17 @@ static int SettingsHitTest(HWND hWnd, int x, int y) {
           if (x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom) return S_HIT_STYLE; }
 
     } else {
-        // 关于 tab：两个链接行整行可点（卡片位置与绘制同源）
-        // 许可 / 诊断行的热区只有右侧按钮本身 —— 行内的文字是读数，不是动作
+        // 关于 tab：链接行整行可点（GitHub）；官网钮 / 许可与诊断行的热区只有按钮本身
         AboutLayout al = GetAboutLayout(m);
         RECT r0 = AboutRowRect(m, al.card2, 0);
+        RECT rs = AboutSiteBtnRect(m, r0);   // 官网钮先判（嵌在行内，整行是 GitHub）
+        if (x >= rs.left && x < rs.right && y >= rs.top && y < rs.bottom) return S_HIT_SITE;
         if (x >= r0.left && x < r0.right && y >= r0.top && y < r0.bottom) return S_HIT_URL;
         RECT rb = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3, 0).top,
                                       T(L"查看", L"View"));
         if (x >= rb.left && x < rb.right && y >= rb.top && y < rb.bottom) return S_HIT_LICENSE;
         RECT rd = AboutLicenceBtnRect(m, AboutLicenceRowRect(m, al.card3, 1).top,
-                                      T(L"导出", L"Export"));
+                                      DiagBtnLabel());   // 完成态时按钮文字变了，热区跟着变
         if (x >= rd.left && x < rd.right && y >= rd.top && y < rd.bottom) return S_HIT_DIAG;
     }
     return S_HIT_NONE;
@@ -5580,13 +5614,21 @@ static void SettingsApplyHit(HWND hWnd, int hit, int x) {
     case S_HIT_URL:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard", NULL, NULL, SW_SHOWNORMAL);
         break;
+    case S_HIT_SITE:
+        ShellExecuteW(NULL, L"open", L"https://www.pandadatech.cn/archives/hydrogen-keyboard", NULL, NULL, SW_SHOWNORMAL);
+        break;
     case S_HIT_LICENSE:
         ShellExecuteW(NULL, L"open", L"https://github.com/PanDaDaTech/Hydrogen-Keyboard/blob/main/LICENSE", NULL, NULL, SW_SHOWNORMAL);
         break;
     case S_HIT_DIAG: {
         // 关于 Tab / 托盘右键都有这个入口：导出最近约 3 分钟的运行记录
         // 外加环境快照与 UIA 自检结果（见 ExportDiagLog）。
-        ExportDiagLog();
+        // 完成态 3 秒内不重复触发（按钮正显示「完成」）。
+        if (g_diagDoneTick && GetTickCount() - g_diagDoneTick < 3000) break;
+        if (ExportDiagLog()) {
+            g_diagDoneTick = GetTickCount();
+            SetTimer(hWnd, TIMER_DIAGDONE, 3000, NULL);   // 3s 后「完成」变回「导出」
+        }
         break;
     }
     default: return;
@@ -5769,7 +5811,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ScreenToClient(hWnd, &pt);
         if (g_sTab == 2) {
             int hv = SettingsHitTest(hWnd, pt.x, pt.y);
-            if (hv == S_HIT_URL || hv == S_HIT_LICENSE || hv == S_HIT_DIAG) {
+            if (hv == S_HIT_URL || hv == S_HIT_SITE || hv == S_HIT_LICENSE || hv == S_HIT_DIAG) {
                 SetCursor(LoadCursor(NULL, IDC_HAND));
                 return TRUE;
             }
@@ -5794,6 +5836,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         InvalidateRect(hWnd, NULL, FALSE);
         return 0;
     case WM_TIMER:
+        if (w == TIMER_DIAGDONE) {
+            KillTimer(hWnd, TIMER_DIAGDONE);
+            InvalidateRect(hWnd, NULL, FALSE);   // 「完成」变回「导出」
+            return 0;
+        }
         if (w == TIMER_WINDOW_ANIM) {
             TickWindowMotion(&g_settingsMotion, hWnd);
             return 0;
@@ -7112,7 +7159,7 @@ static void DiagOsVersion(char* out, int cch) {
     _snprintf_s(out, cch, _TRUNCATE, "%s %s build %s.%s", product, dv, build, ubr);
 }
 
-static void ExportDiagLog() {
+static BOOL ExportDiagLog() {   // 返回是否成功导出（用户取消 / 写入失败返回 FALSE）
     wchar_t self[MAX_PATH * 2] = {0};
     GetModuleFileNameW(NULL, self, MAX_PATH * 2);
     wchar_t* sl = wcsrchr(self, L'\\');
@@ -7120,17 +7167,40 @@ static void ExportDiagLog() {
 
     SYSTEMTIME st;
     GetLocalTime(&st);
-    wchar_t path[MAX_PATH * 2] = {0};
-    _snwprintf_s(path, MAX_PATH * 2, _TRUNCATE,
-                 L"%sHKeyboard_diag_%04d%02d%02d_%02d%02d%02d.txt",
-                 self, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    // 另存为对话框：用户自选存放位置（默认 exe 目录 + 时间戳文件名）
+    // ⚠ GetSaveFileNameW 从 comdlg32.dll 动态加载 —— 链接库清单固定，不新增依赖
+    typedef BOOL (WINAPI *GetSaveFileNameW_t)(OPENFILENAMEW*);
+    static GetSaveFileNameW_t pfn = NULL;
+    if (!pfn) {
+        HMODULE m = LoadLibraryW(L"comdlg32.dll");
+        if (m) pfn = (GetSaveFileNameW_t)GetProcAddress(m, "GetSaveFileNameW");
+    }
+    if (!pfn) return FALSE;
+
+    wchar_t file[MAX_PATH * 2] = {0};
+    _snwprintf_s(file, MAX_PATH * 2, _TRUNCATE,
+                 L"HKeyboard_diag_%04d%02d%02d_%02d%02d%02d.txt",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    OPENFILENAMEW ofn = {sizeof(ofn)};
+    ofn.hwndOwner      = g_hWnd;
+    ofn.lpstrFilter    = L"文本文件 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFile      = file;
+    ofn.nMaxFile       = MAX_PATH * 2;
+    ofn.lpstrTitle     = T(L"导出诊断日志", L"Export Diagnostics");
+    ofn.lpstrDefExt    = L"txt";
+    ofn.lpstrInitialDir= self;
+    ofn.Flags          = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!pfn(&ofn)) return FALSE;       // 用户取消
+    const wchar_t* path = file;
 
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         MessageBoxW(g_hWnd, L"无法写入日志文件（目录不可写）。", L"导出诊断日志",
                     MB_OK | MB_ICONWARNING);
-        return;
+        return FALSE;
     }
 
     char osv[192] = {0};
@@ -7188,16 +7258,8 @@ static void ExportDiagLog() {
         if (n == 0 || line[n - 1] != '\n') WriteFile(h, "\r\n", 2, &wr, NULL);
     }
     CloseHandle(h);
-
-    // 打开资源管理器并选中该文件
-    wchar_t arg[MAX_PATH * 2 + 32] = {0};
-    _snwprintf_s(arg, MAX_PATH * 2 + 32, _TRUNCATE, L"/select,\"%s\"", path);
-    ShellExecuteW(NULL, L"open", L"explorer.exe", arg, NULL, SW_SHOWNORMAL);
-
-    wchar_t msg[MAX_PATH * 3] = {0};
-    _snwprintf_s(msg, MAX_PATH * 3, _TRUNCATE,
-                 L"诊断日志已导出：\n%s\n\n请把该文件发送给开发者。", path);
-    MessageBoxW(g_hWnd, msg, L"导出诊断日志", MB_OK | MB_ICONINFORMATION);
+    // ⚠ 不再弹窗、不再开资源管理器 —— 成功反馈就是按钮变「完成」3 秒（用户要求）
+    return TRUE;
 }
 
 // ⚠ 取**上升沿**：TabTip 一旦出现会持续可见（电平），直接用会变成
